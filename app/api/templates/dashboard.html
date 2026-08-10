@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RMP Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+        h1 { font-size: 24px; font-weight: 700; margin-bottom: 24px; color: #f8fafc; }
+        h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; color: #f1f5f9; }
+
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 32px; }
+        .stat-card { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
+        .stat-card .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8; margin-bottom: 4px; }
+        .stat-card .value { font-size: 28px; font-weight: 700; }
+        .stat-card .value.running { color: #38bdf8; }
+        .stat-card .value.completed { color: #4ade80; }
+        .stat-card .value.failed { color: #f87171; }
+        .stat-card .value.model { font-size: 14px; color: #a78bfa; word-break: break-all; }
+        .stat-card .hint { font-size: 11px; color: #64748b; margin-top: 4px; }
+
+        .section { background: #1e293b; border-radius: 12px; padding: 24px; margin-bottom: 24px; border: 1px solid #334155; }
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; border-bottom: 1px solid #334155; }
+        td { padding: 10px 12px; font-size: 13px; border-bottom: 1px solid #1e293b; }
+        tr:hover td { background: #334155; }
+
+        .badge { display: inline-block; padding: 2px 10px; border-radius: 9999px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+        .badge.running { background: #0c4a6e; color: #38bdf8; }
+        .badge.completed { background: #14532d; color: #4ade80; }
+        .badge.failed { background: #7f1d1d; color: #f87171; }
+        .badge.created { background: #3f3f46; color: #a1a1aa; }
+        .badge.pending { background: #713f12; color: #fbbf24; }
+        .badge.stopped { background: #581c87; color: #c084fc; }
+        .badge.stale { background: #44403c; color: #fbbf24; }
+        .badge.unknown { background: #27272a; color: #a1a1aa; }
+
+        .config-form { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 12px; align-items: end; }
+        .config-form label { font-size: 12px; color: #94a3b8; display: block; margin-bottom: 4px; }
+        .config-form input, .config-form select { background: #0f172a; border: 1px solid #475569; color: #e2e8f0; padding: 8px 12px; border-radius: 8px; font-size: 13px; width: 100%; }
+        .config-form button { background: #6366f1; color: white; border: none; padding: 8px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px; height: 37px; }
+        .config-form button:hover { background: #4f46e5; }
+
+        .toggle-row { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+        .toggle-row label { font-size: 13px; color: #94a3b8; }
+        .toggle { position: relative; width: 44px; height: 24px; }
+        .toggle input { opacity: 0; width: 0; height: 0; }
+        .toggle .slider { position: absolute; inset: 0; background: #475569; border-radius: 12px; cursor: pointer; transition: 0.2s; }
+        .toggle .slider:before { content: ""; position: absolute; height: 18px; width: 18px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.2s; }
+        .toggle input:checked + .slider { background: #6366f1; }
+        .toggle input:checked + .slider:before { transform: translateX(20px); }
+
+        .dirty-indicator { font-size: 11px; color: #fbbf24; display: none; }
+        .dirty-indicator.visible { display: inline; }
+
+        .task-id { font-family: monospace; font-size: 12px; color: #94a3b8; }
+        .task-goal { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        .dev-banner { background: #713f12; border: 1px solid #fbbf24; border-radius: 12px; padding: 16px 20px; margin-bottom: 24px; display: none; }
+        .dev-banner.visible { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+        .dev-banner p { font-size: 14px; color: #fef3c7; }
+        .dev-banner button { background: #fbbf24; color: #1e293b; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px; }
+        .dev-banner button:hover { background: #f59e0b; }
+
+        .prod-banner { background: #14532d; border: 1px solid #4ade80; border-radius: 12px; padding: 16px 20px; margin-bottom: 24px; display: none; }
+        .prod-banner.visible { display: block; }
+        .prod-banner p { font-size: 14px; color: #dcfce7; }
+
+        .stat-card .value.score-pass { color: #4ade80; }
+        .stat-card .value.score-warn { color: #fbbf24; }
+        .stat-card .value.score-fail { color: #f87171; }
+
+        .btn-action { background: #334155; color: #e2e8f0; border: 1px solid #475569; padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 11px; margin-right: 4px; }
+        .btn-action:hover { background: #475569; }
+        .btn-action.danger { background: #7f1d1d; border-color: #991b1b; }
+        .btn-action.danger:hover { background: #991b1b; }
+        .btn-action.primary { background: #1e3a5f; border-color: #2563eb; }
+        .btn-action.primary:hover { background: #2563eb; }
+        .btn-action:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        @media (max-width: 768px) {
+            .config-form { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Reliability & Memory Plane</h1>
+
+        <div class="dev-banner {% if settings.development_mode %}visible{% endif %}" id="dev-banner">
+            <p><strong>Development mode</strong> — Slack notifications and task interception are suspended.</p>
+            <button type="button" onclick="suspendAll()">Suspend all running tasks</button>
+        </div>
+
+        <div class="prod-banner {% if not settings.development_mode %}visible{% endif %}" id="prod-banner">
+            <p><strong>Production mode</strong> — Reconciler, scanner sync, and alerting are active. Monitor readiness and backups below.</p>
+        </div>
+
+        <div class="stats" id="stats-grid">
+            <div class="stat-card">
+                <div class="label">Total Tasks</div>
+                <div class="value" id="stat-total">{{ tasks|length }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Running</div>
+                <div class="value running" id="stat-running">{{ tasks|selectattr('status', 'equalto', 'running')|list|length }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Completed</div>
+                <div class="value completed" id="stat-completed">{{ tasks|selectattr('status', 'equalto', 'completed')|list|length }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Failed</div>
+                <div class="value failed" id="stat-failed">{{ tasks|selectattr('status', 'equalto', 'failed')|list|length }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Active LLM Model</div>
+                <div class="value model" id="stat-model">{{ model.model }}</div>
+                <div class="hint" id="stat-key-hint">Key: {{ model.api_key_hint or 'N/A' }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Vector Memory</div>
+                <div class="value model" id="stat-vector">—</div>
+                <div class="hint" id="stat-vector-hint">Mem0 + Qdrant</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Readiness Score</div>
+                <div class="value" id="stat-readiness">—</div>
+                <div class="hint" id="stat-readiness-hint">Production checks</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Last Backup</div>
+                <div class="value model" id="stat-backup">—</div>
+                <div class="hint" id="stat-backup-hint">ops/backup.sh</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>LLM Configuration</h2>
+            <form class="config-form" id="config-form" onsubmit="updateConfig(event)">
+                <div>
+                    <label>Provider</label>
+                    <select name="provider" id="cfg-provider">
+                        {% for provider_name in model_catalog.keys()|list|sort %}
+                        <option value="{{ provider_name }}" {% if model.provider == provider_name %}selected{% endif %}>{{ provider_name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label>Model</label>
+                    <select name="model_select" id="cfg-model-select"></select>
+                    <input type="text" name="model_custom" id="cfg-model-custom" placeholder="Enter custom model id" style="display:none; margin-top:8px;">
+                </div>
+                <div>
+                    <label>API Key</label>
+                    <input type="password" name="api_key" id="cfg-key" placeholder="Enter API key">
+                </div>
+                <button type="submit">Update</button>
+            </form>
+            <span class="dirty-indicator" id="dirty-flag">Unsaved changes</span>
+
+            <div class="toggle-row">
+                <label class="toggle">
+                    <input type="checkbox" id="toggle-updates" {% if settings.intermediate_updates %}checked{% endif %} onchange="toggleUpdates(this)">
+                    <span class="slider"></span>
+                </label>
+                <label>Send intermediate task updates to user</label>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Moltbook Scanners</h2>
+            <p style="font-size:13px;color:#94a3b8;margin-bottom:12px;">
+                OS process tracking — <span id="scanner-summary">Loading…</span>
+                <button type="button" class="btn-action primary" style="margin-left:12px;" onclick="syncScanners()">Sync now</button>
+            </p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Scanner</th>
+                        <th>Status</th>
+                        <th>PID</th>
+                        <th>Log updated</th>
+                        <th>Runs</th>
+                    </tr>
+                </thead>
+                <tbody id="scanners-body">
+                    <tr><td colspan="5">Loading…</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section">
+            <h2>Workflow Catalog</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Process Type</th>
+                        <th>Name</th>
+                        <th>Steps</th>
+                    </tr>
+                </thead>
+                <tbody id="catalog-body">
+                    <tr><td colspan="3">Loading…</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section">
+            <h2>Recent Tasks</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Task ID</th>
+                        <th>Intent</th>
+                        <th>Type</th>
+                        <th>Session</th>
+                        <th>Status</th>
+                        <th>Created</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="tasks-body">
+                    {% for t in tasks %}
+                    <tr data-task-id="{{ t.id }}">
+                        <td class="task-id">{{ t.id[:8] }}</td>
+                        <td class="task-goal">{{ (t.goal or '')[:80] }}</td>
+                        <td>{{ t.task_type or 'user' }}</td>
+                        <td class="task-id">{{ (t.openclaw_session_key or '')[-12:] }}</td>
+                        <td><span class="badge {{ t.status }}">{{ t.status }}</span></td>
+                        <td>{{ t.created_at.strftime('%Y-%m-%d %H:%M') if t.created_at else '' }}</td>
+                        <td>{{ '' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        const modelCatalog = {{ model_catalog|tojson }};
+        let formDirty = false;
+        document.getElementById('config-form').addEventListener('input', () => {
+            formDirty = true;
+            document.getElementById('dirty-flag').classList.add('visible');
+        });
+
+        function getModelName(modelId) {
+            const parts = (modelId || '').split('/');
+            return parts.length > 1 ? parts[1] : parts[0];
+        }
+
+        function renderModelOptions(provider, selectedModel = '') {
+            const select = document.getElementById('cfg-model-select');
+            const customInput = document.getElementById('cfg-model-custom');
+            const models = modelCatalog[provider] || [];
+            const normalizedSelected = getModelName(selectedModel);
+
+            select.innerHTML = '';
+            for (const model of models) {
+                const option = document.createElement('option');
+                option.value = model.id;
+                option.textContent = model.id;
+                if (model.id === normalizedSelected) option.selected = true;
+                select.appendChild(option);
+            }
+
+            const customOption = document.createElement('option');
+            customOption.value = '__custom__';
+            customOption.textContent = 'Custom model...';
+            select.appendChild(customOption);
+
+            const useCustom = normalizedSelected && !models.some((model) => model.id === normalizedSelected);
+            if (useCustom) {
+                select.value = '__custom__';
+                customInput.style.display = 'block';
+                customInput.value = normalizedSelected;
+            } else {
+                if (models.length > 0 && !select.value) select.value = models[0];
+                customInput.style.display = 'none';
+                customInput.value = '';
+            }
+        }
+
+        function getSelectedModelValue() {
+            const selectValue = document.getElementById('cfg-model-select').value;
+            if (selectValue === '__custom__') {
+                return document.getElementById('cfg-model-custom').value.trim();
+            }
+            return selectValue;
+        }
+
+        document.getElementById('cfg-provider').addEventListener('change', (e) => {
+            renderModelOptions(e.target.value);
+            formDirty = true;
+            document.getElementById('dirty-flag').classList.add('visible');
+        });
+
+        document.getElementById('cfg-model-select').addEventListener('change', (e) => {
+            const customInput = document.getElementById('cfg-model-custom');
+            if (e.target.value === '__custom__') {
+                customInput.style.display = 'block';
+                customInput.focus();
+            } else {
+                customInput.style.display = 'none';
+                customInput.value = '';
+            }
+        });
+
+        async function updateConfig(e) {
+            e.preventDefault();
+            const provider = document.getElementById('cfg-provider').value;
+            const model = getSelectedModelValue();
+            const key = document.getElementById('cfg-key').value.trim();
+            if (!model) { alert('Please select or enter a model'); return; }
+            try {
+                const resp = await fetch('/config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({provider, model, api_key: key})
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    alert(data.detail || 'Failed to update config');
+                    return;
+                }
+                if (data.status === 'ok') {
+                    formDirty = false;
+                    document.getElementById('dirty-flag').classList.remove('visible');
+                    document.getElementById('cfg-key').value = '';
+                    refreshData();
+                }
+            } catch (err) { alert('Failed: ' + err.message); }
+        }
+
+        async function toggleUpdates(el) {
+            await fetch('/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({intermediate_updates: el.checked})
+            });
+        }
+
+        function isActiveStatus(status) {
+            return ['running', 'pending', 'pending_user_input', 'created'].includes(status);
+        }
+
+        function canRetry(status) {
+            return ['failed', 'stopped_by_user', 'completed'].includes(status);
+        }
+
+        function actionButtons(task) {
+            const parts = [];
+            if (isActiveStatus(task.status)) {
+                parts.push(`<button class="btn-action danger" onclick="cancelTask('${task.id}')">Cancel</button>`);
+            }
+            if (canRetry(task.status)) {
+                parts.push(`<button class="btn-action primary" onclick="retryTask('${task.id}')">Retry</button>`);
+            }
+            return parts.join('') || '—';
+        }
+
+        async function cancelTask(taskId) {
+            if (!confirm('Cancel this task?')) return;
+            try {
+                const resp = await fetch(`/tasks/${taskId}/cancel`, { method: 'POST' });
+                const data = await resp.json();
+                if (!resp.ok) { alert(data.detail || 'Cancel failed'); return; }
+                refreshData();
+            } catch (err) { alert('Cancel failed: ' + err.message); }
+        }
+
+        async function retryTask(taskId) {
+            if (!confirm('Retry this task with a new workflow run?')) return;
+            try {
+                const resp = await fetch(`/tasks/${taskId}/retry`, { method: 'POST' });
+                const data = await resp.json();
+                if (!resp.ok) { alert(data.detail || 'Retry failed'); return; }
+                refreshData();
+            } catch (err) { alert('Retry failed: ' + err.message); }
+        }
+
+        async function suspendAll() {
+            if (!confirm('Terminate all running workflows and stop active tasks?')) return;
+            try {
+                const resp = await fetch('/dev/suspend-all', { method: 'POST' });
+                const data = await resp.json();
+                if (!resp.ok) { alert(data.detail || 'Suspend failed'); return; }
+                alert(`Suspended: ${data.terminated_workflows} workflows, ${data.stopped_tasks} tasks marked stopped.`);
+                refreshData();
+            } catch (err) { alert('Suspend failed: ' + err.message); }
+        }
+
+        async function syncScanners() {
+            try {
+                const resp = await fetch('/api/scanners/sync', { method: 'POST' });
+                const data = await resp.json();
+                if (!resp.ok) { alert(data.detail || 'Sync failed'); return; }
+                refreshData();
+            } catch (err) { alert('Sync failed: ' + err.message); }
+        }
+
+        async function refreshData() {
+            try {
+                const resp = await fetch('/api/dashboard-data');
+                const data = await resp.json();
+
+                document.getElementById('stat-total').textContent = data.stats.total;
+                document.getElementById('stat-running').textContent = data.stats.running;
+                document.getElementById('stat-completed').textContent = data.stats.completed;
+                document.getElementById('stat-failed').textContent = data.stats.failed;
+                document.getElementById('stat-model').textContent = data.model.model;
+                document.getElementById('stat-key-hint').textContent = 'Key: ' + (data.model.api_key_hint || 'N/A');
+
+                const vm = data.vector_memory || {};
+                const vmEl = document.getElementById('stat-vector');
+                const vmHint = document.getElementById('stat-vector-hint');
+                if (!vm.enabled) {
+                    vmEl.textContent = 'disabled';
+                    vmHint.textContent = 'Vector recall off';
+                } else if (vm.ready) {
+                    vmEl.textContent = 'ready';
+                    vmHint.textContent = vm.collection || 'Qdrant';
+                } else {
+                    vmEl.textContent = 'offline';
+                    vmHint.textContent = vm.error ? vm.error.slice(0, 60) : 'Not initialized';
+                }
+
+                const tel = data.telemetry || {};
+                const telHint = document.getElementById('stat-vector-hint');
+                if (tel.enabled && tel.ready) {
+                    const exportInfo = tel.otlp_endpoint ? 'OTLP' : (tel.console_export ? 'console' : 'in-process');
+                    vmHint.textContent = (vmHint.textContent || '') + ' · traces: ' + exportInfo;
+                }
+
+                const devBanner = document.getElementById('dev-banner');
+                const prodBanner = document.getElementById('prod-banner');
+                if (data.settings && data.settings.development_mode) {
+                    devBanner.classList.add('visible');
+                    prodBanner.classList.remove('visible');
+                } else {
+                    devBanner.classList.remove('visible');
+                    prodBanner.classList.add('visible');
+                }
+
+                const readiness = data.readiness || {};
+                const score = readiness.readiness_score ?? 0;
+                const summary = readiness.summary || {};
+                const scoreEl = document.getElementById('stat-readiness');
+                const scoreHint = document.getElementById('stat-readiness-hint');
+                scoreEl.textContent = score + '%';
+                scoreEl.className = 'value ' + (summary.fail > 0 ? 'score-fail' : (summary.warn > 0 ? 'score-warn' : 'score-pass'));
+                scoreHint.textContent = `${summary.pass || 0} pass · ${summary.warn || 0} warn · ${summary.fail || 0} fail`;
+
+                const backup = data.last_backup || {};
+                const backupEl = document.getElementById('stat-backup');
+                const backupHint = document.getElementById('stat-backup-hint');
+                if (backup.found) {
+                    backupEl.textContent = backup.id || 'ok';
+                    backupHint.textContent = `${backup.age_hours}h ago`;
+                } else {
+                    backupEl.textContent = 'none';
+                    backupHint.textContent = 'Run ops/backup.sh';
+                }
+
+                const catalogBody = document.getElementById('catalog-body');
+                if (data.workflow_catalog && data.workflow_catalog.length) {
+                    catalogBody.innerHTML = data.workflow_catalog.map(t => `
+                        <tr>
+                            <td class="task-id">${t.process_type}</td>
+                            <td>${t.display_name}</td>
+                            <td>${t.steps.map(s => s.name).join(' → ')}</td>
+                        </tr>
+                    `).join('');
+                }
+
+                const scannersBody = document.getElementById('scanners-body');
+                const scannerSummary = document.getElementById('scanner-summary');
+                if (data.scanners && data.scanners.length) {
+                    const running = data.scanners.filter(s => s.status === 'running').length;
+                    const stale = data.scanners.filter(s => s.status === 'stale').length;
+                    scannerSummary.textContent = `${running} running, ${stale} stale, ${data.scanners.length} tracked`;
+                    scannersBody.innerHTML = data.scanners.map(s => {
+                        const statusClass = s.status.includes('stop') ? 'stopped' : s.status;
+                        const logTs = s.last_log_mtime ? s.last_log_mtime.slice(0, 16).replace('T', ' ') : '—';
+                        return `
+                        <tr>
+                            <td class="task-id">${s.display_name}</td>
+                            <td><span class="badge ${statusClass}">${s.status}</span></td>
+                            <td>${s.pid || '—'}</td>
+                            <td>${logTs}</td>
+                            <td>${s.run_count || 0}</td>
+                        </tr>`;
+                    }).join('');
+                } else {
+                    scannerSummary.textContent = '0 tracked';
+                    scannersBody.innerHTML = '<tr><td colspan="5">No scanners in catalog</td></tr>';
+                }
+
+                const tbody = document.getElementById('tasks-body');
+                tbody.innerHTML = '';
+                for (const t of data.tasks) {
+                    const tr = document.createElement('tr');
+                    tr.dataset.taskId = t.id;
+                    const statusClass = t.status.includes('stopped') ? 'stopped' : t.status;
+                    tr.innerHTML = `
+                        <td class="task-id">${t.id.slice(0, 8)}</td>
+                        <td class="task-goal">${(t.goal || '').slice(0, 80)}</td>
+                        <td>${t.task_type || 'user'}</td>
+                        <td class="task-id">${(t.session_key || '').slice(-12)}</td>
+                        <td><span class="badge ${statusClass}">${t.status}</span></td>
+                        <td>${t.created_at ? t.created_at.slice(0, 16).replace('T', ' ') : ''}</td>
+                        <td>${actionButtons(t)}</td>
+                    `;
+                    tbody.appendChild(tr);
+                }
+
+                if (!formDirty && data.model.model) {
+                    document.getElementById('cfg-provider').value = data.model.provider || 'google';
+                    renderModelOptions(data.model.provider || 'google', data.model.model);
+                }
+            } catch (err) { console.error('Refresh failed:', err); }
+        }
+
+        renderModelOptions('{{ model.provider or "google" }}', '{{ model.model }}');
+        refreshData();
+        setInterval(refreshData, 60000);
+    </script>
+</body>
+</html>

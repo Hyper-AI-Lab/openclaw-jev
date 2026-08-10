@@ -1,0 +1,34 @@
+# Qdrant vector store for RMP (shared by rmp-api + rmp-worker).
+# Usage:
+#   systemctl start rmp-qdrant
+#   or: bash ops/start_qdrant.sh
+#
+# settings.json vector_memory:
+#   "qdrant_mode": "server", "qdrant_host": "127.0.0.1", "qdrant_port": 6333
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.17.0
+    container_name: rmp-qdrant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:6333/readyz >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  qdrant_storage:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /root/.openclaw/rmp/data/qdrant-server

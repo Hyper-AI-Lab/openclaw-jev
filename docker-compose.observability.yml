@@ -1,0 +1,37 @@
+# Self-hosted observability stack for RMP (Phase 14)
+# Usage:
+#   docker compose -f docker-compose.observability.yml up -d
+#   Set settings.json telemetry.otlp_endpoint to "http://127.0.0.1:4318/v1/traces"
+#   Restart rmp-api and rmp-worker
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./ops/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4318:4318"   # OTLP HTTP
+      - "127.0.0.1:4317:4317"   # OTLP gRPC
+    networks:
+      - rmp-obs
+
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6006:6006"
+    environment:
+      PHOENIX_WORKING_DIR: /data
+    volumes:
+      - phoenix_data:/data
+    networks:
+      - rmp-obs
+
+networks:
+  rmp-obs:
+    driver: bridge
+
+volumes:
+  phoenix_data:

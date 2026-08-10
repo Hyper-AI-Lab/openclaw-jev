@@ -1,0 +1,58 @@
+# Secrets & local runtime
+settings.json
+*.env
+.env.*
+/etc/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# RMP runtime data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local caches / canary state
+intake_cache.json
+llm_quota.json
+llm_usage.json
+last_*.json
+
+# Backups / junk
+*.bak
+fix_*.py
+openclaw_activities.py.bak
+*.log
+
+# Node (plugin)
+**/node_modules/
+
+# One-off local scripts / scratch (not product)
+fix_*.js
+parse_test*.py
+query_*.py
+get_task_state.py
+delete_tasks.py
+cat_trigger.js
+clear_session.js
+grep_trigger_hook.js
+terminate_all.py
+test_task.sh
+test_worker.py
+fix_worker.py
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,16 @@
+{
+  "id": "rmp_adapter",
+  "name": "Reliability and Memory Plane Adapter",
+  "version": "1.0.0",
+  "description": "RMP task management tools for OpenClaw.",
+  "main": "index.js",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true
+      }
+    }
+  }
+}
