@@ -30,8 +30,6 @@ last_*.json
 
 # Backups / junk
 *.bak
-fix_*.py
-openclaw_activities.py.bak
 *.log
 
 # Node (plugin)
@@ -39,6 +37,7 @@ openclaw_activities.py.bak
 
 # One-off local scripts / scratch (not product)
 fix_*.js
+fix_*.py
 parse_test*.py
 query_*.py
 get_task_state.py
@@ -50,6 +49,19 @@ terminate_all.py
 test_task.sh
 test_worker.py
 fix_worker.py
+patch_hook.js
+patch_hook_crons.js
+patch_intent.js
+rewrite_*.js
+test_hook*.js
+test_parse*.py
+test_db.py
+test_plugin_types.js
+test_send.py
+trigger_*.js
+update_hook*.js
+update_key.js
+update_log_plugin.js
 
 # Editor / OS
 .DS_Store

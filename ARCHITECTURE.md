@@ -8,8 +8,8 @@ This document describes the full stack built for **Aura** — an autonomous agen
 
 Related plans (execution logs):
 
-- [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md) — Phases 0–11 feature delivery
-- [`PRODUCTION_PLAN.md`](PRODUCTION_PLAN.md) — Phases 12–20 hardening & go-live
+- [`docs/history/DEVELOPMENT_PLAN.md`](docs/history/DEVELOPMENT_PLAN.md) — Phases 0–11 feature delivery
+- [`docs/history/PRODUCTION_PLAN.md`](docs/history/PRODUCTION_PLAN.md) — Phases 12–20 hardening & go-live
 
 ---
 
