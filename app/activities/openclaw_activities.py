@@ -10,7 +10,10 @@ import httpx
 from temporalio import activity
 
 from app.config import (
+    OPENCLAW_CONFIG_PATH,
+    OPENCLAW_HOME,
     SESSIONS_JSON_PATH,
+    SETTINGS_PATH,
     get_llm_quota_config,
     get_openclaw_hook_token,
     get_openclaw_url,
@@ -34,9 +37,6 @@ from app.notification_policy import (
     should_deliver_slack,
 )
 from app.telemetry import traced_activity
-
-OPENCLAW_CONFIG_PATH = "/root/.openclaw/openclaw.json"
-SETTINGS_PATH = "/root/.openclaw/rmp/settings.json"
 
 # Only these stop reasons indicate a final assistant turn worth evaluating.
 TERMINAL_STOP_REASONS = frozenset({"stop", "error", "maxTokens"})
@@ -234,7 +234,7 @@ def _poll_session_ids_for_response(
 ) -> Tuple[str, str]:
     """Scan multiple session JSONL files for a terminal reply."""
     for sid in session_ids:
-        jsonl_path = f"/root/.openclaw/agents/main/sessions/{sid}.jsonl"
+        jsonl_path = os.path.join(OPENCLAW_HOME, "agents", "main", "sessions", f"{sid}.jsonl")
         if not os.path.exists(jsonl_path):
             continue
         try:
@@ -458,7 +458,7 @@ async def _dispatch_openclaw_session(
             # Pin NVIDIA profile after the session exists (safe on OpenClaw 2026.7+).
             assign_openclaw_session_profile(internal_session_key, profile_id)
 
-            jsonl_path = f"/root/.openclaw/agents/main/sessions/{session_id}.jsonl"
+            jsonl_path = os.path.join(OPENCLAW_HOME, "agents", "main", "sessions", f"{session_id}.jsonl")
             seen_session_ids: List[str] = []
             text_content = ""
             poll_deadline = time.time() + poll_timeout_sec
@@ -481,7 +481,7 @@ async def _dispatch_openclaw_session(
                         if latest and latest != session_id:
                             session_id = latest
                             jsonl_path = (
-                                f"/root/.openclaw/agents/main/sessions/{session_id}.jsonl"
+                                os.path.join(OPENCLAW_HOME, "agents", "main", "sessions", f"{session_id}.jsonl")
                             )
                             if session_id not in seen_session_ids:
                                 seen_session_ids.append(session_id)
@@ -502,7 +502,7 @@ async def _dispatch_openclaw_session(
                     if fb_text:
                         record_success(profile_id)
                         fb_path = (
-                            f"/root/.openclaw/agents/main/sessions/{fallback_ids[0]}.jsonl"
+                            os.path.join(OPENCLAW_HOME, "agents", "main", "sessions", f"{fallback_ids[0]}.jsonl")
                             if fallback_ids
                             else jsonl_path
                         )

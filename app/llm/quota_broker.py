@@ -16,10 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
+from app.config import AUTH_PROFILES_PATH as _AUTH_PROFILES, RMP_DATA_DIR
+
 logger = logging.getLogger("rmp.llm_quota")
 
-AUTH_PROFILES_PATH = Path("/root/.openclaw/agents/main/agent/auth-profiles.json")
-STATE_PATH = Path("/root/.openclaw/rmp/data/llm_quota.json")
+AUTH_PROFILES_PATH = Path(_AUTH_PROFILES)
+STATE_PATH = Path(RMP_DATA_DIR) / "llm_quota.json"
 LOCK_PATH = STATE_PATH.parent / ".llm_quota.lock"
 OPENCLAW_ENV_PATH = Path("/etc/openclaw/openclaw.env")
 
@@ -379,7 +381,9 @@ def assign_openclaw_session_profile(session_key: str, profile_id: str) -> bool:
     Creating/touching a brand-new key before /hooks/agent races OpenClaw 2026.7+
     session lifecycle claims (CronSessionLifecycleClaimError).
     """
-    sessions_path = Path("/root/.openclaw/agents/main/sessions/sessions.json")
+    from app.config import SESSIONS_JSON_PATH
+
+    sessions_path = Path(SESSIONS_JSON_PATH)
     if not session_key or not profile_id or not sessions_path.is_file():
         return False
     try:

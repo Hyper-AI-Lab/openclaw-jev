@@ -10,12 +10,13 @@ from typing import Any, Dict, List, Optional, Union
 
 from sqlalchemy import select
 
+from app.config import RMP_DATA_DIR
 from app.db.database import AsyncSessionLocal
 from app.db.models import Artifact
 
 logger = logging.getLogger("rmp.artifacts")
 
-DEFAULT_ARTIFACT_ROOT = "/root/.openclaw/rmp/data/artifacts"
+DEFAULT_ARTIFACT_ROOT = os.path.join(RMP_DATA_DIR, "artifacts")
 
 
 def get_artifact_root() -> Path:

@@ -9,6 +9,12 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Keep tests off the real /root layout (not writable on Actions runners).
+      OPENCLAW_HOME: ${{ github.workspace }}/.ci-openclaw
+      RMP_ROOT: ${{ github.workspace }}
+      RMP_DATA_DIR: ${{ github.workspace }}/data
+      RMP_SETTINGS_PATH: ${{ github.workspace }}/settings.json
     steps:
       - uses: actions/checkout@v4
 
@@ -23,22 +29,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Seed OpenClaw/RMP host paths
+      - name: Seed writable OpenClaw/RMP layout
         run: |
-          # Production code hardcodes /root/.openclaw/...; map the checked-out
-          # repo there so unit tests can read/write settings + data like on the VPS.
-          sudo mkdir -p /root/.openclaw
-          sudo ln -sfn "$GITHUB_WORKSPACE" /root/.openclaw/rmp
-          sudo mkdir -p \
-            /root/.openclaw/agents/main/agent \
-            /root/.openclaw/agents/main/sessions \
-            /root/.openclaw/workspace \
-            /root/.openclaw/cron
-          sudo chmod -R a+rwX /root/.openclaw/agents /root/.openclaw/workspace /root/.openclaw/cron
-          mkdir -p "$GITHUB_WORKSPACE/data"
-          if [[ ! -f "$GITHUB_WORKSPACE/settings.json" ]]; then
-            cp "$GITHUB_WORKSPACE/settings.example.json" "$GITHUB_WORKSPACE/settings.json"
-          fi
+          mkdir -p \
+            "$OPENCLAW_HOME/agents/main/agent" \
+            "$OPENCLAW_HOME/agents/main/sessions" \
+            "$OPENCLAW_HOME/workspace" \
+            "$OPENCLAW_HOME/cron" \
+            "$RMP_DATA_DIR"
+          cp settings.example.json settings.json
 
       - name: Unit tests
         run: python -m pytest tests/ -q --ignore=tests/integration

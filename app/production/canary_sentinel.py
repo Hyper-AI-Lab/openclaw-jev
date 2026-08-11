@@ -10,13 +10,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.config import RMP_ROOT as _RMP_ROOT
 from app.production.alerting import send_alert
 from app.production.ops_notify import notify_ops_slack
 from app.llm.quota_broker import reap_stale_llm_slots_sync
 
 logger = logging.getLogger("rmp.canary_sentinel")
 
-RMP_ROOT = Path("/root/.openclaw/rmp")
+RMP_ROOT = Path(_RMP_ROOT)
 HEALTH_CANARY_PATH = RMP_ROOT / "data" / "last_health_canary.json"
 MEMORY_CANARY_PATH = RMP_ROOT / "data" / "last_memory_canary.json"
 ALERT_STATE_PATH = RMP_ROOT / "data" / "last_canary_alert.json"

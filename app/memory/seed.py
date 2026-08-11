@@ -8,14 +8,14 @@ from typing import Any, Dict, List, Tuple
 
 from sqlalchemy import select
 
-from app.config import get_vector_memory_config
+from app.config import OPENCLAW_HOME, get_vector_memory_config
 from app.db.database import AsyncSessionLocal
 from app.db.models import MemoryItem
 from app.memory.vector import get_vector_service, reset_vector_service
 
 logger = logging.getLogger("rmp.vector_seed")
 
-WORKSPACE_ROOT = Path("/root/.openclaw/workspace")
+WORKSPACE_ROOT = Path(OPENCLAW_HOME) / "workspace"
 WORKSPACE_FILES = ("USER.md", "MEMORY.md", "SOUL.md", "AGENTS.md")
 MIN_CHUNK_CHARS = 80
 MAX_CHUNK_CHARS = 1800

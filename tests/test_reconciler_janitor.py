@@ -1,4 +1,5 @@
 """Reconciler and workflow janitor tests (W5)."""
+import os
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -114,8 +115,11 @@ async def test_janitor_terminates_old_orphan():
     import importlib.util
     from datetime import timezone
 
+    from app.config import RMP_ROOT
+
+    janitor_path = os.path.join(RMP_ROOT, "ops", "workflow_janitor.py")
     spec = importlib.util.spec_from_file_location(
-        "workflow_janitor", "/root/.openclaw/rmp/ops/workflow_janitor.py"
+        "workflow_janitor", janitor_path
     )
     janitor_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(janitor_mod)

@@ -23,13 +23,17 @@ COUNTERS = (
     "intake_degraded",
 )
 
-_DEFAULT_METRICS_PATH = "/root/.openclaw/rmp/data/metrics_counters.json"
+_DEFAULT_METRICS_PATH = None  # resolved via RMP_DATA_DIR
 _MAX_INTAKE_LATENCY_SAMPLES = 20
 _lock = threading.Lock()
 
 
 def _metrics_path() -> Path:
-    return Path(os.environ.get("RMP_METRICS_PATH", _DEFAULT_METRICS_PATH))
+    if os.environ.get("RMP_METRICS_PATH"):
+        return Path(os.environ["RMP_METRICS_PATH"])
+    from app.config import RMP_DATA_DIR
+
+    return Path(RMP_DATA_DIR) / "metrics_counters.json"
 
 
 def _empty() -> Dict[str, int]:

@@ -1,21 +1,27 @@
 """Catalog of Moltbook scanner scripts tracked by RMP."""
 import glob
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from app.config import OPENCLAW_HOME
+
+_WORKSPACE = os.path.join(OPENCLAW_HOME, "workspace")
+_SAFE_HARBOR = os.environ.get("AURA_SAFE_HARBOR", "/root/aura_safe_harbor")
+
 SEARCH_ROOTS = (
-    "/root/aura_safe_harbor",
-    "/root/.openclaw/workspace",
+    _SAFE_HARBOR,
+    _WORKSPACE,
 )
 
 LOG_OVERRIDES = {
-    "moltbook_4hr_swarm": "/root/aura_safe_harbor/moltbook_4hr_run.log",
-    "moltbook_swarm_10": "/root/aura_safe_harbor/moltbook_swarm_run.log",
-    "real_moltbook_scanner": "/root/.openclaw/workspace/moltbook_research_log.md",
+    "moltbook_4hr_swarm": os.path.join(_SAFE_HARBOR, "moltbook_4hr_run.log"),
+    "moltbook_swarm_10": os.path.join(_SAFE_HARBOR, "moltbook_swarm_run.log"),
+    "real_moltbook_scanner": os.path.join(_WORKSPACE, "moltbook_research_log.md"),
 }
 
-DEFAULT_LOG = "/root/.openclaw/workspace/moltbook_research_log.md"
+DEFAULT_LOG = os.path.join(_WORKSPACE, "moltbook_research_log.md")
 
 
 @dataclass(frozen=True)

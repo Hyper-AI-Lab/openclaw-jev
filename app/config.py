@@ -5,9 +5,25 @@ import secrets
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
-OPENCLAW_CONFIG_PATH = "/root/.openclaw/openclaw.json"
-SETTINGS_PATH = "/root/.openclaw/rmp/settings.json"
-SESSIONS_JSON_PATH = "/root/.openclaw/agents/main/sessions/sessions.json"
+# Host layout defaults match the production VPS. Override in CI / tests via env:
+#   OPENCLAW_HOME, RMP_ROOT, RMP_SETTINGS_PATH, …
+OPENCLAW_HOME = os.environ.get("OPENCLAW_HOME", "/root/.openclaw")
+RMP_ROOT = os.environ.get("RMP_ROOT", os.path.join(OPENCLAW_HOME, "rmp"))
+OPENCLAW_CONFIG_PATH = os.environ.get(
+    "OPENCLAW_CONFIG_PATH", os.path.join(OPENCLAW_HOME, "openclaw.json")
+)
+SETTINGS_PATH = os.environ.get(
+    "RMP_SETTINGS_PATH", os.path.join(RMP_ROOT, "settings.json")
+)
+SESSIONS_JSON_PATH = os.environ.get(
+    "OPENCLAW_SESSIONS_JSON",
+    os.path.join(OPENCLAW_HOME, "agents", "main", "sessions", "sessions.json"),
+)
+AUTH_PROFILES_PATH = os.environ.get(
+    "OPENCLAW_AUTH_PROFILES",
+    os.path.join(OPENCLAW_HOME, "agents", "main", "agent", "auth-profiles.json"),
+)
+RMP_DATA_DIR = os.environ.get("RMP_DATA_DIR", os.path.join(RMP_ROOT, "data"))
 
 
 def _read_json(path: str, default: Any = None) -> Any:
@@ -19,6 +35,9 @@ def _read_json(path: str, default: Any = None) -> Any:
 
 
 def _write_json(path: str, data: Any) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -28,7 +47,7 @@ DEFAULT_VECTOR_MEMORY = {
     "qdrant_mode": "server",
     "qdrant_host": "127.0.0.1",
     "qdrant_port": 6333,
-    "qdrant_path": "/root/.openclaw/rmp/data/qdrant",
+    "qdrant_path": os.path.join(RMP_DATA_DIR, "qdrant"),
     "collection_name": "rmp_memories",
     "embedder_provider": "nvidia",
     "embedder_model": "nvidia/nv-embed-v1",
@@ -47,7 +66,7 @@ DEFAULT_TELEMETRY = {
 
 DEFAULT_ARTIFACT_STORE = {
     "enabled": True,
-    "root_path": "/root/.openclaw/rmp/data/artifacts",
+    "root_path": os.path.join(RMP_DATA_DIR, "artifacts"),
 }
 
 

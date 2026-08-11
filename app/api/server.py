@@ -53,9 +53,11 @@ _scanner_task: Optional[asyncio.Task] = None
 _cron_stop: Optional[asyncio.Event] = None
 _cron_task: Optional[asyncio.Task] = None
 
-OPENCLAW_CONFIG_PATH = "/root/.openclaw/openclaw.json"
-AUTH_PROFILES_PATH = "/root/.openclaw/agents/main/agent/auth-profiles.json"
-SETTINGS_PATH = "/root/.openclaw/rmp/settings.json"
+from app.config import (
+    AUTH_PROFILES_PATH,
+    OPENCLAW_CONFIG_PATH,
+    SETTINGS_PATH,
+)
 
 MODEL_CATALOG = {
     "google": ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3.1-pro-preview"],

@@ -3,19 +3,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import is_development_mode
+from app.config import OPENCLAW_HOME, is_development_mode
 from app.db.models import Event
 from app.metrics import inc as metrics_inc
 
 logger = logging.getLogger("rmp.cron_reconciler")
 
-OPENCLAW_CRON_PATH = "/root/.openclaw/cron/jobs.json"
+OPENCLAW_CRON_PATH = os.path.join(OPENCLAW_HOME, "cron", "jobs.json")
 
 
 def load_openclaw_cron_jobs() -> List[dict]:

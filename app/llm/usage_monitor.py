@@ -11,12 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.config import OPENCLAW_HOME, RMP_DATA_DIR
+
 logger = logging.getLogger("rmp.llm_usage")
 
-USAGE_PATH = Path("/root/.openclaw/rmp/data/llm_usage.json")
-CURSOR_PATH = Path("/root/.openclaw/rmp/data/llm_usage_scrape_cursor.json")
+USAGE_PATH = Path(RMP_DATA_DIR) / "llm_usage.json"
+CURSOR_PATH = Path(RMP_DATA_DIR) / "llm_usage_scrape_cursor.json"
 LOCK_PATH = USAGE_PATH.parent / ".llm_usage.lock"
-SESSIONS_DIR = Path("/root/.openclaw/agents/main/sessions")
+SESSIONS_DIR = Path(OPENCLAW_HOME) / "agents" / "main" / "sessions"
 SESSIONS_JSON = SESSIONS_DIR / "sessions.json"
 
 # Sources:

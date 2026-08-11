@@ -5,15 +5,16 @@ import os
 import threading
 from typing import Any, Dict, List, Optional
 
+from app.config import AUTH_PROFILES_PATH, RMP_DATA_DIR
 from app.memory.mistral_embed import MISTRAL_API_BASE, MistralEmbeddings
 from app.memory.nvidia_embed import NVIDIA_API_BASE, NvidiaEmbeddings
 from app.memory.policy import redact_secrets
 
 logger = logging.getLogger("rmp.vector_memory")
 
-OPENCLAW_AUTH_PATH = "/root/.openclaw/agents/main/agent/auth-profiles.json"
+OPENCLAW_AUTH_PATH = AUTH_PROFILES_PATH
 OPENCLAW_ENV_PATH = "/etc/openclaw/openclaw.env"
-DEFAULT_QDRANT_PATH = "/root/.openclaw/rmp/data/qdrant"
+DEFAULT_QDRANT_PATH = os.path.join(RMP_DATA_DIR, "qdrant")
 DEFAULT_COLLECTION = "rmp_memories"
 
 _service: Optional["VectorMemoryService"] = None

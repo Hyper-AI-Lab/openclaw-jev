@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from app.config import (
+    OPENCLAW_CONFIG_PATH,
+    RMP_DATA_DIR,
+    SETTINGS_PATH,
     get_openclaw_hook_token,
     get_openclaw_url,
     get_slack_bot_token,
@@ -32,11 +35,9 @@ SYSTEMD_UNITS = [
     "openclaw-gateway.service",
     "rmp-qdrant.service",
 ]
-BACKUP_ROOT = "/root/.openclaw/rmp/data/backups"
-SETTINGS_PATH = "/root/.openclaw/rmp/settings.json"
-OPENCLAW_CONFIG_PATH = "/root/.openclaw/openclaw.json"
-MEMORY_CANARY_RESULT_PATH = "/root/.openclaw/rmp/data/last_memory_canary.json"
-HEALTH_CANARY_RESULT_PATH = "/root/.openclaw/rmp/data/last_health_canary.json"
+BACKUP_ROOT = os.path.join(RMP_DATA_DIR, "backups")
+MEMORY_CANARY_RESULT_PATH = os.path.join(RMP_DATA_DIR, "last_memory_canary.json")
+HEALTH_CANARY_RESULT_PATH = os.path.join(RMP_DATA_DIR, "last_health_canary.json")
 
 
 @dataclass
@@ -230,7 +231,7 @@ def check_backup_recency(max_hours: int = 26) -> CheckResult:
 
 
 def check_temporal_persistence() -> CheckResult:
-    db_path = "/root/.openclaw/rmp/data/temporal.db"
+    db_path = os.path.join(RMP_DATA_DIR, "temporal.db")
     svc_path = "/etc/systemd/system/temporal-dev.service"
     try:
         with open(svc_path) as f:

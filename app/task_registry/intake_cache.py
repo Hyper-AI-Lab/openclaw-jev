@@ -10,7 +10,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-CACHE_PATH = Path("/root/.openclaw/rmp/data/intake_cache.json")
+from app.config import RMP_DATA_DIR
+
+CACHE_PATH = Path(RMP_DATA_DIR) / "intake_cache.json"
 LOCK_PATH = CACHE_PATH.parent / ".intake_cache.lock"
 
 _lock = threading.Lock()
