@@ -80,7 +80,7 @@ Slack / Cron / Heartbeat → rmp_adapter → POST /tasks → FastAPI
 - Timers + Slack DM path confirmed (`auth.test`, owner UID)
 - OTLP export enabled end-to-end
 - Alerting remains opt-in (webhook empty)
-- Public `.github/workflows/ci.yml` prepared locally (push blocked until PAT has workflow scope)
+- Public `.github/workflows/ci.yml` (pytest on push/PR)
 
 ---
 

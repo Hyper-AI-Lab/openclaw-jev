@@ -975,7 +975,7 @@
 - **Slack path:** bot `auth.test` OK; `conversations.open` → DM channel; `_get_slack_user_id` → `U0AELFYTLKS`. Health canaries correctly suppress Slack via notification policy.
 - **OTLP:** Phoenix + OTel collector already up; set `telemetry.otlp_endpoint=http://127.0.0.1:4318/v1/traces`; restarted `rmp-api`/`rmp-worker`; readiness telemetry **pass**.
 - **Alerting:** left **disabled** (no webhook configured).
-- **GitHub CI:** `.github/workflows/ci.yml` prepared locally; **not pushed** — PAT lacks `workflow` / Workflows write scope. Add scope, then commit+push the workflow file.
+- **GitHub CI:** `.github/workflows/ci.yml` pushed (PAT Workflows write enabled).
 
 ### Verification
 - Readiness summary: **pass=20, warn=0, fail=0**
