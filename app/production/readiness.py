@@ -542,6 +542,35 @@ def check_task_registry_index_fresh() -> CheckResult:
     )
 
 
+def check_runtime_code_sync() -> CheckResult:
+    """Fail when app/ code on disk is newer than running API/worker boot stamps."""
+    from app.production.runtime_sync import runtime_sync_status
+
+    status = runtime_sync_status()
+    overall = status.get("status")
+    if overall == "ok":
+        return CheckResult(
+            "runtime_code_sync",
+            "pass",
+            "Running API/worker match on-disk code",
+            status,
+        )
+    if overall == "missing":
+        return CheckResult(
+            "runtime_code_sync",
+            "warn",
+            "Runtime boot stamps missing — restart rmp-api/rmp-worker after deploy",
+            status,
+        )
+    stale = ", ".join(status.get("stale_services") or []) or "rmp-api/rmp-worker"
+    return CheckResult(
+        "runtime_code_sync",
+        "fail",
+        f"On-disk code newer than running process ({stale}) — run: make restart-rmp",
+        status,
+    )
+
+
 async def run_all_checks() -> Dict[str, Any]:
     sync_checks = [
         check_development_mode(),
@@ -559,6 +588,7 @@ async def run_all_checks() -> Dict[str, Any]:
         check_task_registry_config(),
         check_task_registry_vector(),
         check_task_registry_index_fresh(),
+        check_runtime_code_sync(),
     ]
     async_checks = await asyncio.gather(
         check_systemd_services(),

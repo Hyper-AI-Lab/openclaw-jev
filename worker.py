@@ -47,6 +47,12 @@ logging.basicConfig(level=logging.INFO)
 async def main():
     logging.info("Starting OpenClaw RMP Worker...")
     init_telemetry("rmp-worker")
+    try:
+        from app.production.runtime_sync import mark_runtime_boot
+
+        mark_runtime_boot("rmp-worker")
+    except Exception as exc:
+        logging.warning("runtime boot stamp failed: %s", exc)
     client = await Client.connect("localhost:7233", **get_temporal_client_kwargs())
     worker = Worker(
         client,

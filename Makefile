@@ -1,4 +1,4 @@
-.PHONY: test backup readiness production-check go-live rollback verify-patch canary memory-canary janitor observability seed-vector-memory ensure-skills restart-rmp
+.PHONY: test backup readiness production-check go-live rollback verify-patch canary memory-canary janitor observability seed-vector-memory ensure-skills restart-rmp install-code-reload
 
 test:
 	cd /root/.openclaw/rmp && ./venv/bin/pytest tests/ -q
@@ -47,6 +47,9 @@ ensure-skills:
 
 restart-rmp:
 	bash /root/.openclaw/rmp/ops/restart_rmp.sh
+
+install-code-reload:
+	bash /root/.openclaw/rmp/ops/install_code_reload_watch.sh
 
 temporal-recover:
 	bash /root/.openclaw/rmp/ops/temporal_recover.sh

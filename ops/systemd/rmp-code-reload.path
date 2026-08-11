@@ -1,0 +1,19 @@
+[Unit]
+Description=Watch RMP Python sources and reload API/worker
+After=network.target
+
+[Path]
+# Any write under app/ or to worker.py reloads long-lived processes so imports
+# cannot drift from disk (the ImportError / stale-canary failure mode).
+PathChanged=/root/.openclaw/rmp/app
+PathModified=/root/.openclaw/rmp/app
+PathChanged=/root/.openclaw/rmp/worker.py
+PathModified=/root/.openclaw/rmp/worker.py
+Unit=rmp-code-reload.service
+MakeDirectory=false
+# Avoid restart storms during large multi-file edits.
+TriggerLimitIntervalSec=60
+TriggerLimitBurst=3
+
+[Install]
+WantedBy=paths.target

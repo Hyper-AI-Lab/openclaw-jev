@@ -81,6 +81,12 @@ async def lifespan(app: FastAPI):
     load_settings()
     init_telemetry("rmp-api")
     instrument_fastapi(app)
+    try:
+        from app.production.runtime_sync import mark_runtime_boot
+
+        mark_runtime_boot("rmp-api")
+    except Exception as exc:
+        logger.warning("runtime boot stamp failed: %s", exc)
     _reconciler_stop = asyncio.Event()
     _reconciler_task = asyncio.create_task(reconciler_loop(_reconciler_stop))
     _scanner_stop = asyncio.Event()

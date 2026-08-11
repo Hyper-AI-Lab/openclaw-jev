@@ -7,23 +7,70 @@ from typing import Any, Dict, Optional
 
 # Host layout defaults match the production VPS. Override in CI / tests via env:
 #   OPENCLAW_HOME, RMP_ROOT, RMP_SETTINGS_PATH, …
-OPENCLAW_HOME = os.environ.get("OPENCLAW_HOME", "/root/.openclaw")
-RMP_ROOT = os.environ.get("RMP_ROOT", os.path.join(OPENCLAW_HOME, "rmp"))
-OPENCLAW_CONFIG_PATH = os.environ.get(
-    "OPENCLAW_CONFIG_PATH", os.path.join(OPENCLAW_HOME, "openclaw.json")
-)
-SETTINGS_PATH = os.environ.get(
-    "RMP_SETTINGS_PATH", os.path.join(RMP_ROOT, "settings.json")
-)
-SESSIONS_JSON_PATH = os.environ.get(
-    "OPENCLAW_SESSIONS_JSON",
-    os.path.join(OPENCLAW_HOME, "agents", "main", "sessions", "sessions.json"),
-)
-AUTH_PROFILES_PATH = os.environ.get(
-    "OPENCLAW_AUTH_PROFILES",
-    os.path.join(OPENCLAW_HOME, "agents", "main", "agent", "auth-profiles.json"),
-)
-RMP_DATA_DIR = os.environ.get("RMP_DATA_DIR", os.path.join(RMP_ROOT, "data"))
+
+
+def _openclaw_home() -> str:
+    return os.environ.get("OPENCLAW_HOME", "/root/.openclaw")
+
+
+def _rmp_root() -> str:
+    return os.environ.get("RMP_ROOT", os.path.join(_openclaw_home(), "rmp"))
+
+
+def _rmp_data_dir() -> str:
+    return os.environ.get("RMP_DATA_DIR", os.path.join(_rmp_root(), "data"))
+
+
+def _settings_path() -> str:
+    return os.environ.get("RMP_SETTINGS_PATH", os.path.join(_rmp_root(), "settings.json"))
+
+
+def _openclaw_config_path() -> str:
+    return os.environ.get(
+        "OPENCLAW_CONFIG_PATH", os.path.join(_openclaw_home(), "openclaw.json")
+    )
+
+
+def _sessions_json_path() -> str:
+    return os.environ.get(
+        "OPENCLAW_SESSIONS_JSON",
+        os.path.join(_openclaw_home(), "agents", "main", "sessions", "sessions.json"),
+    )
+
+
+def _auth_profiles_path() -> str:
+    return os.environ.get(
+        "OPENCLAW_AUTH_PROFILES",
+        os.path.join(_openclaw_home(), "agents", "main", "agent", "auth-profiles.json"),
+    )
+
+
+OPENCLAW_HOME = _openclaw_home()
+RMP_ROOT = _rmp_root()
+OPENCLAW_CONFIG_PATH = _openclaw_config_path()
+SETTINGS_PATH = _settings_path()
+SESSIONS_JSON_PATH = _sessions_json_path()
+AUTH_PROFILES_PATH = _auth_profiles_path()
+RMP_DATA_DIR = _rmp_data_dir()
+
+# PEP 562: resolve path attrs even when a long-lived process imported an older
+# config module that lacked a newly-added name (from app.config import X).
+_PATH_ATTR_RESOLVERS = {
+    "OPENCLAW_HOME": _openclaw_home,
+    "RMP_ROOT": _rmp_root,
+    "RMP_DATA_DIR": _rmp_data_dir,
+    "SETTINGS_PATH": _settings_path,
+    "OPENCLAW_CONFIG_PATH": _openclaw_config_path,
+    "SESSIONS_JSON_PATH": _sessions_json_path,
+    "AUTH_PROFILES_PATH": _auth_profiles_path,
+}
+
+
+def __getattr__(name: str) -> Any:
+    resolver = _PATH_ATTR_RESOLVERS.get(name)
+    if resolver is not None:
+        return resolver()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _read_json(path: str, default: Any = None) -> Any:

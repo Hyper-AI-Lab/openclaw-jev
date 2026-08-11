@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch RMP Python sources (recursive) and reload API/worker
+After=network.target rmp-api.service rmp-worker.service
+Wants=rmp-api.service rmp-worker.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /root/.openclaw/rmp/ops/watch_code_and_reload.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

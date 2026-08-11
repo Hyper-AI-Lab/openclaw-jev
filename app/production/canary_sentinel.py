@@ -130,9 +130,32 @@ def evaluate_memory_canary() -> Optional[CanaryIssue]:
     return None
 
 
+def evaluate_runtime_code_sync() -> Optional[CanaryIssue]:
+    from app.production.runtime_sync import runtime_sync_status
+
+    status = runtime_sync_status()
+    overall = status.get("status")
+    if overall == "ok":
+        return None
+    if overall == "missing":
+        return CanaryIssue(
+            "runtime_code_sync",
+            "missing",
+            "Runtime boot stamps missing (API/worker not stamped after start)",
+            status,
+        )
+    stale = ", ".join(status.get("stale_services") or []) or "rmp-api/rmp-worker"
+    return CanaryIssue(
+        "runtime_code_sync",
+        "stale",
+        f"On-disk code newer than running process ({stale})",
+        status,
+    )
+
+
 def evaluate_canaries() -> List[CanaryIssue]:
     issues: List[CanaryIssue] = []
-    for fn in (evaluate_health_canary, evaluate_memory_canary):
+    for fn in (evaluate_health_canary, evaluate_memory_canary, evaluate_runtime_code_sync):
         issue = fn()
         if issue:
             issues.append(issue)
@@ -165,8 +188,28 @@ def _restart_unit(unit: str) -> bool:
         return False
 
 
+RESTART_UNITS_ON_STALE = ("rmp-api", "rmp-worker")
+REMEDIATION_COOLDOWN_MINUTES = 20
+REMEDIATION_STATE_PATH = RMP_ROOT / "data" / "last_canary_remediation.json"
+
+
+def _remediation_cooldown_active(key: str = "restart_runtime") -> bool:
+    state = _read_json(REMEDIATION_STATE_PATH) or {}
+    ts = _parse_ts(state.get(key))
+    if not ts:
+        return False
+    return datetime.utcnow() - ts < timedelta(minutes=REMEDIATION_COOLDOWN_MINUTES)
+
+
+def _record_remediation(key: str = "restart_runtime") -> None:
+    state = _read_json(REMEDIATION_STATE_PATH) or {}
+    state[key] = datetime.utcnow().isoformat() + "Z"
+    REMEDIATION_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REMEDIATION_STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
 def attempt_remediation(issues: List[CanaryIssue]) -> List[str]:
-    """Deterministic fixes only — release leaked LLM slots, restart inactive services."""
+    """Deterministic fixes — reap LLM slots, restart down units, reload stale runtime."""
     actions: List[str] = []
     reaped = reap_stale_llm_slots_sync()
     if reaped:
@@ -180,6 +223,21 @@ def attempt_remediation(issues: List[CanaryIssue]) -> List[str]:
                 if _restart_unit(unit):
                     actions.append(f"restarted {unit}")
                     restarted.add(unit)
+
+    needs_runtime_reload = any(
+        (i.name == "runtime_code_sync" and i.status in {"stale", "missing"})
+        or (i.name == "health_canary" and i.status in {"stale", "failed", "timeout", "missing"})
+        for i in issues
+    )
+    if needs_runtime_reload and not _remediation_cooldown_active():
+        for unit in RESTART_UNITS_ON_STALE:
+            if unit in restarted:
+                continue
+            if _restart_unit(unit):
+                actions.append(f"restarted {unit} (stale-runtime/canary)")
+                restarted.add(unit)
+        if any(u in restarted for u in RESTART_UNITS_ON_STALE):
+            _record_remediation()
     return actions
 
 

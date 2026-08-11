@@ -30,7 +30,7 @@ run_sentinel() {
   ) || true
 }
 
-RESP=$(curl -sf -X POST "http://127.0.0.1:8000/tasks" \
+RESP=$(curl -sS -w "\n%{http_code}" -X POST "http://127.0.0.1:8000/tasks" \
   -H "Content-Type: application/json" \
   -H "X-RMP-API-Key: ${API_KEY}" \
   -d "$(python3 -c "
@@ -41,7 +41,17 @@ print(json.dumps({
   'idempotency_key': '${KEY}',
   'tags': ['canary', 'system'],
 }))
-")")
+")" || true)
+HTTP_CODE=$(printf '%s' "$RESP" | tail -n1)
+BODY=$(printf '%s' "$RESP" | sed '$d')
+if [[ -z "$HTTP_CODE" || "$HTTP_CODE" != "200" || -z "$BODY" ]]; then
+  err="task create failed http=${HTTP_CODE:-none} body=${BODY:0:200}"
+  echo "CANARY FAIL: ${err}"
+  write_result failed "" "${err}"
+  run_sentinel
+  exit 1
+fi
+RESP="$BODY"
 
 TASK_ID=$(echo "$RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('task_id',''))")
 echo "Canary task created: ${TASK_ID}"

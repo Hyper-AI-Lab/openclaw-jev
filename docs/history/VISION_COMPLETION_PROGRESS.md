@@ -980,3 +980,12 @@
 ### Verification
 - Readiness summary: **pass=20, warn=0, fail=0**
 
+## Runtime code sync guard (2026-08-11)
+
+**Problem:** Editing `app/` without restarting long-lived `rmp-api`/`rmp-worker` left stale imports in memory → `POST /tasks` 500 → hourly canary exit 22 → Slack “health canary stale”.
+
+**Root-cause elimination (code/runtime):**
+1. **`rmp-code-watch.service`** — recursive `inotify` on `app/` + `worker.py`; debounced restart of API/worker so disk and memory cannot diverge after edits (`make install-code-reload`)
+2. **`app.config.__getattr__` (PEP 562)** — path attrs like `RMP_DATA_DIR` resolve even if missing from an older in-memory module dict (`from app.config import X`)
+3. Belt-and-suspenders: boot stamps + readiness `runtime_code_sync`, sentinel auto-restart, canary create-failure → sentinel
+
