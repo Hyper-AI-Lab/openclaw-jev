@@ -967,3 +967,16 @@
 - `make production-check` PASS
 - UID smoke: `agent:main:main` and slack channel key → `U0AELFYTLKS`
 
+## Phase 21 — Production polish & public packaging (2026-08-11)
+
+### Done
+- **Registry backfill:** `ops/backfill_task_registry.py` now supports `--missing-only` / `--limit` / `--sleep-sec`. Indexed 700 missing entries (0 errors); readiness `task_registry_index` **pass** at **1900/2140** (≥85%). Remainder continues off-peak.
+- **Timers:** `rmp-canary`, `rmp-memory-canary`, `rmp-janitor*`, `rmp-backup`, `rmp-canary-sentinel`, watchdog — all **active**; recent canaries `CANARY OK`.
+- **Slack path:** bot `auth.test` OK; `conversations.open` → DM channel; `_get_slack_user_id` → `U0AELFYTLKS`. Health canaries correctly suppress Slack via notification policy.
+- **OTLP:** Phoenix + OTel collector already up; set `telemetry.otlp_endpoint=http://127.0.0.1:4318/v1/traces`; restarted `rmp-api`/`rmp-worker`; readiness telemetry **pass**.
+- **Alerting:** left **disabled** (no webhook configured).
+- **GitHub CI:** added `.github/workflows/ci.yml` (pytest on push/PR). Push may require PAT **workflow** / fine-grained **Workflows** write scope.
+
+### Verification
+- Readiness summary: **pass=20, warn=0, fail=0**
+

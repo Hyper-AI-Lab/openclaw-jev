@@ -19,7 +19,7 @@
   "telemetry": {
     "enabled": true,
     "service_name": "rmp",
-    "otlp_endpoint": "",
+    "otlp_endpoint": "http://127.0.0.1:4318/v1/traces",
     "console_export": false
   },
   "artifact_store": {

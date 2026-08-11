@@ -1,6 +1,6 @@
 # Aura System Architecture
 
-**Last updated:** 2026-08-10  
+**Last updated:** 2026-08-11  
 **Host:** Single Linux VPS (Europe/Berlin timezone on server; Kirill in JST)  
 **Status:** Production live (`development_mode: false`)
 
@@ -567,7 +567,7 @@ Scanner catalog synced by RMP (`app/scanners/`) when `development_mode: false`.
 | Hourly canary | ✅ `:07` past each hour |
 | Daily backup | ✅ `ops/backup.sh` |
 | Runbooks | ✅ `docs/runbooks/` |
-| OTLP trace backend | ⏳ Needs `make observability` (Docker Compose) |
+| OTLP trace backend | ✅ Phoenix + OTel collector (`make observability`); `telemetry.otlp_endpoint` set |
 | Production Temporal cluster | ⏳ Using persistent dev server |
 | Alerting webhook | ⏳ Config present; disabled by default |
 
@@ -673,7 +673,7 @@ cat /root/.openclaw/rmp/data/llm_usage.json   # daily usage ledger
 
 | Area | Gap |
 |------|-----|
-| **OTLP live backend** | Phoenix UI at `http://127.0.0.1:6006`; OTLP HTTP `4318`; RMP `telemetry.otlp_endpoint` currently empty (in-process traces; readiness warns) |
+| **OTLP live backend** | Phoenix UI at `http://127.0.0.1:6006`; OTLP HTTP `4318`; RMP exports to `http://127.0.0.1:4318/v1/traces` |
 | **Production Temporal** | Dev server with SQLite persistence (Phase 7) |
 | **Safe harbor integration** | `deep_core` compact wired; `auditor.js` / `memory_chunker.js` exist under `/root/aura_safe_harbor` (deeper consolidation optional) |
 | **72h soak** | Recommended post-go-live; not formally signed off (Phase 7) |
@@ -697,7 +697,7 @@ Prioritized for stability first, then capability.
 
 ### P1 — Observability & ops
 
-4. **Enable OTLP stack** — `make observability`, set `telemetry.otlp_endpoint` in `settings.json`.  
+4. **OTLP stack** — done on this host (`make observability` + `telemetry.otlp_endpoint`).  
 5. **Enable alerting webhook** — internal channel for canary failures.  
 6. **Upgrade Temporal** — Temporal Cloud or self-hosted HA cluster.
 

@@ -13,7 +13,8 @@
 | 0–11 | Feature development | ✅ Complete (`DEVELOPMENT_PLAN.md`) |
 | 12 | Production foundation | ✅ Complete |
 | 13 | Go-live & soak | ✅ Go-live + E2E canary; ⏳ 72h soak ongoing |
-| 14 | Observability | ✅ Metrics, export API, alerts, dashboard; ⏳ OTLP stack (needs Docker) |
+| 14 | Observability | ✅ Metrics, export API, alerts, dashboard; ✅ OTLP (Phoenix + collector) |
+| 21 | Production polish | ✅ Registry backfill, timers/Slack confirm, OTLP live, public CI workflow |
 | 15 | Infrastructure | ✅ Env secrets, patch verify, restore script; ⏳ Full Temporal cluster optional |
 | 16 | Reliability | ✅ Idempotent Slack, leases, signals |
 | 17 | Memory depth | ✅ Policy, retention, graph links, procedural promotion |
@@ -59,7 +60,7 @@ Slack / Cron / Heartbeat → rmp_adapter → POST /tasks → FastAPI
 
 ---
 
-## Phase 14 — Observability ✅ (OTLP pending Docker)
+## Phase 14 — Observability ✅ (OTLP live)
 
 | # | Deliverable |
 |---|-------------|
@@ -69,7 +70,17 @@ Slack / Cron / Heartbeat → rmp_adapter → POST /tasks → FastAPI
 | 14.4 | Dashboard production banner, readiness score, backup card |
 | 14.5 | `GET /tasks/{id}/export` postmortem bundle |
 
-**To enable traces:** `make observability` then set `telemetry.otlp_endpoint` to `http://127.0.0.1:4318/v1/traces`.
+**Traces:** Phoenix + collector running; `telemetry.otlp_endpoint=http://127.0.0.1:4318/v1/traces` (Phase 21).
+
+---
+
+## Phase 21 — Production polish ✅ (2026-08-11)
+
+- Task-registry backfill (`--missing-only`) cleared readiness index warn
+- Timers + Slack DM path confirmed (`auth.test`, owner UID)
+- OTLP export enabled end-to-end
+- Alerting remains opt-in (webhook empty)
+- Public `.github/workflows/ci.yml` added (requires workflow push scope on PAT)
 
 ---
 
