@@ -9,9 +9,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: .
     steps:
       - uses: actions/checkout@v4
 
@@ -26,9 +23,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Unit tests
-        env:
-          # Offline unit suite — no live NVIDIA / Slack / Temporal required.
-          RMP_SETTINGS_PATH: ${{ github.workspace }}/settings.example.json
+      - name: Seed OpenClaw/RMP host paths
         run: |
-          python -m pytest tests/ -q --ignore=tests/integration
+          # Production code hardcodes /root/.openclaw/...; map the checked-out
+          # repo there so unit tests can read/write settings + data like on the VPS.
+          sudo mkdir -p /root/.openclaw
+          sudo ln -sfn "$GITHUB_WORKSPACE" /root/.openclaw/rmp
+          sudo mkdir -p \
+            /root/.openclaw/agents/main/agent \
+            /root/.openclaw/agents/main/sessions \
+            /root/.openclaw/workspace \
+            /root/.openclaw/cron
+          sudo chmod -R a+rwX /root/.openclaw/agents /root/.openclaw/workspace /root/.openclaw/cron
+          mkdir -p "$GITHUB_WORKSPACE/data"
+          if [[ ! -f "$GITHUB_WORKSPACE/settings.json" ]]; then
+            cp "$GITHUB_WORKSPACE/settings.example.json" "$GITHUB_WORKSPACE/settings.json"
+          fi
+
+      - name: Unit tests
+        run: python -m pytest tests/ -q --ignore=tests/integration
