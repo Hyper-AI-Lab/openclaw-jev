@@ -41,13 +41,6 @@ Aura (the **Reliability & Memory Plane**, RMP) is the sidecar that owns those gu
 
 ## Architecture
 
-Hero diagram (full system narrative):
-
-<p align="center">
-  <img src="docs/assets/AI_Agent_Reliability_Architecture.jpg" alt="Aura RMP architecture" width="100%" />
-</p>
-
-Full-resolution PNG: [`docs/assets/AI_Agent_Reliability_Architecture.png`](docs/assets/AI_Agent_Reliability_Architecture.png)
 ### Control-plane flow (current)
 
 ```mermaid
