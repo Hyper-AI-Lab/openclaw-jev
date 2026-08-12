@@ -35,15 +35,29 @@ function rmpHeaders() {
   return headers;
 }
 
+function sleepSync(ms) {
+  const sec = Math.max(1, Math.ceil(Number(ms) / 1000));
+  try {
+    execFileSync('/bin/sleep', [String(sec)], { stdio: 'ignore' });
+  } catch (_) {}
+}
+
+function isLikelyTimeoutError(err) {
+  const msg = String(err && err.message ? err.message : err || '');
+  // curl exit 28 → "Command failed: ... --max-time ..."
+  return /max-time|timed?\s*out|ETIMEDOUT|timeout/i.test(msg) || /Command failed:[\s\S]*--max-time/i.test(msg);
+}
+
 /** Synchronous RMP HTTP — before_message_write must not return a Promise. */
-function rmpFetchSync(method, urlPath, body) {
+function rmpFetchSync(method, urlPath, body, opts) {
   const key = getApiKey();
+  const maxTime = String((opts && opts.maxTimeSec) || (method === 'POST' && urlPath === '/tasks' ? 45 : 15));
   const args = [
     '-sS',
     '-X', method,
     '-H', 'Content-Type: application/json',
     '-H', `X-RMP-API-Key: ${key}`,
-    '--max-time', '10',
+    '--max-time', maxTime,
     '-w', '\n%{http_code}',
   ];
   if (body !== undefined) {
@@ -157,14 +171,13 @@ function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeat
   } else {
     idemKey = crypto.createHash('sha256').update(`${sessionKey}:${rawText || intent}`).digest('hex');
   }
-  const processHint = classifyProcessType(intent);
   const data = rmpFetchSync('POST', '/tasks', {
     intent: intent.substring(0, 500),
     tags: tags || ['user-request'],
     user_id: 'slack_user',
     session_key: sessionKey,
     raw_text: rawText || intent,
-    process_type_hint: processHint,
+    // No process_type_hint: intake LLM + memory/registry decide routing.
     idempotency_key: idemKey,
   });
   if (data.skipped) {
@@ -217,19 +230,65 @@ function routeSlackDmToRmp(content, sessionKey) {
       }
     } catch (e) {
       log(`Signal error: ${e.message}`);
-      enableNativeSlackFallback(`stop-signal-failed:${e.message}`);
       throw e;
     }
     return true;
   }
 
-  createRmpTaskFromInbound({
+  const payload = {
     sessionKey,
     intent,
     tags: ['user-request'],
     rawText: intent,
-  });
-  return true;
+  };
+  try {
+    createRmpTaskFromInbound(payload);
+    return true;
+  } catch (e) {
+    // curl --max-time can abort while POST /tasks is still running intake LLM.
+    // Server may still create the task; recover via idempotent re-POST. Never
+    // hand the turn back to native OpenClaw.
+    if (isLikelyTimeoutError(e)) {
+      log(`Intake POST timed out; recovering via idempotent re-POST: ${e.message}`);
+      for (const waitMs of [2000, 3000, 5000]) {
+        sleepSync(waitMs);
+        try {
+          const data = createRmpTaskFromInbound(payload);
+          log(`Recovered RMP ownership after timeout (task=${data?.task_id || '?'})`);
+          return true;
+        } catch (e2) {
+          log(`Recovery attempt failed: ${e2.message}`);
+        }
+        try {
+          const active = getActiveRmpUserTask(sessionKey);
+          if (active?.id) {
+            log(`Recovered RMP ownership via active task ${active.id}`);
+            return true;
+          }
+        } catch (_) {}
+      }
+    }
+    throw e;
+  }
+}
+
+/** Recent Slack DMs claimed by inbound_claim — avoid double POST from message_received. */
+const claimedSlackKeys = new Map();
+function markSlackClaimed(sessionKey, content) {
+  const key = `${sessionKey}::${crypto.createHash('sha256').update(content || '').digest('hex')}`;
+  claimedSlackKeys.set(key, Date.now());
+  if (claimedSlackKeys.size > 200) {
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    for (const [k, ts] of claimedSlackKeys) {
+      if (ts < cutoff) claimedSlackKeys.delete(k);
+    }
+  }
+  return key;
+}
+function wasSlackClaimed(sessionKey, content) {
+  const key = `${sessionKey}::${crypto.createHash('sha256').update(content || '').digest('hex')}`;
+  const ts = claimedSlackKeys.get(key);
+  return Boolean(ts && Date.now() - ts < 10 * 60 * 1000);
 }
 
 function isMainChatSession(sessionKey) {
@@ -252,17 +311,6 @@ function getActiveRmpUserTask(sessionKey) {
   } catch (_) {
     return null;
   }
-}
-
-function classifyProcessType(text) {
-  // Fast pre-hint only; universal intake adjudicates final routing.
-  const lower = (text || '').toLowerCase();
-  if (/\b(register|sign up|create account)\b/.test(lower)) return 'account_registration';
-  if (/\b(log in|login|sign in)\b/.test(lower)) return 'login';
-  if (/\b(procure|purchase|buy)\b/.test(lower)) return 'procurement';
-  if (/\b(email|follow-up|follow up)\b/.test(lower)) return 'email_followup';
-  if (/\b(browser|navigate|automate|moltmarket)\b/.test(lower)) return 'browser_automation';
-  return null;
 }
 
 function prefetchProcessMemory(taskId, processRunId) {
@@ -324,14 +372,9 @@ function releaseLlmSlot(sessionKey) {
 function installNativeSlackSuppressor() {
   // OpenClaw Slack DM delivery (deliverReplies) bypasses message_sending hooks.
   // Patched dist calls this before chat.postMessage so RMP stays the sole reply path.
-  // Exception: one-shot native fallback after RMP intake failure (avoid silent black hole).
+  // Hard policy: never allow native Slack replies (no intake-failure escape hatch).
   globalThis.__RMP_SUPPRESS_NATIVE_SLACK = (params) => {
     if (isDevSuspended()) return false;
-    if (consumeNativeSlackFallback()) {
-      const target = String(params?.target || '');
-      log(`ALLOW native Slack deliverReplies after intake failure target=${target.slice(0, 40)}`);
-      return false;
-    }
     const target = String(params?.target || '');
     log(`SUPPRESSED native Slack deliverReplies (RMP owns delivery) target=${target.slice(0, 40)}`);
     return true;
@@ -341,21 +384,6 @@ function installNativeSlackSuppressor() {
 function isSlackInboundSession(sessionKey) {
   const key = sessionKey || '';
   return isMainChatSession(key) || key.includes('slack:');
-}
-
-/** When RMP intake fails, allow one native Slack reply so DMs are not silently dropped. */
-let allowNativeSlackFallback = false;
-function enableNativeSlackFallback(reason) {
-  allowNativeSlackFallback = true;
-  log(`Enabled native Slack fallback: ${reason}`);
-}
-function peekNativeSlackFallback() {
-  return allowNativeSlackFallback;
-}
-function consumeNativeSlackFallback() {
-  if (!allowNativeSlackFallback) return false;
-  allowNativeSlackFallback = false;
-  return true;
 }
 
 module.exports = {
@@ -437,8 +465,61 @@ module.exports = {
       }
     });
 
-    // Runs before sendPolicy check — required so Slack DMs reach RMP even when
-    // the main session must not deliver natively.
+    // Claim Slack DMs before OpenClaw's native agent turn. Returning
+    // { handled: true } stops the gateway from answering (and double-posting).
+    api.on('inbound_claim', (event, ctx) => {
+      try {
+        if (isDevSuspended()) return;
+        const channel = String(event?.channel || ctx?.channelId || '').toLowerCase();
+        const content = String(event?.content || event?.body || '').trim();
+        if (!content) return;
+        if (channel !== 'slack' && !channel.includes('slack')) return;
+        const sessionKey = event?.sessionKey || ctx?.sessionKey || 'agent:main:main';
+        log(`inbound_claim slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
+        routeSlackDmToRmp(content, sessionKey);
+        markSlackClaimed(sessionKey, content);
+        return { handled: true };
+      } catch (e) {
+        // Fail closed: still claim the turn so native OpenClaw cannot answer.
+        log(`inbound_claim route error (still claiming; no native): ${e.message}`);
+        try {
+          const sessionKey = event?.sessionKey || ctx?.sessionKey || 'agent:main:main';
+          const content = String(event?.content || event?.body || '').trim();
+          if (content) markSlackClaimed(sessionKey, content);
+        } catch (_) {}
+        return { handled: true };
+      }
+    }, { priority: 120 });
+
+    api.on('before_dispatch', (event, ctx) => {
+      try {
+        if (isDevSuspended()) return;
+        const channel = String(event?.channel || ctx?.channelId || '').toLowerCase();
+        const content = String(event?.content || event?.body || '').trim();
+        if (!content) return;
+        if (channel !== 'slack' && !channel.includes('slack')) return;
+        const sessionKey = event?.sessionKey || ctx?.sessionKey || 'agent:main:main';
+        if (wasSlackClaimed(sessionKey, content)) {
+          log(`before_dispatch: already claimed by inbound_claim on ${sessionKey}`);
+          return { handled: true };
+        }
+        // Safety net if inbound_claim did not run for this build/path.
+        log(`before_dispatch claiming slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
+        routeSlackDmToRmp(content, sessionKey);
+        markSlackClaimed(sessionKey, content);
+        return { handled: true };
+      } catch (e) {
+        log(`before_dispatch route error (still claiming; no native): ${e.message}`);
+        try {
+          const sessionKey = event?.sessionKey || ctx?.sessionKey || 'agent:main:main';
+          const content = String(event?.content || event?.body || '').trim();
+          if (content) markSlackClaimed(sessionKey, content);
+        } catch (_) {}
+        return { handled: true };
+      }
+    }, { priority: 120 });
+
+    // Backup if claim hooks are unavailable; skip when already claimed.
     api.on('message_received', (event, ctx) => {
       try {
         const meta = event?.metadata || {};
@@ -448,12 +529,29 @@ module.exports = {
         const isSlack = provider === 'slack' || provider.includes('slack');
         if (!isSlack) return;
         const sessionKey = ctx?.sessionKey || meta.sessionKey || 'agent:main:main';
+        if (wasSlackClaimed(sessionKey, content)) {
+          log(`message_received skip (already claimed) on ${sessionKey}`);
+          return;
+        }
         log(`message_received slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
         routeSlackDmToRmp(content, sessionKey);
+        markSlackClaimed(sessionKey, content);
       } catch (e) {
-        const sessionKey = ctx?.sessionKey || 'agent:main:main';
-        log(`message_received route error: ${e.message}`);
-        enableNativeSlackFallback(`intake-route-failed:${e.message}`);
+        log(`message_received route error (no native fallback): ${e.message}`);
+      }
+    }, { priority: 120 });
+
+    api.on('reply_payload_sending', (event, ctx) => {
+      try {
+        if (isDevSuspended()) return;
+        const sessionKey = event?.sessionKey || ctx?.sessionKey || '';
+        const channel = String(event?.channel || ctx?.channelId || '').toLowerCase();
+        const isSlack = channel === 'slack' || channel.includes('slack') || isSlackInboundSession(sessionKey);
+        if (!isSlack) return;
+        log(`reply_payload_sending cancel on ${sessionKey || channel} (RMP owns delivery)`);
+        return { cancel: true, reason: 'rmp_owns_slack_delivery' };
+      } catch (e) {
+        log(`reply_payload_sending error: ${e.message}`);
       }
     }, { priority: 120 });
 
@@ -480,10 +578,6 @@ module.exports = {
         }
 
         if (msg.role === 'assistant' && isSlackInboundSession(ctx?.sessionKey || '')) {
-          if (peekNativeSlackFallback()) {
-            log('ALLOW Slack-session assistant msg (native fallback after intake failure)');
-            return;
-          }
           if (isPureSystemAck(text)) {
             log('BLOCKED system ack from Slack session transcript');
             return { block: true };
@@ -522,11 +616,7 @@ module.exports = {
         }
 
         if (isSlackDM) {
-          if (peekNativeSlackFallback()) {
-            log('ALLOW Slack DM write after intake failure (native fallback)');
-            return;
-          }
-          log('BLOCKED Slack DM write on main session (RMP routed via message_received)');
+          log('BLOCKED Slack DM write on main session (RMP owns intake)');
           return { block: true };
         }
 
@@ -584,12 +674,8 @@ module.exports = {
 
       const sessionKey = ctx?.sessionKey || event?.sessionKey || 'agent:main:main';
 
-      // RMP owns all Slack DM delivery; native gateway must never double-post.
+      // RMP owns all Slack DM delivery; native gateway must never post.
       if (isSlackInboundSession(sessionKey) && !isDevSuspended()) {
-        if (peekNativeSlackFallback()) {
-          log(`ALLOW native Slack on ${sessionKey} (intake failure fallback)`);
-          return;
-        }
         log(`SUPPRESSED native Slack on ${sessionKey} (RMP owns delivery)`);
         return { cancel: true };
       }

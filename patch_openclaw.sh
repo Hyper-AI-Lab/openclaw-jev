@@ -120,6 +120,12 @@ PY
         applied="${applied} allow-unsafe-rmp-force"
     fi
 
+    # Patch 6: Fast LLM idle silence (5s) then rotate NVIDIA keys — do not sit 120s.
+    if grep -q 'const DEFAULT_LLM_IDLE_TIMEOUT_MS = 12e4;' "$f" 2>/dev/null; then
+        sed -i 's/const DEFAULT_LLM_IDLE_TIMEOUT_MS = 12e4;/const DEFAULT_LLM_IDLE_TIMEOUT_MS = 5e3; \/* RMP_LLM_IDLE_5S *\//' "$f"
+        applied="${applied} llm-idle-5s"
+    fi
+
     if [ -n "$applied" ]; then
         echo "  Patched $(basename "$f"):$applied"
         PATCHED=$((PATCHED + 1))

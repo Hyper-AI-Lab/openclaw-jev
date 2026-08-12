@@ -9,6 +9,19 @@ HOUR="$(date -u +%Y%m%dT%H%M)"
 KEY="canary:${HOUR}"
 RESULT_FILE="${RMP_ROOT}/data/last_health_canary.json"
 
+# Soft skip: do not compete with live user work (prevents LLM starvation → false timeout).
+ACTIVE_USERS=$(
+  cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.production.canary_sentinel import count_active_user_tasks_sync
+print(count_active_user_tasks_sync())
+" 2>/dev/null || echo 0
+)
+if [[ "${ACTIVE_USERS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CANARY SKIP: ${ACTIVE_USERS} active user task(s) — deferring hourly canary"
+  # Do not write timeout; leave last successful result so sentinel does not restart worker.
+  exit 0
+fi
+
 write_result() {
   local status="$1"
   local task_id="${2:-}"
@@ -77,5 +90,10 @@ done
 
 write_result timeout "${TASK_ID}" "poll timeout"
 echo "CANARY TIMEOUT"
+# Cancel the stuck canary task so it cannot pin LLM slots / starve user work.
+if [[ -n "${TASK_ID}" ]]; then
+  curl -sf -X POST -H "X-RMP-API-Key: ${API_KEY}" \
+    "http://127.0.0.1:8000/tasks/${TASK_ID}/cancel" >/dev/null 2>&1 || true
+fi
 run_sentinel
 exit 1

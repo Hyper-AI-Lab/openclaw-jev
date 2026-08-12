@@ -111,7 +111,7 @@ def apply_intake_policy(
         llm_result=llm_result,
     )
 
-    return {
+    result = {
         "decision": decision,
         "effective_decision": effective if enforced else "create_fresh",
         "confidence": confidence,
@@ -125,3 +125,10 @@ def apply_intake_policy(
         "llm_raw": llm_result,
         "execution_mode": execution_mode,
     }
+    from app.orchestrator.web_capability import merge_web_into_intake
+
+    return merge_web_into_intake(
+        result,
+        context.get("intent") or "",
+        llm_result=llm_result,
+    )

@@ -1,0 +1,5 @@
+# Optional heavy stack. Install separately if the base image can afford Playwright.
+crawl4ai>=0.5.0
+scrapling[fetchers]>=0.2.0
+scrapegraphai>=1.0.0
+browser-use>=0.1.0

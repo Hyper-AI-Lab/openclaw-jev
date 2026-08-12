@@ -115,6 +115,7 @@ def build_generic_execute_prompt(
     context_block: str,
     profile: Optional[str] = None,
     user_time_block: Optional[str] = None,
+    web_brief: Optional[str] = None,
 ) -> str:
     budget = profile_tool_budget(profile)
     hint = profile_memory_hint(profile)
@@ -129,14 +130,28 @@ def build_generic_execute_prompt(
             f"USER LOCAL TIME: Kirill is in {USER_TIMEZONE_LABEL}. "
             "Use Japan-local greetings, not Europe/Berlin VPS server time."
         )
+    # Prefer explicit brief; else derive from intent for web-ish tasks.
+    brief = (web_brief or "").strip()
+    if not brief:
+        try:
+            from app.orchestrator.web_capability import analyze_web_capability
+
+            brief = (analyze_web_capability(user_intent).get("web_brief") or "").strip()
+        except Exception:
+            brief = ""
+    web_block = f"\n{brief}\n" if brief else ""
+    # Raise budget slightly when web tools are in play.
+    if brief and budget < 4:
+        budget = 4
     return f"""User Request: {user_intent}
 {tz}
 {mem}
 {context_block}
 {extra}
+{web_block}
 {MEMORY_FIRST_UNIVERSAL}
 Instructions:
-1. Execute the required steps. Use tools sparingly (at most {budget} tool calls for simple read/summarize requests).
+1. Execute the required steps. Use tools sparingly (at most {budget} tool calls for simple read/summarize requests). When WEB CAPABILITY BRIEF is present, prefer the listed tools in order.
 2. Use the OpenClaw tool named `read` (with `file_path`) to read files — there is no `read_file` tool.
 3. After gathering what you need, reply in clear English to Kirill — concise, no mixed languages, no internal planning monologue, no numbered option menus unless the user asked for choices.
 4. Do NOT include Origin/Session/Goal/Memory status metadata in your reply.
@@ -156,16 +171,25 @@ def build_catalog_step_prompt(
     step_prompt: str,
 ) -> str:
     mem = memory_block or "PROCESS-SCOPED MEMORY: (none yet)\n"
+    web_block = ""
+    try:
+        from app.orchestrator.web_capability import analyze_web_capability
+
+        brief = (analyze_web_capability(user_intent).get("web_brief") or "").strip()
+        if brief:
+            web_block = f"\n{brief}\n"
+    except Exception:
+        pass
     return f"""User Request: {user_intent}
 
 {mem}
 {context_block}
-
+{web_block}
 {step_prompt}
 
 {MEMORY_FIRST_UNIVERSAL}
 Instructions:
-1. Complete ONLY this step. Use tools as needed (prefer at most 3 tool calls unless the step requires more). Use `read` with `file_path` for files (not `read_file`).
+1. Complete ONLY this step. Use tools as needed (prefer at most 3 tool calls unless the step requires more). Use `read` with `file_path` for files (not `read_file`). For interact steps prefer OpenClaw `browser`, then `browser_use`, then `obscura_browse`.
 2. Reply in clear English — concise, no internal planning monologue or metadata blocks.
 3. Put facts JSON ONLY in a final fenced block:
 ```json

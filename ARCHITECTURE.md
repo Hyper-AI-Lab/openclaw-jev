@@ -159,7 +159,7 @@ OpenClaw also has built-in profile cooldown/rotation on 429; RMP’s quota broke
 
 | Hook | Behavior |
 |------|----------|
-| `message_received` | Primary Slack DM → `POST /tasks` with real slack session key; enable native fallback on route failure |
+| `message_received` / `inbound_claim` | Slack DM → `POST /tasks`; claim turn so native OpenClaw never replies (fail closed) |
 | `before_message_write` | Block Slack DM / assistant writes while RMP owns delivery; cron task create; skip internal heartbeat routing |
 | `message_sending` | Suppress native Slack during active RMP user task; strip interim tool-planning text; cancel pure-ack messages |
 | `before_agent_start` | **`POST /api/llm/reserve`** — balanced key + concurrency slot for gateway sessions (not `rmp_task_*`, `rmp_verify_*`, `rmp_intake_*`, Slack/main, heartbeat) |
@@ -170,6 +170,22 @@ OpenClaw also has built-in profile cooldown/rotation on 429; RMP’s quota broke
 On task create the plugin also **prefetches** process memory (`GET /memory/process/{id}/context`) and passes `initial_memory_block` into the workflow payload.
 
 Tools exposed to the agent: `rmp_task_create`, `rmp_task_status`, `rmp_memory_recall` (optional; normal path is automatic routing).
+
+### 4.0.1 Galaxy web capability stack
+
+OpenClaw plugin **`aura_web`** (`/root/.openclaw/plugins/aura_web`) plus localhost FastAPI **web-stack** (`http://127.0.0.1:8791`, systemd `aura-web-backends`) give Aura multi-backend web tools:
+
+| Class | Tools |
+|-------|--------|
+| Search | Brave `web_search` (default), `langsearch_search` (key in `plugins.entries.langsearch`) |
+| Fetch | `jina_reader` (r.jina.ai), built-in `web_fetch`, `crawl4ai` |
+| Crawl / extract | `crawl4ai`, `crawlee_crawl`, `scrapling`, `scrapegraph_extract` |
+| Interact | OpenClaw `browser`, `browser_use`, `obscura_browse` |
+| Status | `web_capability_status` |
+
+RMP **`WebCapabilityAnalyzer`** (`app/orchestrator/web_capability.py`) classifies intake intents (`search|fetch|crawl|adaptive_extract|schema_extract|interact|none`), soft-routes interact → `browser_automation` catalog when justified, and injects a **WEB CAPABILITY BRIEF** into execute prompts / `initial_memory_block`. Agent-visible docs: workspace `TOOLS.md`.
+
+Paid APIs (Perplexity, Firecrawl, Tavily) are **not** configured unless keys are added later.
 
 ### 4.1 OpenClaw dist patches (re-apply after every `npm install -g openclaw`)
 

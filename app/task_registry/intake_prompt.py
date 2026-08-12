@@ -13,6 +13,7 @@ INTAKE_JSON_SCHEMA = {
     "catalog_hint": "optional catalog process_type or null",
     "guidance_notes": "optional string for create_guided",
     "target_task_id": "optional task id for attach/wait/spawn",
+    "web_intent": "optional none|search|fetch|crawl|adaptive_extract|schema_extract|interact — soft hint for web tool routing",
 }
 
 
@@ -39,6 +40,7 @@ RULES:
   - conversational: social chat, greetings, acknowledgements, dev updates with no concrete deliverable — reply in one turn, no filesystem/code exploration.
   - structured_work: needs tools, files, research, multi-step execution, or explicit "explore/read/implement" asks.
 - catalog_hint is optional (browser_automation, outreach, etc.) — only if clearly applicable.
+- web_intent is optional soft hint: search|fetch|crawl|adaptive_extract|schema_extract|interact|none. Prefer interact only for real click/login/screenshot automation (not mere "search the web").
 - Never invent task IDs; use only IDs from context.
 
 Respond with ONLY a single JSON object matching this schema (no markdown fences, no prose before or after):

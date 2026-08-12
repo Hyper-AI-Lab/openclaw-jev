@@ -39,6 +39,8 @@ TERMINAL_TASK_STATUSES = frozenset(
     {"completed", "failed", "compensated", "stopped_by_user", "cancelled"}
 )
 DEFAULT_STALE_SLOT_MS = 90 * 60 * 1000
+# Canary/system sessions must not pin LLM slots for long — they starve user work.
+CANARY_STALE_SLOT_MS = 6 * 60 * 1000
 
 _lock = asyncio.Lock()
 _state_lock = threading.Lock()
@@ -541,15 +543,28 @@ def reap_stale_llm_slots_sync(max_age_ms: int = DEFAULT_STALE_SLOT_MS) -> List[s
         started_ms = float(slot.get("started_ms") or 0)
         task_id = _task_id_from_rmp_session(session_key)
         reason: Optional[str] = None
-
-        if started_ms and now_ms - started_ms > max_age_ms:
-            reason = "stale_age"
-        elif task_id:
+        age_limit = max_age_ms
+        # Faster reap for canary/system sessions (they must not block user keys).
+        sk_lower = session_key.lower()
+        if "canary" in sk_lower or "rmp_verify" in sk_lower:
+            age_limit = min(age_limit, CANARY_STALE_SLOT_MS)
+        if task_id:
+            # If the task goal/type looks like canary, also use short TTL.
             status = _lookup_task_status_sync(task_id)
             if status is None:
                 reason = "missing_task"
             elif status in TERMINAL_TASK_STATUSES:
                 reason = f"task_{status}"
+            else:
+                # Look up canary-ish goals cheaply via session key only above;
+                # also shorten age for any rmp_task older than canary TTL when
+                # the task row is a known canary type (best-effort).
+                canaryish = _task_looks_like_canary_sync(task_id)
+                if canaryish:
+                    age_limit = min(age_limit, CANARY_STALE_SLOT_MS)
+
+        if reason is None and started_ms and now_ms - started_ms > age_limit:
+            reason = "stale_age"
 
         if reason:
             if release_profile_sync(session_key=session_key, slot_id=slot_id):
@@ -558,6 +573,28 @@ def reap_stale_llm_slots_sync(max_age_ms: int = DEFAULT_STALE_SLOT_MS) -> List[s
     if actions:
         logger.info("Reaped %d stale LLM slot(s): %s", len(actions), actions)
     return actions
+
+
+def _task_looks_like_canary_sync(task_id: str) -> bool:
+    try:
+        from sqlalchemy import create_engine, text
+
+        from app.db.database import DATABASE_URL
+
+        sync_url = DATABASE_URL.replace("+asyncpg", "+psycopg2")
+        engine = create_engine(sync_url)
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT task_type, goal FROM tasks WHERE id = :id"),
+                {"id": task_id},
+            ).fetchone()
+        if not row:
+            return False
+        task_type = (row[0] or "").lower()
+        goal = (row[1] or "").upper()
+        return task_type == "canary" or "RMP CANARY" in goal or "MEMORY CANARY" in goal
+    except Exception:
+        return False
 
 
 def get_orchestration_status(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

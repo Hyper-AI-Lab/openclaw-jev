@@ -75,3 +75,16 @@ def test_sanitize_user_facing_text():
     assert sanitize_user_facing_text(meta) == "Hello"
     dup = "Short reply.\n\nShort reply."
     assert sanitize_user_facing_text(dup) == "Short reply."
+
+
+def test_plan_json_never_delivered_to_slack():
+    from app.notification_policy import sanitize_user_facing_text
+
+    plan = (
+        '{"steps": [{"name": "Explain tooling", "kind": "deliver", '
+        '"predicate_id": "deliver", "prompt": "Explain web_search."}]}'
+    )
+    assert sanitize_user_facing_text(plan) == ""
+    assert not should_deliver_slack(
+        "How do you search the web?", "user", ["user-request"], plan
+    )

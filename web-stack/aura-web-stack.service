@@ -1,0 +1,15 @@
+[Unit]
+Description=Aura web-stack backends (Crawl4AI, Scrapling, Crawlee, ScrapeGraphAI, browser-use, Obscura)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/root/.openclaw/web-stack
+ExecStart=/usr/bin/docker compose up -d --build
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

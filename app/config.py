@@ -143,10 +143,13 @@ DEFAULT_TASK_REGISTRY = {
     "similarity_threshold": 0.72,
     "intake_confidence_threshold": 65,
     "intake_cache_sec": 60,
-    "intake_llm_timeout_sec": 60,
+    "intake_llm_timeout_sec": 20,
     "intake_model": "nvidia/deepseek-ai/deepseek-v4-flash-0731",
-    "intake_model_fallbacks": [],
-    "intake_vector_deadline_sec": 15,
+    "intake_model_fallbacks": [
+        "nvidia/minimaxai/minimax-m3",
+        "nvidia/z-ai/glm-5.2",
+    ],
+    "intake_vector_deadline_sec": 10,
     "qdrant_query_timeout_sec": 8,
     "backfill_days": 90,
     "rework_max_attempts": 3,
@@ -176,6 +179,19 @@ def get_intake_models() -> list[str]:
         if str(m).strip() and str(m).strip() != primary
     ]
     return [primary] + fallbacks if primary else fallbacks
+
+
+def get_primary_agent_model() -> str:
+    """OpenClaw agents.defaults.model.primary — MiniMax M3 for user-facing RMP turns."""
+    cfg = _read_json(OPENCLAW_CONFIG_PATH, {})
+    model = (cfg.get("agents") or {}).get("defaults", {}).get("model") or {}
+    if isinstance(model, dict):
+        primary = str(model.get("primary") or "").strip()
+        if primary:
+            return primary
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return "nvidia/minimaxai/minimax-m3"
 
 
 def get_intake_timeout_budget() -> dict:

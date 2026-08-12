@@ -1,8 +1,9 @@
 """Intake timeout constants — safe inside Temporal workflow sandbox (no file I/O)."""
 from __future__ import annotations
 
-DEFAULT_INTAKE_LLM_TIMEOUT_SEC = 60
-DEFAULT_INTAKE_CONTEXT_SEC = 15
+# Keep intake snappy: fail/rotate quickly rather than blocking Slack create for a minute.
+DEFAULT_INTAKE_LLM_TIMEOUT_SEC = 20
+DEFAULT_INTAKE_CONTEXT_SEC = 10
 
 
 def intake_timeout_budget(

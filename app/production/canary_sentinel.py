@@ -192,6 +192,9 @@ RESTART_UNITS_ON_STALE = ("rmp-api", "rmp-worker")
 REMEDIATION_COOLDOWN_MINUTES = 20
 REMEDIATION_STATE_PATH = RMP_ROOT / "data" / "last_canary_remediation.json"
 
+# Soft health_canary failures that often mean "busy / LLM starved", not dead runtime.
+SOFT_HEALTH_STATUSES = frozenset({"timeout", "failed"})
+
 
 def _remediation_cooldown_active(key: str = "restart_runtime") -> bool:
     state = _read_json(REMEDIATION_STATE_PATH) or {}
@@ -208,8 +211,79 @@ def _record_remediation(key: str = "restart_runtime") -> None:
     REMEDIATION_STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
+def count_active_user_tasks_sync() -> int:
+    """Count non-terminal user tasks that would be hurt by a worker restart."""
+    try:
+        from sqlalchemy import create_engine, text
+
+        from app.db.database import DATABASE_URL
+        from app.notification_policy import is_internal_task
+
+        sync_url = DATABASE_URL.replace("+asyncpg", "+psycopg2")
+        engine = create_engine(sync_url)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id, task_type, goal FROM tasks "
+                    "WHERE status IN ('running', 'created', 'pending_user_input')"
+                )
+            ).fetchall()
+        count = 0
+        for _id, task_type, goal in rows:
+            if is_internal_task(goal or "", task_type or "", []):
+                continue
+            count += 1
+        return count
+    except Exception as exc:
+        logger.warning("count_active_user_tasks_sync failed: %s", exc)
+        return 0
+
+
+def cancel_task_sync(task_id: str, reason: str = "canary_timeout") -> bool:
+    if not task_id:
+        return False
+    try:
+        from sqlalchemy import create_engine, text
+
+        from app.db.database import DATABASE_URL
+
+        sync_url = DATABASE_URL.replace("+asyncpg", "+psycopg2")
+        engine = create_engine(sync_url)
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE tasks SET status = 'cancelled' "
+                    "WHERE id = :id AND status IN ('running', 'created', 'pending_user_input')"
+                ),
+                {"id": task_id},
+            )
+        try:
+
+            async def _term() -> None:
+                from temporalio.client import Client
+
+                client = await Client.connect("localhost:7233")
+                for wid in (f"workflow-{task_id}", f"{task_id}-plan-deliver-1"):
+                    try:
+                        await client.get_workflow_handle(wid).terminate(reason)
+                    except Exception:
+                        pass
+
+            asyncio.run(_term())
+        except Exception as exc:
+            logger.debug("Temporal terminate after canary cancel skipped: %s", exc)
+        return True
+    except Exception as exc:
+        logger.warning("cancel_task_sync %s failed: %s", task_id[:8], exc)
+        return False
+
+
 def attempt_remediation(issues: List[CanaryIssue]) -> List[str]:
-    """Deterministic fixes — reap LLM slots, restart down units, reload stale runtime."""
+    """Deterministic fixes — reap LLM slots, restart down units, reload stale runtime.
+
+    Never restart rmp-worker/rmp-api for soft health_canary timeout/failed while
+    active user tasks are running — that aborts mid-flight Slack delivery.
+    """
     actions: List[str] = []
     reaped = reap_stale_llm_slots_sync()
     if reaped:
@@ -224,11 +298,39 @@ def attempt_remediation(issues: List[CanaryIssue]) -> List[str]:
                     actions.append(f"restarted {unit}")
                     restarted.add(unit)
 
-    needs_runtime_reload = any(
-        (i.name == "runtime_code_sync" and i.status in {"stale", "missing"})
-        or (i.name == "health_canary" and i.status in {"stale", "failed", "timeout", "missing"})
-        for i in issues
+    # Cancel timed-out/failed canary tasks so they cannot pin LLM slots.
+    for issue in issues:
+        if issue.name == "health_canary" and issue.status in SOFT_HEALTH_STATUSES:
+            tid = str((issue.details or {}).get("task_id") or "")
+            if tid and cancel_task_sync(tid, f"health_canary_{issue.status}"):
+                actions.append(f"cancelled canary task {tid[:8]}")
+                # Reap again after cancel so slots drop immediately
+                reaped2 = reap_stale_llm_slots_sync()
+                if reaped2:
+                    actions.extend([f"reaped slot {r}" for r in reaped2])
+
+    hard_reload = any(
+        i.name == "runtime_code_sync" and i.status in {"stale", "missing"} for i in issues
     )
+    soft_health = any(
+        i.name == "health_canary" and i.status in SOFT_HEALTH_STATUSES for i in issues
+    )
+    hard_health = any(
+        i.name == "health_canary" and i.status in {"stale", "missing"} for i in issues
+    )
+
+    active_users = count_active_user_tasks_sync()
+    needs_runtime_reload = hard_reload or hard_health
+    if soft_health and not hard_reload and not hard_health:
+        if active_users > 0:
+            actions.append(
+                f"deferred runtime restart ({active_users} active user task(s); "
+                "health_canary soft failure only)"
+            )
+            needs_runtime_reload = False
+        else:
+            needs_runtime_reload = True
+
     if needs_runtime_reload and not _remediation_cooldown_active():
         for unit in RESTART_UNITS_ON_STALE:
             if unit in restarted:

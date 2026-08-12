@@ -1,0 +1,33 @@
+services:
+  # Local Obscura CDP server (Hermes-compatible remote mode).
+  # https://github.com/SGavrl/hermes-plugin-obscura
+  # Default image serves CDP on 0.0.0.0:9222 → map to 127.0.0.1:9222
+  obscura:
+    image: h4ckf0r0day/obscura:latest
+    container_name: aura-obscura
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9222:9222"
+
+  aura-web-backends:
+    build: ./backends
+    container_name: aura-web-backends
+    restart: unless-stopped
+    depends_on:
+      - obscura
+    ports:
+      - "127.0.0.1:8791:8791"
+    environment:
+      - OBSCURA_CDP_URL=http://127.0.0.1:9222
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - SCRAPEGRAPH_LLM_KEY=${SCRAPEGRAPH_LLM_KEY:-}
+      - SCRAPEGRAPH_MODEL=${SCRAPEGRAPH_MODEL:-openai/gpt-4o-mini}
+      - BROWSER_USE_MODEL=${BROWSER_USE_MODEL:-gpt-4o-mini}
+    network_mode: host
+    profiles: ["full-docker"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8791/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

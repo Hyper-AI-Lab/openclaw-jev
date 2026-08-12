@@ -54,10 +54,13 @@
     "similarity_threshold": 0.72,
     "intake_confidence_threshold": 65,
     "intake_cache_sec": 60,
-    "intake_llm_timeout_sec": 60,
+    "intake_llm_timeout_sec": 20,
     "intake_model": "nvidia/deepseek-ai/deepseek-v4-flash-0731",
-    "intake_model_fallbacks": [],
-    "intake_vector_deadline_sec": 15,
+    "intake_model_fallbacks": [
+      "nvidia/minimaxai/minimax-m3",
+      "nvidia/z-ai/glm-5.2"
+    ],
+    "intake_vector_deadline_sec": 10,
     "qdrant_query_timeout_sec": 8,
     "backfill_days": 90,
     "rework_max_attempts": 3,

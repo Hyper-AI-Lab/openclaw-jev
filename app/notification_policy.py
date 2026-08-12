@@ -1,6 +1,7 @@
 """Rules for when RMP should deliver messages to Slack."""
 from __future__ import annotations
 
+import json
 import re
 from typing import Iterable, List, Optional
 
@@ -12,6 +13,27 @@ _ACK_PREFIX_RE = re.compile(
     r"^(\s*(?:HEARTBEAT_OK|CANARY_OK)\s*)+",
     re.IGNORECASE,
 )
+
+
+def _looks_like_internal_plan_json(text: str) -> bool:
+    """True when the whole message is an RMP plan object, not a user reply."""
+    raw = (text or "").strip()
+    if not raw.startswith("{") or '"steps"' not in raw:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    steps = parsed.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return False
+    # Plan steps are dicts with prompt/kind/name — never a user-facing answer.
+    first = steps[0]
+    return isinstance(first, dict) and (
+        "prompt" in first or "predicate_id" in first or "kind" in first
+    )
 
 
 def _dedupe_repeated_body(text: str) -> str:
@@ -34,9 +56,13 @@ def _dedupe_repeated_body(text: str) -> str:
 
 def sanitize_user_facing_text(message: str) -> str:
     """Strip machine JSON, internal metadata, and duplicate bodies before Slack."""
+    if _looks_like_internal_plan_json(message):
+        return ""
     text = strip_system_acks(message or "")
     text = extract_agent_facts(text).get("body") or text
     text = _strip_json_blocks(text)
+    if _looks_like_internal_plan_json(text):
+        return ""
     text = re.sub(r"```json\s*\{[\s\S]*?\}\s*```", "", text, flags=re.IGNORECASE)
     for pattern in (
         r"(?m)^Origin:\s.*$",
@@ -144,6 +170,10 @@ def should_deliver_slack(
     if is_internal_task(intent, task_type, tags):
         return False
     if message and is_system_slack_message(message):
+        return False
+    if message and _looks_like_internal_plan_json(message):
+        return False
+    if message and not sanitize_user_facing_text(message).strip():
         return False
     return True
 

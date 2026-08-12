@@ -1,0 +1,29 @@
+---
+description: Aura/RMP architecture — every Slack turn goes through RMP; never native OpenClaw replies
+alwaysApply: true
+---
+
+# Aura + RMP architecture (binding)
+
+## Hard rules
+
+1. **Every user Slack DM goes through RMP.** Plugin claims the turn → `POST /tasks` → intake (memory/registry/active tasks) → Temporal workflow → RMP `chat.postMessage`. No exceptions for “simple” questions.
+2. **Never answer via native OpenClaw Slack.** No intake-failure native fallback. Fail closed (claim + suppress) rather than let the gateway agent reply.
+3. **OpenClaw is the execution engine only** for RMP-owned sessions (`rmp_task_*`, `rmp_verify_*`, `rmp_intake_*`). It must not own user-visible Slack delivery.
+4. **Primary chat model is MiniMax M3** (`nvidia/minimaxai/minimax-m3`). DeepSeek / GLM are fallbacks. Intake/subagent models may use DeepSeek Flash.
+5. **LLM idle silence must fail fast and rotate NVIDIA keys** (~5s idle), not sit on one key for 120s.
+
+## Allowed RMP paths (all still RMP)
+
+- Intake may choose `conversational` or `structured_work` **after** analysis. Both create RMP tasks and RMP-delivered Slack replies.
+- `conversational` ≠ native OpenClaw. It means a short RMP plan (usually one deliver step), not bypassing intake.
+
+## Do not
+
+- Reintroduce native Slack fallback, plugin `process_type_hint` hard-routing, or gateway replies on `agent:main:main` for user DMs.
+- Treat vector/catalog hints as stronger than intake policy without LLM/gates.
+- Raise idle timeout back to minutes to “be safe” — rotate keys / models instead.
+
+## When changing code
+
+Prefer fixing RMP intake/workflow/notify. Touch OpenClaw dist only via `patch_openclaw.sh`. Keep secrets out of git.

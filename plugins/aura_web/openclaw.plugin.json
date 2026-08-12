@@ -1,0 +1,42 @@
+{
+  "id": "aura_web",
+  "name": "Aura Web Stack",
+  "version": "1.0.0",
+  "description": "Multi-backend web search/fetch/crawl/extract/browser tools with LangSearch + Jina.",
+  "main": "index.js",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "backendsUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8791"
+      },
+      "jina": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "apiKey": { "type": ["string", "object"] },
+          "baseUrl": { "type": "string" }
+        }
+      }
+    }
+  },
+  "contracts": {
+    "tools": [
+      "langsearch_search",
+      "jina_reader",
+      "crawl4ai",
+      "scrapling",
+      "crawlee_crawl",
+      "scrapegraph_extract",
+      "browser_use",
+      "obscura_browse",
+      "web_capability_status"
+    ],
+    "webFetchProviders": ["jina"]
+  }
+}

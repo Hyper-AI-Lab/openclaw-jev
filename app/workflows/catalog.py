@@ -432,15 +432,23 @@ def catalog_type_for_workflow(
     intent: str,
     task_type: str = "",
 ) -> Optional[str]:
-    """Resolve a catalog process_type only when a template exists."""
-    candidate = normalize_catalog_type(process_type_hint or task_type, intent)
-    if candidate and get_template(candidate):
-        return candidate
-    if process_type_hint:
-        candidate = normalize_catalog_type("", intent)
+    """Resolve a catalog process_type from intent; plugin hints are soft only.
+
+    A bare process_type_hint must not force a catalog workflow when the intent
+    does not match that template (false positives like mentioning "browser"
+    in a how-to question). Hints only confirm an intent-based match.
+    """
+    if task_type in CATALOG or task_type in CATALOG_ALIASES:
+        candidate = normalize_catalog_type(task_type, intent)
         if candidate and get_template(candidate):
             return candidate
-    return resolve_catalog_template(intent, task_type)
+
+    intent_match = resolve_catalog_template(intent, "")
+    if process_type_hint:
+        hinted = normalize_catalog_type(process_type_hint, "")
+        if hinted and get_template(hinted) and hinted == intent_match:
+            return hinted
+    return intent_match
 
 
 def get_template(process_type: str) -> Optional[WorkflowTemplate]:

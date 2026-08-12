@@ -394,6 +394,8 @@ async def create_task(
     intake_decision_id = None
     intake_catalog_type = None
     execution_mode = None
+    intake_result: dict = {}
+    web_capability_block = ""
 
     if is_task_registry_enabled() and get_task_registry_intake_mode() != "off":
         from app.task_registry.intake_runner import run_classify_task_intake
@@ -411,6 +413,8 @@ async def create_task(
         )
         intake_catalog_type = intake_result.get("catalog_type")
         execution_mode = intake_result.get("execution_mode")
+        wc = intake_result.get("web_capability") or {}
+        web_capability_block = (wc.get("web_brief") or "").strip()
         outcome = await handle_intake_outcome(
             intake_result,
             request=request,
@@ -539,10 +543,14 @@ async def create_task(
                 skip_vector=skip_vector,
             )
             initial_memory_block = "\n\n".join(
-                p for p in (guided_memory, prefetched) if p
+                p for p in (guided_memory, web_capability_block, prefetched) if p
             ).strip()
         except Exception as exc:
             logger.warning("Memory prefetch skipped: %s", exc)
+    elif web_capability_block:
+        initial_memory_block = "\n\n".join(
+            p for p in (guided_memory, web_capability_block) if p
+        ).strip()
 
     try:
         with trace_span(

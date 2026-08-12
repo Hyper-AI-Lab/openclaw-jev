@@ -12,5 +12,15 @@
         "default": true
       }
     }
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "rmp_memory_recall",
+      "rmp_task_create",
+      "rmp_task_status"
+    ]
   }
 }

@@ -155,8 +155,15 @@ Do NOT use memory_search or workspace files when planning.
 [INTERNAL_RMP]"""
 
     try:
+        # Separate session from execute path so plan JSON is not mistaken for
+        # the user-facing deliverable (shared rmp_task_* sessions caused Slack
+        # to receive raw {"steps":[...]} plans).
         response = await send_to_openclaw(
-            {"message": plan_prompt, "task_id": task_id, "session_key": session_key}
+            {
+                "message": plan_prompt,
+                "task_id": f"{task_id}__plan",
+                "session_key": session_key,
+            }
         )
         text = ""
         if "result" in response and "payloads" in response["result"]:

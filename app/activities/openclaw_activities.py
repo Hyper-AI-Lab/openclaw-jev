@@ -580,9 +580,13 @@ async def _dispatch_openclaw_session(
 
 @traced_activity("openclaw.dispatch")
 async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
+    from app.config import get_primary_agent_model
+
     task_id = payload.get("task_id", "unknown")
     internal_session_key = f"agent:main:rmp_task_{task_id}"
     message = payload.get("message", "") + "\n\n[INTERNAL_RMP]"
+    # User-facing / plan execute turns use MiniMax primary unless caller overrides.
+    model = payload.get("model") or get_primary_agent_model()
 
     text_content = await _dispatch_openclaw_session(
         internal_session_key,
@@ -590,6 +594,7 @@ async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
         poll_timeout_sec=600,
         require_terminal=True,
         task_id=task_id if task_id != "unknown" else None,
+        model=model,
     )
     return {"result": {"payloads": [{"text": text_content}]}}
 

@@ -277,11 +277,17 @@ class CatalogTaskWorkflow:
                         f"Approval required for step '{step.name}'. "
                         "Reply 'approve' to continue or 'stop' to cancel."
                     )
-                    if send_updates:
-                        await workflow.execute_activity(
-                            notify_slack_user,
-                            {"session_key": session_key, "task_id": task_id, "message": approval_msg},
-                            start_to_close_timeout=timedelta(seconds=30),
+                    # Approval gates always notify — they block progress. Do not
+                    # treat them as optional intermediate updates.
+                    await workflow.execute_activity(
+                        notify_slack_user,
+                        {"session_key": session_key, "task_id": task_id, "message": approval_msg},
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                    if not send_updates:
+                        workflow.logger.info(
+                            "approval_gate notified despite intermediate_updates=off task=%s",
+                            task_id,
                         )
                     approved = False
                     while not approved:

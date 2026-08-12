@@ -1,0 +1,24 @@
+{
+  "id": "langsearch",
+  "name": "LangSearch",
+  "version": "1.0.0",
+  "description": "LangSearch free web search API provider.",
+  "main": "index.js",
+  "activation": { "onStartup": true },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "webSearch": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "apiKey": { "type": ["string", "object"] }
+        }
+      }
+    }
+  },
+  "contracts": {
+    "webSearchProviders": ["langsearch"]
+  }
+}

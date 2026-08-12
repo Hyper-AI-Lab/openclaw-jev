@@ -1,0 +1,6 @@
+{
+  "name": "openclaw-langsearch",
+  "version": "1.0.0",
+  "main": "index.js",
+  "description": "LangSearch web search provider (key holder + provider registration)"
+}

@@ -60,12 +60,27 @@ def test_moltmarket_check_alias():
     ) == "browser_automation"
 
 
-def test_unknown_hint_falls_back_to_generic_routing():
-    assert catalog_type_for_workflow(
-        "totally_unknown_type",
-        "What is the weather today?",
-        "user",
-    ) is None
+def test_loose_browser_mention_does_not_force_catalog():
+    """Plugin-style soft hints must not force catalog on conversational questions."""
+    assert (
+        catalog_type_for_workflow(
+            "browser_automation",
+            "How do you do the web search? I open a browser and type into google.",
+            "user",
+        )
+        is None
+    )
+
+
+def test_hint_confirms_matching_browser_intent():
+    assert (
+        catalog_type_for_workflow(
+            "browser_automation",
+            "Automate the browser to navigate to the dashboard",
+            "user",
+        )
+        == "browser_automation"
+    )
 
 
 def test_email_followup_alias():

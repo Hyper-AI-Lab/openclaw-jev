@@ -18,6 +18,9 @@ logger = logging.getLogger("rmp.reconciler")
 RECONCILE_INTERVAL_SEC = 60
 STALE_TASK_MINUTES = 20
 STUCK_REPAIR_MINUTES = 45
+# Recover completed OpenClaw replies quickly after worker crashes mid-notify.
+ORPHAN_REPLY_MIN_AGE_SEC = 90
+ORPHAN_REPLY_MAX_AGE_MINUTES = 30
 
 _temporal_client: Client | None = None
 
@@ -43,6 +46,92 @@ async def _notify_repair(task: Task, message: str) -> None:
         )
     except Exception as exc:
         logger.warning("Reconciler Slack notify failed for %s: %s", task.id, exc)
+
+
+async def _recover_orphaned_session_reply(
+    client: Client,
+    db,
+    task: Task,
+    now: datetime,
+    stats: dict,
+) -> bool:
+    """If OpenClaw finished but workflow/Slack did not, deliver and complete."""
+    if _task_is_internal(task):
+        return False
+    if task.status not in ("running", "created"):
+        return False
+    if not task.updated_at:
+        return False
+    age = now - task.updated_at
+    if age < timedelta(seconds=ORPHAN_REPLY_MIN_AGE_SEC):
+        return False
+    if age > timedelta(minutes=ORPHAN_REPLY_MAX_AGE_MINUTES):
+        return False
+
+    # Skip if we already recovered once.
+    prior = await db.execute(
+        select(Event).where(
+            Event.entity_id == task.id,
+            Event.event_type == "reconciler.orphaned_reply_delivered",
+        )
+    )
+    if prior.scalars().first():
+        return False
+
+    from app.orchestrator.session_recovery import (
+        extract_user_facing_reply,
+        read_completed_rmp_session_reply,
+    )
+
+    raw = read_completed_rmp_session_reply(task.id)
+    if not raw:
+        return False
+    clean = extract_user_facing_reply(raw)
+    if not clean or len(clean) < 40:
+        return False
+
+    await notify_slack_user_safe(task, clean)
+    task.status = "completed"
+    task.next_check_at = None
+
+    wf_id = f"workflow-{task.id}"
+    await _terminate_workflow(client, wf_id, "Orphan reply recovered — OpenClaw done, Slack delivered")
+    orphans = await _cleanup_orphan_plan_children(client, task.id)
+    stats["orphans_terminated"] = stats.get("orphans_terminated", 0) + orphans
+    stats["orphaned_replies"] = stats.get("orphaned_replies", 0) + 1
+    db.add(
+        Event(
+            correlation_id=task.correlation_id or task.id,
+            entity_type="task",
+            entity_id=task.id,
+            event_type="reconciler.orphaned_reply_delivered",
+            event_payload={"chars": len(clean), "terminated_children": orphans},
+        )
+    )
+    stats["events"] += 1
+    metrics_inc("reconciler_orphaned_reply_delivered")
+    logger.info("Recovered orphaned reply for task %s (%d chars)", task.id[:8], len(clean))
+    return True
+
+
+async def notify_slack_user_safe(task: Task, message: str) -> None:
+    if not task.openclaw_session_key:
+        return
+    try:
+        from app.activities.openclaw_activities import notify_slack_user
+
+        await notify_slack_user(
+            {
+                "session_key": task.openclaw_session_key,
+                "task_id": task.id,
+                "message": message,
+                "intent": task.goal or "",
+                "task_type": task.task_type or "",
+                "tags": ["reconciler-recover"],
+            }
+        )
+    except Exception as exc:
+        logger.warning("Orphan reply Slack notify failed for %s: %s", task.id, exc)
 
 
 async def _get_temporal() -> Client:
@@ -214,6 +303,7 @@ async def reconcile_once() -> dict:
         "repaired": 0,
         "terminated": 0,
         "orphans_terminated": 0,
+        "orphaned_replies": 0,
         "events": 0,
         "llm_slots_reaped": 0,
     }
@@ -228,6 +318,13 @@ async def reconcile_once() -> dict:
     client = await _get_temporal()
 
     async with AsyncSessionLocal() as db:
+        # Fast path: OpenClaw finished but worker died before Slack notify.
+        orphan_candidates = await db.execute(
+            select(Task).where(Task.status.in_(["running", "created"]))
+        )
+        for task in orphan_candidates.scalars().all():
+            await _recover_orphaned_session_reply(client, db, task, now, stats)
+
         stuck_result = await db.execute(
             select(Task).where(
                 Task.status.in_(["running", "created"]),

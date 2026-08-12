@@ -1,0 +1,6 @@
+{
+  "name": "openclaw-aura-web",
+  "version": "1.0.0",
+  "main": "index.js",
+  "description": "Aura galaxy web stack: LangSearch, Jina, Crawl4AI, Scrapling, Crawlee, ScrapeGraphAI, browser-use, Obscura"
+}
