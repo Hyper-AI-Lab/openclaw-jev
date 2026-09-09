@@ -16,6 +16,42 @@ def _snippet(text: str, limit: int = 400) -> str:
     return t if len(t) <= limit else t[: limit - 3] + "..."
 
 
+LEDGER_INDEX_EVENTS = frozenset(
+    {
+        "task.completed",
+        "task.failed",
+        "reconciler.stuck_repaired",
+        "intake.decided",
+        "intake.clarify",
+        "intake.attach",
+        "intake.rebuild_stale",
+        "evaluator.verdict",
+        "evaluator.accept",
+        "evaluator.escalate",
+        "slack.delivered",
+    }
+)
+
+
+def outcome_parts_from_events(status: str, events: List[Any]) -> List[str]:
+    parts: List[str] = [f"status={status}"]
+    for ev in events:
+        if getattr(ev, "event_type", None) not in LEDGER_INDEX_EVENTS:
+            continue
+        payload = ev.event_payload or {}
+        if ev.event_type.startswith("evaluator") and payload.get("verdict"):
+            parts.append(f"evaluator={payload['verdict']}")
+            if payload.get("issues"):
+                parts.append(str(payload["issues"])[:120])
+        elif payload.get("reason"):
+            parts.append(str(payload["reason"])[:120])
+        elif payload.get("decision"):
+            parts.append(f"decision={payload['decision']}")
+        else:
+            parts.append(ev.event_type)
+    return parts
+
+
 async def build_task_summary(
     task_id: str,
     db: Optional[AsyncSession] = None,
@@ -48,22 +84,10 @@ async def build_task_summary(
             select(Event)
             .where(Event.entity_id == task_id)
             .order_by(Event.occurred_at.desc())
-            .limit(5)
+            .limit(20)
         )
         events = ev_result.scalars().all()
-        outcome_parts: List[str] = [f"status={task.status}"]
-        for ev in events:
-            if ev.event_type in (
-                "task.completed",
-                "task.failed",
-                "reconciler.stuck_repaired",
-                "intake.decided",
-            ):
-                payload = ev.event_payload or {}
-                if payload.get("reason"):
-                    outcome_parts.append(str(payload["reason"])[:120])
-                elif payload.get("decision"):
-                    outcome_parts.append(f"decision={payload['decision']}")
+        outcome_parts = outcome_parts_from_events(task.status, events)
 
         artifact_refs: List[str] = []
         if runs:

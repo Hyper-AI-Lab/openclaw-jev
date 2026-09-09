@@ -136,6 +136,10 @@ def test_poll_session_ids_fallback_finds_reply(monkeypatch):
         fake_poll,
     )
     monkeypatch.setattr(
+        "app.activities.openclaw_activities.read_transcript_lines",
+        lambda sid: ["{}"],
+    )
+    monkeypatch.setattr(
         "app.activities.openclaw_activities.os.path.exists",
         lambda p: True,
     )
@@ -163,3 +167,33 @@ def test_poll_accepts_facts_terminal():
     ]
     text, reason, _ = _poll_jsonl_for_response("x.jsonl", 0, lines)
     assert _is_rmp_terminal_response(text)
+
+
+def test_terminal_accepts_short_greeting_and_canary_ok():
+    assert _is_rmp_terminal_response("Yes, I'm here.") is True
+    assert _is_rmp_terminal_response("CANARY_OK") is True
+    assert _is_rmp_terminal_response("OK") is False
+    assert _is_rmp_terminal_response("Let me check") is False
+
+
+def test_hard_failure_detects_all_models_failed():
+    from app.activities.openclaw_activities import _jsonl_hard_failure
+
+    lines = [
+        _line(
+            {
+                "type": "message",
+                "timestamp": "2026-09-05T12:50:38.000Z",
+                "stopReason": "error",
+                "message": {
+                    "role": "assistant",
+                    "content": [],
+                    "errorMessage": (
+                        "All models failed (3): openai/gpt-5-nano: LLM request timed out."
+                    ),
+                },
+            }
+        )
+    ]
+    err = _jsonl_hard_failure(lines, 0)
+    assert err and "All models failed" in err

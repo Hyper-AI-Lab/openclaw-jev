@@ -10,6 +10,7 @@ from typing import Optional
 
 from app.config import OPENCLAW_HOME, SESSIONS_JSON_PATH
 from app.notification_policy import sanitize_user_facing_text
+from app.openclaw_sessions import get_session_entry, read_transcript_lines
 
 logger = logging.getLogger("rmp.session_recovery")
 
@@ -62,24 +63,44 @@ def read_completed_rmp_session_reply(task_id: str) -> Optional[str]:
     session_key = f"agent:main:rmp_task_{task_id}"
     session_id = None
     try:
-        if os.path.exists(SESSIONS_JSON_PATH):
-            with open(SESSIONS_JSON_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            meta = data.get(session_key) or {}
-            session_id = meta.get("sessionId")
-            session_file = meta.get("sessionFile")
-            if session_file and Path(session_file).exists():
-                text = _latest_assistant_text(Path(session_file))
-                if text and _is_terminal_reply(text):
-                    return text
+        meta = get_session_entry(session_key, SESSIONS_JSON_PATH)
+        session_id = meta.get("sessionId")
+        session_file = meta.get("sessionFile")
+        if session_file and Path(session_file).exists():
+            text = _latest_assistant_text(Path(session_file))
+            if text and _is_terminal_reply(text):
+                return text
     except Exception as exc:
-        logger.debug("sessions.json lookup failed for %s: %s", task_id, exc)
+        logger.debug("session lookup failed for %s: %s", task_id, exc)
 
     if session_id:
         path = Path(OPENCLAW_HOME) / "agents" / "main" / "sessions" / f"{session_id}.jsonl"
         text = _latest_assistant_text(path)
         if text and _is_terminal_reply(text):
             return text
+        lines = read_transcript_lines(session_id)
+        if lines:
+            best = None
+            for line in lines:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") != "message":
+                    continue
+                msg = obj.get("message") or {}
+                if msg.get("role") != "assistant":
+                    continue
+                parts = msg.get("content") or []
+                texts = []
+                for p in parts:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        texts.append(p.get("text") or "")
+                text = "\n".join(texts).strip()
+                if text and "[assistant turn failed" not in text.lower():
+                    best = text
+            if best and _is_terminal_reply(best):
+                return best
     return None
 
 

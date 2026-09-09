@@ -153,6 +153,70 @@ def check_slack_configured() -> CheckResult:
     return CheckResult("slack", "pass", "Slack bot token present")
 
 
+def gateway_process_pids() -> List[int]:
+    """PIDs of openclaw-gateway on this host (systemd MainPID + /proc comm)."""
+    pids: List[int] = []
+    try:
+        raw = subprocess.check_output(
+            [
+                "systemctl",
+                "show",
+                "-p",
+                "MainPID",
+                "--value",
+                "openclaw-gateway.service",
+            ],
+            text=True,
+            timeout=5,
+        ).strip()
+        if raw.isdigit() and int(raw) > 0:
+            pids.append(int(raw))
+    except Exception:
+        pass
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            comm_path = os.path.join("/proc", name, "comm")
+            try:
+                with open(comm_path, "r", encoding="utf-8") as handle:
+                    comm = handle.read().strip()
+            except OSError:
+                continue
+            if comm == "openclaw-gateway":
+                pids.append(int(name))
+    except OSError:
+        pass
+    return sorted(set(pids))
+
+
+def check_slack_sockets() -> CheckResult:
+    """Detect duplicate Slack Socket Mode gateways on this machine only."""
+    pids = gateway_process_pids()
+    n = len(pids)
+    details = {"gateway_pids": pids, "count": n}
+    if n == 1:
+        return CheckResult(
+            "slack_sockets",
+            "pass",
+            "Single OpenClaw gateway on this host",
+            details,
+        )
+    if n == 0:
+        return CheckResult(
+            "slack_sockets",
+            "warn",
+            "No openclaw-gateway process on this host",
+            details,
+        )
+    return CheckResult(
+        "slack_sockets",
+        "warn",
+        f"{n} openclaw-gateway processes on this host (dual Slack socket risk)",
+        details,
+    )
+
+
 def check_api_key() -> CheckResult:
     key = load_settings().get("api_key", "")
     if len(key) < 32:
@@ -274,7 +338,18 @@ def check_telemetry_export() -> CheckResult:
 
 def check_vector_memory() -> CheckResult:
     if not is_vector_memory_enabled():
-        return CheckResult("vector_memory", "warn", "Vector memory disabled")
+        cfg = load_settings().get("vector_memory", {})
+        reason = cfg.get("not_ready_reason") or "Vector memory disabled"
+        return CheckResult(
+            "vector_memory",
+            "warn",
+            reason,
+            {
+                "enabled": False,
+                "ready": False,
+                "embedder_model": cfg.get("embedder_model"),
+            },
+        )
     cfg = load_settings().get("vector_memory", {})
     mode = (cfg.get("qdrant_mode") or "embedded").strip().lower()
     try:
@@ -433,6 +508,23 @@ async def check_stuck_workflows(max_count: int = 3) -> CheckResult:
     )
 
 
+def check_openai_key() -> CheckResult:
+    """Warn when OPENAI_API_KEY is unset — primary stays gpt-5-nano; NVIDIA fallbacks still work."""
+    from app.llm.model_policy import openai_key_present
+
+    if openai_key_present():
+        return CheckResult(
+            "openai_key",
+            "pass",
+            "OPENAI_API_KEY present (gpt-5-nano primary wired)",
+        )
+    return CheckResult(
+        "openai_key",
+        "warn",
+        "openai_key_missing — primary openai/gpt-5-nano unwired until OPENAI_API_KEY is set in /etc/openclaw/openclaw.env",
+    )
+
+
 def check_task_registry_config() -> CheckResult:
     from app.config import get_task_registry_config, get_task_registry_intake_mode
 
@@ -449,11 +541,17 @@ def check_task_registry_config() -> CheckResult:
 
 
 def check_task_registry_vector() -> CheckResult:
-    from app.config import get_task_registry_config
+    from app.config import get_task_registry_config, is_vector_memory_enabled
 
     cfg = get_task_registry_config()
     if not cfg.get("enabled", True):
         return CheckResult("task_registry_vector", "warn", "Task registry disabled")
+    if not is_vector_memory_enabled():
+        return CheckResult(
+            "task_registry_vector",
+            "warn",
+            "Task registry dense index skipped (embedder not-ready)",
+        )
     try:
         from app.task_registry.vector_store import probe_task_registry_vector
 
@@ -576,6 +674,7 @@ async def run_all_checks() -> Dict[str, Any]:
         check_development_mode(),
         check_api_key(),
         check_slack_configured(),
+        check_slack_sockets(),
         check_backup_recency(),
         check_temporal_persistence(),
         check_telemetry_export(),
@@ -589,6 +688,7 @@ async def run_all_checks() -> Dict[str, Any]:
         check_task_registry_vector(),
         check_task_registry_index_fresh(),
         check_runtime_code_sync(),
+        check_openai_key(),
     ]
     async_checks = await asyncio.gather(
         check_systemd_services(),

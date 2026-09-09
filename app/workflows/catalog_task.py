@@ -15,6 +15,7 @@ with workflow.unsafe.imports_passed_through():
         validate_openclaw_output,
         verify_response_quality,
     )
+    from app.task_registry.stop_command import is_whole_message_stop
     from app.activities.db_activities import (
         acquire_process_run_lease,
         build_process_memory_context,
@@ -37,14 +38,23 @@ with workflow.unsafe.imports_passed_through():
         check_catalog_completion,
         check_completion_artifact,
         check_evidence,
-        evidence_high_confidence,
     )
-    from app.orchestrator.completion_rework import build_rework_prompt
+    from app.orchestrator.completion_rework import (
+        build_escalation_message,
+        build_rework_prompt,
+        build_strategy_change_prompt,
+        next_loop_action,
+    )
     from app.orchestrator.decision_engine import decide_completion_gate
-    from app.workflows.catalog import catalog_type_for_workflow, get_template
+    from app.workflows.catalog import get_template
     from app.notification_policy import format_workflow_error, is_silent_system_ack
     from app.workflows.catalog_step_child import CatalogStepChildWorkflow
     from app.workflows.generic_task import is_heartbeat_ack, is_heartbeat_request, strip_json_eval
+    from app.orchestrator.process_brief import (
+        compose_executor_memory,
+        ensure_brief_header,
+        format_user_catchup,
+    )
 
 
 @workflow.defn
@@ -57,6 +67,8 @@ class CatalogTaskWorkflow:
         self._approved: bool = False
         self._spawn_leg_requested: bool = False
         self._spawn_leg_payload: Dict[str, Any] = {}
+        self._catchup_chunks: List[str] = []
+        self._initial_memory_block: str = ""
 
     @workflow.signal
     def spawn_leg(self, payload: Dict[str, Any]) -> None:
@@ -114,10 +126,12 @@ class CatalogTaskWorkflow:
             )
         while self.user_inputs:
             reply = self.user_inputs.pop(0).strip()
-            if reply and re.search(r"\b(stop|abort|cancel|halt)\b", reply.lower()):
+            if is_whole_message_stop(reply):
                 return await self._stop_task(
                     task_id, session_key, f"Task {task_id[:8]} stopped as requested."
                 )
+            if reply:
+                self._catchup_chunks.append(reply)
         return None
 
     async def _finish_durable_catalog(
@@ -158,21 +172,28 @@ class CatalogTaskWorkflow:
         user_intent = payload.get("intent", "")
         session_key = payload.get("session_key", "agent:main:main")
         correlation_id = payload.get("correlation_id", task_id)
-        rework_max_attempts = int(payload.get("rework_max_attempts") or 3)
+        rework_max_attempts = int(payload.get("rework_max_attempts") or 20)
+        attempt_policy = {
+            "max_attempts": rework_max_attempts,
+            "strategy_change_attempt": int(payload.get("strategy_change_attempt") or 10),
+            "escalate_user_attempt": int(payload.get("escalate_user_attempt") or 20),
+        }
         process_type_raw = payload.get("process_type") or payload.get("task_type", "generic")
-        process_type = catalog_type_for_workflow(process_type_raw, user_intent, process_type_raw)
-        if not process_type:
-            process_type = process_type_raw
+        self._initial_memory_block = (payload.get("initial_memory_block") or "").strip()
+        # Trust the process_type already assigned at intake/start — do not
+        # re-match intent keywords (that would reintroduce hard routing).
+        from app.workflows.catalog import get_template, normalize_catalog_type
 
-        task_kind = payload.get("task_kind", "one_shot")
-        durable_leg = bool(payload.get("_durable_leg"))
-
-        template = get_template(process_type)
-        if not template:
+        process_type = normalize_catalog_type(str(process_type_raw), "") or str(process_type_raw)
+        if not get_template(process_type):
             raise ValueError(
                 f"Unknown catalog process_type: {process_type_raw} "
                 f"(resolved={process_type!r}); not in workflow catalog"
             )
+        template = get_template(process_type)
+
+        task_kind = payload.get("task_kind", "one_shot")
+        durable_leg = bool(payload.get("_durable_leg"))
 
         if durable_leg and payload.get("process_run_id"):
             self.process_run_id = str(payload["process_run_id"])
@@ -221,6 +242,18 @@ class CatalogTaskWorkflow:
                 },
                 start_to_close_timeout=timedelta(seconds=10),
             )
+            if self._initial_memory_block:
+                await workflow.execute_activity(
+                    write_process_memory,
+                    {
+                        "scope_type": "process",
+                        "scope_id": self.process_run_id,
+                        "memory_type": "working",
+                        "content": self._initial_memory_block[:8000],
+                        "provenance_ref": {"kind": "process_brief"},
+                    },
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
         if durable_leg:
             await workflow.execute_activity(
                 update_task_status,
@@ -394,7 +427,7 @@ class CatalogTaskWorkflow:
                     if stop:
                         return stop
 
-                    memory_block = await workflow.execute_activity(
+                    memory_fetched = await workflow.execute_activity(
                         build_process_memory_context,
                         {
                             "process_run_id": self.process_run_id,
@@ -404,6 +437,14 @@ class CatalogTaskWorkflow:
                         },
                         start_to_close_timeout=timedelta(seconds=15),
                     )
+                    memory_block = compose_executor_memory(
+                        ensure_brief_header(self._initial_memory_block),
+                        memory_fetched,
+                    )
+
+                    if self._catchup_chunks:
+                        step_context += "\n" + format_user_catchup(self._catchup_chunks)
+                        self._catchup_chunks.clear()
 
                     context_block = step_context
                     if step_feedback:
@@ -535,7 +576,7 @@ class CatalogTaskWorkflow:
                         )
                         await workflow.wait_condition(lambda: len(self.user_inputs) > 0)
                         reply = self.user_inputs.pop(0)
-                        if re.search(r"\b(stop|abort|cancel|halt)\b", reply.lower()):
+                        if is_whole_message_stop(reply):
                             return await self._stop_task(
                                 task_id, session_key, f"Task {task_id[:8]} stopped."
                             )
@@ -613,28 +654,8 @@ class CatalogTaskWorkflow:
                 template.process_type, user_intent, clean_result
             )
             base_evidence = check_evidence(user_intent, clean_result)
-            if not catalog_evidence["passed"] or not base_evidence["passed"]:
-                issues = catalog_evidence["issues"] + base_evidence["issues"]
-                await workflow.execute_activity(
-                    finalize_task_failure,
-                    {
-                        "task_id": task_id,
-                        "process_run_id": self.process_run_id,
-                        "task_status": "failed",
-                        "process_state": "failed_terminal",
-                    },
-                    start_to_close_timeout=timedelta(seconds=10),
-                )
-                await workflow.execute_activity(
-                    notify_slack_user,
-                    {
-                        "session_key": session_key,
-                        "task_id": task_id,
-                        "message": f"Completion evidence missing: {'; '.join(issues)}",
-                    },
-                    start_to_close_timeout=timedelta(seconds=30),
-                )
-                return {"status": "failed", "task_id": task_id, "issues": issues}
+            evidence_issues = list(catalog_evidence["issues"]) + list(base_evidence["issues"])
+            evidence_ok = catalog_evidence["passed"] and base_evidence["passed"]
 
             artifact = await workflow.execute_activity(
                 register_artifact,
@@ -660,64 +681,52 @@ class CatalogTaskWorkflow:
                     all_artifacts, required_kinds=required_kinds
                 )
                 if not artifact_evidence["passed"]:
-                    await workflow.execute_activity(
-                        finalize_task_failure,
-                        {
-                            "task_id": task_id,
-                            "process_run_id": self.process_run_id,
-                            "task_status": "failed",
-                            "process_state": "failed_terminal",
-                        },
-                        start_to_close_timeout=timedelta(seconds=10),
-                    )
-                    await workflow.execute_activity(
-                        notify_slack_user,
-                        {
-                            "session_key": session_key,
-                            "task_id": task_id,
-                            "message": f"Artifact evidence failed: {'; '.join(artifact_evidence['issues'])}",
-                        },
-                        start_to_close_timeout=timedelta(seconds=30),
-                    )
-                    return {"status": "failed", "task_id": task_id}
+                    evidence_ok = False
+                    evidence_issues = evidence_issues + list(artifact_evidence["issues"])
 
-            skip_quality = evidence_high_confidence(user_intent, clean_result)
-            gate = decide_completion_gate(
-                evidence_passed=True,
-                evidence_issues=[],
-                quality_passed=True,
-                skip_quality_llm=skip_quality
-                or (catalog_evidence["passed"] and base_evidence["passed"]),
+            quality = await workflow.execute_activity(
+                verify_response_quality,
+                {
+                    "task_id": task_id,
+                    "user_intent": user_intent,
+                    "agent_response": clean_result[:4000],
+                    "process_run_id": self.process_run_id,
+                    "attempt": 1,
+                    "process_brief": self._initial_memory_block or "",
+                },
+                start_to_close_timeout=timedelta(minutes=5),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+                heartbeat_timeout=timedelta(seconds=30),
             )
-            quality = {"quality": "pass"}
-            if not skip_quality and not gate.get("skip_quality_llm"):
-                quality = await workflow.execute_activity(
-                    verify_response_quality,
-                    {
-                        "task_id": task_id,
-                        "user_intent": user_intent,
-                        "agent_response": clean_result[:2000],
-                    },
-                    start_to_close_timeout=timedelta(minutes=5),
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                    heartbeat_timeout=timedelta(seconds=30),
-                )
-                gate = decide_completion_gate(
-                    evidence_passed=True,
-                    evidence_issues=[],
-                    quality_passed=quality.get("quality") != "fail",
-                    quality_issues=quality.get("issues", ""),
-                )
+            gate = decide_completion_gate(
+                evidence_passed=evidence_ok,
+                evidence_issues=evidence_issues,
+                quality_passed=quality.get("quality") != "fail",
+                quality_issues=quality.get("issues", ""),
+                skip_quality_llm=False,
+            )
             if gate["action"] == "retry" or quality.get("quality") == "fail":
-                max_rework = rework_max_attempts
+                policy = attempt_policy
+                max_rework = rework_max_attempts or int(policy["max_attempts"])
                 rework_ok = False
-                for rework_attempt in range(1, max_rework + 1):
-                    rework_prompt = build_rework_prompt(
+                judged = 1
+                while True:
+                    action = next_loop_action(judged, policy)
+                    if action == "escalate_user":
+                        rework_ok = False
+                        break
+                    prompt_fn = (
+                        build_strategy_change_prompt
+                        if action == "strategy_change"
+                        else build_rework_prompt
+                    )
+                    rework_prompt = prompt_fn(
                         user_intent,
                         clean_result,
-                        evidence_issues=base_evidence.get("issues"),
+                        evidence_issues=evidence_issues,
                         quality_issues=quality.get("issues", ""),
-                        attempt=rework_attempt,
+                        command_to_aura=quality.get("command_to_aura", ""),
+                        attempt=judged + 1,
                         max_attempts=max_rework,
                     )
                     rework_resp = await workflow.execute_activity(
@@ -733,34 +742,37 @@ class CatalogTaskWorkflow:
                         clean_result = rework_resp["result"]["payloads"][0]["text"]
                     except Exception:
                         clean_result = str(rework_resp)
-                    from app.orchestrator.completion_rework import should_admit_failure
-
-                    if should_admit_failure(rework_attempt, max_rework, clean_result):
-                        rework_ok = False
-                        break
                     from app.notification_policy import sanitize_user_facing_text
                     from app.orchestrator.step_predicates import extract_agent_facts
 
                     clean_result = sanitize_user_facing_text(
                         extract_agent_facts(clean_result).get("body") or clean_result
                     )
+                    judged += 1
+                    catalog_evidence = check_catalog_completion(
+                        template.process_type, user_intent, clean_result
+                    )
                     base_evidence = check_evidence(user_intent, clean_result)
-                    skip_quality = evidence_high_confidence(user_intent, clean_result)
-                    quality = {"quality": "pass"}
-                    if not skip_quality:
-                        quality = await workflow.execute_activity(
-                            verify_response_quality,
-                            {
-                                "task_id": task_id,
-                                "user_intent": user_intent,
-                                "agent_response": clean_result[:2000],
-                            },
-                            start_to_close_timeout=timedelta(minutes=5),
-                            retry_policy=RetryPolicy(maximum_attempts=1),
-                        )
+                    evidence_issues = list(catalog_evidence["issues"]) + list(
+                        base_evidence["issues"]
+                    )
+                    quality = await workflow.execute_activity(
+                        verify_response_quality,
+                        {
+                            "task_id": task_id,
+                            "user_intent": user_intent,
+                            "agent_response": clean_result[:4000],
+                            "process_run_id": self.process_run_id,
+                            "attempt": judged,
+                            "process_brief": self._initial_memory_block or "",
+                        },
+                        start_to_close_timeout=timedelta(minutes=5),
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                    )
                     gate = decide_completion_gate(
-                        evidence_passed=base_evidence["passed"],
-                        evidence_issues=base_evidence.get("issues", []),
+                        evidence_passed=catalog_evidence["passed"]
+                        and base_evidence["passed"],
+                        evidence_issues=evidence_issues,
                         quality_passed=quality.get("quality") != "fail",
                         quality_issues=quality.get("issues", ""),
                     )
@@ -768,6 +780,13 @@ class CatalogTaskWorkflow:
                         rework_ok = True
                         break
                 if not rework_ok:
+                    diag = build_escalation_message(
+                        user_intent,
+                        clean_result,
+                        evidence_issues=evidence_issues,
+                        quality_issues=quality.get("issues", ""),
+                        attempts=judged,
+                    )
                     await workflow.execute_activity(
                         finalize_task_failure,
                         {
@@ -783,7 +802,10 @@ class CatalogTaskWorkflow:
                         {
                             "session_key": session_key,
                             "task_id": task_id,
-                            "message": f"Quality review failed: {quality.get('issues', gate.get('reason', 'issues'))}",
+                            "intent": user_intent,
+                            "task_type": payload.get("task_type", ""),
+                            "tags": payload.get("tags") or [],
+                            "message": diag[:3000],
                         },
                         start_to_close_timeout=timedelta(seconds=30),
                     )

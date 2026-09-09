@@ -1,7 +1,7 @@
 """Workflow catalog: registration, login, email verification, procurement, outreach, browser automation."""
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,19 @@ class WorkflowTemplate:
     success_criteria: Dict[str, Any]
     steps: List[WorkflowStep] = field(default_factory=list)
     version: int = 1
+    # If any match, this template must not claim the intent (meta / false-positive guards).
+    negative_intent_patterns: List[str] = field(default_factory=list)
+
+
+# Meta / status questions must not start catalog workflows via keyword collision.
+_META_NON_CATALOG_PATTERNS = (
+    r"\bare you aware\b",
+    r"\bdo you (know|realize|understand)\b",
+    r"\bi thought you (will|would|were going to)\b",
+    r"\bfollow up after you (said|told|mentioned|wrote)\b",
+    r"\bnow you can\b",
+    r"\bi (just )?(added|built|implemented|shipped)\b.{0,80}\bfor you\b",
+)
 
 
 REGISTRATION = WorkflowTemplate(
@@ -262,12 +275,17 @@ OUTREACH = WorkflowTemplate(
     version=1,
     intent_patterns=[
         r"\boutreach\b",
-        r"\bfollow\s*up\b",
+        r"\b(send|draft|write|do)\s+(an?\s+)?follow[\s-]*up\b",
+        r"\bfollow[\s-]*up\s+(email|message|with|to)\b",
         r"\breach\s+out\b",
         r"\bsend\s+(an?\s+)?email\b",
         r"\bemail\s+thread\b",
         r"\bthread\s+id\b",
         r"\bcontact\s+(them|him|her|vendor|client)\b",
+    ],
+    negative_intent_patterns=[
+        r"\bfollow up after you (said|told|mentioned|wrote)\b",
+        r"\bi thought you (will|would)\b",
     ],
     success_criteria={
         "requires_thread_tracking": True,
@@ -369,6 +387,123 @@ BROWSER_AUTOMATION = WorkflowTemplate(
     ],
 )
 
+TOOL_SELF_UPGRADE = WorkflowTemplate(
+    process_type="tool_self_upgrade",
+    display_name="Tool / Capability Self-Upgrade",
+    version=1,
+    intent_patterns=[
+        r"\btool[_\s-]?self[_\s-]?upgrade\b",
+        r"\b(please|can you|could you|want you to|go ahead and|start|run|do a)\b.{0,48}\b(self[_\s-]?upgrade|capability[_\s-]?upgrade)\b",
+        r"\b(self[_\s-]?upgrade|capability[_\s-]?upgrade)\b.{0,40}\b(please|now|for me)\b",
+        r"\bupgrade\s+yourself\b",
+        r"\b(add|install|build|create)\s+(a\s+)?(new\s+)?(tool|plugin)\b.{0,60}\b(to\s+)?(your|her|aura'?s?)\s+(arsenal|stack)\b",
+        r"\binstall\s+(an?\s+)?openclaw\s+plugin\b",
+        r"\bdraft\s+(a\s+)?plugin\b.{0,40}\b(test|approval|restart)\b",
+        r"\b(please|can you|could you)\b.{0,40}\bgive\s+(yourself|her|aura)\s+(the\s+)?capability\b",
+        r"\bexpand\s+(your|her|aura'?s?)\s+(tool|arsenal|capabilities)\b",
+    ],
+    negative_intent_patterns=[
+        r"\bare you aware\b",
+        r"\bnow you can\b",
+        r"\byou can (now )?self",
+        r"\bi (just )?(added|built|implemented|shipped)\b",
+    ],
+    success_criteria={
+        "requires_human_approval": True,
+        "requires_tests_passed": True,
+        "requires_verify_ok": True,
+    },
+    steps=[
+        WorkflowStep(
+            name="draft_upgrade",
+            prompt=(
+                "STEP: Draft capability upgrade (NO restarts yet).\n"
+                "You are implementing a gated self-upgrade of Aura's tool arsenal.\n"
+                "If the user only asked whether you are aware of self-upgrade (no concrete "
+                "target tool/plugin), do NOT explore the filesystem and do NOT invent a "
+                "capability — reply that you know the gated path and ask what to add, then "
+                "stop with upgrade_drafted=false.\n"
+                "1. Clarify the target capability (new OpenClaw plugin tool, web-stack backend, "
+                "or RMP routing change).\n"
+                "2. Draft/code changes under allowed paths only:\n"
+                "   - /root/.openclaw/plugins/<plugin_id>/ (and mirror under "
+                "/root/.openclaw/rmp/plugins/ when applicable)\n"
+                "   - /root/.openclaw/web-stack/ for backends\n"
+                "   - /root/.openclaw/rmp/app/ only for routing/docs/tests that support the tool\n"
+                "3. Do NOT put secrets in git. Leave API key placeholders as <> in openclaw.json "
+                "if needed; never print secrets.\n"
+                "4. Do NOT restart services in this step.\n"
+                "5. Write a short UPGRADE PLAN: files touched, risk, restart units needed "
+                "(openclaw-gateway / aura-web-backends / rmp-api / rmp-worker), and test commands.\n"
+                "End with facts JSON including step_complete=true and upgrade_drafted=true."
+            ),
+            user_update="Drafting the capability upgrade plan and code…",
+            max_attempts=3,
+        ),
+        WorkflowStep(
+            name="run_tests",
+            prompt=(
+                "STEP: Run tests for the draft (NO restarts yet).\n"
+                "Execute relevant tests, e.g.:\n"
+                "  cd /root/.openclaw/rmp && ./venv/bin/pytest -q "
+                "tests/test_catalog.py tests/test_web_capability.py tests/test_session_recovery.py "
+                "tests/test_runtime_sync.py\n"
+                "Plus any new tests you added for the upgrade.\n"
+                "If web-stack Python changed, smoke-import or pytest those modules if present.\n"
+                "Report pass/fail with command output summary.\n"
+                "If tests fail, fix the draft and re-run until green (within attempt budget).\n"
+                "Do NOT restart services.\n"
+                "End with facts including tests_passed=true|false."
+            ),
+            user_update="Running upgrade tests…",
+            max_attempts=3,
+        ),
+        WorkflowStep(
+            name="approval_gate",
+            kind="approval_gate",
+            user_update=(
+                "Capability self-upgrade approval required.\n"
+                "Review the draft + test results above.\n"
+                "Reply *approve* to run controlled restart + verify, or *stop* to cancel "
+                "(draft stays on disk; nothing is restarted)."
+            ),
+        ),
+        WorkflowStep(
+            name="controlled_restart",
+            prompt=(
+                "STEP: Controlled restart (approved).\n"
+                "Run ONLY one of:\n"
+                "  bash /root/.openclaw/rmp/ops/controlled_capability_restart.sh "
+                "--gateway          # plugin-only\n"
+                "  bash /root/.openclaw/rmp/ops/controlled_capability_restart.sh "
+                "--all-safe         # gateway + web; RMP only if idle\n"
+                "Do not invent ad-hoc systemctl restart of random units.\n"
+                "Never pass --force-rmp unless the user explicitly approved killing "
+                "in-flight work. Mid-upgrade, RMP restart is normally deferred.\n"
+                "Paste the script's summary (units restarted / deferred).\n"
+                "End with facts including restart_ok=true|false."
+            ),
+            user_update="Applying controlled restart…",
+            max_attempts=2,
+        ),
+        WorkflowStep(
+            name="verify_upgrade",
+            prompt=(
+                "STEP: Verify upgrade.\n"
+                "Run:\n"
+                "  bash /root/.openclaw/rmp/ops/verify_capability_upgrade.sh\n"
+                "Also call tool web_capability_status if this upgrade touched web tools.\n"
+                "Summarize: plugin load, backend health, canary/sentinel soft status.\n"
+                "If verify fails, report clearly; do not loop infinite restarts.\n"
+                "End with a user-facing summary of the new capability and facts "
+                "verify_ok=true|false, step_complete=true."
+            ),
+            user_update="Verifying capability upgrade…",
+            max_attempts=2,
+        ),
+    ],
+)
+
 CATALOG: Dict[str, WorkflowTemplate] = {
     t.process_type: t
     for t in (
@@ -378,6 +513,7 @@ CATALOG: Dict[str, WorkflowTemplate] = {
         PROCUREMENT,
         OUTREACH,
         BROWSER_AUTOMATION,
+        TOOL_SELF_UPGRADE,
     )
 }
 
@@ -385,10 +521,13 @@ CATALOG: Dict[str, WorkflowTemplate] = {
 CATALOG_ALIASES: Dict[str, str] = {
     "moltmarket_check": "browser_automation",
     "email_followup": "outreach",
+    "self_upgrade": "tool_self_upgrade",
+    "capability_upgrade": "tool_self_upgrade",
 }
 
 # Order matters: more specific patterns first.
 _CLASSIFY_ORDER = (
+    "tool_self_upgrade",
     "email_verification",
     "browser_automation",
     "procurement",
@@ -398,16 +537,47 @@ _CLASSIFY_ORDER = (
 )
 
 
+def _any_pattern(text: str, patterns: Sequence[str]) -> bool:
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+
+def soft_catalog_candidates(intent: str) -> List[str]:
+    """Advisory keyword hits for the intake LLM — never assigns a workflow.
+
+    The intake agent must dismiss false positives (awareness, meta chat, etc.).
+    """
+    text = (intent or "").lower()
+    hits: List[str] = []
+    for key in _CLASSIFY_ORDER:
+        template = CATALOG[key]
+        for pattern in template.intent_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                hits.append(template.process_type)
+                break
+    return hits
+
+
 def resolve_catalog_template(intent: str, task_type: str = "") -> Optional[str]:
-    """Return process_type if intent matches a catalog template, else None."""
+    """Return process_type if intent matches a catalog template, else None.
+
+    Used for soft candidates / legacy callers. Live Slack DMs must not hard-assign
+    catalog workflows from this alone — intake LLM ``catalog_hint`` is authoritative.
+    """
     if task_type in CATALOG:
         return task_type
     alias = CATALOG_ALIASES.get(task_type)
     if alias:
         return alias
     text = (intent or "").lower()
+    # Awareness / meta chat must not open catalog workflows on keyword collisions.
+    if _any_pattern(text, _META_NON_CATALOG_PATTERNS):
+        return None
     for key in _CLASSIFY_ORDER:
         template = CATALOG[key]
+        if template.negative_intent_patterns and _any_pattern(
+            text, template.negative_intent_patterns
+        ):
+            continue
         for pattern in template.intent_patterns:
             if re.search(pattern, text, re.IGNORECASE):
                 return template.process_type
@@ -449,6 +619,22 @@ def catalog_type_for_workflow(
         if hinted and get_template(hinted) and hinted == intent_match:
             return hinted
     return intent_match
+
+
+def catalog_assignment_from_intake(
+    *,
+    intake_ran: bool,
+    intake_catalog_type: Optional[str],
+) -> Optional[str]:
+    """Live catalog assignment is intake-LLM only.
+
+    When intake did not run (off/degraded path with empty result), never
+    regex-assign a catalog workflow. Templates and ``intent_patterns`` stay
+    advisory via ``soft_catalog_candidates``.
+    """
+    if intake_ran:
+        return intake_catalog_type
+    return None
 
 
 def get_template(process_type: str) -> Optional[WorkflowTemplate]:

@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,7 +15,7 @@ from typing import Any, Dict, List, Optional
 from app.config import RMP_ROOT as _RMP_ROOT
 from app.production.alerting import send_alert
 from app.production.ops_notify import notify_ops_slack
-from app.llm.quota_broker import reap_stale_llm_slots_sync
+from app.llm.quota_broker import reap_stale_llm_slots_sync, seconds_until_any_key_ready
 
 logger = logging.getLogger("rmp.canary_sentinel")
 
@@ -74,11 +76,22 @@ def evaluate_health_canary() -> Optional[CanaryIssue]:
     if not finished:
         return CanaryIssue("health_canary", "invalid", "Health canary missing finished_at", data)
     age = datetime.utcnow() - finished
-    if data.get("status") != "completed":
+    status = data.get("status") or "failed"
+    # Deferred = we skipped competing with user work. Recent defer is healthy.
+    if status == "deferred":
+        if age > timedelta(hours=HEALTH_MAX_AGE_HOURS):
+            return CanaryIssue(
+                "health_canary",
+                "stale",
+                f"Health canary deferred {age.total_seconds() / 3600:.1f}h (never recovered)",
+                data,
+            )
+        return None
+    if status != "completed":
         return CanaryIssue(
             "health_canary",
-            data.get("status", "failed"),
-            f"Hourly health canary status={data.get('status')}",
+            status,
+            f"Hourly health canary status={status}",
             data,
         )
     if age > timedelta(hours=HEALTH_MAX_AGE_HOURS):
@@ -106,7 +119,23 @@ def evaluate_memory_canary() -> Optional[CanaryIssue]:
     status = data.get("status", "")
     if status in ("running", "created"):
         status = "timeout"
+    if status == "deferred":
+        if age > timedelta(hours=MEMORY_MAX_AGE_HOURS):
+            return CanaryIssue(
+                "memory_canary",
+                "stale",
+                f"Memory canary deferred {age.total_seconds() / 3600:.1f}h",
+                data,
+            )
+        return None
+    # Transcript checks are the memory canary's purpose. A Temporal timeout
+    # after memory_ok/prompt_ok is a dispatch-completion issue (health canary).
+    transcript_ok = bool(data.get("memory_ok")) and bool(data.get("prompt_ok")) and not data.get(
+        "search_bad"
+    )
     if status != "completed":
+        if transcript_ok:
+            return None
         return CanaryIssue(
             "memory_canary",
             status or "failed",
@@ -194,6 +223,10 @@ REMEDIATION_STATE_PATH = RMP_ROOT / "data" / "last_canary_remediation.json"
 
 # Soft health_canary failures that often mean "busy / LLM starved", not dead runtime.
 SOFT_HEALTH_STATUSES = frozenset({"timeout", "failed"})
+SOFT_MEMORY_STATUSES = frozenset({"timeout", "failed", "running", "created"})
+CANARY_SCRIPT = RMP_ROOT / "ops" / "canary.sh"
+RECOVERY_MAX_POLLS = 24  # 4 minutes
+LLM_COOLDOWN_WAIT_CAP_SEC = 60.0
 
 
 def _remediation_cooldown_active(key: str = "restart_runtime") -> bool:
@@ -278,58 +311,135 @@ def cancel_task_sync(task_id: str, reason: str = "canary_timeout") -> bool:
         return False
 
 
-def attempt_remediation(issues: List[CanaryIssue]) -> List[str]:
-    """Deterministic fixes — reap LLM slots, restart down units, reload stale runtime.
+def list_stuck_canary_task_ids_sync() -> List[str]:
+    """Non-terminal canary/system probe tasks that can pin LLM slots."""
+    try:
+        from sqlalchemy import create_engine, text
 
-    Never restart rmp-worker/rmp-api for soft health_canary timeout/failed while
-    active user tasks are running — that aborts mid-flight Slack delivery.
+        from app.db.database import DATABASE_URL
+
+        sync_url = DATABASE_URL.replace("+asyncpg", "+psycopg2")
+        engine = create_engine(sync_url)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id, task_type, goal FROM tasks "
+                    "WHERE status IN ('running', 'created', 'pending_user_input')"
+                )
+            ).fetchall()
+        ids: List[str] = []
+        for task_id, task_type, goal in rows:
+            t = (task_type or "").lower()
+            g = (goal or "").upper()
+            if t == "canary" or "RMP CANARY" in g or "MEMORY CANARY" in g:
+                ids.append(str(task_id))
+        return ids
+    except Exception as exc:
+        logger.warning("list_stuck_canary_task_ids_sync failed: %s", exc)
+        return []
+
+
+def cancel_stuck_canary_tasks_sync(reason: str = "canary_timeout") -> List[str]:
+    cancelled: List[str] = []
+    for tid in list_stuck_canary_task_ids_sync():
+        if cancel_task_sync(tid, reason):
+            cancelled.append(tid)
+    return cancelled
+
+
+def rerun_health_canary_sync(*, max_polls: int = RECOVERY_MAX_POLLS) -> bool:
+    """Re-prove the dispatch path. Must not recurse into the sentinel."""
+    env = os.environ.copy()
+    env["RMP_CANARY_SKIP_SENTINEL"] = "1"
+    env["RMP_CANARY_MAX_POLLS"] = str(max_polls)
+    timeout_sec = max_polls * 10 + 90
+    try:
+        proc = subprocess.run(
+            ["bash", str(CANARY_SCRIPT)],
+            cwd=str(RMP_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except Exception as exc:
+        logger.warning("recovery health canary failed to start: %s", exc)
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "recovery health canary rc=%s tail=%s",
+            proc.returncode,
+            (proc.stdout or proc.stderr or "")[-400:],
+        )
+        return False
+    return True
+
+
+def _wait_for_llm_capacity() -> Optional[str]:
+    try:
+        wait_sec = float(seconds_until_any_key_ready() or 0.0)
+    except Exception:
+        wait_sec = 0.0
+    if wait_sec <= 1:
+        return None
+    sleep_for = min(wait_sec, LLM_COOLDOWN_WAIT_CAP_SEC)
+    time.sleep(sleep_for)
+    return f"waited {sleep_for:.0f}s for LLM key cooldown"
+
+
+def attempt_remediation(issues: List[CanaryIssue]) -> List[str]:
+    """Deterministic fixes — reap LLM slots, cancel stuck canaries, restart down/stale units.
+
+    Soft health_canary timeout/failed does NOT restart rmp-api/worker. That is LLM
+    starvation or a stuck probe, not a dead runtime. Recovery is cancel + reap +
+    re-run (see run_sentinel). Restart only for down units or stale/missing code.
     """
     actions: List[str] = []
     reaped = reap_stale_llm_slots_sync()
     if reaped:
         actions.extend([f"reaped slot {r}" for r in reaped])
     restarted: set[str] = set()
-    for issue in issues:
-        for unit in SERVICE_UNITS:
-            if unit in restarted:
-                continue
-            if not _systemctl_is_active(unit):
-                if _restart_unit(unit):
-                    actions.append(f"restarted {unit}")
-                    restarted.add(unit)
+    for unit in SERVICE_UNITS:
+        if unit in restarted:
+            continue
+        if not _systemctl_is_active(unit):
+            if _restart_unit(unit):
+                actions.append(f"restarted {unit}")
+                restarted.add(unit)
 
-    # Cancel timed-out/failed canary tasks so they cannot pin LLM slots.
+    extra_ids: List[str] = []
     for issue in issues:
-        if issue.name == "health_canary" and issue.status in SOFT_HEALTH_STATUSES:
+        if issue.name in {"health_canary", "memory_canary"} and issue.status in (
+            SOFT_HEALTH_STATUSES | SOFT_MEMORY_STATUSES
+        ):
             tid = str((issue.details or {}).get("task_id") or "")
-            if tid and cancel_task_sync(tid, f"health_canary_{issue.status}"):
+            if tid and cancel_task_sync(tid, f"{issue.name}_{issue.status}"):
+                extra_ids.append(tid)
                 actions.append(f"cancelled canary task {tid[:8]}")
-                # Reap again after cancel so slots drop immediately
-                reaped2 = reap_stale_llm_slots_sync()
-                if reaped2:
-                    actions.extend([f"reaped slot {r}" for r in reaped2])
+
+    stuck = cancel_stuck_canary_tasks_sync("canary_sentinel_recovery")
+    for tid in stuck:
+        if tid not in extra_ids:
+            actions.append(f"cancelled canary task {tid[:8]}")
+
+    reaped2 = reap_stale_llm_slots_sync()
+    if reaped2:
+        actions.extend([f"reaped slot {r}" for r in reaped2])
 
     hard_reload = any(
         i.name == "runtime_code_sync" and i.status in {"stale", "missing"} for i in issues
     )
-    soft_health = any(
-        i.name == "health_canary" and i.status in SOFT_HEALTH_STATUSES for i in issues
-    )
     hard_health = any(
         i.name == "health_canary" and i.status in {"stale", "missing"} for i in issues
     )
-
     active_users = count_active_user_tasks_sync()
     needs_runtime_reload = hard_reload or hard_health
-    if soft_health and not hard_reload and not hard_health:
-        if active_users > 0:
-            actions.append(
-                f"deferred runtime restart ({active_users} active user task(s); "
-                "health_canary soft failure only)"
-            )
-            needs_runtime_reload = False
-        else:
-            needs_runtime_reload = True
+    if needs_runtime_reload and active_users > 0:
+        actions.append(
+            f"deferred runtime restart ({active_users} active user task(s); "
+            "stale/missing canary only)"
+        )
+        needs_runtime_reload = False
 
     if needs_runtime_reload and not _remediation_cooldown_active():
         for unit in RESTART_UNITS_ON_STALE:
@@ -364,6 +474,7 @@ def write_health_canary_result(
     status: str,
     task_id: str = "",
     error: str = "",
+    **extra: Any,
 ) -> None:
     HEALTH_CANARY_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -371,8 +482,43 @@ def write_health_canary_result(
         "task_id": task_id,
         "error": error,
         "finished_at": datetime.utcnow().isoformat() + "Z",
+        **extra,
     }
     HEALTH_CANARY_PATH.write_text(json.dumps(payload, indent=2))
+
+
+def maybe_mark_health_canary_deferred(*, reason: str, active_users: int = 0) -> bool:
+    """If last health result is a failure, mark deferred instead of leaving timeout on disk."""
+    data = _read_json(HEALTH_CANARY_PATH) or {}
+    if data.get("status") == "completed":
+        return False
+    write_health_canary_result(
+        status="deferred",
+        task_id=str(data.get("task_id") or ""),
+        error=reason,
+        prior_status=data.get("status"),
+        active_users=active_users,
+    )
+    return True
+
+
+def maybe_mark_memory_canary_deferred(*, reason: str, active_users: int = 0) -> bool:
+    data = _read_json(MEMORY_CANARY_PATH) or {}
+    if data.get("status") == "completed":
+        return False
+    if data.get("memory_ok") and data.get("prompt_ok") and not data.get("search_bad"):
+        return False
+    MEMORY_CANARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        **data,
+        "status": "deferred",
+        "error": reason,
+        "prior_status": data.get("status"),
+        "active_users": active_users,
+        "finished_at": datetime.utcnow().isoformat() + "Z",
+    }
+    MEMORY_CANARY_PATH.write_text(json.dumps(payload, indent=2))
+    return True
 
 
 async def handle_canary_failure(
@@ -402,12 +548,37 @@ async def run_sentinel(*, trigger: str = "scheduled") -> Dict[str, Any]:
         return result
 
     result["remediation"] = attempt_remediation(issues)
-    if result["remediation"]:
-        await asyncio.sleep(5)
-        issues = evaluate_canaries()
-        result["issues_after_remediation"] = [
-            {"name": i.name, "status": i.status, "message": i.message} for i in issues
-        ]
+
+    wait_note = _wait_for_llm_capacity()
+    if wait_note:
+        result["remediation"].append(wait_note)
+
+    remaining = evaluate_canaries()
+    needs_prove = any(
+        (i.name == "health_canary" and i.status in SOFT_HEALTH_STATUSES)
+        or (i.name == "memory_canary" and i.status in SOFT_MEMORY_STATUSES)
+        for i in remaining
+    )
+    if needs_prove:
+        active_users = count_active_user_tasks_sync()
+        if active_users > 0:
+            maybe_mark_health_canary_deferred(
+                reason="active_user_tasks", active_users=active_users
+            )
+            result["remediation"].append(
+                f"deferred recovery re-run ({active_users} active user task(s))"
+            )
+        else:
+            ok = rerun_health_canary_sync()
+            result["recovery_canary_ok"] = ok
+            result["remediation"].append(
+                "recovery health canary ok" if ok else "recovery health canary failed"
+            )
+
+    issues = evaluate_canaries()
+    result["issues_after_remediation"] = [
+        {"name": i.name, "status": i.status, "message": i.message} for i in issues
+    ]
 
     if not issues:
         result["resolved_by_remediation"] = True
@@ -421,7 +592,7 @@ async def run_sentinel(*, trigger: str = "scheduled") -> Dict[str, Any]:
         lines.append(f"• {issue.name}: {issue.message}")
     if result["remediation"]:
         lines.append(f"Auto-fix attempted: {', '.join(result['remediation'])}")
-        lines.append("Issue persists — manual check recommended.")
+        lines.append("Recovery re-run did not clear the incident.")
     else:
         lines.append("No automatic fix applied.")
 

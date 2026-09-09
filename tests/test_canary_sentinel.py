@@ -88,6 +88,32 @@ def test_evaluate_memory_canary_stale(tmp_path, monkeypatch):
     assert issue.status == "stale"
 
 
+def test_evaluate_memory_timeout_with_transcript_ok_is_not_an_issue(tmp_path, monkeypatch):
+    import json
+
+    path = tmp_path / "memory.json"
+    monkeypatch.setattr("app.production.canary_sentinel.MEMORY_CANARY_PATH", path)
+    path.write_text(
+        json.dumps(
+            {
+                "status": "timeout",
+                "finished_at": datetime.utcnow().isoformat() + "Z",
+                "memory_ok": 1,
+                "prompt_ok": 1,
+                "search_bad": 0,
+            }
+        )
+    )
+    assert evaluate_memory_canary() is None
+
+
+def test_evaluate_health_deferred_recent_is_ok(tmp_path, monkeypatch):
+    path = tmp_path / "health.json"
+    monkeypatch.setattr("app.production.canary_sentinel.HEALTH_CANARY_PATH", path)
+    write_health_canary_result(status="deferred", error="active_user_tasks")
+    assert evaluate_health_canary() is None
+
+
 @pytest.mark.asyncio
 async def test_run_sentinel_alerts_on_failure(tmp_path, monkeypatch):
     from app.production import canary_sentinel
@@ -96,15 +122,65 @@ async def test_run_sentinel_alerts_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(canary_sentinel, "HEALTH_CANARY_PATH", health_path)
     monkeypatch.setattr(canary_sentinel, "MEMORY_CANARY_PATH", tmp_path / "mem.json")
     monkeypatch.setattr(canary_sentinel, "ALERT_STATE_PATH", tmp_path / "alerts.json")
+    monkeypatch.setattr(canary_sentinel, "evaluate_runtime_code_sync", lambda: None)
     canary_sentinel.write_health_canary_result(status="failed", task_id="x", error="boom")
 
     with patch.object(canary_sentinel, "attempt_remediation", return_value=[]):
-        with patch.object(
-            canary_sentinel, "notify_ops_slack", new_callable=AsyncMock, return_value=True
-        ) as notify:
-            with patch.object(
-                canary_sentinel, "send_alert", new_callable=AsyncMock, return_value=True
-            ):
-                result = await canary_sentinel.run_sentinel(trigger="test")
+        with patch.object(canary_sentinel, "_wait_for_llm_capacity", return_value=None):
+            with patch.object(canary_sentinel, "count_active_user_tasks_sync", return_value=0):
+                with patch.object(canary_sentinel, "rerun_health_canary_sync", return_value=False):
+                    with patch.object(
+                        canary_sentinel, "notify_ops_slack", new_callable=AsyncMock, return_value=True
+                    ) as notify:
+                        with patch.object(
+                            canary_sentinel, "send_alert", new_callable=AsyncMock, return_value=True
+                        ):
+                            result = await canary_sentinel.run_sentinel(trigger="test")
     assert result["issues"]
     notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_sentinel_recovery_rerun_clears_timeout_without_alert(tmp_path, monkeypatch):
+    import json
+
+    from app.production import canary_sentinel
+
+    health_path = tmp_path / "health.json"
+    mem_path = tmp_path / "mem.json"
+    monkeypatch.setattr(canary_sentinel, "HEALTH_CANARY_PATH", health_path)
+    monkeypatch.setattr(canary_sentinel, "MEMORY_CANARY_PATH", mem_path)
+    monkeypatch.setattr(canary_sentinel, "ALERT_STATE_PATH", tmp_path / "alerts.json")
+    monkeypatch.setattr(canary_sentinel, "evaluate_runtime_code_sync", lambda: None)
+    canary_sentinel.write_health_canary_result(status="timeout", task_id="stuck", error="poll timeout")
+    mem_path.write_text(
+        json.dumps(
+            {
+                "status": "timeout",
+                "finished_at": datetime.utcnow().isoformat() + "Z",
+                "memory_ok": 1,
+                "prompt_ok": 1,
+                "search_bad": 0,
+            }
+        )
+    )
+
+    def _prove():
+        canary_sentinel.write_health_canary_result(status="completed", task_id="recovered")
+        return True
+
+    with patch.object(canary_sentinel, "attempt_remediation", return_value=["cancelled canary task stuck"]):
+        with patch.object(canary_sentinel, "_wait_for_llm_capacity", return_value=None):
+            with patch.object(canary_sentinel, "count_active_user_tasks_sync", return_value=0):
+                with patch.object(canary_sentinel, "rerun_health_canary_sync", side_effect=_prove):
+                    with patch.object(
+                        canary_sentinel, "notify_ops_slack", new_callable=AsyncMock, return_value=True
+                    ) as notify:
+                        with patch.object(
+                            canary_sentinel, "send_alert", new_callable=AsyncMock, return_value=True
+                        ) as alert:
+                            result = await canary_sentinel.run_sentinel(trigger="health_canary")
+    assert result.get("resolved_by_remediation") is True
+    assert result.get("recovery_canary_ok") is True
+    notify.assert_not_awaited()
+    alert.assert_not_awaited()

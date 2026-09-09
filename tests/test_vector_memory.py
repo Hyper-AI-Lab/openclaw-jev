@@ -5,6 +5,24 @@ from app.memory.nvidia_embed import NvidiaEmbeddings
 from app.memory.vector import VectorMemoryService, _read_mistral_key
 
 
+def test_vector_disabled_status_is_not_ready():
+    svc = VectorMemoryService(
+        {
+            "enabled": False,
+            "embedder_provider": "nvidia",
+            "embedder_model": "nvidia/llama-nemotron-embed-1b-v2",
+            "embedding_dims": 2048,
+            "collection_name": "rmp_memories_nemotron_v2",
+            "not_ready_reason": "NVIDIA NIM embeddings HTTP 410 EOL",
+        }
+    )
+    st = svc.status()
+    assert st["enabled"] is False
+    assert st["ready"] is False
+    assert "410" in (st["error"] or "")
+    assert st["embedder_model"] == "nvidia/llama-nemotron-embed-1b-v2"
+
+
 def test_vector_service_nvidia_embedder_config():
     svc = VectorMemoryService(
         {
@@ -64,6 +82,72 @@ def test_vector_service_mistral_embedder_config():
     assert isinstance(cfg["embedder"]["config"]["model"], MistralEmbeddings)
     assert cfg["vector_store"]["config"]["embedding_model_dims"] == 1024
     assert cfg["llm"]["config"]["openai_base_url"] == "https://api.mistral.ai/v1"
+
+
+def test_vector_service_openai_embedder_config():
+    svc = VectorMemoryService(
+        {
+            "enabled": True,
+            "embedder_provider": "openai",
+            "embedder_model": "text-embedding-3-small",
+            "embedding_dims": 1536,
+            "collection_name": "test_memories",
+        }
+    )
+    with patch("app.memory.vector._read_openai_key", return_value="test-openai-key"):
+        cfg = svc._build_mem0_config()
+
+    assert cfg["embedder"]["provider"] == "openai"
+    assert cfg["embedder"]["config"]["model"] == "text-embedding-3-small"
+    assert cfg["embedder"]["config"]["embedding_dims"] == 1536
+    assert cfg["vector_store"]["config"]["embedding_model_dims"] == 1536
+
+
+def test_probe_embed_requires_successful_vector():
+    svc = VectorMemoryService(
+        {
+            "enabled": True,
+            "embedder_provider": "openai",
+            "embedder_model": "text-embedding-3-small",
+            "embedding_dims": 1536,
+        }
+    )
+    with patch("app.memory.vector.embed_query_text", return_value=[0.1] * 1536):
+        assert svc._probe_embed() is True
+    with patch("app.memory.vector.embed_query_text", return_value=[0.1] * 8):
+        assert svc._probe_embed() is False
+        assert "dims" in (svc._error or "")
+
+
+def test_embed_query_text_openai_dispatches(monkeypatch):
+    class _Data:
+        embedding = [0.2, 0.3]
+
+    class _Resp:
+        data = [_Data()]
+
+    class _Embeddings:
+        def create(self, model, input):
+            assert model == "text-embedding-3-small"
+            return _Resp()
+
+    class _Client:
+        def __init__(self, api_key):
+            assert api_key == "sk-test"
+            self.embeddings = _Embeddings()
+
+    monkeypatch.setattr("app.memory.vector._read_openai_key", lambda: "sk-test")
+    with patch("openai.OpenAI", _Client):
+        from app.memory.vector import embed_query_text
+
+        vec = embed_query_text(
+            "hello",
+            {
+                "embedder_provider": "openai",
+                "embedder_model": "text-embedding-3-small",
+            },
+        )
+    assert vec == [0.2, 0.3]
 
 
 def test_read_mistral_key_from_env(monkeypatch):

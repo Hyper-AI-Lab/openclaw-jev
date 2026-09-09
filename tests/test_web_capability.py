@@ -49,11 +49,13 @@ def test_interact_intent():
 
 
 def test_meta_tools_question_not_interact():
-    # Asking about tools should not force browser catalog
+    # Asking about tools should not force browser catalog or dump a tool brief
     intent = "what web-search tools do you have?"
     assert classify_web_intent(intent) == "none"
     a = analyze_web_capability(intent)
-    assert "web_capability_status" in a["preferred_tools"]
+    assert a["web_intent"] == "none"
+    assert a["preferred_tools"] == []
+    assert a["web_brief"] == ""
 
 
 def test_llm_cannot_force_interact_without_rules():
@@ -62,6 +64,44 @@ def test_llm_cannot_force_interact_without_rules():
         llm_web_intent="interact",
     )
     assert a["web_intent"] != "interact"
+
+
+def test_rmp_system_opinion_is_not_web():
+    intent = (
+        "And how about the recent changes that I've done with our system, "
+        "like RMP and everything else? Do you think it is better or not and why?"
+    )
+    assert classify_web_intent(intent) == "none"
+    a = analyze_web_capability(intent)
+    assert a["web_brief"] == ""
+    assert "WEB CAPABILITY BRIEF" not in (a["web_brief"] or "")
+
+
+def test_chat_and_awareness_get_no_web_brief():
+    for intent in (
+        "are you here",
+        "RMP and tools — how do you feel about the recent changes?",
+        "I added some functionality for you: now you can self-upgrade and add a plugin.",
+    ):
+        a = analyze_web_capability(intent)
+        assert a["web_intent"] == "none", intent
+        assert a["web_brief"] == "", intent
+
+
+def test_task_status_question_is_not_web_search():
+    intent = "what is the current status of my task"
+    assert classify_web_intent(intent) == "none"
+    a = analyze_web_capability(intent)
+    assert a["web_brief"] == ""
+    decision = {
+        "decision": "create_fresh",
+        "catalog_type": None,
+        "guidance_notes": "",
+        "policy_overrides": [],
+    }
+    out = merge_web_into_intake(decision, intent)
+    assert out["web_capability"]["web_intent"] == "none"
+    assert "WEB CAPABILITY BRIEF" not in (out.get("guidance_notes") or "")
 
 
 def test_merge_web_into_intake_adds_brief():

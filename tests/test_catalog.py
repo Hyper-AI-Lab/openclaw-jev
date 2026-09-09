@@ -17,6 +17,7 @@ def test_catalog_lists_templates():
     assert "procurement" in ids
     assert "outreach" in ids
     assert "browser_automation" in ids
+    assert "tool_self_upgrade" in ids
 
 
 def test_catalog_templates_have_version():
@@ -120,3 +121,100 @@ def test_browser_automation_has_approval_and_screenshot():
         "screenshot",
     ]
     assert any(s.name == "capture_screenshot" for s in template.steps)
+
+
+def test_resolve_self_upgrade_intent():
+    t = resolve_catalog_template(
+        "Please self-upgrade and add a new plugin to your arsenal"
+    )
+    assert t == "tool_self_upgrade"
+
+
+def test_self_upgrade_aliases():
+    assert normalize_catalog_type("self_upgrade", "") == "tool_self_upgrade"
+    assert normalize_catalog_type("capability_upgrade", "") == "tool_self_upgrade"
+
+
+def test_tool_self_upgrade_pipeline_gates():
+    template = get_template("tool_self_upgrade")
+    assert template is not None
+    names = [s.name for s in template.steps]
+    assert names == [
+        "draft_upgrade",
+        "run_tests",
+        "approval_gate",
+        "controlled_restart",
+        "verify_upgrade",
+    ]
+    assert any(s.kind == "approval_gate" for s in template.steps)
+    assert template.success_criteria.get("requires_human_approval") is True
+    assert template.success_criteria.get("requires_tests_passed") is True
+    assert template.success_criteria.get("requires_verify_ok") is True
+
+
+def test_loose_upgrade_mention_does_not_force_catalog():
+    assert (
+        catalog_type_for_workflow(
+            "tool_self_upgrade",
+            "How do software upgrades usually work in general?",
+            "user",
+        )
+        is None
+    )
+
+
+def test_hint_confirms_matching_self_upgrade_intent():
+    assert (
+        catalog_type_for_workflow(
+            "tool_self_upgrade",
+            "Please self-upgrade and add a new plugin to your arsenal",
+            "user",
+        )
+        == "tool_self_upgrade"
+    )
+
+
+def test_awareness_of_self_upgrade_is_not_catalog():
+    intent = (
+        "I added some functionality for you: now you can self-upgrade and add a "
+        "plugin to your arsenal. Are you aware of that?"
+    )
+    assert resolve_catalog_template(intent) is None
+    assert catalog_type_for_workflow(None, intent, "user") is None
+    assert catalog_type_for_workflow("tool_self_upgrade", intent, "user") is None
+
+
+def test_follow_up_after_you_said_is_not_outreach():
+    intent = (
+        'I thought you will follow up after you said "Let me check the plugins '
+        'directory". no?'
+    )
+    assert resolve_catalog_template(intent) is None
+    assert catalog_type_for_workflow(None, intent, "user") is None
+
+
+def test_actionable_self_upgrade_still_matches():
+    assert (
+        resolve_catalog_template(
+            "Please self-upgrade and add a new plugin to your arsenal"
+        )
+        == "tool_self_upgrade"
+    )
+
+
+def test_degraded_intake_never_regex_assigns_catalog():
+    from app.workflows.catalog import catalog_assignment_from_intake
+
+    assert (
+        catalog_assignment_from_intake(
+            intake_ran=False, intake_catalog_type="tool_self_upgrade"
+        )
+        is None
+    )
+    assert (
+        catalog_assignment_from_intake(intake_ran=True, intake_catalog_type="login")
+        == "login"
+    )
+    assert (
+        catalog_assignment_from_intake(intake_ran=True, intake_catalog_type=None) is None
+    )

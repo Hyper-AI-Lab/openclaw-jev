@@ -6,9 +6,8 @@ import socket
 import threading
 from typing import Any, Dict, List, Optional
 
-from app.config import get_task_registry_config, get_vector_memory_config
-from app.memory.nvidia_embed import NvidiaEmbeddings
-from app.memory.vector import _read_nvidia_key
+from app.config import get_task_registry_config, get_vector_memory_config, is_vector_memory_enabled
+from app.memory.vector import embed_query_text
 
 logger = logging.getLogger("rmp.task_registry.vector")
 
@@ -56,15 +55,7 @@ def _get_qdrant_client():
 
 
 def _embed(text: str) -> List[float]:
-    vm = get_vector_memory_config()
-    api_key = _read_nvidia_key()
-    if not api_key:
-        raise RuntimeError("NVIDIA_API_KEY required for task registry embeddings")
-    model = NvidiaEmbeddings(
-        api_key=api_key,
-        model=vm.get("embedder_model", "nvidia/nv-embed-v1"),
-    )
-    return model.embed_query(text)
+    return embed_query_text(text, get_vector_memory_config())
 
 
 def _normalize_query_hits(response: Any, *, min_score: float) -> List[Dict[str, Any]]:
@@ -94,7 +85,7 @@ def _ensure_collection() -> None:
 
     cfg = get_task_registry_config()
     name = cfg.get("collection_name", "rmp_task_registry")
-    dims = int(get_vector_memory_config().get("embedding_dims", 4096))
+    dims = int(get_vector_memory_config().get("embedding_dims", 2048))
     client = _get_qdrant_client()
     if client.collection_exists(name):
         return
@@ -119,7 +110,7 @@ def registry_document_text(summary: Dict[str, Any]) -> str:
 
 def upsert_task_vector(task_id: str, summary: Dict[str, Any]) -> Optional[str]:
     cfg = get_task_registry_config()
-    if not cfg.get("enabled", True):
+    if not cfg.get("enabled", True) or not is_vector_memory_enabled():
         return None
     try:
         from qdrant_client.http import models as rest
@@ -163,7 +154,7 @@ def search_similar_tasks(
     min_score: float = 0.0,
 ) -> List[Dict[str, Any]]:
     cfg = get_task_registry_config()
-    if not cfg.get("enabled", True):
+    if not cfg.get("enabled", True) or not is_vector_memory_enabled():
         return []
     try:
         _ensure_collection()
@@ -185,9 +176,16 @@ def search_similar_tasks(
 
 def probe_task_registry_vector(*, limit: int = 1) -> Dict[str, Any]:
     """Lightweight live probe for readiness checks."""
+    if not is_vector_memory_enabled():
+        return {
+            "ok": True,
+            "skipped": True,
+            "message": "embedder not-ready",
+            "latency_ms": 0,
+        }
     cfg = get_task_registry_config()
     collection = cfg.get("collection_name", "rmp_task_registry")
-    dims = int(get_vector_memory_config().get("embedding_dims", 4096))
+    dims = int(get_vector_memory_config().get("embedding_dims", 2048))
     client = _get_qdrant_client()
     if not client.collection_exists(collection):
         return {"ok": True, "message": f"collection {collection} not yet created", "latency_ms": 0}

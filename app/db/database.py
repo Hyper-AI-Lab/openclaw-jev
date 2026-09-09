@@ -96,6 +96,9 @@ _MIGRATIONS = [
         task_created_at TIMESTAMP,
         task_ended_at TIMESTAMP
     )""",
+    "CREATE INDEX IF NOT EXISTS ix_tasks_goal_fts ON tasks USING gin (to_tsvector('english', coalesce(goal, '')))",
+    "CREATE INDEX IF NOT EXISTS ix_task_registry_fts ON task_registry_entries USING gin (to_tsvector('english', coalesce(intent_snippet,'') || ' ' || coalesce(outcome_summary,'')))",
+    "CREATE INDEX IF NOT EXISTS ix_task_messages_fts ON task_messages USING gin (to_tsvector('english', coalesce(content, '')))",
 ]
 
 

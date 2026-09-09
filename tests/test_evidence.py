@@ -51,5 +51,37 @@ def test_evidence_high_confidence_conversational_greeting():
     assert evidence_high_confidence(intent, response) is True
 
 
+def test_evidence_high_confidence_are_you_here():
+    assert (
+        evidence_high_confidence(
+            "Are you here aura?",
+            "Yes, I'm here — ready when you are.",
+        )
+        is True
+    )
+
+
 def test_evidence_high_confidence_conversational_short_fails():
     assert evidence_high_confidence("How are you?", "Fine.") is False
+
+
+def test_catalog_tool_self_upgrade_requires_pipeline_signals():
+    short = check_catalog_completion(
+        "tool_self_upgrade",
+        "Self-upgrade please",
+        "Upgrade finished.",
+    )
+    assert short["passed"] is False
+
+    ok = check_catalog_completion(
+        "tool_self_upgrade",
+        "Self-upgrade please",
+        (
+            "Draft plugin landed under plugins/aura_demo. Upgrade plan listed files touched. "
+            "pytest focused suite: all tests passed (tests_passed=true). "
+            "Ran controlled_capability_restart.sh; openclaw-gateway restart_ok=true. "
+            "verify_capability_upgrade.sh OK; web_capability_status healthy; canary soft skip. "
+            "verify_ok=true."
+        ),
+    )
+    assert ok["passed"] is True

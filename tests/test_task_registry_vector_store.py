@@ -30,9 +30,15 @@ def test_search_similar_tasks_uses_query_points():
     mock_client.collection_exists.return_value = True
     mock_client.query_points.return_value = MagicMock(points=[point])
 
-    with patch.object(vector_store, "_get_qdrant_client", return_value=mock_client):
-        with patch.object(vector_store, "_embed", return_value=[0.1, 0.2]):
-            hits = vector_store.search_similar_tasks("hello aura", limit=3, min_score=0.5)
+    with patch.object(vector_store, "is_vector_memory_enabled", return_value=True):
+        with patch.object(
+            vector_store,
+            "get_task_registry_config",
+            return_value={"enabled": True, "collection_name": "rmp_task_registry"},
+        ):
+            with patch.object(vector_store, "_get_qdrant_client", return_value=mock_client):
+                with patch.object(vector_store, "_embed", return_value=[0.1, 0.2]):
+                    hits = vector_store.search_similar_tasks("hello aura", limit=3, min_score=0.5)
 
     mock_client.query_points.assert_called_once()
     call_kw = mock_client.query_points.call_args.kwargs

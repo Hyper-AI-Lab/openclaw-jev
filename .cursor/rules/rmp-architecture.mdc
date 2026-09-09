@@ -1,29 +1,14 @@
 ---
-description: Aura/RMP architecture — every Slack turn goes through RMP; never native OpenClaw replies
+description: Aura/RMP binding — every Slack DM through RMP; OpenClaw executes only
 alwaysApply: true
 ---
 
-# Aura + RMP architecture (binding)
+# Aura + RMP binding
 
-## Hard rules
+Read `/root/.openclaw/rmp/docs/CONCEPT_TREE.md` before adding routing, prompt bans, or Slack shortcuts.
 
-1. **Every user Slack DM goes through RMP.** Plugin claims the turn → `POST /tasks` → intake (memory/registry/active tasks) → Temporal workflow → RMP `chat.postMessage`. No exceptions for “simple” questions.
-2. **Never answer via native OpenClaw Slack.** No intake-failure native fallback. Fail closed (claim + suppress) rather than let the gateway agent reply.
-3. **OpenClaw is the execution engine only** for RMP-owned sessions (`rmp_task_*`, `rmp_verify_*`, `rmp_intake_*`). It must not own user-visible Slack delivery.
-4. **Primary chat model is MiniMax M3** (`nvidia/minimaxai/minimax-m3`). DeepSeek / GLM are fallbacks. Intake/subagent models may use DeepSeek Flash.
-5. **LLM idle silence must fail fast and rotate NVIDIA keys** (~5s idle), not sit on one key for 120s.
-
-## Allowed RMP paths (all still RMP)
-
-- Intake may choose `conversational` or `structured_work` **after** analysis. Both create RMP tasks and RMP-delivered Slack replies.
-- `conversational` ≠ native OpenClaw. It means a short RMP plan (usually one deliver step), not bypassing intake.
-
-## Do not
-
-- Reintroduce native Slack fallback, plugin `process_type_hint` hard-routing, or gateway replies on `agent:main:main` for user DMs.
-- Treat vector/catalog hints as stronger than intake policy without LLM/gates.
-- Raise idle timeout back to minutes to “be safe” — rotate keys / models instead.
-
-## When changing code
-
-Prefer fixing RMP intake/workflow/notify. Touch OpenClaw dist only via `patch_openclaw.sh`. Keep secrets out of git.
+1. Every user Slack DM: plugin claim → `POST /tasks` → intake → Temporal → evaluator → RMP `chat.postMessage`. No native OpenClaw Slack. Fail closed (claim + suppress). No intake-failure gateway reply.
+2. OpenClaw is the execution engine only (`rmp_task_*`, `rmp_verify_*`, `rmp_intake_*`). `conversational` is a short **RMP** plan, still gated — not a native reply.
+3. Primary model `openai/gpt-5-nano`; MiniMax then DeepSeek; no GLM. Idle ~5s then rotate. HTTP 410 is skip. Never pin `nvidia:keyN` on `openai/*`. Secrets only in `/etc/openclaw/openclaw.env`.
+4. Do not add static narrow-case rules (greeting-word locks, crawler bans, keyword catalog assignment). Intake LLM + program-owned workflows decide the situation.
+5. Dist only via `patch_openclaw.sh` / `ops/upgrade_openclaw.sh`. Nested copy of this file under `rmp/.cursor/rules` must stay identical.

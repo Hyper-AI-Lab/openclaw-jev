@@ -100,7 +100,7 @@ _SEARCH_RE = re.compile(
     r"\b("
     r"search\s+(the\s+)?web|web\s*search|google\s+|look\s+up\s+online|"
     r"find\s+(online|on\s+the\s+web|on\s+the\s+internet)|langsearch|"
-    r"brave\s+search|latest\s+news|what\s+is\s+the\s+current"
+    r"brave\s+search|latest\s+news"
     r")\b",
     re.I,
 )
@@ -163,8 +163,8 @@ def analyze_web_capability(
 
     route = ROUTING[web_intent]
     preferred = list(route["preferred_tools"])
-    if web_intent == "none" and _META_TOOLS_RE.search(intent or ""):
-        preferred = ["web_capability_status"]
+    if web_intent == "none":
+        preferred = []
 
     brief = format_web_capability_brief(web_intent, preferred, route.get("fallbacks") or [])
     return {
@@ -182,7 +182,7 @@ def format_web_capability_brief(
     preferred: List[str],
     fallbacks: List[str],
 ) -> str:
-    if web_intent == "none" and not preferred:
+    if web_intent == "none" or not preferred:
         return ""
     lines = [
         "WEB CAPABILITY BRIEF (Aura galaxy stack — use these real tools; do NOT invent Perplexity/Firecrawl/Tavily unless configured):",
@@ -208,7 +208,12 @@ def merge_web_into_intake(
     *,
     llm_result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Attach web_capability to intake policy result; soft-set catalog for interact."""
+    """Attach web_capability brief to intake; never hard-assign catalog workflows.
+
+    Catalog assignment is intake-LLM only (catalog_hint). Keyword web_intent may
+    suggest tools in the brief; interact may note browser_automation as a soft
+    hint inside the brief, but must not set decision['catalog_type'].
+    """
     llm_web = None
     if llm_result:
         llm_web = llm_result.get("web_intent") or llm_result.get("web_capability")
@@ -217,20 +222,12 @@ def merge_web_into_intake(
     analysis = analyze_web_capability(intent, llm_web_intent=llm_web)
     decision["web_capability"] = analysis
 
-    # Soft catalog: only if analyzer says interact AND catalog not already set
-    if analysis.get("catalog_hint") == "browser_automation" and not decision.get("catalog_type"):
-        from app.workflows.catalog import catalog_type_for_workflow
-
-        cat = catalog_type_for_workflow(
-            "browser_automation",
-            intent,
-            "browser_automation",
-        )
-        if cat:
-            decision["catalog_type"] = cat
-            overrides = list(decision.get("policy_overrides") or [])
-            overrides.append("web_capability_interact_catalog")
-            decision["policy_overrides"] = overrides
+    # Soft note only — intake LLM already decided catalog_type (or left it null).
+    soft = analysis.get("catalog_hint")
+    if soft and not decision.get("catalog_type"):
+        overrides = list(decision.get("policy_overrides") or [])
+        overrides.append(f"web_capability_soft_catalog_hint:{soft}")
+        decision["policy_overrides"] = overrides
 
     # Append brief into guidance_notes for create_guided / memory path
     brief = analysis.get("web_brief") or ""

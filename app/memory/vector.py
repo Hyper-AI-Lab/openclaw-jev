@@ -5,14 +5,13 @@ import os
 import threading
 from typing import Any, Dict, List, Optional
 
-from app.config import AUTH_PROFILES_PATH, RMP_DATA_DIR
+from app.config import RMP_DATA_DIR
 from app.memory.mistral_embed import MISTRAL_API_BASE, MistralEmbeddings
 from app.memory.nvidia_embed import NVIDIA_API_BASE, NvidiaEmbeddings
 from app.memory.policy import redact_secrets
 
 logger = logging.getLogger("rmp.vector_memory")
 
-OPENCLAW_AUTH_PATH = AUTH_PROFILES_PATH
 OPENCLAW_ENV_PATH = "/etc/openclaw/openclaw.env"
 DEFAULT_QDRANT_PATH = os.path.join(RMP_DATA_DIR, "qdrant")
 DEFAULT_COLLECTION = "rmp_memories"
@@ -40,8 +39,9 @@ def _load_env_file(path: str) -> Dict[str, str]:
 
 def _read_profile_key(provider: str) -> str:
     try:
-        with open(OPENCLAW_AUTH_PATH, "r", encoding="utf-8") as handle:
-            auth = json.load(handle)
+        from app.llm.quota_broker import load_openclaw_auth_blob
+
+        auth = load_openclaw_auth_blob()
         for profile in auth.get("profiles", {}).values():
             if profile.get("provider") == provider and profile.get("key"):
                 return profile["key"]
@@ -73,6 +73,37 @@ def _read_mistral_key() -> str:
 
 def _read_openai_key() -> str:
     return _read_api_key("OPENAI_API_KEY", provider="openai")
+
+
+def embed_query_text(text: str, config: Optional[Dict[str, Any]] = None) -> List[float]:
+    """One embedding vector for the configured provider. Never logs keys."""
+    cfg = config or {}
+    provider = str(cfg.get("embedder_provider") or "openai").strip().lower()
+    model = cfg.get("embedder_model") or (
+        "text-embedding-3-small" if provider == "openai" else "nvidia/llama-nemotron-embed-1b-v2"
+    )
+    query = (text or "").replace("\n", " ")[:8000]
+    if provider == "nvidia":
+        api_key = _read_nvidia_key()
+        if not api_key:
+            raise RuntimeError("NVIDIA_API_KEY missing; embedder not ready")
+        return list(NvidiaEmbeddings(api_key=api_key, model=model).embed_query(query))
+    if provider == "mistral":
+        api_key = _read_mistral_key()
+        if not api_key:
+            raise RuntimeError("MISTRAL_API_KEY missing; embedder not ready")
+        return list(MistralEmbeddings(api_key=api_key, model=model).embed_query(query))
+    api_key = _read_openai_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY missing; embedder not ready")
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key)
+    response = client.embeddings.create(model=model, input=query)
+    data = response.data or []
+    if not data:
+        return []
+    return list(data[0].embedding)
 
 
 class VectorMemoryService:
@@ -129,9 +160,9 @@ class VectorMemoryService:
             if not api_key:
                 raise RuntimeError("NVIDIA_API_KEY required for vector embeddings")
             embedder_model = self.config.get(
-                "embedder_model", "nvidia/nv-embed-v1"
+                "embedder_model", "nvidia/llama-nemotron-embed-1b-v2"
             )
-            embedding_dims = int(self.config.get("embedding_dims", 4096))
+            embedding_dims = int(self.config.get("embedding_dims", 2048))
             embedder = {
                 "provider": "langchain",
                 "config": {
@@ -173,6 +204,12 @@ class VectorMemoryService:
         }
 
     def _ensure_client(self) -> bool:
+        if not self.config.get("enabled", True):
+            self._ready = False
+            self._error = (
+                self.config.get("not_ready_reason") or "vector memory disabled"
+            )
+            return False
         if self._ready:
             return True
         if self._error:
@@ -181,6 +218,11 @@ class VectorMemoryService:
             from mem0 import Memory
 
             self._memory = Memory.from_config(self._build_mem0_config())
+            # Mem0 init is not proof the embedder works. Probe one vector.
+            if not self._probe_embed():
+                self._ready = False
+                self._memory = None
+                return False
             self._ready = True
             logger.info("Vector memory (Mem0/Qdrant) initialized")
             return True
@@ -189,13 +231,44 @@ class VectorMemoryService:
             logger.warning("Vector memory unavailable: %s", e)
             return False
 
+    def _probe_embed(self) -> bool:
+        """ready=true only after a successful embed, not after client construction."""
+        model_name = self.config.get("embedder_model", "text-embedding-3-small")
+        try:
+            vec = embed_query_text("probe", self.config)
+            if not vec:
+                self._error = "embedder returned empty vector"
+                return False
+            expected = int(self.config.get("embedding_dims") or 0)
+            if expected and len(vec) != expected:
+                self._error = f"embedder dims {len(vec)} != configured {expected}"
+                return False
+            return True
+        except Exception as exc:
+            msg = str(exc)
+            if "410" in msg or "Gone" in msg or "end of life" in msg.lower():
+                self._error = self.config.get("not_ready_reason") or (
+                    f"embedder HTTP 410 EOL: {model_name}"
+                )
+            else:
+                self._error = msg[:300]
+            logger.warning("Vector embed probe failed: %s", self._error)
+            return False
+
     def status(self) -> Dict[str, Any]:
-        if self.config.get("enabled", True) and not self._ready and not self._error:
+        enabled = bool(self.config.get("enabled", True))
+        if not enabled:
+            self._ready = False
+            if not self._error:
+                self._error = (
+                    self.config.get("not_ready_reason") or "vector memory disabled"
+                )
+        elif not self._ready and not self._error:
             self._ensure_client()
         mode = (self.config.get("qdrant_mode") or "embedded").strip().lower()
         out: Dict[str, Any] = {
-            "enabled": bool(self.config.get("enabled", True)),
-            "ready": self._ready,
+            "enabled": enabled,
+            "ready": bool(enabled and self._ready),
             "error": self._error,
             "qdrant_mode": mode,
             "collection": self.config.get("collection_name", DEFAULT_COLLECTION),

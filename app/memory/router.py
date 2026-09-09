@@ -328,8 +328,16 @@ class MemoryRouter:
 
     @staticmethod
     async def vector_status() -> Dict[str, Any]:
+        cfg = get_vector_memory_config()
         if not is_vector_memory_enabled():
-            return {"enabled": False, "ready": False}
+            return {
+                "enabled": False,
+                "ready": False,
+                "embedder_model": cfg.get("embedder_model"),
+                "embedding_dims": cfg.get("embedding_dims"),
+                "collection": cfg.get("collection_name"),
+                "error": cfg.get("not_ready_reason") or "vector memory disabled",
+            }
         svc = get_vector_service()
         return await asyncio.to_thread(svc.status)
 

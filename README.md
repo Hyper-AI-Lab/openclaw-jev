@@ -32,7 +32,7 @@ Aura (the **Reliability & Memory Plane**, RMP) is the sidecar that owns those gu
 | --- | --- |
 | Durable task intake | 3-layer funnel (fast path → vector gate → LLM classify) with `off` / `shadow` / `enforce` modes |
 | Workflow control plane | Temporal `GenericTask` / `CatalogTask` workflows, child steps, reconciler + janitor |
-| Process memory | Process-scoped recall + promotion; Qdrant vectors (`nv-embed-v1`) |
+| Process memory | Process-scoped recall + promotion; Qdrant vectors (not-ready: NVIDIA embed HTTP 410) |
 | Slack ownership | OpenClaw plugin routes DMs to RMP; RMP posts the final reply (no double-send / no native fallback) |
 | LLM orchestration | Balanced NVIDIA key rotation, concurrency caps, fast idle rotate (~5s), usage ledger |
 | Galaxy web stack | Brave + LangSearch search; Jina Reader; Crawl4AI / Scrapling / Crawlee / ScrapeGraphAI; OpenClaw `browser` + browser-use + Obscura CDP |
@@ -86,7 +86,7 @@ flowchart TD
 | **Plugin (`plugins/rmp_adapter`)** | Intercepts Slack → creates RMP tasks; suppresses native double-posts (fail closed) |
 | **Web (`plugins/aura_web`, `plugins/langsearch`, `web-stack/`)** | Multi-backend search/fetch/crawl/extract/browser tools + localhost FastAPI backends |
 
-**Binding rules:** every Slack DM goes through RMP; MiniMax M3 is the primary chat model; LLM idle silence fails fast (~5s) and rotates NVIDIA keys.
+**Binding rules:** every Slack DM goes through RMP; primary chat model is `openai/gpt-5-nano` (MiniMax then DeepSeek); LLM idle silence fails fast (~5s) and rotates keys. No GLM.
 
 Deep dive: [`ARCHITECTURE.md`](ARCHITECTURE.md) · Runbooks: [`docs/runbooks/`](docs/runbooks/)
 
@@ -157,8 +157,8 @@ curl -s http://127.0.0.1:8791/health   # web-stack backends (if enabled)
 - Example config: [`settings.example.json`](settings.example.json).  
 - LangSearch / Jina keys live in OpenClaw `plugins.entries.*` (not this repo).  
 - Obscura remote mode: `OBSCURA_CDP_URL=http://127.0.0.1:9222` (Hermes-compatible).  
-- After every `npm install -g openclaw`, re-run `patch_openclaw.sh` (hook persistence, Slack suppress, allowUnsafe passthrough, ~5s LLM idle).  
-- Model stack (typical): MiniMax M3 primary → DeepSeek V4 Flash → GLM-5.2; intake/subagents on DeepSeek Flash.  
+- After every `npm install -g openclaw`, run `ops/upgrade_openclaw.sh` (never hand-edit dist; never `openclaw onboard`).  
+- Model stack: `openai/gpt-5-nano` primary → MiniMax M3 → DeepSeek V4 Flash; intake uses the same chain. No GLM.  
 - Health canary **soft** failures (`timeout`/`failed`) defer worker restart while user tasks are active; reconciler can recover finished OpenClaw replies to Slack if delivery was interrupted.
 
 ## Status

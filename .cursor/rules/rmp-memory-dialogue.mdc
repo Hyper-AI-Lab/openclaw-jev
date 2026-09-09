@@ -1,0 +1,13 @@
+---
+description: RMP memory and dialogue — process memory plus conversation continuity; vectors advisory
+globs: "**/memory/**,**/task_registry/messages.py,**/orchestrator/prompt_policy.py,**/orchestrator/web_capability.py"
+alwaysApply: false
+---
+
+# Memory and dialogue
+
+- Production recall for RMP turns: process-scoped memory + **RECENT DIALOGUE** from `task_messages`. Key dialogue on the real Slack session (`agent:main:slack:…`), not `agent:main:main`.
+- `create_fresh` is a new task row, not a new person. Do not depend on embeddings for chat continuity.
+- `USER LOCAL TIME` is a clock fact (Asia/Tokyo). Do not add greeting allowed/forbidden lists.
+- Inject WEB CAPABILITY BRIEF only for real web intents (`search|fetch|crawl|…`). Chat, awareness, and RMP-opinion get no tool-catalog dump. Do not re-derive a brief from regex when intent is `none`.
+- `/health` must not claim a dead embedder is ready. Workspace `MEMORY.md` is not first recall during `rmp_task_*`.

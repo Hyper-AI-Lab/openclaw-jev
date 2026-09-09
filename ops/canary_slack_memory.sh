@@ -11,6 +11,21 @@ KEY="canary-memory:${STAMP}"
 
 echo "=== RMP Slack memory canary (${STAMP}) ==="
 
+ACTIVE_USERS=$(
+  cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.production.canary_sentinel import count_active_user_tasks_sync
+print(count_active_user_tasks_sync())
+" 2>/dev/null || echo 0
+)
+if [[ "${ACTIVE_USERS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CANARY SKIP: ${ACTIVE_USERS} active user task(s) — deferring memory canary"
+  cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.production.canary_sentinel import maybe_mark_memory_canary_deferred
+maybe_mark_memory_canary_deferred(reason='active_user_tasks', active_users=int('${ACTIVE_USERS}'))
+" || true
+  exit 0
+fi
+
 RESP=$(curl -sf -X POST "http://127.0.0.1:8000/tasks" \
   -H "Content-Type: application/json" \
   -H "X-RMP-API-Key: ${API_KEY}" \
@@ -98,6 +113,10 @@ echo "Memory context API count: $(echo "$CTX" | python3 -c "import json,sys; pri
 
 if [[ "$STATUS" != "completed" ]]; then
   echo "CANARY FAIL: task status=${STATUS}"
+  if [[ -n "${TASK_ID}" ]]; then
+    curl -sf -X POST -H "X-RMP-API-Key: ${API_KEY}" \
+      "http://127.0.0.1:8000/tasks/${TASK_ID}/cancel" >/dev/null 2>&1 || true
+  fi
   RESULT_FILE="${RMP_ROOT}/data/last_memory_canary.json"
   mkdir -p "$(dirname "${RESULT_FILE}")"
   final_status="${STATUS}"
@@ -119,10 +138,12 @@ print(json.dumps({
   if [[ "$MEMORY_OK" -eq 1 && "$PROMPT_OK" -eq 1 && "$SEARCH_BAD" -eq 0 ]]; then
     echo "NOTE: memory transcript checks passed; task did not reach completed (likely workflow timeout/stuck)"
   fi
-  (
-    cd "${RMP_ROOT}"
-    ./venv/bin/python -m app.production.canary_sentinel --trigger memory_canary
-  ) || true
+  if [[ "${RMP_CANARY_SKIP_SENTINEL:-0}" != "1" ]]; then
+    (
+      cd "${RMP_ROOT}"
+      ./venv/bin/python -m app.production.canary_sentinel --trigger memory_canary
+    ) || true
+  fi
   exit 1
 fi
 

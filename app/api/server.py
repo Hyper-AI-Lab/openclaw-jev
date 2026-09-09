@@ -42,8 +42,11 @@ from app.telemetry import (
     trace_span,
     get_temporal_client_kwargs,
 )
-from app.orchestrator.prompt_policy import resolve_generic_profile
-from app.workflows.catalog import CATALOG, catalog_type_for_workflow, list_catalog, resolve_catalog_template
+from app.workflows.catalog import (
+    CATALOG,
+    catalog_assignment_from_intake,
+    list_catalog,
+)
 
 logger = logging.getLogger("rmp.api")
 _reconciler_stop: Optional[asyncio.Event] = None
@@ -54,20 +57,18 @@ _cron_stop: Optional[asyncio.Event] = None
 _cron_task: Optional[asyncio.Task] = None
 
 from app.config import (
-    AUTH_PROFILES_PATH,
     OPENCLAW_CONFIG_PATH,
     SETTINGS_PATH,
 )
 
 MODEL_CATALOG = {
     "google": ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3.1-pro-preview"],
-    "openai": ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o", "o3-mini"],
+    "openai": ["gpt-5-nano", "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o", "o3-mini"],
     "anthropic": ["claude-3-5-haiku-latest", "claude-3-7-sonnet-latest"],
     "mistral": ["mistral-large-latest", "mistral-large-2512", "mistral-medium-2505"],
     "nvidia": [
         "minimaxai/minimax-m3",
         "deepseek-ai/deepseek-v4-flash-0731",
-        "z-ai/glm-5.2",
         "nvidia/nemotron-3-nano-30b-a3b",
     ],
 }
@@ -309,7 +310,7 @@ async def preview_task_intake(
     preview_task_type = "canary" if is_canary else "user"
     result = await run_classify_task_intake(
         {
-            "intent": intent,
+            "intent": (request.raw_text or intent or "")[:20000] or intent,
             "session_key": request.session_key,
             "tags": request.tags or [],
             "process_type_hint": request.process_type_hint,
@@ -379,6 +380,14 @@ async def create_task(
     else:
         task_type = "user"
 
+    from app.task_registry.session_identity import persist_user_session_key
+
+    request.session_key = persist_user_session_key(
+        request.session_key,
+        task_type=task_type,
+        discover=not os.environ.get("PYTEST_CURRENT_TEST"),
+    )
+
     from app.task_registry.recurrence import derive_recurrence_key, derive_task_kind
 
     recurrence_key = derive_recurrence_key(
@@ -403,7 +412,7 @@ async def create_task(
 
         intake_result = await run_classify_task_intake(
             {
-                "intent": intent,
+                "intent": (request.raw_text or intent or "")[:20000] or intent,
                 "session_key": request.session_key,
                 "tags": request.tags or [],
                 "process_type_hint": request.process_type_hint,
@@ -430,16 +439,51 @@ async def create_task(
             if outcome.get("skipped"):
                 await db.commit()
                 return outcome
-            if outcome.get("intake_action") == "wait_active":
+            if outcome.get("intake_action") in ("wait_active", "clarify"):
                 await db.commit()
                 return outcome
+            if outcome.get("intake_action") == "resume_clarify":
+                tid = outcome.get("task_id")
+                guided_resume = outcome.get("_guided_memory_block") or ""
+                try:
+                    await _start_task_workflow(
+                        tid,
+                        intent,
+                        request.session_key,
+                        outcome.get("task_type") or task_type,
+                        initial_memory_block=guided_resume or None,
+                        execution_mode=outcome.get("execution_mode") or execution_mode,
+                        tags=request.tags or [],
+                    )
+                except Exception as exc:
+                    logger.warning("Clarify resume workflow start failed: %s", exc)
+                    await db.commit()
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "intake_action": "resume_clarify",
+                            "task_id": tid,
+                            "error": str(exc)[:300],
+                        },
+                    )
+                await db.commit()
+                return {
+                    "task_id": tid,
+                    "status": "created",
+                    "intake_action": "resume_clarify",
+                    "intake_decision_id": outcome.get("intake_decision_id"),
+                    "workflow_started": True,
+                }
             if outcome.get("intake_action") == "attach_active":
                 tid = outcome.get("task_id")
                 if tid and outcome.get("signal_required"):
                     try:
                         client = await connect_temporal()
                         handle = client.get_workflow_handle(f"workflow-{tid}")
-                        await handle.signal("user_input", intent)
+                        await handle.signal(
+                            "user_input",
+                            outcome.get("signal_text") or intent,
+                        )
                     except Exception as exc:
                         logger.warning("Intake attach signal failed: %s", exc)
                         await db.commit()
@@ -458,14 +502,16 @@ async def create_task(
                 return outcome
             guided_memory = outcome.get("_guided_memory_block") or ""
 
-    catalog_type = intake_catalog_type or catalog_type_for_workflow(
-        request.process_type_hint, intent, task_type
+    # Catalog assignment is intake-LLM only. Keyword/regex must not assign
+    # when intake is off or returned no result (awareness false positives).
+    catalog_type = catalog_assignment_from_intake(
+        intake_ran=bool(intake_result),
+        intake_catalog_type=intake_catalog_type,
     )
     if catalog_type:
         task_type = catalog_type
 
     task_id = str(uuid.uuid4())
-    generic_profile = resolve_generic_profile(intent) if not catalog_type else None
 
     task = Task(
         id=task_id,
@@ -530,6 +576,25 @@ async def create_task(
     except Exception as exc:
         logger.warning("Eager process run creation skipped: %s", exc)
 
+    session_dialogue = ""
+    inject_dialogue = (
+        not is_canary
+        and not is_heartbeat
+        and not is_cron
+        and task_type not in ("canary", "heartbeat")
+    )
+    if inject_dialogue:
+        try:
+            from app.task_registry.messages import recent_session_dialogue_block
+
+            session_dialogue = await recent_session_dialogue_block(
+                request.session_key or "",
+                exclude_task_id=task_id,
+                db=db,
+            )
+        except Exception as exc:
+            logger.warning("Session dialogue prefetch skipped: %s", exc)
+
     initial_memory_block = guided_memory
     if process_run_id:
         try:
@@ -543,13 +608,23 @@ async def create_task(
                 skip_vector=skip_vector,
             )
             initial_memory_block = "\n\n".join(
-                p for p in (guided_memory, web_capability_block, prefetched) if p
+                p
+                for p in (
+                    guided_memory,
+                    session_dialogue,
+                    web_capability_block,
+                    prefetched,
+                )
+                if p
             ).strip()
         except Exception as exc:
             logger.warning("Memory prefetch skipped: %s", exc)
-    elif web_capability_block:
+            initial_memory_block = "\n\n".join(
+                p for p in (guided_memory, session_dialogue, web_capability_block) if p
+            ).strip()
+    elif session_dialogue or web_capability_block:
         initial_memory_block = "\n\n".join(
-            p for p in (guided_memory, web_capability_block) if p
+            p for p in (guided_memory, session_dialogue, web_capability_block) if p
         ).strip()
 
     try:
@@ -908,10 +983,15 @@ async def approve_task(task_id: str, signal: SignalRequest):
 
 @app.get("/sessions/{session_key:path}/active_task")
 async def get_active_task(session_key: str, db: AsyncSession = Depends(get_db)):
+    from app.task_registry.session_identity import active_task_lookup_keys
+
+    lookup = active_task_lookup_keys(
+        session_key, discover=not os.environ.get("PYTEST_CURRENT_TEST")
+    ) or [session_key]
     result = await db.execute(
         select(Task)
         .where(
-            Task.openclaw_session_key == session_key,
+            Task.openclaw_session_key.in_(lookup),
             Task.status.in_(["running", "pending_user_input", "created"]),
         )
         .order_by(Task.created_at.desc())
@@ -927,12 +1007,17 @@ async def get_active_task(session_key: str, db: AsyncSession = Depends(get_db)):
 
 @app.get("/sessions/{session_key:path}/active_user_task")
 async def get_active_user_task(session_key: str, db: AsyncSession = Depends(get_db)):
+    from app.task_registry.session_identity import active_task_lookup_keys
+
+    lookup = active_task_lookup_keys(
+        session_key, discover=not os.environ.get("PYTEST_CURRENT_TEST")
+    ) or [session_key]
     result = await db.execute(
         select(Task)
         .where(
-            Task.openclaw_session_key == session_key,
+            Task.openclaw_session_key.in_(lookup),
             Task.status.in_(["running", "pending_user_input", "created"]),
-            Task.task_type.notin_(["cron", "heartbeat"]),
+            Task.task_type.notin_(["cron", "heartbeat", "canary"]),
         )
         .order_by(Task.created_at.desc())
         .limit(1)
@@ -1196,6 +1281,12 @@ async def llm_orchestration_status():
     return get_orchestration_status(load_settings())
 
 
+class NotifyUserRequest(BaseModel):
+    session_key: str
+    reason: str
+    idempotency_key: Optional[str] = None
+
+
 class LlmReserveRequest(BaseModel):
     session_key: Optional[str] = None
 
@@ -1214,6 +1305,20 @@ class LlmRecordGatewayRequest(BaseModel):
     total_tokens: int = 0
 
 
+@app.post("/api/notify-user")
+async def notify_user(body: NotifyUserRequest):
+    """RMP-owned Slack DM without starting Aura (intake fail / idle stop)."""
+    from app.notify_user import ALLOWED_REASONS, deliver_user_notice
+
+    if body.reason not in ALLOWED_REASONS:
+        raise HTTPException(status_code=400, detail="unknown notify reason")
+    return await deliver_user_notice(
+        session_key=body.session_key,
+        reason=body.reason,
+        idempotency_key=body.idempotency_key or "",
+    )
+
+
 @app.post("/api/llm/reserve")
 async def llm_reserve(body: LlmReserveRequest):
     from app.llm.quota_broker import get_orchestration_status, reserve_profile
@@ -1225,9 +1330,12 @@ async def llm_reserve(body: LlmReserveRequest):
         )
     except TimeoutError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
+    from app.llm.model_policy import should_pin_nvidia_profile
+
     return {
         "profile_id": profile_id,
         "slot_id": slot_id,
+        "pin_session": should_pin_nvidia_profile(None, profile_id),
         "orchestration": get_orchestration_status(load_settings()),
     }
 
@@ -1249,16 +1357,14 @@ async def llm_release(body: LlmReleaseRequest):
 @app.post("/api/llm/record-gateway")
 async def llm_record_gateway(body: LlmRecordGatewayRequest):
     from app.llm.quota_broker import profile_for_session
-    from app.llm.usage_monitor import record_request
+    from app.llm.usage_monitor import record_request, resolve_usage_profile_id
 
-    profile_id = body.profile_id
-    if not profile_id and body.session_key:
-        profile_id = profile_for_session(body.session_key)
-    if not profile_id and body.session_key:
-        from app.llm.usage_monitor import _profile_for_session_key
-
-        profile_id = _profile_for_session_key(body.session_key)
-    profile_id = profile_id or "nvidia:unknown"
+    slot_pin = profile_for_session(body.session_key) if body.session_key else None
+    profile_id = resolve_usage_profile_id(
+        body.profile_id or slot_pin,
+        model=body.model,
+        session_key=body.session_key or "",
+    )
     record_request(
         profile_id,
         "openclaw_llm",
@@ -1364,18 +1470,18 @@ async def update_config(config: ConfigRequest):
 
     if config.api_key:
         try:
-            with open(AUTH_PROFILES_PATH, "r") as f:
-                auth = json.load(f)
-        except Exception:
-            auth = {"version": 1, "profiles": {}}
-        profile_key = f"{provider}:default"
-        auth.setdefault("profiles", {})[profile_key] = {
-            "provider": provider,
-            "type": "api_key",
-            "key": config.api_key.strip(),
-        }
-        with open(AUTH_PROFILES_PATH, "w") as f:
-            json.dump(auth, f, indent=2)
+            from app.llm.quota_broker import load_openclaw_auth_blob, save_openclaw_auth_blob
+
+            auth = load_openclaw_auth_blob()
+            profile_key = f"{provider}:default"
+            auth.setdefault("profiles", {})[profile_key] = {
+                "provider": provider,
+                "type": "api_key",
+                "key": config.api_key.strip(),
+            }
+            save_openclaw_auth_blob(auth)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Cannot write auth profiles: {exc}")
 
     subprocess.Popen(
         "pkill -f 'openclaw-gateway' 2>/dev/null; sleep 2; "

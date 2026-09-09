@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import threading
 import time
@@ -24,6 +25,11 @@ AUTH_PROFILES_PATH = Path(_AUTH_PROFILES)
 STATE_PATH = Path(RMP_DATA_DIR) / "llm_quota.json"
 LOCK_PATH = STATE_PATH.parent / ".llm_quota.lock"
 OPENCLAW_ENV_PATH = Path("/etc/openclaw/openclaw.env")
+OPENCLAW_STATE_DB = Path("/root/.openclaw/state/openclaw.sqlite")
+_AUTH_STORE_KEY = "authProfiles.store"
+_AUTH_STATE_KEY = "authProfiles.state"
+# None = auto (SQLite when live OpenClaw 2026.9+ store exists). Tests set False.
+USE_SQLITE_AUTH: Optional[bool] = None
 
 # Shorter than OpenClaw defaults (1m/5m/25m/1h) — prefer rotating keys.
 COOLDOWN_STEPS_SEC = (15, 30, 60, 120)
@@ -39,7 +45,7 @@ TERMINAL_TASK_STATUSES = frozenset(
     {"completed", "failed", "compensated", "stopped_by_user", "cancelled"}
 )
 DEFAULT_STALE_SLOT_MS = 90 * 60 * 1000
-# Canary/system sessions must not pin LLM slots for long — they starve user work.
+# Canary/system/intake sessions must not pin LLM slots for long — they starve user work.
 CANARY_STALE_SLOT_MS = 6 * 60 * 1000
 
 _lock = asyncio.Lock()
@@ -112,6 +118,121 @@ def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def _sqlite_auth_available() -> bool:
+    db = OPENCLAW_STATE_DB
+    if not db.is_file():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute(
+                "SELECT 1 FROM config_machine_state WHERE state_key = ? LIMIT 1",
+                (_AUTH_STORE_KEY,),
+            ).fetchone()
+            return row is not None
+        finally:
+            con.close()
+    except Exception:
+        return False
+
+
+def _use_sqlite_auth() -> bool:
+    if USE_SQLITE_AUTH is not None:
+        return bool(USE_SQLITE_AUTH)
+    if Path(AUTH_PROFILES_PATH).resolve() != Path(_AUTH_PROFILES).resolve():
+        return False
+    return _sqlite_auth_available()
+
+
+def _read_machine_state(key: str) -> Optional[Dict[str, Any]]:
+    con = sqlite3.connect(f"file:{OPENCLAW_STATE_DB}?mode=ro", uri=True, timeout=10)
+    try:
+        row = con.execute(
+            "SELECT value_json FROM config_machine_state WHERE state_key = ?",
+            (key,),
+        ).fetchone()
+    finally:
+        con.close()
+    if not row or not row[0]:
+        return None
+    data = json.loads(row[0])
+    return data if isinstance(data, dict) else None
+
+
+def _write_machine_state(key: str, value: Dict[str, Any]) -> None:
+    payload = json.dumps(value, separators=(",", ":"))
+    now_ms = int(time.time() * 1000)
+    con = sqlite3.connect(str(OPENCLAW_STATE_DB), timeout=10)
+    try:
+        con.execute("PRAGMA busy_timeout = 10000")
+        con.execute(
+            "INSERT INTO config_machine_state(state_key, value_json, updated_at_ms) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(state_key) DO UPDATE SET "
+            "value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
+            (key, payload, now_ms),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _retire_legacy_auth_json() -> None:
+    path = AUTH_PROFILES_PATH
+    if not path.is_file():
+        return
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    dest = path.with_name(f"{path.name}.retired-{stamp}")
+    path.replace(dest)
+    logger.info("Retired leftover %s → %s (OpenClaw 2026.9 reads SQLite)", path.name, dest.name)
+
+
+def load_openclaw_auth_blob() -> Dict[str, Any]:
+    """Combined auth blob: profiles + lastGood + usageStats (JSON or SQLite)."""
+    if _use_sqlite_auth():
+        store = _read_machine_state(_AUTH_STORE_KEY) or {}
+        state = _read_machine_state(_AUTH_STATE_KEY) or {}
+        return {
+            "version": store.get("version", 1),
+            "profiles": dict(store.get("profiles") or {}),
+            "lastGood": dict(state.get("lastGood") or {}),
+            "usageStats": dict(state.get("usageStats") or {}),
+        }
+    if AUTH_PROFILES_PATH.is_file():
+        try:
+            data = json.loads(AUTH_PROFILES_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data.setdefault("version", 1)
+                data.setdefault("profiles", {})
+                data.setdefault("lastGood", {})
+                data.setdefault("usageStats", {})
+                return data
+        except Exception:
+            pass
+    return {"version": 1, "profiles": {}, "lastGood": {}, "usageStats": {}}
+
+
+def save_openclaw_auth_blob(store: Dict[str, Any]) -> None:
+    """Persist combined auth blob to SQLite (2026.9+) or legacy JSON."""
+    if _use_sqlite_auth():
+        existing_store = _read_machine_state(_AUTH_STORE_KEY) or {"version": 1, "profiles": {}}
+        existing_state = _read_machine_state(_AUTH_STATE_KEY) or {
+            "version": 1,
+            "lastGood": {},
+            "usageStats": {},
+        }
+        existing_store["profiles"] = store.get("profiles") or {}
+        existing_store["version"] = store.get("version", existing_store.get("version", 1))
+        existing_state["lastGood"] = store.get("lastGood") or {}
+        existing_state["usageStats"] = store.get("usageStats") or {}
+        _write_machine_state(_AUTH_STORE_KEY, existing_store)
+        _write_machine_state(_AUTH_STATE_KEY, existing_state)
+        _retire_legacy_auth_json()
+        return
+    AUTH_PROFILES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(AUTH_PROFILES_PATH, store)
 
 
 @dataclass
@@ -292,6 +413,20 @@ def _soonest_ready_ms(
     return max(waits)
 
 
+def seconds_until_any_key_ready() -> float:
+    """Seconds until at least one NVIDIA key is off cooldown (0 if any is ready)."""
+    state = _read_state()
+    now_ms = _now_ms()
+    waits: List[float] = []
+    keys = state.get("keys") or {}
+    if not keys:
+        return 0.0
+    for entry in keys.values():
+        until = float((entry or {}).get("cooldown_until_ms") or 0)
+        waits.append(max(0.0, (until - now_ms) / 1000.0))
+    return min(waits) if waits else 0.0
+
+
 def record_rate_limit(
     profile_id: Optional[str] = None,
     retry_after_sec: Optional[float] = None,
@@ -351,27 +486,23 @@ def record_success(profile_id: Optional[str] = None) -> None:
 
 def _patch_auth_profile_cooldown(profile_id: str, until_ms: float) -> None:
     """Keep OpenClaw auth rotation aligned with our shorter cooldowns."""
-    if not AUTH_PROFILES_PATH.is_file():
-        return
     try:
-        store = json.loads(AUTH_PROFILES_PATH.read_text(encoding="utf-8"))
+        store = load_openclaw_auth_blob()
         stats = store.setdefault("usageStats", {})
         entry = stats.setdefault(profile_id, {})
         entry["cooldownUntil"] = int(until_ms)
         entry["lastFailureAt"] = int(_now_ms())
-        _atomic_write_json(AUTH_PROFILES_PATH, store)
+        save_openclaw_auth_blob(store)
     except Exception as exc:
         logger.debug("Could not patch auth-profiles cooldown: %s", exc)
 
 
 def _patch_auth_last_good(profile_id: str) -> None:
     """Hint OpenClaw gateway toward the key RMP selected."""
-    if not AUTH_PROFILES_PATH.is_file():
-        return
     try:
-        store = json.loads(AUTH_PROFILES_PATH.read_text(encoding="utf-8"))
+        store = load_openclaw_auth_blob()
         store.setdefault("lastGood", {})["nvidia"] = profile_id
-        _atomic_write_json(AUTH_PROFILES_PATH, store)
+        save_openclaw_auth_blob(store)
     except Exception as exc:
         logger.debug("Could not patch auth-profiles lastGood: %s", exc)
 
@@ -382,22 +513,23 @@ def assign_openclaw_session_profile(session_key: str, profile_id: str) -> bool:
     Only updates an existing session entry that already has a sessionId.
     Creating/touching a brand-new key before /hooks/agent races OpenClaw 2026.7+
     session lifecycle claims (CronSessionLifecycleClaimError).
+    Callers must not pin nvidia:* onto openai/* sessions.
     """
-    from app.config import SESSIONS_JSON_PATH
-
-    sessions_path = Path(SESSIONS_JSON_PATH)
-    if not session_key or not profile_id or not sessions_path.is_file():
+    if not session_key or not profile_id:
         return False
     try:
-        store = json.loads(sessions_path.read_text(encoding="utf-8"))
-        entry = store.get(session_key)
+        from app.openclaw_sessions import get_session_entry, patch_session_entry
+
+        entry = get_session_entry(session_key)
         if not isinstance(entry, dict) or not entry.get("sessionId"):
             return False
-        entry["authProfileOverride"] = profile_id
-        entry["authProfileOverrideSource"] = "user"
-        store[session_key] = entry
-        _atomic_write_json(sessions_path, store)
-        return True
+        return patch_session_entry(
+            session_key,
+            {
+                "authProfileOverride": profile_id,
+                "authProfileOverrideSource": "user",
+            },
+        )
     except Exception as exc:
         logger.debug("Could not assign session profile %s: %s", session_key, exc)
         return False
@@ -417,8 +549,18 @@ def parse_retry_after(headers: Optional[Dict[str, str]], body: str = "") -> Opti
     return None
 
 
+def is_gone_message(text: str) -> bool:
+    """HTTP 410 / gone — skip the model; do not treat as a 429 cooldown."""
+    blob = (text or "").lower()
+    if re.search(r"\b410\b", blob):
+        return True
+    return "gone" in blob and "model" in blob
+
+
 def is_rate_limit_message(text: str) -> bool:
     blob = (text or "").lower()
+    if is_gone_message(blob):
+        return False
     return "429" in blob or "rate limit" in blob or "too many requests" in blob
 
 
@@ -438,6 +580,45 @@ def _profile_ready_in_ms(
     return 0.0
 
 
+def _session_is_user_priority(session_key: Optional[str]) -> bool:
+    sk = (session_key or "").lower()
+    if not sk or "canary" in sk or "heartbeat" in sk:
+        return False
+    return "rmp_intake_" in sk or "rmp_task_" in sk or "rmp_verify_" in sk
+
+
+def _slot_is_canary(slot: Dict[str, Any]) -> bool:
+    sk = str(slot.get("session_key") or "")
+    sk_lower = sk.lower()
+    if "canary" in sk_lower or "heartbeat" in sk_lower:
+        return True
+    task_id = _task_id_from_rmp_session(sk)
+    if task_id:
+        return bool(_task_looks_like_canary_sync(task_id))
+    return False
+
+
+def _preempt_canary_slot(state: Dict[str, Any]) -> bool:
+    """Drop one canary/heartbeat slot so user intake/task work can reserve."""
+    g = state.setdefault("global", {})
+    slots = g.get("active_slots") or {}
+    by_session = g.get("session_slots") or {}
+    for slot_id, slot in list(slots.items()):
+        if not _slot_is_canary(slot):
+            continue
+        sk = str(slot.get("session_key") or "")
+        slots.pop(slot_id, None)
+        if sk and by_session.get(sk) == slot_id:
+            by_session.pop(sk, None)
+        pid = str(slot.get("profile_id") or "")
+        if pid:
+            entry = state.setdefault("keys", {}).setdefault(pid, {})
+            entry["in_flight"] = max(0, int(entry.get("in_flight", 0) or 0) - 1)
+        logger.info("Preempted canary LLM slot session=%s", sk or slot_id)
+        return True
+    return False
+
+
 def _mutate_reserve(
     session_key: Optional[str],
     profiles: List[str],
@@ -449,6 +630,9 @@ def _mutate_reserve(
             if existing and existing[0]:
                 return existing
 
+        if _active_slot_count(state) >= max(1, cfg.max_concurrent):
+            if _session_is_user_priority(session_key):
+                _preempt_canary_slot(state)
         if _active_slot_count(state) >= max(1, cfg.max_concurrent):
             return None
 
@@ -546,7 +730,12 @@ def reap_stale_llm_slots_sync(max_age_ms: int = DEFAULT_STALE_SLOT_MS) -> List[s
         age_limit = max_age_ms
         # Faster reap for canary/system sessions (they must not block user keys).
         sk_lower = session_key.lower()
-        if "canary" in sk_lower or "rmp_verify" in sk_lower:
+        if (
+            "canary" in sk_lower
+            or "rmp_verify" in sk_lower
+            or "heartbeat" in sk_lower
+            or "rmp_intake_" in sk_lower
+        ):
             age_limit = min(age_limit, CANARY_STALE_SLOT_MS)
         if task_id:
             # If the task goal/type looks like canary, also use short TTL.
@@ -622,6 +811,7 @@ async def reserve_profile(
     session_key: Optional[str] = None,
     settings: Optional[Dict[str, Any]] = None,
     heartbeat=None,
+    model: Optional[str] = None,
 ) -> tuple[str, str]:
     """Reserve a concurrency slot and balanced NVIDIA profile for an agent run."""
     cfg = QuotaConfig.from_settings(settings)
@@ -635,7 +825,10 @@ async def reserve_profile(
             if result:
                 profile_id, slot_id = result
                 if session_key:
-                    assign_openclaw_session_profile(session_key, profile_id)
+                    from app.llm.model_policy import should_pin_nvidia_profile
+
+                    if should_pin_nvidia_profile(model, profile_id):
+                        assign_openclaw_session_profile(session_key, profile_id)
                 _patch_auth_last_good(profile_id)
                 logger.debug(
                     "LLM reserve: profile=%s slot=%s session=%s active=%s",
@@ -746,19 +939,19 @@ def wait_for_dispatch_sync(settings: Optional[Dict[str, Any]] = None) -> str:
     )
 
 
-def sync_nvidia_auth_profiles() -> Dict[str, Any]:
-    """Write multi-key NVIDIA profiles to auth-profiles.json (no secrets in return)."""
+def sync_llm_auth_profiles() -> Dict[str, Any]:
+    """Write NVIDIA + optional OpenAI keys into OpenClaw auth store (no secrets in return).
+
+    OpenClaw 2026.9+ keeps credentials in shared SQLite (`authProfiles.store`).
+    Writing leftover `auth-profiles.json` makes the gateway refuse NVIDIA with
+    AUTH_PROFILE_MIGRATION_REQUIRED.
+    """
     keys = _load_env_keys()
-    if not keys:
-        return {"synced": 0, "profile_ids": []}
+    openai_key = _read_env_value("OPENAI_API_KEY")
+    if not keys and not openai_key:
+        return {"synced": 0, "openai_synced": False, "profile_ids": []}
 
-    store: Dict[str, Any] = {"version": 1, "profiles": {}, "lastGood": {}, "usageStats": {}}
-    if AUTH_PROFILES_PATH.is_file():
-        try:
-            store = json.loads(AUTH_PROFILES_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
+    store = load_openclaw_auth_blob()
     profiles = store.setdefault("profiles", {})
     last_good = store.setdefault("lastGood", {})
     for profile_id, api_key in keys:
@@ -767,11 +960,35 @@ def sync_nvidia_auth_profiles() -> Dict[str, Any]:
             "type": "api_key",
             "key": api_key,
         }
-    last_good["nvidia"] = keys[0][0]
-
-    AUTH_PROFILES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(AUTH_PROFILES_PATH, store)
+    if keys:
+        last_good["nvidia"] = keys[0][0]
+    openai_synced = False
+    if openai_key:
+        profiles["openai:default"] = {
+            "provider": "openai",
+            "type": "api_key",
+            "key": openai_key,
+        }
+        last_good["openai"] = "openai:default"
+        openai_synced = True
+    save_openclaw_auth_blob(store)
 
     profile_ids = [p for p, _ in keys]
-    logger.info("Synced %d NVIDIA auth profile(s): %s", len(profile_ids), profile_ids)
-    return {"synced": len(profile_ids), "profile_ids": profile_ids}
+    if openai_synced:
+        profile_ids.append("openai:default")
+    logger.info(
+        "Synced %d NVIDIA auth profile(s)%s: %s",
+        len(keys),
+        " + openai:default" if openai_synced else "",
+        [p for p, _ in keys],
+    )
+    return {
+        "synced": len(keys),
+        "openai_synced": openai_synced,
+        "profile_ids": profile_ids,
+    }
+
+
+def sync_nvidia_auth_profiles() -> Dict[str, Any]:
+    """Backward-compatible name — systemd ExecStartPre still calls this."""
+    return sync_llm_auth_profiles()

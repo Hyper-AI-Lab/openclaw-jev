@@ -1,10 +1,17 @@
-"""Layer 2 vector similarity gate tests."""
-from app.task_registry.vector_gate import vector_similarity_gate
+"""Vector similarity is advisory evidence only — never assigns a workflow."""
+from app.task_registry.vector_gate import advisory_vector_hits, vector_similarity_gate
 
 
-def test_vector_gate_active_same_session_attach():
-    ctx = {
-        "vector_similar": [{"task_id": "abc", "score": 0.85}],
+def _high_score_ctx():
+    return {
+        "vector_similar": [
+            {
+                "task_id": "abc",
+                "score": 0.95,
+                "intent_snippet": "self-upgrade and add a plugin",
+                "process_type": "tool_self_upgrade",
+            }
+        ],
         "active_tasks": [
             {
                 "task_id": "abc",
@@ -14,54 +21,22 @@ def test_vector_gate_active_same_session_attach():
         ],
         "recent_registry": [],
     }
+
+
+def test_vector_gate_never_auto_attaches():
+    ctx = _high_score_ctx()
     result = vector_similarity_gate(ctx, session_key="agent:main:main")
-    assert result is not None
-    assert result["decision"] == "attach_active"
-    assert result["target_task_id"] == "abc"
+    assert result is None
+    assert ctx["advisory_hits"]
+    assert ctx["advisory_hits"][0]["task_id"] == "abc"
+    assert ctx["advisory_hits"][0]["advisory"] is True
+    assert ctx["advisory_hits"][0]["above_threshold"] is True
 
 
-def test_vector_gate_cross_session_wait():
-    ctx = {
-        "vector_similar": [{"task_id": "abc", "score": 0.9}],
-        "active_tasks": [
-            {
-                "task_id": "abc",
-                "session_key": "agent:other:main",
-                "task_kind": "one_shot",
-            }
-        ],
-        "recent_registry": [],
-    }
-    result = vector_similarity_gate(ctx, session_key="agent:main:main")
-    assert result is not None
-    assert result["decision"] == "wait_active"
-
-
-def test_vector_gate_durable_cross_session_attach():
-    ctx = {
-        "vector_similar": [{"task_id": "abc", "score": 0.9}],
-        "active_tasks": [
-            {
-                "task_id": "abc",
-                "session_key": "agent:other:main",
-                "task_kind": "durable",
-            }
-        ],
-        "recent_registry": [],
-    }
-    result = vector_similarity_gate(ctx, session_key="agent:main:main")
-    assert result is not None
-    assert result["decision"] == "attach_active"
-
-
-def test_vector_gate_no_hits():
-    assert vector_similarity_gate({"vector_similar": [], "active_tasks": []}) is None
-
-
-def test_vector_gate_create_guided_uses_registry_outcome():
+def test_vector_gate_never_wait_or_create_guided():
     ctx = {
         "vector_similar": [
-            {"task_id": "done-1", "score": 0.88, "intent_snippet": "short snippet"}
+            {"task_id": "done-1", "score": 0.99, "intent_snippet": "deploy"}
         ],
         "active_tasks": [],
         "recent_registry": [
@@ -72,7 +47,21 @@ def test_vector_gate_create_guided_uses_registry_outcome():
             }
         ],
     }
-    result = vector_similarity_gate(ctx, session_key="agent:main:main")
-    assert result is not None
-    assert result["decision"] == "create_guided"
-    assert "deployment checklist" in result["guidance_notes"]
+    assert vector_similarity_gate(ctx, session_key="agent:main:main") is None
+    assert ctx["advisory_hits"][0]["task_id"] == "done-1"
+
+
+def test_vector_gate_no_hits_still_none():
+    ctx = {"vector_similar": [], "active_tasks": []}
+    assert vector_similarity_gate(ctx) is None
+    assert ctx["advisory_hits"] == []
+
+
+def test_advisory_hits_flag_below_threshold():
+    ctx = {
+        "vector_similar": [{"task_id": "low", "score": 0.1}],
+        "active_tasks": [],
+    }
+    hits = advisory_vector_hits(ctx)
+    assert hits[0]["above_threshold"] is False
+    assert hits[0]["advisory"] is True

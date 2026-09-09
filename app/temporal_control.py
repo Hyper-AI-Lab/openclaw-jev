@@ -7,8 +7,6 @@ from typing import Any, Dict, List, Optional
 from temporalio.client import Client, WorkflowExecutionStatus
 
 from app.telemetry import get_temporal_client_kwargs
-from app.workflows.catalog import catalog_type_for_workflow
-from app.orchestrator.prompt_policy import resolve_generic_profile
 
 logger = logging.getLogger("rmp.temporal_control")
 
@@ -56,7 +54,19 @@ async def start_task_workflow(
     task_kind: Optional[str] = None,
     execution_mode: Optional[str] = None,
 ) -> None:
-    catalog_type = catalog_type_for_workflow(process_type, intent, task_type)
+    from app.workflows.catalog import CATALOG, CATALOG_ALIASES, get_template, normalize_catalog_type
+
+    # Catalog workflows are assigned by intake LLM (or explicit API process_type).
+    # Do NOT re-derive from intent keyword patterns — that bypasses adjudication.
+    catalog_type: Optional[str] = None
+    explicit = process_type or (
+        task_type if (task_type in CATALOG or task_type in CATALOG_ALIASES) else None
+    )
+    if explicit:
+        catalog_type = normalize_catalog_type(str(explicit), "")
+        if catalog_type and not get_template(catalog_type):
+            catalog_type = None
+
     if workflow_name is None:
         workflow_name = "CatalogTaskWorkflow" if catalog_type else "GenericTaskWorkflow"
 
@@ -71,17 +81,17 @@ async def start_task_workflow(
     }
     if catalog_type:
         payload["process_type"] = catalog_type
-    profile = resolve_generic_profile(intent) if not catalog_type else None
-    if profile:
-        payload["generic_profile"] = profile
     if initial_memory_block:
         payload["initial_memory_block"] = initial_memory_block
 
-    from app.orchestrator.completion_rework import get_rework_max_attempts
+    from app.orchestrator.completion_rework import get_attempt_policy
     from app.orchestrator.execution_mode import resolve_execution_mode
     from app.orchestrator.prompt_policy import user_local_time_block
 
-    payload["rework_max_attempts"] = get_rework_max_attempts()
+    policy = get_attempt_policy()
+    payload["rework_max_attempts"] = policy["max_attempts"]
+    payload["strategy_change_attempt"] = policy["strategy_change_attempt"]
+    payload["escalate_user_attempt"] = policy["escalate_user_attempt"]
     payload["user_time_block"] = user_local_time_block()
     payload["execution_mode"] = resolve_execution_mode(
         intent=intent,

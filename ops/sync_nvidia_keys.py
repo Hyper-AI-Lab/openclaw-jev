@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Sync NVIDIA_API_KEY* from /etc/openclaw/openclaw.env into auth-profiles.json."""
+"""Sync LLM keys from /etc/openclaw/openclaw.env into OpenClaw auth store.
+
+Systemd ExecStartPre still invokes this path. NVIDIA keys remain required
+for a successful pre-start; OPENAI_API_KEY is optional (warn-only).
+Never recreates leftover auth-profiles.json.
+"""
 import json
 import sys
 

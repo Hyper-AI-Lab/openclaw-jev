@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_task_registry_config
 from app.db.database import AsyncSessionLocal
 from app.db.models import Task, TaskRegistryEntry
+from app.task_registry.session_identity import active_task_lookup_keys, dialogue_lookup_keys
 from app.task_registry.vector_store import search_similar_tasks
 
 logger = logging.getLogger("rmp.task_registry.retriever")
@@ -65,17 +67,23 @@ async def fetch_active_tasks(
     recurrence_key: Optional[str] = None,
     limit: int = 10,
     db: Optional[AsyncSession] = None,
+    host_wide: bool = False,
 ) -> List[Dict[str, Any]]:
     async def _query(session: AsyncSession) -> List[Dict[str, Any]]:
         q = select(Task).where(Task.status.in_(list(ACTIVE_STATUSES)))
-        if session_key:
-            q = q.where(Task.openclaw_session_key == session_key)
+        if session_key and not host_wide:
+            keys = active_task_lookup_keys(
+                session_key, discover=not os.environ.get("PYTEST_CURRENT_TEST")
+            )
+            if keys:
+                q = q.where(Task.openclaw_session_key.in_(keys))
         if recurrence_key:
             q = q.where(Task.recurrence_key == recurrence_key)
         q = q.order_by(Task.updated_at.desc()).limit(limit)
         result = await session.execute(q)
         rows = []
         for t in result.scalars().all():
+            ctx = t.supplementary_context or {}
             rows.append(
                 {
                     "task_id": t.id,
@@ -87,6 +95,7 @@ async def fetch_active_tasks(
                     "goal": t.goal or "",
                     "goal_snippet": (t.goal or "")[:300],
                     "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+                    "intake_clarify": bool(ctx.get("intake_clarify")),
                 }
             )
         return rows
@@ -114,7 +123,9 @@ async def fetch_recent_registry(
         if recurrence_key:
             q = q.where(TaskRegistryEntry.recurrence_key == recurrence_key)
         if session_key:
-            q = q.where(TaskRegistryEntry.session_key == session_key)
+            keys = dialogue_lookup_keys(session_key)
+            if keys:
+                q = q.where(TaskRegistryEntry.session_key.in_(keys))
         q = q.order_by(TaskRegistryEntry.task_ended_at.desc().nullslast()).limit(limit)
         result = await session.execute(q)
         out = []
@@ -203,7 +214,8 @@ async def hybrid_search_bounded(
         fetch_active_tasks(
             session_key=session_key,
             recurrence_key=recurrence_key,
-            limit=limit,
+            limit=max(limit, 10),
+            host_wide=True,
         ),
         fetch_recent_registry(
             recurrence_key=recurrence_key,
@@ -218,8 +230,30 @@ async def hybrid_search_bounded(
         ),
     )
     vector_hits = _apply_temporal_decay(vector_hits, recent, half_life_days=half_life)
+    pack: Dict[str, Any] = {}
+    if deadline_sec >= 3.0:
+        from app.task_registry.hybrid_retriever import assemble_evidence_pack
+
+        try:
+            pack = await asyncio.wait_for(
+                assemble_evidence_pack(
+                    intent,
+                    active=active,
+                    recent=recent,
+                    dense=vector_hits,
+                    limit=max(limit, 8),
+                    include_liveness=deadline_sec >= 3.0,
+                ),
+                timeout=min(max(deadline_sec, 1.0), 4.0),
+            )
+        except Exception as exc:
+            logger.warning("Evidence pack fusion skipped: %s", exc)
+            pack = {}
     return {
         "active_tasks": active,
         "recent_registry": recent,
         "vector_similar": vector_hits,
+        "evidence_pack": pack.get("ranked") or [],
+        "memory_hits": pack.get("memory_hits") or [],
+        "fts_hits": pack.get("fts_hits") or [],
     }
