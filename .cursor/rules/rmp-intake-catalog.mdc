@@ -1,0 +1,14 @@
+---
+description: RMP intake and catalog assignment — LLM adjudicates; keywords are advisory
+globs: "**/task_registry/**,**/workflows/catalog.py,**/workflows/catalog_task.py,**/intake_*.py,**/plugins/rmp_adapter/**"
+alwaysApply: false
+---
+
+# Intake and catalog
+
+- Catalog **templates** are libraries. Assignment is Intake Analyst `catalog_hint` + policy, never `resolve_catalog_template` / `intent_patterns` / `process_type_hint` as a hard route.
+- When intake did not run or is degraded, user DMs stay `GenericTaskWorkflow`. Do not regex-assign a catalog.
+- `soft_catalog_candidates` may appear in the intake prompt as dismissible evidence only.
+- Canary/heartbeat/system are not user work: never `wait_active` / `attach_active` onto them. Low confidence → clarify (or wait on one **user** active), not silent `create_fresh`.
+- Plugin stop/cancel/abort/halt only when the **whole message** is that command. Incidental “stop” still goes through `POST /tasks`.
+- Mirror plugin edits in both `/root/.openclaw/rmp/plugins/rmp_adapter/index.js` and `/root/.openclaw/plugins/rmp_adapter/index.js`.

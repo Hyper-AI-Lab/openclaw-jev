@@ -64,35 +64,19 @@ USER_TIMEZONE_LABEL = "Japan Standard Time (JST, UTC+9)"
 
 
 def user_local_time_block() -> str:
-    """Deterministic user-local clock for greetings (server runs Europe/Berlin)."""
+    """User-local clock as a fact (host timezone is not the user's)."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
     now = datetime.now(ZoneInfo(USER_TIMEZONE))
-    hour = now.hour
-    if 5 <= hour < 12:
-        period = "morning"
-    elif 12 <= hour < 17:
-        period = "afternoon"
-    elif 17 <= hour < 21:
-        period = "evening"
-    else:
-        period = "night"
     return (
         f"USER LOCAL TIME: {now.strftime('%A %Y-%m-%d %H:%M')} {USER_TIMEZONE_LABEL} "
-        f"(appropriate greeting period: {period}). "
-        f"Kirill lives in Japan — never use Europe/VPS server time for greetings."
+        "(user clock, not the server clock)."
     )
 
 
 def resolve_generic_profile(intent: str) -> Optional[str]:
-    import re
-
-    text = intent or ""
-    for name, cfg in GENERIC_PROFILES.items():
-        for pattern in cfg["patterns"]:
-            if re.search(pattern, text, re.IGNORECASE):
-                return name
+    """Disabled: regex must not pick tool budgets on user DMs."""
     return None
 
 
@@ -126,19 +110,9 @@ def build_generic_execute_prompt(
     elif user_time_block.strip():
         tz = user_time_block.strip()
     else:
-        tz = (
-            f"USER LOCAL TIME: Kirill is in {USER_TIMEZONE_LABEL}. "
-            "Use Japan-local greetings, not Europe/Berlin VPS server time."
-        )
-    # Prefer explicit brief; else derive from intent for web-ish tasks.
+        tz = f"USER LOCAL TIME: {USER_TIMEZONE_LABEL} (user clock, not the server clock)."
     brief = (web_brief or "").strip()
-    if not brief:
-        try:
-            from app.orchestrator.web_capability import analyze_web_capability
-
-            brief = (analyze_web_capability(user_intent).get("web_brief") or "").strip()
-        except Exception:
-            brief = ""
+    # Do not re-derive a WEB CAPABILITY BRIEF from regex when missing.
     web_block = f"\n{brief}\n" if brief else ""
     # Raise budget slightly when web tools are in play.
     if brief and budget < 4:
@@ -154,9 +128,10 @@ Instructions:
 1. Execute the required steps. Use tools sparingly (at most {budget} tool calls for simple read/summarize requests). When WEB CAPABILITY BRIEF is present, prefer the listed tools in order.
 2. Use the OpenClaw tool named `read` (with `file_path`) to read files — there is no `read_file` tool.
 3. After gathering what you need, reply in clear English to Kirill — concise, no mixed languages, no internal planning monologue, no numbered option menus unless the user asked for choices.
-4. Do NOT include Origin/Session/Goal/Memory status metadata in your reply.
-5. If the user asks to stop, set "stopped": true in facts JSON.
-6. Put facts JSON ONLY in a final fenced block (never inline in the user-visible answer):
+4. If RECENT DIALOGUE is present, continue that conversation.
+5. Do NOT include Origin/Session/Goal/Memory status metadata in your reply.
+6. If the user asks to stop, set "stopped": true in facts JSON.
+7. Put facts JSON ONLY in a final fenced block (never inline in the user-visible answer):
 ```json
 {{"facts": {{"step_complete": true, "stopped": false}}}}
 ```
@@ -172,14 +147,6 @@ def build_catalog_step_prompt(
 ) -> str:
     mem = memory_block or "PROCESS-SCOPED MEMORY: (none yet)\n"
     web_block = ""
-    try:
-        from app.orchestrator.web_capability import analyze_web_capability
-
-        brief = (analyze_web_capability(user_intent).get("web_brief") or "").strip()
-        if brief:
-            web_block = f"\n{brief}\n"
-    except Exception:
-        pass
     return f"""User Request: {user_intent}
 
 {mem}

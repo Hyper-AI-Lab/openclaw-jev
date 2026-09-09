@@ -37,8 +37,7 @@ CONVERSATIONAL_DELIVER_STEP = {
     "prompt": (
         "Reply naturally to the user in clear English. "
         "Be concise — one short paragraph for greetings, status updates, or simple chat. "
-        "Do not run broad filesystem scans or codebase exploration unless the user explicitly "
-        "asked for an audit with concrete deliverables."
+        "If RECENT DIALOGUE is present, continue that conversation."
     ),
 }
 

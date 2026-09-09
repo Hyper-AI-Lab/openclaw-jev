@@ -17,7 +17,7 @@ from app.llm.quota_broker import (
 from app.llm.usage_monitor import estimate_tokens, record_request
 
 NVIDIA_API_BASE = "https://integrate.api.nvidia.com/v1"
-DEFAULT_MODEL = "nvidia/nv-embed-v1"
+DEFAULT_MODEL = "nvidia/llama-nemotron-embed-1b-v2"
 
 # Short-lived cache so parallel memory-scope searches for the same query
 # share one NVIDIA embed call instead of N serial embeds.

@@ -43,12 +43,10 @@ def test_decide_completion_gate_skip_quality():
     assert d["action"] == "complete"
 
 
-def test_resolve_generic_profile_summarize():
-    assert resolve_generic_profile("Please summarize the weekly status report") == "summarize"
-
-
-def test_resolve_generic_profile_read_file():
-    assert resolve_generic_profile("read the architecture file") == "memory_first_read"
+def test_resolve_generic_profile_disabled():
+    assert resolve_generic_profile("Please summarize the weekly status report") is None
+    assert resolve_generic_profile("read the architecture file") is None
+    assert resolve_generic_profile("are you here") is None
 
 
 def test_build_generic_execute_prompt_includes_profile_hint():

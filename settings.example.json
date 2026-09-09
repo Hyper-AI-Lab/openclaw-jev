@@ -10,10 +10,10 @@
     "qdrant_host": "127.0.0.1",
     "qdrant_port": 6333,
     "qdrant_path": "/root/.openclaw/rmp/data/qdrant",
-    "collection_name": "rmp_memories",
-    "embedder_provider": "nvidia",
-    "embedder_model": "nvidia/nv-embed-v1",
-    "embedding_dims": 4096,
+    "collection_name": "rmp_memories_openai_3small",
+    "embedder_provider": "openai",
+    "embedder_model": "text-embedding-3-small",
+    "embedding_dims": 1536,
     "semantic_recall_limit": 5
   },
   "telemetry": {
@@ -49,21 +49,23 @@
   },
   "task_registry": {
     "enabled": true,
-    "collection_name": "rmp_task_registry",
+    "collection_name": "rmp_task_registry_openai_3small",
     "intake_mode": "enforce",
     "similarity_threshold": 0.72,
     "intake_confidence_threshold": 65,
     "intake_cache_sec": 60,
-    "intake_llm_timeout_sec": 20,
-    "intake_model": "nvidia/deepseek-ai/deepseek-v4-flash-0731",
+    "intake_llm_timeout_sec": 40,
+    "intake_model": "openai/gpt-5-nano",
     "intake_model_fallbacks": [
       "nvidia/minimaxai/minimax-m3",
-      "nvidia/z-ai/glm-5.2"
+      "nvidia/deepseek-ai/deepseek-v4-flash-0731"
     ],
     "intake_vector_deadline_sec": 10,
     "qdrant_query_timeout_sec": 8,
     "backfill_days": 90,
-    "rework_max_attempts": 3,
+    "rework_max_attempts": 20,
+    "strategy_change_attempt": 10,
+    "escalate_user_attempt": 20,
     "temporal_half_life_days": 30,
     "recurrence_intervals": {
       "heartbeat": 25,

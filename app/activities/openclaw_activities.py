@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +23,7 @@ from app.config import (
     should_send_intermediate_updates,
     should_suspend_slack,
 )
+from app.openclaw_sessions import get_session_entry, iter_session_entries, read_transcript_lines
 from app.llm.quota_broker import (
     assign_openclaw_session_profile,
     is_rate_limit_message,
@@ -64,6 +66,11 @@ def _safe_activity_heartbeat() -> None:
 def _is_rmp_terminal_response(text: str) -> bool:
     """Reject whitespace-only, stub, or missing-eval replies from RMP agent sessions."""
     cleaned = (text or "").strip()
+    first_line = cleaned.split("\n")[0].strip() if cleaned else ""
+    if first_line in {"HEARTBEAT_OK", "CANARY_OK"} or first_line.startswith(
+        ("HEARTBEAT_OK", "CANARY_OK")
+    ):
+        return True
     if len(cleaned) < 10:
         return False
     lower = cleaned.lower()
@@ -74,10 +81,8 @@ def _is_rmp_terminal_response(text: str) -> bool:
         return True
     if re.search(r'"facts"\s*:', cleaned):
         return True
-    if cleaned == "HEARTBEAT_OK" or cleaned.split("\n")[0].strip() == "HEARTBEAT_OK":
-        return True
-    # Conversational Slack replies routed through RMP should be substantive.
-    return len(cleaned) >= 80
+    # RMP still owns delivery; greetings may be a short paragraph.
+    return True
 
 
 class OpenClawError(Exception):
@@ -100,9 +105,6 @@ def _get_slack_user_id(session_key: str) -> str:
     from app.config import get_slack_owner_user_id
 
     try:
-        with open(SESSIONS_JSON_PATH, "r") as f:
-            sessions = json.load(f)
-
         def _from_entry(entry: dict) -> str:
             origin = (entry or {}).get("origin") or {}
             for field in (
@@ -117,13 +119,12 @@ def _get_slack_user_id(session_key: str) -> str:
                     return uid
             return ""
 
-        entry = sessions.get(session_key) or {}
-        uid = _from_entry(entry)
+        uid = _from_entry(get_session_entry(session_key, SESSIONS_JSON_PATH))
         if uid:
             return uid
 
         # Tasks historically stored agent:main:main while Slack lives under slack:channel:*.
-        for key, candidate in sessions.items():
+        for key, candidate in iter_session_entries(SESSIONS_JSON_PATH):
             if "slack" not in str(key).lower():
                 continue
             uid = _from_entry(candidate or {})
@@ -159,6 +160,35 @@ def _jsonl_has_recent_activity(lines: list, start_time: float) -> bool:
         if _parse_msg_timestamp(entry) > start_time:
             return True
     return False
+
+
+def _jsonl_hard_failure(lines: list, start_time: float) -> Optional[str]:
+    """Return the All-models-failed error if the agent already exhausted fallbacks."""
+    last = None
+    for line in lines:
+        try:
+            entry = json.loads(line.strip())
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") != "message":
+            continue
+        if entry.get("message", {}).get("role") != "assistant":
+            continue
+        msg_ts = _parse_msg_timestamp(entry)
+        if msg_ts <= start_time:
+            continue
+        stop_reason = entry.get(
+            "stopReason", entry.get("message", {}).get("stopReason", "")
+        )
+        if stop_reason != "error":
+            continue
+        err_msg = str(entry.get("message", {}).get("errorMessage") or "")
+        if is_rate_limit_message(err_msg):
+            continue
+        blob = (err_msg or _extract_assistant_text(entry) or "").strip()
+        if "all models failed" in blob.lower():
+            last = blob
+    return last
 
 
 def _jsonl_agent_stalled(lines: list, start_time: float) -> bool:
@@ -202,15 +232,9 @@ def _recent_session_ids(
     for sid in (current_session_id, pre_session_id):
         if sid and sid not in ids:
             ids.append(sid)
-    if os.path.exists(SESSIONS_JSON_PATH):
-        try:
-            with open(SESSIONS_JSON_PATH, "r") as f:
-                sessions_data = json.load(f)
-            sid = (sessions_data.get(session_key) or {}).get("sessionId")
-            if sid and sid not in ids:
-                ids.append(sid)
-        except Exception:
-            pass
+    sid = get_session_entry(session_key, SESSIONS_JSON_PATH).get("sessionId")
+    if sid and sid not in ids:
+        ids.append(sid)
     session_dir = os.path.dirname(SESSIONS_JSON_PATH)
     if os.path.isdir(session_dir):
         files = sorted(
@@ -235,11 +259,10 @@ def _poll_session_ids_for_response(
     """Scan multiple session JSONL files for a terminal reply."""
     for sid in session_ids:
         jsonl_path = os.path.join(OPENCLAW_HOME, "agents", "main", "sessions", f"{sid}.jsonl")
-        if not os.path.exists(jsonl_path):
+        lines = read_transcript_lines(sid)
+        if not lines:
             continue
         try:
-            with open(jsonl_path, "r") as f:
-                lines = f.readlines()
             text_content, stop_reason, _ = _poll_jsonl_for_response(
                 jsonl_path, start_time, lines
             )
@@ -350,6 +373,7 @@ async def _dispatch_openclaw_session(
         "deliver": False,
         # Trusted RMP-owned sessions — avoid OpenClaw EXTERNAL wrap (NO_REPLY on JSON).
         "allowUnsafeExternalContent": True,
+        "sessionMode": "persistent",
     }
     if model:
         hook_payload["model"] = model
@@ -375,22 +399,16 @@ async def _dispatch_openclaw_session(
             session_key=internal_session_key,
             settings=settings,
             heartbeat=activity.heartbeat,
+            model=model,
         )
         try:
             record_request(profile_id, "openclaw_hook")
             start_time = poll_start_time
 
             # Snapshot before dispatch — new OpenClaw may create sessionId during POST.
-            pre_session_id = None
-            if os.path.exists(SESSIONS_JSON_PATH):
-                try:
-                    with open(SESSIONS_JSON_PATH, "r") as f:
-                        pre_data = json.load(f)
-                    pre_session_id = (pre_data.get(internal_session_key) or {}).get(
-                        "sessionId"
-                    )
-                except Exception:
-                    pass
+            pre_session_id = get_session_entry(
+                internal_session_key, SESSIONS_JSON_PATH
+            ).get("sessionId")
 
             async with httpx.AsyncClient() as client:
                 last_err = None
@@ -428,35 +446,32 @@ async def _dispatch_openclaw_session(
             session_id = None
             for _ in range(60):
                 _safe_activity_heartbeat()
-                if os.path.exists(SESSIONS_JSON_PATH):
-                    try:
-                        with open(SESSIONS_JSON_PATH, "r") as f:
-                            sessions_data = json.load(f)
-                        if internal_session_key in sessions_data:
-                            entry = sessions_data[internal_session_key] or {}
-                            candidate = entry.get("sessionId")
-                            if candidate and candidate != pre_session_id:
-                                session_id = candidate
-                                break
-                            if candidate and not pre_session_id:
-                                session_id = candidate
-                                break
-                            # Session key reused with same sessionId (common on OpenClaw 2026.7+).
-                            if candidate and (
-                                entry.get("status") == "running"
-                                or float(entry.get("updatedAt") or 0) >= start_time
-                            ):
-                                session_id = candidate
-                                break
-                    except Exception:
-                        pass
+                entry = get_session_entry(internal_session_key, SESSIONS_JSON_PATH)
+                if entry:
+                    candidate = entry.get("sessionId")
+                    if candidate and candidate != pre_session_id:
+                        session_id = candidate
+                        break
+                    if candidate and not pre_session_id:
+                        session_id = candidate
+                        break
+                    # Session key reused with same sessionId (common on OpenClaw 2026.7+).
+                    if candidate and (
+                        entry.get("status") == "running"
+                        or float(entry.get("updatedAt") or 0) >= start_time
+                    ):
+                        session_id = candidate
+                        break
                 await asyncio.sleep(1)
 
             if not session_id:
                 raise OpenClawError("Could not find session ID for internal execution.")
 
-            # Pin NVIDIA profile after the session exists (safe on OpenClaw 2026.7+).
-            assign_openclaw_session_profile(internal_session_key, profile_id)
+            # Pin NVIDIA profile only for nvidia/* models (never openai/gpt-5-nano).
+            from app.llm.model_policy import should_pin_nvidia_profile
+
+            if should_pin_nvidia_profile(model, profile_id):
+                assign_openclaw_session_profile(internal_session_key, profile_id)
 
             jsonl_path = os.path.join(OPENCLAW_HOME, "agents", "main", "sessions", f"{session_id}.jsonl")
             seen_session_ids: List[str] = []
@@ -471,22 +486,16 @@ async def _dispatch_openclaw_session(
                 await _maybe_touch_liveness()
                 if session_id and session_id not in seen_session_ids:
                     seen_session_ids.append(session_id)
-                if os.path.exists(SESSIONS_JSON_PATH):
-                    try:
-                        with open(SESSIONS_JSON_PATH, "r") as f:
-                            sessions_data = json.load(f)
-                        latest = (sessions_data.get(internal_session_key) or {}).get(
-                            "sessionId"
-                        )
-                        if latest and latest != session_id:
-                            session_id = latest
-                            jsonl_path = (
-                                os.path.join(OPENCLAW_HOME, "agents", "main", "sessions", f"{session_id}.jsonl")
-                            )
-                            if session_id not in seen_session_ids:
-                                seen_session_ids.append(session_id)
-                    except Exception:
-                        pass
+                latest = get_session_entry(
+                    internal_session_key, SESSIONS_JSON_PATH
+                ).get("sessionId")
+                if latest and latest != session_id:
+                    session_id = latest
+                    jsonl_path = (
+                        os.path.join(OPENCLAW_HOME, "agents", "main", "sessions", f"{session_id}.jsonl")
+                    )
+                    if session_id not in seen_session_ids:
+                        seen_session_ids.append(session_id)
                 if time.time() > poll_deadline - 30 and not text_content:
                     fallback_ids = _recent_session_ids(
                         internal_session_key,
@@ -513,10 +522,12 @@ async def _dispatch_openclaw_session(
                             session_key=internal_session_key,
                         )
                         return fb_text
-                if os.path.exists(jsonl_path):
+                lines = read_transcript_lines(session_id) if session_id else []
+                if lines:
                     try:
-                        with open(jsonl_path, "r") as f:
-                            lines = f.readlines()
+                        hard_fail = _jsonl_hard_failure(lines, start_time)
+                        if hard_fail:
+                            raise OpenClawError(hard_fail)
                         text_content, stop_reason, rate_err = _poll_jsonl_for_response(
                             jsonl_path, start_time, lines
                         )
@@ -585,7 +596,7 @@ async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
     task_id = payload.get("task_id", "unknown")
     internal_session_key = f"agent:main:rmp_task_{task_id}"
     message = payload.get("message", "") + "\n\n[INTERNAL_RMP]"
-    # User-facing / plan execute turns use MiniMax primary unless caller overrides.
+    # User-facing / plan execute turns use policy primary unless caller overrides.
     model = payload.get("model") or get_primary_agent_model()
 
     text_content = await _dispatch_openclaw_session(
@@ -732,56 +743,24 @@ async def check_intermediate_updates_enabled(payload: Dict[str, Any]) -> bool:
 
 @traced_activity("openclaw.verify_quality")
 async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, str]:
+    from app.orchestrator.process_evaluator import (
+        build_evaluator_prompt,
+        parse_evaluator_response,
+        persist_evaluator_verdict,
+    )
+    from app.orchestrator.evaluator_tools import collect_situational_context
+
+    enriched = dict(payload)
+    try:
+        enriched["situational_tools"] = await collect_situational_context(payload)
+    except Exception:
+        enriched["situational_tools"] = "(situational tools unavailable)"
+    verification_prompt = build_evaluator_prompt(enriched)
     task_id = payload.get("task_id", "unknown")
-    user_intent = payload.get("user_intent", "")
-    agent_response = payload.get("agent_response", "")
-
-    verification_prompt = f"""You are a QUALITY REVIEWER. Critically evaluate whether the response CORRECTLY and COMPLETELY answers the user's original question.
-
-ORIGINAL USER QUESTION:
-{user_intent}
-
-AGENT'S RESPONSE:
-{agent_response}
-
-REVIEW CHECKLIST:
-1. Does the response actually answer what was asked?
-2. Are names, URLs, and references accurate?
-3. Is the information complete?
-4. Are there factual errors or entity confusion (e.g. Moltbook vs MoltMarket)?
-
-Mark FAIL only for MATERIAL problems. If substantially correct, return PASS.
-
-Respond with ONLY JSON:
-{{"quality": "pass", "reason": "brief explanation"}}
-or
-{{"quality": "fail", "issues": "specific description"}}
-
-[INTERNAL_RMP]"""
-
     response = await _execute_on_internal_session(task_id, verification_prompt)
-
-    for pattern in [r"(\{[^{}]*\"quality\"[^{}]*\})"]:
-        match = re.search(pattern, response, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(1))
-                quality = parsed.get("quality", "pass")
-                if quality == "fail":
-                    return {
-                        "quality": "fail",
-                        "issues": parsed.get("issues", "Quality check found issues."),
-                    }
-                return {"quality": "pass", "reason": parsed.get("reason", "")}
-            except json.JSONDecodeError:
-                pass
-
-    if "fail" in response.lower() and any(
-        w in response.lower() for w in ("issue", "incorrect", "wrong")
-    ):
-        return {"quality": "fail", "issues": "Verification flagged potential issues."}
-
-    return {"quality": "pass", "reason": "No issues detected."}
+    result = parse_evaluator_response(response)
+    await persist_evaluator_verdict(payload, result)
+    return result
 
 
 async def _execute_on_internal_session(task_id: str, message: str) -> str:
@@ -807,9 +786,11 @@ async def _execute_intake_llm(intake_id: str, prompt: str) -> str:
         models = [None]
     last = "Error: intake LLM failed"
     for idx, model in enumerate(models):
-        # Distinct session keys avoid sticky session modelOverride across retries.
+        # Distinct session keys avoid sticky session modelOverride and poisoned
+        # transcripts from a prior failed intake of the same fingerprint.
+        nonce = uuid.uuid4().hex[:8]
         suffix = "" if idx == 0 else f"_fb{idx}"
-        internal_session_key = f"agent:main:rmp_intake_{intake_id}{suffix}"
+        internal_session_key = f"agent:main:rmp_intake_{intake_id}_{nonce}{suffix}"
         try:
             text = await _dispatch_openclaw_session(
                 internal_session_key,
@@ -825,7 +806,17 @@ async def _execute_intake_llm(intake_id: str, prompt: str) -> str:
             )
             continue
         if text and not str(text).strip().lower().startswith("error:"):
-            return text
+            from app.task_registry.intake_prompt import parse_intake_response
+
+            parsed = parse_intake_response(text)
+            if parsed.get("rationale") != "Failed to parse intake JSON":
+                return text
+            last = text
+            activity.logger.warning(
+                "intake LLM model %s returned unparseable JSON; trying next",
+                model or "default",
+            )
+            continue
         last = text or last
         activity.logger.warning(
             "intake LLM model %s returned unusable reply; trying next",

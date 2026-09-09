@@ -48,6 +48,26 @@ function isLikelyTimeoutError(err) {
   return /max-time|timed?\s*out|ETIMEDOUT|timeout/i.test(msg) || /Command failed:[\s\S]*--max-time/i.test(msg);
 }
 
+/** RMP chat.postMessage without Aura. Fail closed if this also fails. */
+function notifyRmpUser(sessionKey, reason, content) {
+  try {
+    const idem = crypto.createHash('sha256')
+      .update(`${sessionKey}:${reason}:${content || ''}`)
+      .digest('hex')
+      .slice(0, 32);
+    rmpFetchSync('POST', '/api/notify-user', {
+      session_key: sessionKey,
+      reason,
+      idempotency_key: idem,
+    }, { maxTimeSec: 10 });
+    log(`RMP user notice sent (${reason}) on ${sessionKey}`);
+    return true;
+  } catch (e) {
+    log(`RMP user notice failed (${reason}): ${e.message}`);
+    return false;
+  }
+}
+
 /** Synchronous RMP HTTP — before_message_write must not return a Promise. */
 function rmpFetchSync(method, urlPath, body, opts) {
   const key = getApiKey();
@@ -90,7 +110,76 @@ function extractText(msg) {
 }
 
 function isStopCommand(intent) {
-  return /\b(stop|abort|cancel|halt)\b/i.test(intent);
+  const t = String(intent || '').trim();
+  return /^(?:[.!?,:;]+\s*)?(?:please\s+)?(stop|abort|cancel|halt)(?:[.!?]*)?$/i.test(t);
+}
+
+function isSlackConversationKey(sessionKey) {
+  return String(sessionKey || '').includes('slack:');
+}
+
+const SESSIONS_JSON = '/root/.openclaw/agents/main/sessions/sessions.json';
+const AGENT_SQLITE = '/root/.openclaw/agents/main/agent/openclaw-agent.sqlite';
+let _slackKeyCache = { key: '', ts: 0 };
+
+function findSlackSessionKeyFromStore() {
+  const now = Date.now();
+  if (_slackKeyCache.key && now - _slackKeyCache.ts < 60000) {
+    return _slackKeyCache.key;
+  }
+  let found = '';
+  try {
+    const store = JSON.parse(fs.readFileSync(SESSIONS_JSON, 'utf8'));
+    const keys = Object.keys(store).filter((k) => k.includes('slack:channel:'));
+    keys.sort((a, b) => {
+      const da = a.toLowerCase().includes('slack:channel:d') ? 0 : 1;
+      const db = b.toLowerCase().includes('slack:channel:d') ? 0 : 1;
+      return da - db;
+    });
+    found = keys[0] || '';
+  } catch (_) {}
+  if (!found) {
+    try {
+      const py = [
+        'import sqlite3,sys',
+        'con=sqlite3.connect(sys.argv[1])',
+        "rows=con.execute(\"select session_key from session_nodes where session_key like '%slack:channel:%'\").fetchall()",
+        'keys=[r[0] for r in rows]',
+        'keys.sort(key=lambda k: (0 if "slack:channel:d" in k.lower() else 1, k.lower()))',
+        'print(keys[0] if keys else "")',
+      ].join('\n');
+      found = String(execFileSync('python3', ['-c', py, AGENT_SQLITE], {
+        encoding: 'utf8',
+        timeout: 4000,
+      })).trim();
+    } catch (_) {
+      found = '';
+    }
+  }
+  if (found) _slackKeyCache = { key: found, ts: now };
+  return found;
+}
+
+function pickSlackSessionKey(event, ctx) {
+  const candidates = [
+    event && event.sessionKey,
+    ctx && ctx.sessionKey,
+    event && event.metadata && event.metadata.sessionKey,
+    ctx && ctx.origin && ctx.origin.sessionKey,
+  ];
+  const slack = candidates.filter((k) => isSlackConversationKey(k));
+  slack.sort((a, b) => {
+    const da = String(a).toLowerCase().includes('slack:channel:d') ? 0 : 1;
+    const db = String(b).toLowerCase().includes('slack:channel:d') ? 0 : 1;
+    return da - db;
+  });
+  if (slack[0]) return String(slack[0]);
+  const fromStore = findSlackSessionKeyFromStore();
+  if (fromStore) return fromStore;
+  for (const k of candidates) {
+    if (k) return String(k);
+  }
+  return 'agent:main:main';
 }
 
 function isHeartbeatMessage(text) {
@@ -172,7 +261,7 @@ function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeat
     idemKey = crypto.createHash('sha256').update(`${sessionKey}:${rawText || intent}`).digest('hex');
   }
   const data = rmpFetchSync('POST', '/tasks', {
-    intent: intent.substring(0, 500),
+    intent: (rawText || intent || "").slice(0, 20000),
     tags: tags || ['user-request'],
     user_id: 'slack_user',
     session_key: sessionKey,
@@ -186,6 +275,14 @@ function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeat
   }
   if (data.intake_action === 'wait_active') {
     log(`INTAKE wait_active on task ${data.task_id}`);
+    return data;
+  }
+  if (data.intake_action === 'clarify') {
+    log(`INTAKE clarify on task ${data.task_id} (no Aura yet)`);
+    return data;
+  }
+  if (data.intake_action === 'resume_clarify') {
+    log(`INTAKE resume_clarify on task ${data.task_id} workflow=${!!data.workflow_started}`);
     return data;
   }
   if (data.intake_action === 'attach_active') {
@@ -220,16 +317,20 @@ function routeSlackDmToRmp(content, sessionKey) {
 
   if (isStopCommand(intent)) {
     try {
-      const activeData = rmpFetchSync('GET', `/sessions/${encodeURIComponent(sessionKey)}/active_task`);
+      const activeData = rmpFetchSync('GET', `/sessions/${encodeURIComponent(sessionKey)}/active_user_task`);
       if (activeData.active_task?.id) {
         rmpFetchSync('POST', `/tasks/${activeData.active_task.id}/signal`, {
           signal_type: 'user_input',
           message: intent,
         });
         log(`SIGNALED stop to task ${activeData.active_task.id}`);
+      } else {
+        notifyRmpUser(sessionKey, 'stop_idle', intent);
+        log(`Stop with no active task; RMP ack on ${sessionKey}`);
       }
     } catch (e) {
       log(`Signal error: ${e.message}`);
+      notifyRmpUser(sessionKey, 'intake_unavailable', intent);
       throw e;
     }
     return true;
@@ -268,6 +369,7 @@ function routeSlackDmToRmp(content, sessionKey) {
         } catch (_) {}
       }
     }
+    notifyRmpUser(sessionKey, 'intake_unavailable', intent);
     throw e;
   }
 }
@@ -275,20 +377,33 @@ function routeSlackDmToRmp(content, sessionKey) {
 /** Recent Slack DMs claimed by inbound_claim — avoid double POST from message_received. */
 const claimedSlackKeys = new Map();
 function markSlackClaimed(sessionKey, content) {
-  const key = `${sessionKey}::${crypto.createHash('sha256').update(content || '').digest('hex')}`;
-  claimedSlackKeys.set(key, Date.now());
-  if (claimedSlackKeys.size > 200) {
+  const fp = crypto.createHash('sha256').update(content || '').digest('hex');
+  const now = Date.now();
+  const aliases = new Set([sessionKey, 'agent:main:main']);
+  const discovered = findSlackSessionKeyFromStore();
+  if (discovered) aliases.add(discovered);
+  for (const alias of aliases) {
+    claimedSlackKeys.set(`${alias}::${fp}`, now);
+  }
+  if (claimedSlackKeys.size > 400) {
     const cutoff = Date.now() - 10 * 60 * 1000;
     for (const [k, ts] of claimedSlackKeys) {
       if (ts < cutoff) claimedSlackKeys.delete(k);
     }
   }
-  return key;
+  return `${sessionKey}::${fp}`;
 }
 function wasSlackClaimed(sessionKey, content) {
-  const key = `${sessionKey}::${crypto.createHash('sha256').update(content || '').digest('hex')}`;
-  const ts = claimedSlackKeys.get(key);
-  return Boolean(ts && Date.now() - ts < 10 * 60 * 1000);
+  const fp = crypto.createHash('sha256').update(content || '').digest('hex');
+  const aliases = new Set([sessionKey, 'agent:main:main']);
+  const discovered = findSlackSessionKeyFromStore();
+  if (discovered) aliases.add(discovered);
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const alias of aliases) {
+    const ts = claimedSlackKeys.get(`${alias}::${fp}`);
+    if (ts && ts >= cutoff) return true;
+  }
+  return false;
 }
 
 function isMainChatSession(sessionKey) {
@@ -355,7 +470,7 @@ function pinSessionProfile(sessionKey, profileId) {
 
 function reserveLlmSlot(sessionKey) {
   const data = rmpFetchSync('POST', '/api/llm/reserve', { session_key: sessionKey });
-  if (data.profile_id && sessionKey) {
+  if (data.pin_session && data.profile_id && sessionKey) {
     pinSessionProfile(sessionKey, data.profile_id);
   }
   return data;
@@ -437,7 +552,7 @@ module.exports = {
             intent: params.intent,
             tags: params.tags || [],
             user_id: context?.session?.origin?.from || 'unknown',
-            session_key: context?.sessionKey || 'agent:main:main',
+            session_key: pickSlackSessionKey({}, context) || context?.sessionKey || 'agent:main:main',
             raw_text: params.intent
           });
           return `Task created: ${result.task_id}`;
@@ -474,7 +589,7 @@ module.exports = {
         const content = String(event?.content || event?.body || '').trim();
         if (!content) return;
         if (channel !== 'slack' && !channel.includes('slack')) return;
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || 'agent:main:main';
+        const sessionKey = pickSlackSessionKey(event, ctx);
         log(`inbound_claim slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
         routeSlackDmToRmp(content, sessionKey);
         markSlackClaimed(sessionKey, content);
@@ -483,7 +598,7 @@ module.exports = {
         // Fail closed: still claim the turn so native OpenClaw cannot answer.
         log(`inbound_claim route error (still claiming; no native): ${e.message}`);
         try {
-          const sessionKey = event?.sessionKey || ctx?.sessionKey || 'agent:main:main';
+          const sessionKey = pickSlackSessionKey(event, ctx);
           const content = String(event?.content || event?.body || '').trim();
           if (content) markSlackClaimed(sessionKey, content);
         } catch (_) {}
@@ -498,7 +613,7 @@ module.exports = {
         const content = String(event?.content || event?.body || '').trim();
         if (!content) return;
         if (channel !== 'slack' && !channel.includes('slack')) return;
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || 'agent:main:main';
+        const sessionKey = pickSlackSessionKey(event, ctx);
         if (wasSlackClaimed(sessionKey, content)) {
           log(`before_dispatch: already claimed by inbound_claim on ${sessionKey}`);
           return { handled: true };
@@ -511,7 +626,7 @@ module.exports = {
       } catch (e) {
         log(`before_dispatch route error (still claiming; no native): ${e.message}`);
         try {
-          const sessionKey = event?.sessionKey || ctx?.sessionKey || 'agent:main:main';
+          const sessionKey = pickSlackSessionKey(event, ctx);
           const content = String(event?.content || event?.body || '').trim();
           if (content) markSlackClaimed(sessionKey, content);
         } catch (_) {}
@@ -528,7 +643,7 @@ module.exports = {
         if (!content) return;
         const isSlack = provider === 'slack' || provider.includes('slack');
         if (!isSlack) return;
-        const sessionKey = ctx?.sessionKey || meta.sessionKey || 'agent:main:main';
+        const sessionKey = pickSlackSessionKey(event, ctx);
         if (wasSlackClaimed(sessionKey, content)) {
           log(`message_received skip (already claimed) on ${sessionKey}`);
           return;
@@ -652,7 +767,7 @@ module.exports = {
             }
             createRmpTaskFromInbound({
               sessionKey,
-              intent: intent.substring(0, 500),
+              intent: (intent || "").slice(0, 20000),
               tags: isCron ? ['cron'] : isHeartbeat ? ['heartbeat'] : ['user-request'],
               rawText: intent,
               heartbeatKey: idemKey,
@@ -704,26 +819,30 @@ module.exports = {
 
     // Balanced NVIDIA key rotation + concurrency cap for gateway agent runs.
     // RMP-owned sessions (rmp_task_*/rmp_verify_*/rmp_intake_*) reserve/release inside the worker.
-    api.on('before_agent_start', async (event, ctx) => {
+    api.on('before_agent_run', async (event, ctx) => {
       const sessionKey = ctx?.sessionKey || '';
       const trigger = ctx?.trigger || '';
       if (!sessionKey || sessionKey.includes('rmp_task_') || sessionKey.includes('rmp_verify_') || sessionKey.includes('rmp_intake_')) {
-        return;
+        return { outcome: 'pass' };
       }
       if (trigger === 'heartbeat') {
         log(`SKIP LLM reserve for heartbeat on ${sessionKey}`);
-        return;
+        return { outcome: 'pass' };
       }
       if (isRmpOwnedSlackSession(sessionKey) && !isDevSuspended()) {
         log(`SKIP LLM reserve on Slack/main session (RMP owns Slack path): ${sessionKey}`);
-        return;
+        return { outcome: 'pass' };
       }
       try {
         const data = await rmpFetch('POST', '/api/llm/reserve', { session_key: sessionKey });
+        if (data.pin_session && data.profile_id) {
+          pinSessionProfile(sessionKey, data.profile_id);
+        }
         log(`Reserved ${data.profile_id} for ${sessionKey} (${data.orchestration?.active_slots || '?'}/${data.orchestration?.max_concurrent || '?'} slots)`);
       } catch (e) {
         log(`LLM reserve failed for ${sessionKey}: ${e.message}`);
       }
+      return { outcome: 'pass' };
     }, { priority: 110 });
 
     api.on('agent_end', async (event, ctx) => {

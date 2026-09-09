@@ -15,6 +15,50 @@ from app.config import get_task_registry_config
 from app.db.database import AsyncSessionLocal, engine
 from app.db.models import Task, TaskRegistryEntry
 from app.task_registry.indexer import index_terminal_task, TERMINAL_STATUSES
+from app.task_registry.vector_store import upsert_task_vector
+
+
+async def _reembed_existing(limit: int | None) -> int:
+    async with AsyncSessionLocal() as db:
+        q = select(TaskRegistryEntry).order_by(TaskRegistryEntry.indexed_at.desc())
+        if limit is not None and limit > 0:
+            q = q.limit(limit)
+        rows = (await db.execute(q)).scalars().all()
+    print(f"Backfill start: mode=reembed candidates={len(rows)}", flush=True)
+    indexed = 0
+    errors = 0
+    for i, row in enumerate(rows, 1):
+        try:
+            point = upsert_task_vector(
+                row.task_id,
+                {
+                    "intent_snippet": row.intent_snippet,
+                    "outcome_summary": row.outcome_summary,
+                    "process_type": row.process_type,
+                    "terminal_status": row.terminal_status,
+                    "task_kind": row.task_kind,
+                    "recurrence_key": row.recurrence_key,
+                    "session_key": row.session_key,
+                },
+            )
+            if point:
+                indexed += 1
+            else:
+                errors += 1
+            if i % 25 == 0 or i == len(rows):
+                print(
+                    f"progress {i}/{len(rows)} indexed={indexed} errors={errors}",
+                    flush=True,
+                )
+        except Exception as exc:
+            errors += 1
+            print(f"FAIL {row.task_id}: {exc}", file=sys.stderr, flush=True)
+    print(
+        f"Backfill complete: scanned={len(rows)} indexed={indexed} errors={errors}",
+        flush=True,
+    )
+    await engine.dispose()
+    return 0 if errors == 0 else 1
 
 
 async def _missing_task_ids(cutoff: datetime, limit: int | None) -> list[str]:
@@ -71,12 +115,20 @@ async def main() -> int:
         help="Max tasks to process (0 = no limit)",
     )
     parser.add_argument(
+        "--reembed",
+        action="store_true",
+        help="Re-embed existing registry summaries into the live Qdrant collection",
+    )
+    parser.add_argument(
         "--sleep-sec",
         type=float,
         default=0.0,
         help="Pause between successful indexes (quota pacing)",
     )
     args = parser.parse_args()
+
+    if args.reembed:
+        return await _reembed_existing(limit=args.limit if args.limit > 0 else None)
 
     cfg = get_task_registry_config()
     days = int(cfg.get("backfill_days", 90))

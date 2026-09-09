@@ -90,8 +90,13 @@ def decide_completion_gate(
             "action": "retry",
             "reason": f"Evidence check failed: {'; '.join(evidence_issues)}",
         }
-    if skip_quality_llm or quality_passed is None:
+    if skip_quality_llm:
         return {"action": "complete", "reason": "Evidence passed (quality LLM skipped)"}
+    if quality_passed is None:
+        return {
+            "action": "retry",
+            "reason": "Evaluator error: missing quality verdict (fail closed)",
+        }
     if quality_passed is False:
         return {
             "action": "retry",

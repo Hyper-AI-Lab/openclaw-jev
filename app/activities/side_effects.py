@@ -83,6 +83,32 @@ async def send_slack_message_idempotent(
                     "slack",
                     {"task_id": task_id, "user_id": user_id},
                 )
+                try:
+                    from app.db.models import Event, TaskMessage
+                    import uuid as _uuid
+
+                    async with AsyncSessionLocal() as db:
+                        db.add(
+                            Event(
+                                correlation_id=task_id,
+                                entity_type="task",
+                                entity_id=task_id,
+                                event_type="slack.delivered",
+                                event_payload={"user_id": user_id},
+                            )
+                        )
+                        db.add(
+                            TaskMessage(
+                                id=str(_uuid.uuid4()),
+                                task_id=task_id,
+                                role="assistant",
+                                content=message[:4000],
+                                source="slack",
+                            )
+                        )
+                        await db.commit()
+                except Exception as exc:
+                    logger.debug("Slack ledger write skipped: %s", exc)
                 return True
             logger.warning("Slack API error: %s", data.get("error"))
             return False

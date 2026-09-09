@@ -23,12 +23,22 @@ with workflow.unsafe.imports_passed_through():
         record_event,
         update_process_state,
         update_task_status,
-        write_episodic_observation,
     )
-    from app.evidence import check_evidence, evidence_high_confidence
-    from app.orchestrator.completion_rework import build_rework_prompt, get_rework_max_attempts
+    from app.evidence import check_evidence
+    from app.orchestrator.process_brief import (
+        compose_executor_memory,
+        ensure_brief_header,
+        format_user_catchup,
+    )
     from app.orchestrator.decision_engine import decide_completion_gate
+    from app.orchestrator.completion_rework import (
+        build_escalation_message,
+        build_rework_prompt,
+        build_strategy_change_prompt,
+        next_loop_action,
+    )
     from app.workflows.generic_execute_child import GenericExecuteChildWorkflow
+    from app.task_registry.stop_command import is_whole_message_stop
     from app.notification_policy import (
         format_workflow_error,
         is_internal_task,
@@ -65,6 +75,7 @@ class GenericTaskWorkflow:
         self._approved: bool = False
         self._spawn_leg_requested: bool = False
         self._spawn_leg_payload: Dict[str, Any] = {}
+        self._catchup_chunks: List[str] = []
 
     @workflow.signal
     def user_input(self, message: str) -> None:
@@ -143,9 +154,14 @@ class GenericTaskWorkflow:
                 payload.get("tags") or [],
                 generic_profile,
                 initial_memory_block=payload.get("initial_memory_block"),
-                rework_max_attempts=int(payload.get("rework_max_attempts") or 3),
+                rework_max_attempts=int(payload.get("rework_max_attempts") or 20),
                 user_time_block=user_time_block,
                 execution_mode=execution_mode,
+                attempt_policy={
+                    "max_attempts": int(payload.get("rework_max_attempts") or 20),
+                    "strategy_change_attempt": int(payload.get("strategy_change_attempt") or 10),
+                    "escalate_user_attempt": int(payload.get("escalate_user_attempt") or 20),
+                },
             )
         except Exception as e:
             await workflow.execute_activity(
@@ -195,9 +211,14 @@ class GenericTaskWorkflow:
                     payload.get("tags") or [],
                     generic_profile,
                     initial_memory_block=payload.get("initial_memory_block"),
-                    rework_max_attempts=int(payload.get("rework_max_attempts") or 3),
+                    rework_max_attempts=int(payload.get("rework_max_attempts") or 20),
                     user_time_block=user_time_block,
                     execution_mode=execution_mode,
+                    attempt_policy={
+                        "max_attempts": int(payload.get("rework_max_attempts") or 20),
+                        "strategy_change_attempt": int(payload.get("strategy_change_attempt") or 10),
+                        "escalate_user_attempt": int(payload.get("escalate_user_attempt") or 20),
+                    },
                 )
             except Exception as e:
                 err_text = format_workflow_error(e)
@@ -238,9 +259,10 @@ class GenericTaskWorkflow:
         tags: List[str],
         generic_profile: str | None,
         initial_memory_block: str | None = None,
-        rework_max_attempts: int = 3,
+        rework_max_attempts: int = 20,
         user_time_block: str = "",
         execution_mode: str = "",
+        attempt_policy: Dict[str, int] | None = None,
     ) -> Dict[str, Any]:
         plan_result = await workflow.execute_activity(
             generate_process_plan,
@@ -274,18 +296,34 @@ class GenericTaskWorkflow:
             memory_payload["skip_vector"] = True
         else:
             memory_payload["semantic_query"] = user_intent[:300]
-        memory_block = (initial_memory_block or "").strip()
-        if not memory_block:
-            memory_block = await workflow.execute_activity(
-                build_process_memory_context,
-                memory_payload,
-                start_to_close_timeout=timedelta(seconds=120),
-            )
+        memory_fetched = await workflow.execute_activity(
+            build_process_memory_context,
+            memory_payload,
+            start_to_close_timeout=timedelta(seconds=120),
+        )
+        memory_block = compose_executor_memory(
+            ensure_brief_header(initial_memory_block or ""),
+            memory_fetched,
+        )
 
         for plan_step in steps:
             step_name = plan_step.get("name", "execute")
             predicate_id = plan_step.get("predicate_id", "generic_deliver")
             step_prompt = plan_step.get("prompt", "")
+            while self.user_inputs:
+                reply = self.user_inputs.pop(0).strip()
+                if is_whole_message_stop(reply):
+                    await workflow.execute_activity(
+                        update_task_status,
+                        {"task_id": task_id, "status": "stopped_by_user"},
+                        start_to_close_timeout=timedelta(seconds=10),
+                    )
+                    return {"status": "stopped_by_user", "task_id": task_id}
+                if reply:
+                    self._catchup_chunks.append(reply)
+            if self._catchup_chunks:
+                step_context += "\n" + format_user_catchup(self._catchup_chunks)
+                self._catchup_chunks.clear()
             for attempt in range(1, 4):
                 result = await workflow.execute_child_workflow(
                     GenericExecuteChildWorkflow.run,
@@ -315,10 +353,14 @@ class GenericTaskWorkflow:
                     step_context += f"\n[{step_name}]: {text[:500]}"
                     final_text = text
                     if not is_conversational:
-                        memory_block = await workflow.execute_activity(
+                        memory_fetched = await workflow.execute_activity(
                             build_process_memory_context,
                             memory_payload,
                             start_to_close_timeout=timedelta(seconds=120),
+                        )
+                        memory_block = compose_executor_memory(
+                            ensure_brief_header(initial_memory_block or ""),
+                            memory_fetched,
                         )
                     break
                 if status in ("failed", "blocked"):
@@ -348,6 +390,17 @@ class GenericTaskWorkflow:
                             start_to_close_timeout=timedelta(seconds=10),
                         )
                         await workflow.wait_condition(lambda: len(self.user_inputs) > 0)
+                        if self.user_inputs:
+                            reply = self.user_inputs.pop(0).strip()
+                            if is_whole_message_stop(reply):
+                                await workflow.execute_activity(
+                                    update_task_status,
+                                    {"task_id": task_id, "status": "stopped_by_user"},
+                                    start_to_close_timeout=timedelta(seconds=10),
+                                )
+                                return {"status": "stopped_by_user", "task_id": task_id}
+                            if reply:
+                                step_context += "\n" + format_user_catchup([reply])
                         continue
                     break
 
@@ -360,72 +413,29 @@ class GenericTaskWorkflow:
             extracted.get("body") or raw_result
         )
 
-        if is_conversational and clean_result.strip():
-            # Slack first (perceived latency); status/memory afterward (fail-soft).
-            if not is_internal_task(user_intent, task_type, tags):
-                await workflow.execute_activity(
-                    notify_slack_user,
-                    {
-                        "session_key": session_key,
-                        "task_id": task_id,
-                        "intent": user_intent,
-                        "task_type": task_type,
-                        "tags": tags,
-                        "message": clean_result[:3000],
-                    },
-                    start_to_close_timeout=timedelta(seconds=30),
-                )
-            await workflow.execute_activity(
-                update_process_state,
-                {
-                    "process_run_id": self.process_run_id,
-                    "state": "completed",
-                    "ended": True,
-                },
-                start_to_close_timeout=timedelta(seconds=10),
-            )
-            await workflow.execute_activity(
-                update_task_status,
-                {"task_id": task_id, "status": "completed"},
-                start_to_close_timeout=timedelta(seconds=10),
-            )
-            await workflow.execute_activity(
-                write_episodic_observation,
-                {
-                    "process_run_id": self.process_run_id,
-                    "task_id": task_id,
-                    "text": clean_result[:4000],
-                },
-                start_to_close_timeout=timedelta(seconds=90),
-                retry_policy=RetryPolicy(maximum_attempts=1),
-            )
-            await workflow.execute_activity(
-                promote_completion_memory,
-                {
-                    "process_run_id": self.process_run_id,
-                    "process_type": task_type,
-                    "task_id": task_id,
-                    "content": clean_result[:3000],
-                },
-                start_to_close_timeout=timedelta(seconds=30),
-            )
-            return {"status": "completed", "task_id": task_id, "final_result": clean_result}
-
-        if task_type == "canary":
+        policy = attempt_policy or {
+            "max_attempts": int(rework_max_attempts or 20),
+            "strategy_change_attempt": 10,
+            "escalate_user_attempt": 20,
+        }
+        if task_type == "canary" or "canary" in {t.lower() for t in tags}:
             max_rework = 0
         else:
-            max_rework = rework_max_attempts
+            max_rework = int(policy["max_attempts"])
         for rework_attempt in range(1, max_rework + 1):
             evidence = check_evidence(user_intent, clean_result)
-            skip_quality = evidence_high_confidence(user_intent, clean_result)
-            quality = {"quality": "pass"}
+            skip_quality = is_internal_task(user_intent, task_type, tags)
+            quality = {"quality": "pass", "verdict": "accept"}
             if not skip_quality:
                 quality = await workflow.execute_activity(
                     verify_response_quality,
                     {
                         "task_id": task_id,
                         "user_intent": user_intent,
-                        "agent_response": clean_result[:2000],
+                        "agent_response": clean_result[:4000],
+                        "process_run_id": self.process_run_id,
+                        "attempt": rework_attempt,
+                        "process_brief": initial_memory_block or "",
                     },
                     start_to_close_timeout=timedelta(minutes=5),
                     retry_policy=RetryPolicy(maximum_attempts=1),
@@ -439,7 +449,15 @@ class GenericTaskWorkflow:
             )
             if gate["action"] == "complete":
                 break
-            if rework_attempt >= max_rework:
+            action = next_loop_action(rework_attempt, policy)
+            if action == "escalate_user":
+                diag = build_escalation_message(
+                    user_intent,
+                    clean_result,
+                    evidence_issues=evidence.get("issues"),
+                    quality_issues=quality.get("issues", ""),
+                    attempts=rework_attempt,
+                )
                 await workflow.execute_activity(
                     finalize_task_failure,
                     {
@@ -456,17 +474,37 @@ class GenericTaskWorkflow:
                         {
                             "session_key": session_key,
                             "task_id": task_id,
-                            "message": f"Could not complete: {gate.get('reason', 'quality/evidence failed')}",
+                            "intent": user_intent,
+                            "task_type": task_type,
+                            "tags": tags,
+                            "message": diag[:3000],
                         },
                         start_to_close_timeout=timedelta(seconds=30),
                     )
-                return {"status": "failed", "task_id": task_id}
-            rework_prompt = build_rework_prompt(
+                await workflow.execute_activity(
+                    record_event,
+                    {
+                        "correlation_id": task_id,
+                        "entity_type": "task",
+                        "entity_id": task_id,
+                        "event_type": "evaluator.escalate",
+                        "event_payload": {"attempt": rework_attempt},
+                    },
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
+                return {"status": "failed", "task_id": task_id, "reason": "escalated"}
+            prompt_fn = (
+                build_strategy_change_prompt
+                if action == "strategy_change"
+                else build_rework_prompt
+            )
+            rework_prompt = prompt_fn(
                 user_intent,
                 clean_result,
                 evidence_issues=evidence.get("issues"),
                 quality_issues=quality.get("issues", ""),
-                attempt=rework_attempt,
+                command_to_aura=quality.get("command_to_aura", ""),
+                attempt=rework_attempt + 1,
                 max_attempts=max_rework,
             )
             rework_resp = await workflow.execute_activity(
@@ -482,30 +520,6 @@ class GenericTaskWorkflow:
                 clean_result = rework_resp["result"]["payloads"][0]["text"]
             except Exception:
                 clean_result = str(rework_resp)
-            from app.orchestrator.completion_rework import should_admit_failure
-
-            if should_admit_failure(rework_attempt, max_rework, clean_result):
-                await workflow.execute_activity(
-                    finalize_task_failure,
-                    {
-                        "task_id": task_id,
-                        "process_run_id": self.process_run_id,
-                        "task_status": "failed",
-                        "process_state": "failed_terminal",
-                    },
-                    start_to_close_timeout=timedelta(seconds=10),
-                )
-                if not is_internal_task(user_intent, task_type, tags):
-                    await workflow.execute_activity(
-                        notify_slack_user,
-                        {
-                            "session_key": session_key,
-                            "task_id": task_id,
-                            "message": clean_result[:1500],
-                        },
-                        start_to_close_timeout=timedelta(seconds=30),
-                    )
-                return {"status": "failed", "task_id": task_id}
             extracted = extract_agent_facts(clean_result)
             clean_result = sanitize_user_facing_text(
                 extracted.get("body") or clean_result

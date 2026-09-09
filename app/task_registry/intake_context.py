@@ -44,8 +44,14 @@ async def assemble_intake_context(
         limit=5,
         deadline_sec=deadline,
     )
+    from app.task_registry.intake_decision_engine import user_visible_active_tasks
+
+    retrieval["active_tasks"] = user_visible_active_tasks(
+        retrieval.get("active_tasks") or [],
+        tags=tags,
+    )
     task_ids: List[str] = []
-    for bucket in ("active_tasks", "recent_registry", "vector_similar"):
+    for bucket in ("active_tasks", "recent_registry", "vector_similar", "evidence_pack"):
         for item in retrieval.get(bucket, []):
             tid = item.get("task_id")
             if not tid or tid in task_ids:
@@ -57,12 +63,15 @@ async def assemble_intake_context(
             break
     supplementary = await _load_supplementary_messages(task_ids)
     return {
-        "intent": intent[:2000],
+        "intent": intent[:20000],
         "session_key": session_key,
         "recurrence_key": recurrence_key,
         "tags": tags or [],
         "active_tasks": retrieval["active_tasks"],
         "recent_registry": retrieval["recent_registry"],
         "vector_similar": retrieval["vector_similar"],
+        "evidence_pack": retrieval.get("evidence_pack") or [],
+        "memory_hits": retrieval.get("memory_hits") or [],
+        "fts_hits": retrieval.get("fts_hits") or [],
         "supplementary_messages": supplementary,
     }

@@ -1,15 +1,18 @@
 # Aura System Architecture
 
-**Last updated:** 2026-08-11  
+**Last updated:** 2026-09-05  
 **Host:** Single Linux VPS (Europe/Berlin timezone on server; Kirill in JST)  
 **Status:** Production live (`development_mode: false`)
 
-This document describes the full stack built for **Aura** — an autonomous agent (“Reliability and Memory Plane” + OpenClaw) that talks to Kirill on Slack, runs scheduled jobs, and executes durable workflows with evidence-based completion.
+This document describes the **runtime** of **Aura** — OpenClaw + RMP on this VPS. Binding constitution (why / must / conflict law): [`docs/CONCEPT_TREE.md`](docs/CONCEPT_TREE.md). Cursor agents must not violate that file.
 
-Related plans (execution logs):
+Related logs:
 
-- [`docs/history/DEVELOPMENT_PLAN.md`](docs/history/DEVELOPMENT_PLAN.md) — Phases 0–11 feature delivery
-- [`docs/history/PRODUCTION_PLAN.md`](docs/history/PRODUCTION_PLAN.md) — Phases 12–20 hardening & go-live
+- [`docs/CONCEPT_TREE.md`](docs/CONCEPT_TREE.md) — source of truth
+- [`docs/CONCEPT_TREE_PROGRESS.md`](docs/CONCEPT_TREE_PROGRESS.md) — constitution work log
+- [`docs/history/DEVELOPMENT_PLAN.md`](docs/history/DEVELOPMENT_PLAN.md) — Phases 0–11 (historical)
+- [`docs/history/PRODUCTION_PLAN.md`](docs/history/PRODUCTION_PLAN.md) — Phases 12–20 (historical)
+- [`docs/CONTROL_PLANE_PROGRESS.md`](docs/CONTROL_PLANE_PROGRESS.md) — Analyst control-plane log (append-only)
 
 ---
 
@@ -23,15 +26,15 @@ Aura is a **three-layer system** on one machine:
 | **OpenClaw** | `/root/.openclaw` | Agent runtime: Slack gateway, LLM, workspace, cron, plugins |
 | **RMP** (Reliability & Memory Plane) | `/root/.openclaw/rmp` | Sidecar API + Temporal workflows + Postgres ledger + vector memory + LLM orchestration |
 
-**How the layers combine:** OpenClaw is the **runtime** (Slack socket, MiniMax M3 + DeepSeek/GLM fallbacks on NVIDIA, tools, JSONL sessions, cron). RMP wraps it as a **sidecar control plane**: the `rmp_adapter` plugin intercepts inbound messages, creates durable tasks, and blocks the main/Slack session so work runs in isolated `rmp_task_*` sessions under Temporal. Safe Harbor supplies legacy scanners and watchdog scripts; RMP can invoke or sync them when not in development mode.
+**How the layers combine:** OpenClaw is the **runtime** (Slack socket, gpt-5-nano + NVIDIA MiniMax/DeepSeek fallbacks, tools, JSONL sessions, cron). RMP wraps it as a **sidecar control plane**: the `rmp_adapter` plugin intercepts inbound messages, creates durable tasks, and blocks the main/Slack session so work runs in isolated `rmp_task_*` sessions under Temporal. Safe Harbor supplies legacy scanners and watchdog scripts; RMP can invoke or sync them when not in development mode.
 
 **Design intent:** User-facing work (Slack DMs, cron) is **routed through RMP** so every turn becomes a durable Temporal workflow with steps, observations, evidence checks, and idempotent Slack delivery. OpenClaw remains the **execution engine** (tools, LLM, JSONL sessions); RMP is the **control plane** — it owns plans, step predicates, process memory, completion gates, reconciliation, and **LLM key orchestration** (balanced rotation, concurrency caps, usage accounting).
 
-**Primary LLM (chat):** MiniMax M3 via NVIDIA NIM (`nvidia/minimaxai/minimax-m3`), with DeepSeek V4 Flash then GLM-5.2 as OpenClaw fallbacks after auth-key rotation. **Intake** and **subagents** use DeepSeek V4 Flash.
+**Primary LLM (chat):** OpenAI gpt-5-nano (`openai/gpt-5-nano`) on OpenClaw runtime (`agentRuntime.id: "openclaw"`), with MiniMax M3 then DeepSeek V4 Flash as NVIDIA fallbacks after auth-key rotation. **Intake** uses the same chain. GLM-5.2 is dropped (NVIDIA HTTP 410). HTTP 410 is treated as skip, not a 5s idle retry.
 
-**Vector embeddings:** NVIDIA `nvidia/nv-embed-v1` (4096 dims) — same API keys and quota broker as chat; separate model endpoint.
+**Vector embeddings:** Advisory only. Live embedder is OpenAI `text-embedding-3-small` (1536-d) after NVIDIA NIM embeddings returned HTTP 410 EOL. `/health` `ready=true` only after a successful embed probe. Conversational continuity still uses Postgres `task_messages` + process memory and must not depend on embeddings.
 
-**Rate-limit policy:** On NVIDIA **rate limits**, RMP **waits, rotates keys, and tracks usage** (does not hop providers for 429s). Separate from that, OpenClaw keeps an ordered **model fallback chain** for unavailable/broken models. Three NVIDIA accounts (`nvidia:default`, `nvidia:key2`, `nvidia:key3`) with **balanced load** and a **max concurrent agent-run cap** (default 2).
+**Rate-limit policy:** On NVIDIA **rate limits**, RMP **waits, rotates keys, and tracks usage** (does not hop providers for 429s). Separate from that, OpenClaw keeps an ordered **model fallback chain** for unavailable/broken models. OpenAI key: `OPENAI_API_KEY` in `/etc/openclaw/openclaw.env` (SQLite profile `openai:default`). Three NVIDIA accounts (`nvidia:default`, `nvidia:key2`, `nvidia:key3`) with **balanced load** and a **max concurrent agent-run cap** (default 2). Never pin `nvidia:keyN` on an `openai/*` session.
 
 ---
 
@@ -55,7 +58,7 @@ Aura is a **three-layer system** on one machine:
                 │ (sync block → RMP)            │
                 ▼                               ▼
 ┌───────────────────────────┐     ┌───────────────────────────────────────────┐
-│  RMP API (:8000)          │     │  OpenClaw Agent (MiniMax / NVIDIA NIM)    │
+│  RMP API (:8000)          │     │  OpenClaw Agent (gpt-5-nano / NVIDIA fb)  │
 │  FastAPI                  │     │  • Tools, skills, workspace files           │
 │  POST /tasks              │────▶│  • Per-task session: agent:main:rmp_task_*│
 │  signals, memory, export  │     │  • JSONL poll for completion              │
@@ -74,7 +77,7 @@ Aura is a **three-layer system** on one machine:
  Postgres    Qdrant     Artifacts      Side-effect       Safe Harbor
  (rmp_db)   (vectors)   (SHA-256 FS)   receipts          scanners/watchdog
               ▲
-              │ nvidia/nv-embed-v1 (4096d)
+              │ embeddings (advisory; fail-soft if embedder down)
               └── Mem0 + local Qdrant
 
         ┌─────────────────────────────────────┐
@@ -106,19 +109,13 @@ Aura is a **three-layer system** on one machine:
 ### 3.1 Normal Slack DM
 
 1. Kirill sends a DM → OpenClaw Slack provider receives it (session key `agent:main:slack:channel:…`).
-2. **`rmp_adapter`** `message_received` (runs before sendPolicy):
-   - `POST /tasks` to RMP with the **real Slack session key** (idempotent key = session + intent hash)
-   - On intake failure: enables a one-shot **native Slack fallback** so the DM is not silently dropped
-3. **`before_message_write`**: blocks Slack DM persistence / native assistant turns while RMP owns delivery (`{ block: true }`); cron still creates tasks here.
-4. RMP creates a **Task** row and starts **GenericTaskWorkflow** (or **CatalogTaskWorkflow** if intent matches a template).
-5. Worker activity **`send_to_openclaw`** (via LLM orchestration — see §5.10):
-   - **`reserve_profile()`** — acquires a concurrency slot + balanced NVIDIA key for `agent:main:rmp_task_{id}`
-   - `POST http://127.0.0.1:18789/hooks/agent` with `deliver: false`, `allowUnsafeExternalContent: true`; `authProfileOverride` is assigned once the session exists (post-create — avoids OpenClaw 2026.7 lifecycle races)
-   - Polls session JSONL (with fallback across last 3 session files on rotation)
-   - **`release_profile()`** in `finally` — frees slot even on failure
-   - On JSONL `429` / rate-limit errors: record cooldown, rotate key, retry dispatch
-6. Workflow validates output, parses `{"task_status": "…"}`, runs **evidence** + **quality review** (skipped for canary/heartbeat/system).
-7. **`notify_slack_user`** → idempotent `chat.postMessage` to Kirill’s Slack user ID (parses `slack:channel:U…` origins; falls back to `production.slack_owner_user_id`).
+2. **`rmp_adapter`** claims the turn (`inbound_claim` / `message_received`) and `POST /tasks` with the **full Slack text** (not a truncated intent). **No native OpenClaw Slack fallback** — fail closed (claim + suppress) if intake/API is down.
+3. **`before_message_write`**: blocks Slack DM persistence / native assistant turns while RMP owns delivery (`{ block: true }`).
+4. **Intake Analyst** (not Aura) classifies the message against hybrid-retrieved evidence into one of four relation classes, then applies a decision (`clarify` / attach / wait / rebuild / guided / fresh). See §5.0.0.
+5. If work proceeds, Temporal starts **GenericTaskWorkflow** or **CatalogTaskWorkflow** (catalog type is **intake-LLM only**).
+6. Aura executes in `agent:main:rmp_task_*` via **`send_to_openclaw`** (`deliver: false`).
+7. **Process Evaluator** (not Aura; session `rmp_verify_*`) must **accept** the result before Slack. Conversational replies are gated too. Canary/system stay on the short deterministic path.
+8. **`notify_slack_user`** → idempotent RMP `chat.postMessage`. Insufficient work is reworked (attempts 1–19) or escalated with a diagnosis (attempt 20).
 
 ### 3.2 Cron (e.g. MoltMarket)
 
@@ -142,18 +139,19 @@ Success/failure is logged internally; **no Slack notification** to Kirill (canar
 | Config | `/root/.openclaw/openclaw.json` |
 | Workspace | `/root/.openclaw/workspace` (`USER.md`, `MEMORY.md`, `memory/*.md`, `HEARTBEAT.md`) |
 | Agent sessions | `/root/.openclaw/agents/main/sessions/*.jsonl` |
-| Primary model | `nvidia/minimaxai/minimax-m3`; fallbacks DeepSeek V4 Flash → GLM-5.2; intake + subagents DeepSeek V4 Flash |
-| Model fallbacks | MiniMax → DeepSeek V4 Flash → GLM-5.2 (agent); intake/subagents DeepSeek V4 Flash |
+| Primary model | `openai/gpt-5-nano` (`agentRuntime.id: "openclaw"`); fallbacks MiniMax M3 → DeepSeek V4 Flash; intake same chain |
+| Model fallbacks | gpt-5-nano → MiniMax → DeepSeek (no GLM). HTTP 410 = skip to next model |
 | Concurrency | OpenClaw `maxConcurrent: 2`; RMP `max_concurrent: 3`, `min_interval_sec: 5` |
-| NVIDIA keys | `/etc/openclaw/openclaw.env`: `NVIDIA_API_KEY`, `NVIDIA_API_KEY_2`, optional `_3` |
-| Auth profiles | `auth-profiles.json` synced from env via `ops/sync_nvidia_keys.py` |
-| Auth rotation order | `auth.order.nvidia`: `nvidia:default` → `nvidia:key2` → `nvidia:key3` |
+| LLM keys | `/etc/openclaw/openclaw.env`: `OPENAI_API_KEY` (gpt-5-nano), `NVIDIA_API_KEY`, `NVIDIA_API_KEY_2`, optional `_3` |
+| Auth profiles | Shared SQLite `authProfiles.store` in `state/openclaw.sqlite` (2026.9+); synced from env via `ops/sync_nvidia_keys.py`. Do not recreate leftover `auth-profiles.json` (triggers AUTH_PROFILE_MIGRATION_REQUIRED). |
+| Auth rotation order | `auth.order.openai`: `openai:default`. `auth.order.nvidia`: `nvidia:default` → `nvidia:key2` → `nvidia:key3`. Never pin `nvidia:keyN` on `openai/*` sessions.
 | Plugin | `/root/.openclaw/plugins/rmp_adapter/index.js` |
 | Slack streaming | `{"mode":"off","nativeTransport":false}` (RMP owns Slack delivery; object form required by OpenClaw 2026.7+) |
-| OpenClaw version | `2026.7.1-2` (requires Node ≥ 22.23) |
-| Post-update patches | `bash patch_openclaw.sh` then `ops/verify_openclaw_patch.sh` (see §4.1) |
+| OpenClaw version | `2026.9.1` (requires Node ≥ 22.22.3) |
+| Hook sessions | `/hooks/agent` uses `sessionMode: persistent` plus `hooks.allowedSessionKeyPrefixes: ["hook:", "agent:main:rmp_"]` (2026.9 defaults isolated and will not persist `rmp_*` keys otherwise) |
+| Post-update patches | `ops/upgrade_openclaw.sh` (or `patch_openclaw.sh` then `ops/verify_openclaw_patch.sh`; see §4.1) |
 
-OpenClaw also has built-in profile cooldown/rotation on 429; RMP’s quota broker **caps cooldowns**, **balances load across keys**, **limits concurrent agent runs**, and syncs `auth-profiles.json` `usageStats.cooldownUntil`.
+OpenClaw also has built-in profile cooldown/rotation on 429; RMP’s quota broker **caps cooldowns**, **balances load across keys**, **limits concurrent agent runs**, and syncs `authProfiles.state` `usageStats.cooldownUntil`.
 
 ### Plugin hooks (`rmp_adapter`)
 
@@ -162,7 +160,7 @@ OpenClaw also has built-in profile cooldown/rotation on 429; RMP’s quota broke
 | `message_received` / `inbound_claim` | Slack DM → `POST /tasks`; claim turn so native OpenClaw never replies (fail closed) |
 | `before_message_write` | Block Slack DM / assistant writes while RMP owns delivery; cron task create; skip internal heartbeat routing |
 | `message_sending` | Suppress native Slack during active RMP user task; strip interim tool-planning text; cancel pure-ack messages |
-| `before_agent_start` | **`POST /api/llm/reserve`** — balanced key + concurrency slot for gateway sessions (not `rmp_task_*`, `rmp_verify_*`, `rmp_intake_*`, Slack/main, heartbeat) |
+| `before_agent_run` | **`POST /api/llm/reserve`** — balanced key + concurrency slot for gateway sessions (not `rmp_task_*`, `rmp_verify_*`, `rmp_intake_*`, Slack/main, heartbeat) |
 | `agent_end` | **`POST /api/llm/release`** — free slot for same session exclusions |
 | `llm_output` | **`POST /api/llm/record-gateway`** — token/request accounting for gateway LLM turns |
 | Assistant ack block | Pure system acks not written to `agent:main:main` transcript |
@@ -183,13 +181,13 @@ OpenClaw plugin **`aura_web`** (`/root/.openclaw/plugins/aura_web`) plus localho
 | Interact | OpenClaw `browser`, `browser_use`, `obscura_browse` |
 | Status | `web_capability_status` |
 
-RMP **`WebCapabilityAnalyzer`** (`app/orchestrator/web_capability.py`) classifies intake intents (`search|fetch|crawl|adaptive_extract|schema_extract|interact|none`), soft-routes interact → `browser_automation` catalog when justified, and injects a **WEB CAPABILITY BRIEF** into execute prompts / `initial_memory_block`. Agent-visible docs: workspace `TOOLS.md`.
+RMP **`WebCapabilityAnalyzer`** (`app/orchestrator/web_capability.py`) classifies intake intents (`search|fetch|crawl|adaptive_extract|schema_extract|interact|none`), injects a **WEB CAPABILITY BRIEF** into execute prompts / `initial_memory_block`, and may *suggest* `browser_automation` as a soft note. **Catalog workflow assignment is intake-LLM only** (`catalog_hint` → policy). Keyword/regex catalog patterns are advisory (`soft_catalog_candidates` in the intake prompt) — they must not hard-route Slack DMs after intake. Agent-visible docs: workspace `TOOLS.md`.
 
 Paid APIs (Perplexity, Firecrawl, Tavily) are **not** configured unless keys are added later.
 
 ### 4.1 OpenClaw dist patches (re-apply after every `npm install -g openclaw`)
 
-Run: `bash /root/.openclaw/rmp/patch_openclaw.sh` → `bash ops/verify_openclaw_patch.sh`.
+Run: `bash /root/.openclaw/rmp/ops/upgrade_openclaw.sh` (`make upgrade-openclaw`). Never `openclaw onboard`, never `doctor --force`, never hand-edit dist.
 
 | Patch | Why |
 |-------|-----|
@@ -198,9 +196,13 @@ Run: `bash /root/.openclaw/rmp/patch_openclaw.sh` → `bash ops/verify_openclaw_
 | Minimal bootstrap | TOOLS.md only for those RMP sessions |
 | Slack suppress | `deliverReplies` calls `__RMP_SUPPRESS_NATIVE_SLACK` so RMP owns delivery |
 | allowUnsafe passthrough | OpenClaw 2026.7 dropped `allowUnsafeExternalContent` from HTTP `/hooks/agent` normalize; RMP needs it (or auto-enable for `rmp_*` keys) to avoid EXTERNAL wrap → `NO_REPLY` on JSON intake |
-| Model fallbacks | **Left enabled** — MiniMax → DeepSeek → GLM (do not re-apply legacy no-fallback disable) |
+| LLM idle 5s | `DEFAULT_LLM_IDLE_TIMEOUT_MS` 120s → 5s so idle silence fails fast and NVIDIA keys rotate |
+| Session canonical scan | Skip in-flight `{}` placeholders with `entry_valid != 1`; do not fail-closed the whole store on parseable pending rows (2026.9 `entry_valid` triggers otherwise poison every `/hooks/agent`) |
+| Session timestamp drift | Ignore `session_nodes.updated_at` vs JSON `updatedAt` mismatch (often tens of ms); stock parser returns null and `/hooks/agent` throws `SESSION_CANONICAL_KEY_MIGRATION_REQUIRED` |
+| HTTP 410 skip | Classify 410 as `model_not_found` (next fallback), not timeout/idle retry |
+| Model fallbacks | **Left enabled** — gpt-5-nano → MiniMax → DeepSeek (do not re-apply legacy no-fallback disable; do not restore GLM) |
 
-Upgrade checklist: backup `openclaw.json` / auth-profiles / `rmp_adapter` → Node ≥ 22.23 → `npm install -g openclaw@latest` → fix Slack `streaming` object shape → `patch_openclaw.sh` → clear crash-loop rows in `state/openclaw.sqlite` if needed → restart `openclaw-gateway` + `rmp-worker` → `make production-check`.
+Upgrade checklist: `ops/upgrade_openclaw.sh` (backup → Node ≥ 22.22.3 → `npm install -g openclaw@latest` → `OPENCLAW_SERVICE_REPAIR_POLICY=external openclaw doctor --fix --non-interactive` → restore RMP config keys / `TOOLS.md` → `ops/settle_openclaw_sessions.py` (never drop `session_nodes` entry_valid triggers) → `patch_openclaw.sh` → verify → skills → restart if no user tasks → `make production-check`). Do not run `openclaw update` (it re-runs doctor/restart on its own).
 
 ---
 
@@ -208,24 +210,51 @@ Upgrade checklist: backup `openclaw.json` / auth-profiles / `rmp_adapter` → No
 
 RMP is the **control plane** for Aura. OpenClaw provides LLM + tools + Slack transport; RMP provides **durability**, **process semantics**, **memory injection**, **completion gates**, **reconciliation**, and **LLM resource orchestration**. Every user-visible turn becomes a Postgres-backed **Task** driven by a Temporal **workflow**; OpenClaw runs inside isolated **child workflows** / activities as the execution engine.
 
-### 5.0.1 Universal Task Intake (Phase 4–5)
+### 5.0.0 Analyst control plane (binding)
 
-Before `POST /tasks` creates a workflow, the **3-layer intake funnel** runs when `task_registry.enabled`:
+**Constitution:** [`docs/CONCEPT_TREE.md`](docs/CONCEPT_TREE.md). This section is the runtime summary; if it drifts, the constitution wins.
 
-1. **Layer 1 — Fast path** — idempotency key; duplicate same-session intent → `attach_active`; active recurrence → `wait_active`; health-canary LLM bypass; deterministic `skip_valid` interval; `skip_noop` when last registry outcome is silent/no-action within interval; `supersede` when last recurrent run failed and is outside interval
-2. **Layer 2 — Vector gate** — Qdrant similarity ≥ threshold → deterministic attach/wait/guided (with temporal decay re-ranking; guided hints prefer `outcome_summary`)
-3. **Layer 3 — LLM sub-agent** — `classify_task_intake` Temporal **standalone activity** (inline fallback) on internal `rmp_intake_*` session
-4. **Policy engine** (`intake_decision_engine.py`) — hard overrides including durable cross-session attach; modes: `off` | `shadow` | `enforce`
+Two **non-Aura** RMP agents own judgment. Retrieval is **evidence only** — never assignment. Regex catalog patterns and vector similarity are advisory.
 
-Decisions: `create_fresh`, `create_guided`, `attach_active`, `wait_active`, `skip_valid`, `skip_noop`, `supersede`, `spawn_process`.
+| Role | Session | Job |
+|------|---------|-----|
+| **Intake Analyst** | `agent:main:rmp_intake_*` | Classify each user message against running work, finished work, global memory, or “this is new.” If unsure, **clarify** via RMP Slack. |
+| **Process Evaluator** | `agent:main:rmp_verify_*` | Aura never reaches Slack first. Dual gate: deterministic evidence, then semantic judge. Fail closed on parse/tool errors. |
+| **Aura** | `agent:main:rmp_task_*` | Execution engine only (tools, code, search, replies). |
 
-**Plugin:** all Slack DMs route through `POST /tasks` (no active-task bypass); stop commands still signal directly.
+**Four relation classes (intake):**
 
-**Durable tasks:** `task_kind=durable` + `spawn_leg` workflow signal for multi-process legs; `spawn_process` API starts workflow or signals running parent; new legs linked via `ProcessRun.parent_process_run_id`.
+1. Related to a **currently running** process → `attach_active`, `wait_active`, or `rebuild_stale`
+2. Related to **finished** work → `create_guided` (citations of past task + memory)
+3. Related only to **global/user memory** → guided/conversational with memory brief
+4. **New** → `create_fresh` (new Task row for this message — **not** conversational amnesia)
 
-Supplementary user/cron text is stored in `task_messages` (including `/signal`). Terminal tasks indexed into `task_registry_entries` + Qdrant.
+**Decisions:** `clarify`, `attach_active`, `wait_active`, `rebuild_stale`, `create_guided`, `create_fresh`, `skip_valid`, `skip_noop`, `supersede`, `spawn_process`. `skip_*` still persist an intake decision and a short user-visible ack — messages are never silently dropped. Low confidence **must not** default to `create_fresh` (clarify, or wait if a single clear **user** active target exists). Health canary/heartbeat/system tasks are not user work: never `wait_active` / `attach_active` onto them. If intake LLM/workflow fails, user DMs still **`create_fresh` a Task and start `GenericTaskWorkflow`**. `execution_mode=conversational` only selects the one-step RMP plan (still `rmp_task_*` + RMP `chat.postMessage`); it is **not** a native Slack reply and must never skip the plugin → `/tasks` → intake → Temporal path.
 
-**Completion rework:** configurable `rework_max_attempts` (default 3) with structured rejection and early admit-failure.
+**Always-gated Slack:** including greetings. Canary/system tasks stay on the short deterministic path (no 20-turn loops, no user clarify).
+
+**Session continuity:** `create_fresh` still starts a new Task/workflow, but `POST /tasks` injects **RECENT DIALOGUE** from prior same-`session_key` `task_messages` (user + assistant Slack turns). User-local clock is injected as a fact (`USER LOCAL TIME`), not a greeting-phrase policy. Vector recall is advisory (OpenAI `text-embedding-3-small`); dialogue injection must not depend on embeddings.
+
+**Attempt law:** attempts 1–9 rework with evaluator critique; attempt 10 `strategy_change`; 11–19 continue; attempt 20 stop and Slack a diagnosis of what was tried and why it was insufficient.
+
+**Hybrid retrieval:** Postgres FTS + Qdrant dense + user memory + active-task metadata, fused with Reciprocal Rank Fusion (k=60). Intake Analyst adjudicates.
+
+### 5.0.1 Universal Task Intake (Phase 4–5 + analyst)
+
+Before `POST /tasks` starts Aura execution, intake runs when `task_registry.enabled`:
+
+1. **Layer 1 — Fast path** — idempotency; duplicate same-session intent → `attach_active`; active recurrence → `wait_active`; health-canary LLM bypass; deterministic `skip_valid` / `skip_noop` / `supersede` for recurrent jobs (still logged + ack)
+2. **Layer 2 — Hybrid evidence pack** — FTS + dense + memory + active metadata (RRF). Vector similarity is **advisory**; it must not auto-attach or auto-create.
+3. **Layer 3 — Intake Analyst LLM** — `classify_task_intake` on `rmp_intake_*`
+4. **Policy engine** (`intake_decision_engine.py`) — validates catalog ids, low-confidence clarify, modes: `off` | `shadow` | `enforce`
+
+**Plugin:** all Slack DMs route through `POST /tasks`; stop commands still signal directly.
+
+**Durable tasks:** `task_kind=durable` + `spawn_leg`; `spawn_process` API; legs linked via `ProcessRun.parent_process_run_id`.
+
+Supplementary user/cron text is stored in `task_messages`. Terminal tasks indexed into `task_registry_entries` + Qdrant (including evaluator summary).
+
+**Completion rework:** global attempt counter on the process run; strategy change at 10; user diagnosis at 20. Canaries exempt.
 
 ### 5.0 Control-plane overview
 
@@ -236,20 +265,23 @@ Slack / cron
 rmp_adapter (sync block → POST /tasks)
      │
      ▼
-RMP API ──creates──▶ Task + ProcessRun + Event rows
+RMP API ── Intake Analyst (hybrid evidence; decisions including clarify)
+     │
+     ▼
+Task + ProcessRun + Event rows
      │
      ▼
 Temporal workflow (GenericTaskWorkflow | CatalogTaskWorkflow)
      │
-     ├── generate_process_plan (one LLM call → plan_json)
+     ├── generate_process_plan
      ├── for each plan step:
      │      GenericExecuteChildWorkflow | CatalogStepChildWorkflow
-     │           ├── build_process_memory_context
+     │           ├── PROCESS BRIEF + build_process_memory_context
      │           ├── reserve_profile → send_to_openclaw → release_profile
      │           ├── extract_agent_facts + evaluate_step_predicate
      │           └── decide_step_outcome (orchestrator)
-     ├── decide_completion_gate (evidence + optional quality review)
-     ├── notify_slack_user (idempotent, policy-filtered)
+     ├── Process Evaluator (always-gated: evidence then semantic judge)
+     ├── notify_slack_user only after accept (or attempt-20 diagnosis)
      └── execute_compensation on terminal failure
 ```
 
@@ -300,14 +332,14 @@ Primary path for Slack DMs, cron, and most automation.
    - **`build_process_memory_context`** — once at start; refreshed after each completed step (skipped vector for canaries via `skip_vector`).
    - For each plan step, up to **3 attempts** via **`GenericExecuteChildWorkflow`** child.
    - On step `blocked` → task `pending_user_input`; on exhausted failures → **`execute_compensation`**.
-3. **`decide_completion_gate`** — evidence check; may skip LLM quality review when strong.
+3. **`decide_completion_gate`** — evidence check, then Process Evaluator (quality LLM) for user work. Quality LLM is skipped only for internal/canary/heartbeat (`is_internal_task`).
 4. **`notify_slack_user`** — final delivery unless internal/canary/heartbeat suppression applies.
 
 Exception path: any uncaught workflow error triggers compensation + user-facing error message (formatted via `notification_policy`).
 
 #### CatalogTaskWorkflow (`app/workflows/catalog_task.py`)
 
-Structured multi-step flows for repeatable business processes. Six templates in `app/workflows/catalog.py`:
+Structured multi-step flows for repeatable business processes. Seven templates in `app/workflows/catalog.py`:
 
 | # | Template | Typical predicates |
 |---|----------|-------------------|
@@ -317,6 +349,7 @@ Structured multi-step flows for repeatable business processes. Six templates in 
 | 4 | Procurement | cart, checkout |
 | 5 | Outreach / email | draft, send |
 | 6 | Browser automation | navigation, extract |
+| 7 | Tool self-upgrade | draft → tests → approval → controlled restart → verify |
 
 Each catalog step maps to a **`predicate_id`** and runs in **`CatalogStepChildWorkflow`** (same OpenClaw dispatch pattern as generic children).
 
@@ -361,8 +394,8 @@ The orchestrator keeps **program logic** in charge; the LLM proposes actions and
 | Module | File | Role |
 |--------|------|------|
 | **Step predicates** | `step_predicates.py` | `extract_agent_facts()` parses fenced JSON `{ "facts": {...} }`; `evaluate_step_predicate(predicate_id, ...)` returns pass/fail/issues |
-| **Decision engine** | `decision_engine.py` | `decide_step_outcome()` — maps predicate result + attempt budget to `completed`/`pending`/`failed`/`blocked`; `decide_completion_gate()` — evidence + optional quality skip |
-| **Prompt policy** | `prompt_policy.py` | Intent profiles (`memory_first_read`, `summarize`, `recall`, `status`, `monitor`) with tool budgets and memory hints; forbids workspace `memory_search` during RMP steps |
+| **Decision engine** | `decision_engine.py` | `decide_step_outcome()` — maps predicate result + attempt budget to `completed`/`pending`/`failed`/`blocked`; `decide_completion_gate()` — evidence + quality LLM (user work always evaluated) |
+| **Prompt policy** | `prompt_policy.py` | Forbids workspace `memory_search` during RMP steps. Regex `GENERIC_PROFILES` exist as leftover tables; `resolve_generic_profile` returns `None` so they do not assign tool budgets on user DMs |
 
 **Predicate examples:** `generic_deliver`, read/summarize/recall-specific gates, catalog-specific gates. Legacy `task_status` JSON in agent output is still parsed as fallback but **predicates are authoritative**.
 
@@ -377,7 +410,7 @@ The orchestrator keeps **program logic** in charge; the LLM proposes actions and
 5. **`release_profile()`** — always in `finally`.
 6. On 429: `record_rate_limit`, rotate, retry (up to 12× for chat).
 
-**Gateway path (non-RMP sessions):** Plugin hooks call **`POST /api/llm/reserve`** at `before_agent_start` and **`POST /api/llm/release`** at `agent_end` — same broker pool, so gateway cron/misc sessions share the 2-slot cap with worker dispatches.
+**Gateway path (non-RMP sessions):** Plugin hooks call **`POST /api/llm/reserve`** at `before_agent_run` and **`POST /api/llm/release`** at `agent_end` — same broker pool, so gateway cron/misc sessions share the concurrency cap with worker dispatches.
 
 **Session bootstrap:** OpenClaw patch loads minimal TOOLS.md for `rmp_task_*` / `rmp_verify_*` / `rmp_intake_*` sessions — no MEMORY.md pollution.
 
@@ -409,6 +442,7 @@ Key endpoints:
 | `GET /tasks/{id}/export` | Postmortem bundle |
 | `/memory/*` | Write, lookup, compact, graph, process context |
 | `GET /memory/vector/status` | Qdrant / embedder health |
+| `POST /api/notify-user` | RMP-owned Slack notice without Aura (intake unavailable / idle stop) |
 | `POST /api/llm/reserve` | Acquire concurrency slot + balanced NVIDIA profile |
 | `POST /api/llm/release` | Release slot for session |
 | `GET /api/llm/orchestration` | Active slots, in-flight per key, rotation mode |
@@ -453,9 +487,9 @@ All RMP-issued NVIDIA calls (worker dispatch, embeddings, quality review) and ga
 | **Per-key pacing** | `min_interval_sec: 5` (live settings); no global gap across all keys beyond broker pacing |
 | **Concurrency** | `max_concurrent: 3` — `reserve_profile()` / `release_profile()` track `active_slots`, `session_slots`, per-key `in_flight` |
 | **On 429** | Escalating cooldown per key (15s → 30s → 60s → 120s); rotate; retry up to 6× (embed) or 12× (chat) |
-| **Session pinning** | `assign_openclaw_session_profile()` sets `authProfileOverride`; patches `auth-profiles.json` `lastGood` hint |
+| **Session pinning** | `assign_openclaw_session_profile()` sets `authProfileOverride` on the SQLite auth store (do not recreate leftover `auth-profiles.json`) |
 | **State** | `/root/.openclaw/rmp/data/llm_quota.json` |
-| **OpenClaw sync** | Patches `auth-profiles.json` `usageStats.cooldownUntil` to match broker |
+| **OpenClaw sync** | Syncs SQLite `authProfiles` `usageStats.cooldownUntil` to match broker |
 | **Config** | `settings.json` → `llm_quota.*` |
 
 ```json
@@ -469,7 +503,7 @@ All RMP-issued NVIDIA calls (worker dispatch, embeddings, quality review) and ga
 }
 ```
 
-**Key sync:** `ops/sync_nvidia_keys.py` writes env keys into `auth-profiles.json` on service start. Manual: `make sync-nvidia-keys`. Live probe: `ops/nvidia_key_probe.py`.
+**Key sync:** `ops/sync_nvidia_keys.py` writes env keys into SQLite `authProfiles.store` on service start. Manual: `make sync-nvidia-keys`. Live probe: `ops/nvidia_key_probe.py`. Do not recreate leftover `auth-profiles.json`.
 
 #### Usage monitor (`app/llm/usage_monitor.py`)
 
@@ -503,10 +537,10 @@ Core entities: `Task`, `ProcessRun`, `Step`, `Observation`, `Event`, `MemoryItem
 |---------|-------|
 | Qdrant mode | **server** (Docker on `127.0.0.1:6333`) |
 | Qdrant data | `/root/.openclaw/rmp/data/qdrant-server` (bind mount) |
-| Collection | `rmp_memories` |
-| Embedder | **NVIDIA** `nvidia/nv-embed-v1` (4096 dims) |
+| Collection | `rmp_memories_openai_3small` |
+| Embedder | OpenAI `text-embedding-3-small` (1536-d). NVIDIA NIM embedders remain HTTP 410 EOL. See live `settings.json` `vector_memory.*` |
 | Config | `settings.json` → `vector_memory.*` |
-| Implementation | `app/memory/vector.py`, `app/memory/nvidia_embed.py` |
+| Implementation | `app/memory/vector.py` (`embed_query_text`) |
 
 **Why server mode:** Embedded Qdrant uses a single-process `.lock` file. With both `rmp-api` and `rmp-worker` using vector memory, only one process could hold the lock — the other reported `ready: false`. A shared Qdrant server lets both connect over HTTP.
 
@@ -523,11 +557,11 @@ make -C /root/.openclaw/rmp migrate-qdrant
 
 Compose file: `docker-compose.qdrant.yml`. `rmp-api` and `rmp-worker` systemd units `After=rmp-qdrant.service`.
 
-**Key resolution:** `NVIDIA_API_KEY` (+ `_2`, `_3`) from `/etc/openclaw/openclaw.env` or `auth-profiles.json`.
+**Key resolution:** Chat NVIDIA keys from `/etc/openclaw/openclaw.env` → SQLite `authProfiles.store`. Embeddings use `OPENAI_API_KEY` → `openai:default`.
 
-**Rate limits:** Every embed goes through `NvidiaEmbeddings` → `wait_for_dispatch_sync()` → same balanced key rotation as chat (§5.10).
+**Rate limits:** NVIDIA chat/embed helpers still go through `wait_for_dispatch_sync()`. OpenAI embeddings use the OpenAI embeddings API directly.
 
-**Chat vs embed “compatibility”:** Chat models never see raw vectors. Embeddings only rank text chunks for retrieval; any capable embedder works. `nv-embed-v1` is NVIDIA’s free-tier general embedding model on this account (other catalog embed models returned 404/410).
+**Chat vs embed “compatibility”:** Chat models never see raw vectors. Embeddings only rank text chunks for retrieval. Conversational continuity must not depend on embeddings. NVIDIA NIM embedders probed 2026-09-05 return HTTP 410 EOL; live replacement is OpenAI `text-embedding-3-small`.
 
 **Semantic recall:** Memory lookup with `query=` merges Postgres rows and Qdrant vector hits (`MemoryRouter.read`).
 
@@ -554,9 +588,9 @@ Content-addressed store under `/root/.openclaw/rmp/data/artifacts`; completion o
 ### 6.5 OpenClaw workspace memory
 
 Daily notes: `/root/.openclaw/workspace/memory/YYYY-MM-DD.md`  
-Long-term: `MEMORY.md`, `USER.md`
+Long-term notes: `MEMORY.md`, `USER.md`
 
-Workspace files are the **authoritative human-readable layer**; Qdrant is the **semantic search index** over the same content plus promoted Postgres memories.
+Workspace files are **human notes** for main/heartbeat. They are **not** the production recall path for RMP-owned Slack DMs (process-scoped Postgres + RECENT DIALOGUE). Qdrant is advisory dense retrieval (OpenAI `text-embedding-3-small`). Conversational continuity must not depend on embeddings.
 
 ---
 
@@ -595,7 +629,7 @@ make production-check       # health + OpenClaw patch verify
 make canary                 # manual E2E canary
 make readiness              # full readiness JSON
 make backup
-make sync-nvidia-keys       # env → auth-profiles.json
+make sync-nvidia-keys       # env → SQLite authProfiles.store
 make seed-vector-memory     # re-index workspace + Postgres → Qdrant
 make rollback               # return to dev quiet mode (ops/rollback_dev.sh)
 
@@ -633,8 +667,8 @@ cat /root/.openclaw/rmp/data/llm_usage.json   # daily usage ledger
 - **Persisted `plan_json`** on ProcessRun; **`generate_process_plan`** (one LLM call at start)  
 - **`step_predicates.py`** — facts JSON + deterministic predicate gates (not LLM `task_status`)  
 - **Plan-driven generic loop** — program owns step advance/retry/fail (legacy `user_evaluation_loop` removed Phase 3)  
-- **Catalog steps** map to `predicate_id`; finish path uses **`decide_completion_gate`** (skips LLM quality when evidence strong)  
-- **Intent profiles** — read / summarize / recall / status / monitor  
+- **Catalog steps** map to `predicate_id`; finish path uses **`decide_completion_gate`** (user work always hits Process Evaluator)  
+- **Intent profiles** — leftover tables only; `resolve_generic_profile` is disabled (no regex assignment)  
 
 ### Layer C — Process memory daily use ✅ (Phase 2)
 
@@ -642,12 +676,12 @@ cat /root/.openclaw/rmp/data/llm_usage.json   # daily usage ledger
 - **Unified inject** — all dispatch uses `build_process_memory_context`; child workflows receive prebuilt block  
 - **Memory-first executor prompts** — forbid workspace `memory_search` during RMP steps  
 - **Empty-process fallback** — user pinned/semantic from `read_ordered` when process pool empty  
-- **Plugin** — no `[AUTO-ROUTED]` pollution; `process_type_hint`; prefetch `/memory/process/{id}/context`; **`rmp_memory_recall`** tool  
+- **Plugin** — no `[AUTO-ROUTED]` pollution; no `process_type_hint` (intake LLM assigns); prefetch `/memory/process/{id}/context`; **`rmp_memory_recall`** tool  
 - **Vector `pinned` index** on write; promotion dedup by content prefix  
 
 ### Verification ✅ (Phase 2)
 
-- **106 pytest** (zero exclusions)  
+- **Full pytest suite** (zero exclusions)  
 - **`make production-check`** — health + readiness including stuck-workflow and memory-canary checks  
 - **`ops/canary_slack_memory.sh`** — live canary; writes `data/last_memory_canary.json`  
 
@@ -669,7 +703,7 @@ cat /root/.openclaw/rmp/data/llm_usage.json   # daily usage ledger
 - **Concurrency cap** — `max_concurrent: 3` with `reserve_profile` / `release_profile`  
 - **Per-key pacing** — `min_interval_sec: 5`  
 - **Usage monitor** — per-key daily requests/tokens by source (`llm_usage.json`)  
-- **Plugin LLM hooks** — `before_agent_start`, `agent_end`, `llm_output` on gateway sessions  
+- **Plugin LLM hooks** — `before_agent_run`, `agent_end`, `llm_output` on gateway sessions  
 - **Session profile pinning** — `authProfileOverride` on RMP dispatches  
 - **Heartbeat isolation** — no RMP task creation or LLM reserve on internal heartbeat triggers  
 
@@ -678,9 +712,9 @@ cat /root/.openclaw/rmp/data/llm_usage.json   # daily usage ledger
 - External RMP sidecar with Temporal ledger  
 - Plugin fail-closed routing (sync HTTP)  
 - Evidence-based completion + idempotency + reconciler  
-- Six workflow catalog templates  
+- Seven workflow catalog templates  
 - Vector memory infrastructure + graph API  
-- **NVIDIA NIM model stack** — MiniMax M3 primary, DeepSeek/GLM fallbacks; intake + subagent fast models  
+- **RMP keys module** — `app/llm/model_policy.py` + SQLite auth sync; gpt-5-nano primary, NVIDIA MiniMax/DeepSeek fallbacks  
 - **Multi-key NVIDIA rotation** + RMP quota broker (chat + embeddings) + balanced load + usage ledger  
 - Backups, canary, readiness, go-live/rollback  
 - Slack noise suppression (canary/heartbeat/ack stripping)  
@@ -737,7 +771,7 @@ Prioritized for stability first, then capability.
 ├── openclaw.env → /etc/openclaw/openclaw.env
 │                                 # NVIDIA_API_KEY, NVIDIA_API_KEY_2, NVIDIA_API_KEY_3
 ├── agents/main/agent/
-│   └── auth-profiles.json        # Synced NVIDIA profiles (ops/sync_nvidia_keys.py)
+│   └── (auth: SQLite authProfiles.store — do not recreate auth-profiles.json)
 ├── workspace/                    # Agent memory & bootstrap files
 ├── plugins/rmp_adapter/          # Slack → RMP routing + LLM reserve/release hooks
 ├── agents/main/sessions/         # JSONL transcripts
@@ -764,7 +798,7 @@ Prioritized for stability first, then capability.
     │       ├── mistral_embed.py  # Legacy adapter (unused in prod config)
     │       └── seed.py           # Workspace + Postgres re-index
     ├── ops/
-    │   ├── sync_nvidia_keys.py   # Env → auth-profiles
+    │   ├── sync_nvidia_keys.py   # Env → SQLite auth (NVIDIA + optional OpenAI)
     │   ├── nvidia_key_probe.py   # Live NVIDIA smoke test
     │   ├── llm_usage_report.py   # Usage summary CLI
     │   ├── workflow_janitor.py   # Orphan Temporal cleanup
@@ -773,7 +807,7 @@ Prioritized for stability first, then capability.
 
 /root/aura_safe_harbor/           # Scanners, watchdog, legacy Kairos
 /etc/rmp/rmp.env                  # RMP_API_KEY, DATABASE_URL
-/etc/openclaw/openclaw.env        # NVIDIA_API_KEY, NVIDIA_API_KEY_2, NVIDIA_API_KEY_3
+/etc/openclaw/openclaw.env        # OPENAI_API_KEY, NVIDIA_API_KEY, NVIDIA_API_KEY_2, NVIDIA_API_KEY_3
 /etc/systemd/system/              # Service units (ExecStartPre key sync)
 ```
 
@@ -784,11 +818,11 @@ Prioritized for stability first, then capability.
 | Secret | Location | Used for |
 |--------|----------|----------|
 | RMP API key | `/etc/rmp/rmp.env`, `settings.json` | RMP API auth |
-| **NVIDIA API keys** | `/etc/openclaw/openclaw.env`, `auth-profiles.json` | Chat (MiniMax/DeepSeek/GLM) + `nv-embed-v1` embeddings |
+| **NVIDIA API keys** | `/etc/openclaw/openclaw.env` → SQLite `authProfiles.store` | NVIDIA fallbacks (MiniMax/DeepSeek) + embeddings (advisory) |
 | Slack bot/app tokens | `openclaw.json` | Slack gateway |
 | Postgres | `DATABASE_URL` in `/etc/rmp/rmp.env` | RMP ledger |
 | Mistral API key | `/etc/openclaw/openclaw.env` (optional) | **Legacy** — not used by current RMP config |
-| OpenAI keys | `auth-profiles.json` | **Legacy** — not required |
+| **OpenAI API key** | `/etc/openclaw/openclaw.env` `OPENAI_API_KEY` → SQLite `openai:default` | gpt-5-nano primary. Never git, Slack, or `openclaw.json`. Do not set `models.providers.openai.apiKey` to `${OPENAI_API_KEY}` — that marks the provider cold if the gateway process env is stale. Missing key: readiness **warn** `openai_key_missing`; OpenClaw falls back to MiniMax. |
 
 Do not commit secrets to git.
 

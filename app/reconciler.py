@@ -436,7 +436,10 @@ async def reconcile_once() -> dict:
                 logger.debug("Workflow describe failed for %s: %s", task.id, e)
 
             if task.status == "pending_user_input":
-                task.next_check_at = now + timedelta(minutes=5)
+                from app.task_registry.intake_handlers import maybe_remind_intake_clarify
+
+                reminded = await maybe_remind_intake_clarify(task, now)
+                task.next_check_at = now + timedelta(minutes=30 if reminded else 5)
                 stats["events"] += 1
                 continue
 

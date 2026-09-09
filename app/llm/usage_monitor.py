@@ -1,4 +1,4 @@
-"""Per-key NVIDIA usage logging: requests, tokens, and OpenClaw gateway LLM calls."""
+"""Per-profile LLM usage logging: requests, tokens, and OpenClaw gateway LLM calls."""
 from __future__ import annotations
 
 import fcntl
@@ -167,7 +167,7 @@ def record_request(
     """Log one API-facing event (including gateway LLM turns scraped from JSONL)."""
     if source not in _SOURCES:
         logger.debug("Unknown usage source %r; recording anyway", source)
-    pid = profile_id or "nvidia:unknown"
+    pid = resolve_usage_profile_id(profile_id, model=model)
     now = ts if ts is not None else time.time()
     day = _utc_day(now)
 
@@ -217,13 +217,15 @@ def record_openclaw_jsonl_message(
     profile_id: Optional[str] = None,
     session_key: str = "",
 ) -> bool:
-    """Record one assistant JSONL message if it is an NVIDIA LLM call. Returns True if logged."""
+    """Record one assistant JSONL message for an LLM provider. Returns True if logged."""
     if entry.get("type") != "message":
         return False
     msg = entry.get("message") or {}
     if msg.get("role") != "assistant":
         return False
-    if msg.get("provider") != "nvidia":
+    provider = str(msg.get("provider") or "")
+    model = str(msg.get("model") or "")
+    if not provider and not model:
         return False
 
     msg_id = entry.get("id") or ""
@@ -250,7 +252,12 @@ def record_openclaw_jsonl_message(
     )
 
     ts = _parse_jsonl_ts(entry)
-    pid = profile_id or _profile_for_session_key(session_key) or "nvidia:unknown"
+    pid = resolve_usage_profile_id(
+        profile_id,
+        model=model,
+        provider=provider,
+        session_key=session_key,
+    )
     record_request(
         pid,
         "openclaw_llm",
@@ -281,27 +288,61 @@ def _parse_jsonl_ts(entry: Dict[str, Any]) -> float:
 
 
 def _profile_for_session_key(session_key: str) -> Optional[str]:
-    if not session_key or not SESSIONS_JSON.is_file():
+    if not session_key:
         return None
     try:
-        data = json.loads(SESSIONS_JSON.read_text(encoding="utf-8"))
-        entry = data.get(session_key) or {}
-        return entry.get("authProfileOverride")
+        from app.openclaw_sessions import get_session_entry
+
+        entry = get_session_entry(session_key) or {}
+        pin = entry.get("authProfileOverride")
+        return str(pin) if pin else None
     except Exception:
         return None
 
 
 def _profile_for_session_id(session_id: str) -> Optional[str]:
-    if not session_id or not SESSIONS_JSON.is_file():
+    if not session_id:
         return None
     try:
-        data = json.loads(SESSIONS_JSON.read_text(encoding="utf-8"))
-        for _key, entry in data.items():
+        from app.openclaw_sessions import iter_session_entries
+
+        for _key, entry in iter_session_entries():
             if (entry or {}).get("sessionId") == session_id:
-                return entry.get("authProfileOverride")
+                pin = (entry or {}).get("authProfileOverride")
+                return str(pin) if pin else None
     except Exception:
         pass
     return None
+
+
+def resolve_usage_profile_id(
+    profile_id: Optional[str] = None,
+    *,
+    model: str = "",
+    provider: str = "",
+    session_key: str = "",
+) -> str:
+    """Attribute a turn to openai:default / nvidia:keyN — never nvidia:unknown for known OpenAI."""
+    if profile_id:
+        return str(profile_id)
+    if session_key:
+        pinned = _profile_for_session_key(session_key)
+        if pinned:
+            return pinned
+    prov = (provider or "").strip().lower()
+    mdl = (model or "").strip().lower()
+    if (
+        prov == "openai"
+        or mdl.startswith("openai/")
+        or mdl.startswith("gpt-")
+        or mdl.startswith("text-embedding-")
+    ):
+        return "openai:default"
+    if prov == "nvidia" or mdl.startswith("nvidia/"):
+        return "nvidia:default"
+    if prov:
+        return f"{prov}:unknown"
+    return "unknown"
 
 
 def _read_cursor() -> Dict[str, Any]:
@@ -319,7 +360,7 @@ def _write_cursor(cursor: Dict[str, Any]) -> None:
 
 
 def scrape_openclaw_sessions(limit_files: int = 200) -> Dict[str, Any]:
-    """Scan session JSONL files for new NVIDIA LLM usage (heartbeats, Slack, etc.)."""
+    """Scan session JSONL files for new LLM usage (heartbeats, Slack, etc.)."""
     cursor = _read_cursor()
     file_cursors: Dict[str, Any] = cursor.setdefault("files", {})
     logged = 0
@@ -416,7 +457,10 @@ def get_summary() -> Dict[str, Any]:
     for event in store.get("rolling_24h") or []:
         if event.get("ts_ms", 0) < cutoff_ms:
             continue
-        pid = event.get("profile_id") or "nvidia:unknown"
+        pid = resolve_usage_profile_id(
+            event.get("profile_id"),
+            model=str(event.get("model") or ""),
+        )
         bucket = rolling.setdefault(pid, _zero_counts())
         if event.get("is_rate_limit"):
             bucket["rate_limits"] += 1
@@ -460,7 +504,7 @@ def record_jsonl_usage_since(
     profile_id: Optional[str] = None,
     session_key: str = "",
 ) -> int:
-    """Record all NVIDIA assistant turns in a JSONL file after start_time."""
+    """Record assistant LLM turns in a JSONL file after start_time."""
     if not os.path.exists(jsonl_path):
         return 0
     count = 0

@@ -4,8 +4,8 @@ import pytest
 from app.orchestrator.completion_rework import should_admit_failure
 
 
-def test_should_admit_failure_on_max_attempts():
-    assert should_admit_failure(3, 3, "still trying") is True
+def test_should_admit_failure_not_just_max_attempts():
+    assert should_admit_failure(3, 3, "still trying") is False
 
 
 def test_should_admit_failure_on_explicit_admission():
@@ -34,5 +34,5 @@ def test_apply_intake_policy_cross_session_denied():
         },
         tags=["user-request"],
     )
-    assert result["decision"] == "create_fresh"
+    assert result["decision"] == "clarify"
     assert "cross_session_attach_denied" in result["policy_overrides"]

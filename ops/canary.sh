@@ -18,7 +18,10 @@ print(count_active_user_tasks_sync())
 )
 if [[ "${ACTIVE_USERS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "CANARY SKIP: ${ACTIVE_USERS} active user task(s) — deferring hourly canary"
-  # Do not write timeout; leave last successful result so sentinel does not restart worker.
+  cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.production.canary_sentinel import maybe_mark_health_canary_deferred
+maybe_mark_health_canary_deferred(reason='active_user_tasks', active_users=int('${ACTIVE_USERS}'))
+" || true
   exit 0
 fi
 
@@ -37,6 +40,9 @@ write_health_canary_result(status='${status}', task_id='${task_id}', error='''${
 }
 
 run_sentinel() {
+  if [[ "${RMP_CANARY_SKIP_SENTINEL:-0}" == "1" ]]; then
+    return 0
+  fi
   (
     cd "${RMP_ROOT}"
     ./venv/bin/python -m app.production.canary_sentinel --trigger health_canary
@@ -70,7 +76,8 @@ TASK_ID=$(echo "$RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)
 echo "Canary task created: ${TASK_ID}"
 
 # Poll up to 6 minutes (canary workflow includes dispatch + validation)
-for i in $(seq 1 36); do
+MAX_POLLS="${RMP_CANARY_MAX_POLLS:-36}"
+for i in $(seq 1 "${MAX_POLLS}"); do
   sleep 10
   STATUS=$(curl -sf -H "X-RMP-API-Key: ${API_KEY}" "http://127.0.0.1:8000/tasks/${TASK_ID}" \
     | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")

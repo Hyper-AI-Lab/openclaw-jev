@@ -36,14 +36,19 @@ check_present() {
   fi
 }
 
-check_absent 'hookRunner\?\.hasHooks\("before_message_write"\) \? \(event\)' 'legacy hook-persistence ternary'
 check_absent 'hookRunner\?\.hasHooks\("before_message_write"\)' 'hasHooks before_message_write guards'
 # Architecture uses intentional model fallbacks — legacy disable must stay gone.
 check_absent 'fallbackConfigured = false && hasConfiguredModelFallbacks' 'legacy no-fallback disable'
-check_present 'rmp_\(task\|verify\|intake\)_|rmp_task_.*rmp_verify_' 'rmp-minimal-bootstrap / announce session guard'
+check_absent 'const DEFAULT_LLM_IDLE_TIMEOUT_MS = 12e4' '120s LLM idle timeout'
+check_present 'RMP_HOOK_PERSISTENCE' 'hook-persistence runner-only guards'
+check_present 'RMP_ANNOUNCE_SUPPRESS' 'announce-suppress for rmp_* sessions'
+check_present 'RMP_MINIMAL_BOOTSTRAP' 'rmp-minimal-bootstrap TOOLS.md only'
 check_present '__RMP_SUPPRESS_NATIVE_SLACK' 'slack-rmp-suppress patch'
-check_present 'if \(!hookRunner\) return params\.message|if \(hookRunner\) \{' 'hook-persistence runner-only guards'
 check_present 'RMP_ALLOW_UNSAFE_EXTERNAL|RMP_FORCE_ALLOW_UNSAFE' 'allowUnsafeExternalContent RMP passthrough'
+check_present 'RMP_LLM_IDLE_5S' 'llm-idle-5s'
+check_present 'RMP_410_SKIP' '410-skip-model-not-found'
+check_present 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
+check_present 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo ""
@@ -69,3 +74,15 @@ SUB=$(python3 -c "import json; c=json.load(open('/root/.openclaw/openclaw.json')
 echo "OK: agent primary=${PRIMARY}"
 echo "OK: agent fallbacks=${FALLBACKS}"
 echo "OK: subagents model=${SUB}"
+if [[ "${PRIMARY}" != "openai/gpt-5-nano" ]]; then
+  echo "FAIL: agent primary must be openai/gpt-5-nano (got ${PRIMARY})"
+  FAIL=1
+fi
+if [[ "${FALLBACKS}" == *"glm"* ]]; then
+  echo "FAIL: GLM must not be in agent fallbacks (${FALLBACKS})"
+  FAIL=1
+fi
+if [[ "$FAIL" -ne 0 ]]; then
+  echo "Run: bash /root/.openclaw/rmp/ops/upgrade_openclaw.sh  (or apply_openclaw_policy)"
+  exit 1
+fi

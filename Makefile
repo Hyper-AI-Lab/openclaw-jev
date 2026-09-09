@@ -1,4 +1,4 @@
-.PHONY: test backup readiness production-check go-live rollback verify-patch canary memory-canary janitor observability seed-vector-memory ensure-skills restart-rmp install-code-reload
+.PHONY: test backup readiness production-check go-live rollback verify-patch canary memory-canary janitor observability seed-vector-memory ensure-skills restart-rmp install-code-reload upgrade-openclaw
 
 test:
 	cd /root/.openclaw/rmp && ./venv/bin/pytest tests/ -q
@@ -20,6 +20,9 @@ rollback:
 
 verify-patch:
 	bash /root/.openclaw/rmp/ops/verify_openclaw_patch.sh
+
+upgrade-openclaw:
+	bash /root/.openclaw/rmp/ops/upgrade_openclaw.sh
 
 canary:
 	bash /root/.openclaw/rmp/ops/canary.sh

@@ -5,6 +5,8 @@ import secrets
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
+from app.llm.model_policy import FALLBACK_MODELS, PRIMARY_MODEL
+
 # Host layout defaults match the production VPS. Override in CI / tests via env:
 #   OPENCLAW_HOME, RMP_ROOT, RMP_SETTINGS_PATH, …
 
@@ -95,10 +97,10 @@ DEFAULT_VECTOR_MEMORY = {
     "qdrant_host": "127.0.0.1",
     "qdrant_port": 6333,
     "qdrant_path": os.path.join(RMP_DATA_DIR, "qdrant"),
-    "collection_name": "rmp_memories",
-    "embedder_provider": "nvidia",
-    "embedder_model": "nvidia/nv-embed-v1",
-    "embedding_dims": 4096,
+    "collection_name": "rmp_memories_openai_3small",
+    "embedder_provider": "openai",
+    "embedder_model": "text-embedding-3-small",
+    "embedding_dims": 1536,
     "semantic_recall_limit": 5,
 }
 
@@ -138,21 +140,20 @@ DEFAULT_LLM_QUOTA = {
 
 DEFAULT_TASK_REGISTRY = {
     "enabled": True,
-    "collection_name": "rmp_task_registry",
+    "collection_name": "rmp_task_registry_openai_3small",
     "intake_mode": "enforce",  # off | shadow | enforce
     "similarity_threshold": 0.72,
     "intake_confidence_threshold": 65,
     "intake_cache_sec": 60,
-    "intake_llm_timeout_sec": 20,
-    "intake_model": "nvidia/deepseek-ai/deepseek-v4-flash-0731",
-    "intake_model_fallbacks": [
-        "nvidia/minimaxai/minimax-m3",
-        "nvidia/z-ai/glm-5.2",
-    ],
+    "intake_llm_timeout_sec": 40,
+    "intake_model": PRIMARY_MODEL,
+    "intake_model_fallbacks": list(FALLBACK_MODELS),
     "intake_vector_deadline_sec": 10,
     "qdrant_query_timeout_sec": 8,
     "backfill_days": 90,
-    "rework_max_attempts": 3,
+    "rework_max_attempts": 20,
+    "strategy_change_attempt": 10,
+    "escalate_user_attempt": 20,
     "temporal_half_life_days": 30,
     "recurrence_intervals": {
         "heartbeat": 25,
@@ -178,20 +179,36 @@ def get_intake_models() -> list[str]:
         for m in (raw_fb if isinstance(raw_fb, list) else [])
         if str(m).strip() and str(m).strip() != primary
     ]
-    return [primary] + fallbacks if primary else fallbacks
+    from app.llm.model_policy import drop_unwired_openai
+
+    chain = drop_unwired_openai([primary] + fallbacks if primary else fallbacks)
+    # OpenClaw already walks the same fallbacks. When OpenAI is unwired, one
+    # MiniMax turn (then OpenClaw→DeepSeek) beats two sequential 5s-idle budgets.
+    if chain and not any(m.startswith("openai/") for m in chain):
+        return chain[:1]
+    return chain
 
 
 def get_primary_agent_model() -> str:
-    """OpenClaw agents.defaults.model.primary — MiniMax M3 for user-facing RMP turns."""
+    """OpenClaw agents.defaults.model.primary — gpt-5-nano with NVIDIA fallbacks."""
     cfg = _read_json(OPENCLAW_CONFIG_PATH, {})
     model = (cfg.get("agents") or {}).get("defaults", {}).get("model") or {}
     if isinstance(model, dict):
         primary = str(model.get("primary") or "").strip()
         if primary:
-            return primary
+            from app.llm.model_policy import drop_unwired_openai
+
+            wired = drop_unwired_openai([primary, *FALLBACK_MODELS])
+            return wired[0] if wired else FALLBACK_MODELS[0]
     if isinstance(model, str) and model.strip():
-        return model.strip()
-    return "nvidia/minimaxai/minimax-m3"
+        from app.llm.model_policy import drop_unwired_openai
+
+        wired = drop_unwired_openai([model.strip(), *FALLBACK_MODELS])
+        return wired[0] if wired else FALLBACK_MODELS[0]
+    from app.llm.model_policy import drop_unwired_openai
+
+    wired = drop_unwired_openai([PRIMARY_MODEL, *FALLBACK_MODELS])
+    return wired[0] if wired else PRIMARY_MODEL
 
 
 def get_intake_timeout_budget() -> dict:
