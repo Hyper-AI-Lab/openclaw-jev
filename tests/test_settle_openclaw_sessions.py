@@ -3,7 +3,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-_SETTLE = Path("/root/.openclaw/rmp/ops/settle_openclaw_sessions.py")
+_SETTLE = Path(__file__).resolve().parents[1] / "ops" / "settle_openclaw_sessions.py"
 _spec = importlib.util.spec_from_file_location("settle_openclaw_sessions", _SETTLE)
 _mod = importlib.util.module_from_spec(_spec)
 assert _spec and _spec.loader

@@ -99,10 +99,11 @@ def test_notice_task_id_stable_and_reasons_whitelisted():
 def test_plugin_fail_closed_sends_rmp_notice_not_native():
     from pathlib import Path
 
-    copies = [
-        Path("/root/.openclaw/rmp/plugins/rmp_adapter/index.js"),
-        Path("/root/.openclaw/plugins/rmp_adapter/index.js"),
-    ]
+    repo = Path(__file__).resolve().parents[1]
+    copies = [repo / "plugins/rmp_adapter/index.js"]
+    live = Path("/root/.openclaw/plugins/rmp_adapter/index.js")
+    if live.is_file():
+        copies.append(live)
     for path in copies:
         src = path.read_text()
         assert "POST" in src and "/api/notify-user" in src
@@ -161,12 +162,13 @@ def test_second_post_does_not_start_another_intake_while_reserved():
 def test_plugin_post_timeout_covers_intake_budget():
     from pathlib import Path
 
-    src = Path("/root/.openclaw/rmp/plugins/rmp_adapter/index.js").read_text()
+    repo = Path(__file__).resolve().parents[1]
+    src = (repo / "plugins/rmp_adapter/index.js").read_text()
     assert "intakePostTimeoutSec" in src
     assert "intake_llm_timeout_sec" in src
     assert "intake_vector_deadline_sec" in src
     assert "llm + ctx + 45 + 30" in src
-    server = Path("/root/.openclaw/rmp/app/api/server.py").read_text()
+    server = (repo / "app/api/server.py").read_text()
     create = server[server.find("async def create_task") :]
     reserve_at = create.find('supplementary_context={"intake_reserved": True}')
     intake_at = create.find("run_classify_task_intake")
