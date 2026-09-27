@@ -67,7 +67,7 @@ print("Heartbeat set to 30m")
 PY
 
 echo "[6/6] Restarting services..."
-systemctl restart temporal-dev.service || true
+systemctl restart temporal.service || true
 sleep 3
 systemctl restart rmp-api.service rmp-worker.service openclaw-gateway.service
 

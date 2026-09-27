@@ -102,6 +102,50 @@ class GenericTaskWorkflow:
         if message:
             self.user_inputs.append(message)
 
+    def _stop_pending(self) -> bool:
+        if self._cancel_requested:
+            return True
+        return any(is_whole_message_stop(str(msg)) for msg in self.user_inputs)
+
+    async def _finish_stop(
+        self,
+        task_id: str,
+        session_key: str,
+        user_intent: str,
+        task_type: str,
+        tags: List[str],
+    ) -> Dict[str, Any]:
+        self.user_inputs = [
+            msg for msg in self.user_inputs if not is_whole_message_stop(str(msg))
+        ]
+        await workflow.execute_activity(
+            update_task_status,
+            {"task_id": task_id, "status": "stopped_by_user"},
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+        await workflow.execute_activity(
+            update_process_state,
+            {
+                "process_run_id": self.process_run_id,
+                "state": "stopped_by_user",
+                "ended": True,
+            },
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+        await workflow.execute_activity(
+            notify_slack_user,
+            {
+                "session_key": session_key,
+                "task_id": task_id,
+                "intent": user_intent,
+                "task_type": task_type,
+                "tags": tags,
+                "message": f"Task {task_id[:8]} stopped as requested.",
+            },
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+        return {"status": "stopped_by_user", "task_id": task_id}
+
     @workflow.run
     async def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         task_id = payload.get("task_id", "unknown")
@@ -187,6 +231,9 @@ class GenericTaskWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
             )
             return {"status": "compensated", "task_id": task_id, "reason": err_text}
+
+        if isinstance(result, dict) and result.get("status") == "stopped_by_user":
+            return result
 
         while task_kind == "durable" and not self._cancel_requested:
             await workflow.wait_condition(
@@ -310,22 +357,23 @@ class GenericTaskWorkflow:
             step_name = plan_step.get("name", "execute")
             predicate_id = plan_step.get("predicate_id", "generic_deliver")
             step_prompt = plan_step.get("prompt", "")
+            if self._stop_pending():
+                return await self._finish_stop(
+                    task_id, session_key, user_intent, task_type, tags
+                )
             while self.user_inputs:
                 reply = self.user_inputs.pop(0).strip()
-                if is_whole_message_stop(reply):
-                    await workflow.execute_activity(
-                        update_task_status,
-                        {"task_id": task_id, "status": "stopped_by_user"},
-                        start_to_close_timeout=timedelta(seconds=10),
-                    )
-                    return {"status": "stopped_by_user", "task_id": task_id}
                 if reply:
                     self._catchup_chunks.append(reply)
             if self._catchup_chunks:
                 step_context += "\n" + format_user_catchup(self._catchup_chunks)
                 self._catchup_chunks.clear()
             for attempt in range(1, 4):
-                result = await workflow.execute_child_workflow(
+                if self._stop_pending():
+                    return await self._finish_stop(
+                        task_id, session_key, user_intent, task_type, tags
+                    )
+                handle = await workflow.start_child_workflow(
                     GenericExecuteChildWorkflow.run,
                     {
                         "task_id": task_id,
@@ -341,12 +389,23 @@ class GenericTaskWorkflow:
                         "context_block": step_context,
                         "generic_profile": generic_profile,
                         "user_time_block": user_time_block,
+                        "task_type": task_type,
+                        "tags": tags,
                         # Conversational: return agent text ASAP; write episodic after Slack.
                         "defer_episodic_write": is_conversational,
                     },
                     id=f"{task_id}-plan-{step_name}-{attempt}",
                     task_queue=workflow.info().task_queue,
+                    parent_close_policy=workflow.ParentClosePolicy.TERMINATE,
                 )
+                await workflow.wait_condition(
+                    lambda: handle.done() or self._stop_pending()
+                )
+                if self._stop_pending():
+                    return await self._finish_stop(
+                        task_id, session_key, user_intent, task_type, tags
+                    )
+                result = await handle
                 status = result.get("status", "pending")
                 text = result.get("text", "")
                 if status == "completed":
@@ -390,15 +449,12 @@ class GenericTaskWorkflow:
                             start_to_close_timeout=timedelta(seconds=10),
                         )
                         await workflow.wait_condition(lambda: len(self.user_inputs) > 0)
+                        if self._stop_pending():
+                            return await self._finish_stop(
+                                task_id, session_key, user_intent, task_type, tags
+                            )
                         if self.user_inputs:
                             reply = self.user_inputs.pop(0).strip()
-                            if is_whole_message_stop(reply):
-                                await workflow.execute_activity(
-                                    update_task_status,
-                                    {"task_id": task_id, "status": "stopped_by_user"},
-                                    start_to_close_timeout=timedelta(seconds=10),
-                                )
-                                return {"status": "stopped_by_user", "task_id": task_id}
                             if reply:
                                 step_context += "\n" + format_user_catchup([reply])
                         continue

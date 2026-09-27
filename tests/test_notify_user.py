@@ -106,7 +106,8 @@ def test_plugin_fail_closed_sends_rmp_notice_not_native():
     for path in copies:
         src = path.read_text()
         assert "POST" in src and "/api/notify-user" in src
-        assert "intake_unavailable" in src
+        assert "data.delivered !== true" in src
+        assert "RMP user notice not delivered" in src
         assert "stop_idle" in src
         assert "handled: true" in src
         assert "no native" in src.lower() or "no native OpenClaw" in src
@@ -117,6 +118,67 @@ def test_plugin_fail_closed_sends_rmp_notice_not_native():
         assert "stop_idle" in route
         assert "/active_user_task" in route
         assert route.find("/active_user_task") < route.find("SIGNALED stop")
+        recovery = route[route.find("Intake POST timed out") :]
+        assert "by-idempotency" in recovery
+        assert "via active task" not in recovery
+        assert "intake_unavailable" in recovery
+        msg = src[src.find("api.on('message_received'") : src.find("api.on('reply_payload_sending'")]
+        assert "return { handled: true }" in msg
+        assert msg.count("handled: true") >= 3
+        catch_slice = msg[msg.find("} catch (e)") :]
+        assert "handled: true" in catch_slice
+
+
+def test_intake_reservation_is_not_an_active_task():
+    from app.task_registry.retriever import include_in_active_snapshot
+
+    assert include_in_active_snapshot({"intake_reserved": True}) is False
+    assert include_in_active_snapshot({"intake_reserved": False}) is True
+    assert include_in_active_snapshot({}) is True
+    assert include_in_active_snapshot(None) is True
+
+
+def test_second_post_does_not_start_another_intake_while_reserved():
+    from datetime import datetime, timedelta
+
+    from app.api.server import reservation_retry_should_run_intake
+
+    class Row:
+        status = "created"
+        supplementary_context = {"intake_reserved": True}
+        updated_at = datetime.utcnow()
+        created_at = updated_at
+
+    assert reservation_retry_should_run_intake(Row()) is False
+    stale = Row()
+    stale.updated_at = datetime.utcnow() - timedelta(seconds=151)
+    assert reservation_retry_should_run_intake(stale) is True
+    worked = Row()
+    worked.supplementary_context = {}
+    assert reservation_retry_should_run_intake(worked) is False
+
+
+def test_plugin_post_timeout_covers_intake_budget():
+    from pathlib import Path
+
+    src = Path("/root/.openclaw/rmp/plugins/rmp_adapter/index.js").read_text()
+    assert "intakePostTimeoutSec" in src
+    assert "intake_llm_timeout_sec" in src
+    assert "intake_vector_deadline_sec" in src
+    assert "llm + ctx + 45 + 30" in src
+    server = Path("/root/.openclaw/rmp/app/api/server.py").read_text()
+    create = server[server.find("async def create_task") :]
+    reserve_at = create.find('supplementary_context={"intake_reserved": True}')
+    intake_at = create.find("run_classify_task_intake")
+    assert reserve_at != -1 and intake_at != -1
+    assert reserve_at < intake_at
+    from app.api.server import task_visible_for_idempotent_recovery
+
+    assert task_visible_for_idempotent_recovery("running") is True
+    assert task_visible_for_idempotent_recovery("created") is True
+    assert task_visible_for_idempotent_recovery("completed") is False
+    assert task_visible_for_idempotent_recovery("stopped_by_user") is False
+    assert task_visible_for_idempotent_recovery(None) is False
 
 
 def test_active_user_task_endpoint_excludes_canary():

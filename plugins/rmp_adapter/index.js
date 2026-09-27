@@ -55,11 +55,15 @@ function notifyRmpUser(sessionKey, reason, content) {
       .update(`${sessionKey}:${reason}:${content || ''}`)
       .digest('hex')
       .slice(0, 32);
-    rmpFetchSync('POST', '/api/notify-user', {
+    const data = rmpFetchSync('POST', '/api/notify-user', {
       session_key: sessionKey,
       reason,
       idempotency_key: idem,
     }, { maxTimeSec: 10 });
+    if (!data || data.delivered !== true) {
+      log(`RMP user notice not delivered (${reason}) on ${sessionKey}`);
+      return false;
+    }
     log(`RMP user notice sent (${reason}) on ${sessionKey}`);
     return true;
   } catch (e) {
@@ -68,10 +72,26 @@ function notifyRmpUser(sessionKey, reason, content) {
   }
 }
 
+function intakePostTimeoutSec() {
+  try {
+    const settings = JSON.parse(fs.readFileSync('/root/.openclaw/rmp/settings.json', 'utf8'));
+    const reg = settings.task_registry || {};
+    const llm = Number(reg.intake_llm_timeout_sec) || 40;
+    const ctx = Number(reg.intake_vector_deadline_sec) || 10;
+    // workflow_execution budget is llm + context + 45; add slack for the rest of POST /tasks.
+    return Math.ceil(llm + ctx + 45 + 30);
+  } catch (_) {
+    return 125;
+  }
+}
+
 /** Synchronous RMP HTTP — before_message_write must not return a Promise. */
 function rmpFetchSync(method, urlPath, body, opts) {
   const key = getApiKey();
-  const maxTime = String((opts && opts.maxTimeSec) || (method === 'POST' && urlPath === '/tasks' ? 45 : 15));
+  const maxTime = String(
+    (opts && opts.maxTimeSec)
+      || (method === 'POST' && urlPath === '/tasks' ? intakePostTimeoutSec() : 15)
+  );
   const args = [
     '-sS',
     '-X', method,
@@ -253,13 +273,15 @@ function clearMainSessionSendPolicy() {
   }
 }
 
-function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeatKey }) {
-  let idemKey;
+function inboundIdempotencyKey(sessionKey, rawText, intent, heartbeatKey) {
   if (heartbeatKey) {
-    idemKey = crypto.createHash('sha256').update(`${sessionKey}:${heartbeatKey}`).digest('hex');
-  } else {
-    idemKey = crypto.createHash('sha256').update(`${sessionKey}:${rawText || intent}`).digest('hex');
+    return crypto.createHash('sha256').update(`${sessionKey}:${heartbeatKey}`).digest('hex');
   }
+  return crypto.createHash('sha256').update(`${sessionKey}:${rawText || intent}`).digest('hex');
+}
+
+function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeatKey }) {
+  const idemKey = inboundIdempotencyKey(sessionKey, rawText, intent, heartbeatKey);
   const data = rmpFetchSync('POST', '/tasks', {
     intent: (rawText || intent || "").slice(0, 20000),
     tags: tags || ['user-request'],
@@ -324,9 +346,10 @@ function routeSlackDmToRmp(content, sessionKey) {
           message: intent,
         });
         log(`SIGNALED stop to task ${activeData.active_task.id}`);
-      } else {
-        notifyRmpUser(sessionKey, 'stop_idle', intent);
+      } else if (notifyRmpUser(sessionKey, 'stop_idle', intent)) {
         log(`Stop with no active task; RMP ack on ${sessionKey}`);
+      } else {
+        log(`Stop with no active task; RMP notice was not delivered on ${sessionKey}`);
       }
     } catch (e) {
       log(`Signal error: ${e.message}`);
@@ -361,9 +384,10 @@ function routeSlackDmToRmp(content, sessionKey) {
           log(`Recovery attempt failed: ${e2.message}`);
         }
         try {
-          const active = getActiveRmpUserTask(sessionKey);
-          if (active?.id) {
-            log(`Recovered RMP ownership via active task ${active.id}`);
+          const idemKey = inboundIdempotencyKey(sessionKey, intent, intent);
+          const found = rmpFetchSync('GET', `/tasks/by-idempotency/${encodeURIComponent(idemKey)}`);
+          if (found && found.task_id) {
+            log(`Recovered RMP ownership via idempotency ${found.task_id}`);
             return true;
           }
         } catch (_) {}
@@ -374,7 +398,7 @@ function routeSlackDmToRmp(content, sessionKey) {
   }
 }
 
-/** Recent Slack DMs claimed by inbound_claim — avoid double POST from message_received. */
+/** Recent Slack DMs claimed by inbound_claim — avoid a second POST from the same event. */
 const claimedSlackKeys = new Map();
 function markSlackClaimed(sessionKey, content) {
   const fp = crypto.createHash('sha256').update(content || '').digest('hex');
@@ -386,7 +410,7 @@ function markSlackClaimed(sessionKey, content) {
     claimedSlackKeys.set(`${alias}::${fp}`, now);
   }
   if (claimedSlackKeys.size > 400) {
-    const cutoff = Date.now() - 10 * 60 * 1000;
+    const cutoff = Date.now() - 30 * 1000;
     for (const [k, ts] of claimedSlackKeys) {
       if (ts < cutoff) claimedSlackKeys.delete(k);
     }
@@ -398,7 +422,7 @@ function wasSlackClaimed(sessionKey, content) {
   const aliases = new Set([sessionKey, 'agent:main:main']);
   const discovered = findSlackSessionKeyFromStore();
   if (discovered) aliases.add(discovered);
-  const cutoff = Date.now() - 10 * 60 * 1000;
+  const cutoff = Date.now() - 30 * 1000;
   for (const alias of aliases) {
     const ts = claimedSlackKeys.get(`${alias}::${fp}`);
     if (ts && ts >= cutoff) return true;
@@ -646,13 +670,20 @@ module.exports = {
         const sessionKey = pickSlackSessionKey(event, ctx);
         if (wasSlackClaimed(sessionKey, content)) {
           log(`message_received skip (already claimed) on ${sessionKey}`);
-          return;
+          return { handled: true };
         }
         log(`message_received slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
         routeSlackDmToRmp(content, sessionKey);
         markSlackClaimed(sessionKey, content);
+        return { handled: true };
       } catch (e) {
-        log(`message_received route error (no native fallback): ${e.message}`);
+        log(`message_received route error (still claiming; no native): ${e.message}`);
+        try {
+          const sessionKey = pickSlackSessionKey(event, ctx);
+          const content = (event?.content || '').trim();
+          if (content) markSlackClaimed(sessionKey, content);
+        } catch (_) {}
+        return { handled: true };
       }
     }, { priority: 120 });
 

@@ -6,7 +6,7 @@ import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -227,6 +227,44 @@ TERMINAL_TASK_STATUSES = frozenset(
 )
 
 
+def task_visible_for_idempotent_recovery(status: str | None) -> bool:
+    """Timeout recovery owns this DM only when this key's task is still in flight."""
+    return status in ACTIVE_TASK_STATUSES
+
+
+INTAKE_RESERVATION_WINDOW_SEC = 150
+
+
+def reservation_retry_should_run_intake(
+    task: Task, *, now: datetime | None = None, window_sec: int = INTAKE_RESERVATION_WINDOW_SEC
+) -> bool:
+    """A stale intake reservation may be continued. A fresh one must not start a second intake."""
+    ctx = task.supplementary_context or {}
+    if not ctx.get("intake_reserved"):
+        return False
+    if task.status not in ACTIVE_TASK_STATUSES:
+        return False
+    now = now or datetime.utcnow()
+    stamp = task.updated_at or task.created_at
+    if stamp is None:
+        return False
+    if getattr(stamp, "tzinfo", None) is not None:
+        stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return (now - stamp).total_seconds() >= window_sec
+
+
+async def _cancel_intake_reservation(task: Task, db: AsyncSession) -> None:
+    ctx = dict(task.supplementary_context or {})
+    if not ctx.get("intake_reserved"):
+        return
+    if task.status not in ACTIVE_TASK_STATUSES:
+        return
+    task.status = "cancelled"
+    ctx["intake_reserved"] = False
+    task.supplementary_context = ctx
+    await db.commit()
+
+
 def _make_idempotency_key(request: TaskRequest) -> str:
     if request.idempotency_key:
         return request.idempotency_key
@@ -276,11 +314,23 @@ async def prometheus_metrics():
 @app.get("/health")
 async def health():
     vm = await MemoryRouter.vector_status()
+    temporal = {"ok": False, "error": None}
+    try:
+        client = await asyncio.wait_for(
+            Client.connect("localhost:7233", **get_temporal_client_kwargs()),
+            timeout=5.0,
+        )
+        await client.service_client.check_health()
+        temporal = {"ok": True, "error": None}
+    except Exception as exc:
+        temporal = {"ok": False, "error": str(exc)}
+    status = "ok" if temporal["ok"] else "degraded"
     return {
-        "status": "ok",
+        "status": status,
         "service": "rmp",
         "vector_memory": vm,
         "telemetry": telemetry_status(),
+        "temporal": temporal,
     }
 
 
@@ -337,8 +387,11 @@ async def create_task(
         select(Task).where(Task.idempotency_key == idem_key)
     )
     prior = existing.scalar_one_or_none()
+    reuse_stale_reservation = False
     if prior:
-        if prior.status in ACTIVE_TASK_STATUSES:
+        if prior.status in ACTIVE_TASK_STATUSES and not reservation_retry_should_run_intake(
+            prior
+        ):
             return {
                 "task_id": prior.id,
                 "status": prior.status,
@@ -346,6 +399,9 @@ async def create_task(
             }
         if prior.status in TERMINAL_TASK_STATUSES:
             idem_key = _fresh_idempotency_key(idem_key)
+            prior = None
+        elif reservation_retry_should_run_intake(prior):
+            reuse_stale_reservation = True
         else:
             return {
                 "task_id": prior.id,
@@ -399,6 +455,36 @@ async def create_task(
         task_kind_hint=request.task_kind_hint,
     )
 
+    if reuse_stale_reservation and prior is not None:
+        task = prior
+        task.goal = intent
+        task.task_type = task_type
+        task.task_kind = task_kind
+        task.recurrence_key = recurrence_key
+        task.openclaw_session_key = request.session_key
+        task.status = "created"
+        ctx = dict(task.supplementary_context or {})
+        ctx["intake_reserved"] = True
+        task.supplementary_context = ctx
+        task_id = task.id
+    else:
+        task_id = str(uuid.uuid4())
+        task = Task(
+            id=task_id,
+            correlation_id=task_id,
+            idempotency_key=idem_key,
+            requester=request.user_id,
+            openclaw_session_key=request.session_key,
+            task_type=task_type,
+            goal=intent,
+            status="created",
+            task_kind=task_kind,
+            recurrence_key=recurrence_key,
+            supplementary_context={"intake_reserved": True},
+        )
+        db.add(task)
+    await db.commit()
+
     guided_memory = ""
     intake_decision_id = None
     intake_catalog_type = None
@@ -437,14 +523,15 @@ async def create_task(
             if outcome.get("execution_mode"):
                 execution_mode = outcome.get("execution_mode")
             if outcome.get("skipped"):
-                await db.commit()
+                await _cancel_intake_reservation(task, db)
                 return outcome
             if outcome.get("intake_action") in ("wait_active", "clarify"):
-                await db.commit()
+                await _cancel_intake_reservation(task, db)
                 return outcome
             if outcome.get("intake_action") == "resume_clarify":
                 tid = outcome.get("task_id")
                 guided_resume = outcome.get("_guided_memory_block") or ""
+                await _cancel_intake_reservation(task, db)
                 try:
                     await _start_task_workflow(
                         tid,
@@ -476,6 +563,7 @@ async def create_task(
                 }
             if outcome.get("intake_action") == "attach_active":
                 tid = outcome.get("task_id")
+                await _cancel_intake_reservation(task, db)
                 if tid and outcome.get("signal_required"):
                     try:
                         client = await connect_temporal()
@@ -485,20 +573,21 @@ async def create_task(
                             outcome.get("signal_text") or intent,
                         )
                     except Exception as exc:
-                        logger.warning("Intake attach signal failed: %s", exc)
-                        await db.commit()
-                        raise HTTPException(
-                            status_code=502,
-                            detail={
-                                "intake_action": "attach_active",
-                                "task_id": tid,
-                                "error": str(exc)[:300],
-                            },
+                        logger.warning(
+                            "Intake attach found no live workflow for %s (%s); starting this message instead",
+                            tid,
+                            exc,
                         )
-                await db.commit()
-                return outcome
+                        task.status = "created"
+                        guided_memory = outcome.get("_guided_memory_block") or ""
+                    else:
+                        await db.commit()
+                        return outcome
+                else:
+                    await db.commit()
+                    return outcome
             if outcome.get("intake_action") == "spawn_process":
-                await db.commit()
+                await _cancel_intake_reservation(task, db)
                 return outcome
             guided_memory = outcome.get("_guided_memory_block") or ""
 
@@ -511,22 +600,14 @@ async def create_task(
     if catalog_type:
         task_type = catalog_type
 
-    task_id = str(uuid.uuid4())
-
-    task = Task(
-        id=task_id,
-        correlation_id=task_id,
-        idempotency_key=idem_key,
-        requester=request.user_id,
-        openclaw_session_key=request.session_key,
-        task_type=task_type,
-        goal=intent,
-        status="created",
-        task_kind=task_kind,
-        recurrence_key=recurrence_key,
-        intake_decision_id=intake_decision_id,
-    )
-    db.add(task)
+    task.task_type = task_type
+    task.goal = intent
+    task.intake_decision_id = intake_decision_id
+    task.task_kind = task_kind
+    task.recurrence_key = recurrence_key
+    reserved_ctx = dict(task.supplementary_context or {})
+    reserved_ctx["intake_reserved"] = False
+    task.supplementary_context = reserved_ctx
     db.add(
         Event(
             correlation_id=task_id,
@@ -1028,6 +1109,19 @@ async def get_active_user_task(session_key: str, db: AsyncSession = Depends(get_
     return {
         "active_task": {"id": task.id, "status": task.status, "goal": task.goal}
     }
+
+
+@app.get("/tasks/by-idempotency/{idempotency_key}")
+async def get_task_by_idempotency(
+    idempotency_key: str, db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(Task).where(Task.idempotency_key == idempotency_key)
+    )
+    task = result.scalar_one_or_none()
+    if not task or not task_visible_for_idempotent_recovery(task.status):
+        return {"task_id": None}
+    return {"task_id": task.id, "status": task.status}
 
 
 @app.post("/memory/write")

@@ -36,6 +36,12 @@ _SOURCES = (
     "probe",
 )
 
+_UNSET_PROFILE_IDS = frozenset({"nvidia:unknown", "unknown", ""})
+
+
+def _is_unset_profile(profile_id: Optional[str]) -> bool:
+    return str(profile_id or "").strip() in _UNSET_PROFILE_IDS
+
 
 def _utc_day(ts: Optional[float] = None) -> str:
     t = ts if ts is not None else time.time()
@@ -323,7 +329,7 @@ def resolve_usage_profile_id(
     session_key: str = "",
 ) -> str:
     """Attribute a turn to openai:default / nvidia:keyN — never nvidia:unknown for known OpenAI."""
-    if profile_id:
+    if profile_id and not _is_unset_profile(profile_id):
         return str(profile_id)
     if session_key:
         pinned = _profile_for_session_key(session_key)
@@ -444,9 +450,44 @@ def get_today_load_by_profile() -> Dict[str, Dict[str, int]]:
     }
 
 
+def rewrite_unattributed_rolling() -> int:
+    """Rewrite rolling_24h nvidia:unknown only when the event has a model. Leave day buckets."""
+
+    def _apply(store: Dict[str, Any]) -> int:
+        return _rewrite_rolling_unknown_with_model(store)
+
+    return int(_mutate_store(_apply) or 0)
+
+
+def _rewrite_rolling_unknown_with_model(store: Dict[str, Any]) -> int:
+    changed = 0
+    for event in store.get("rolling_24h") or []:
+        model = str(event.get("model") or "").strip()
+        if not model:
+            continue
+        raw = str(event.get("profile_id") or "")
+        if not _is_unset_profile(raw):
+            continue
+        new_pid = resolve_usage_profile_id(raw, model=model)
+        if new_pid != raw and not _is_unset_profile(new_pid):
+            event["profile_id"] = new_pid
+            changed += 1
+    return changed
+
+
+def _unattributed_historical_days(store: Dict[str, Any]) -> List[str]:
+    days = []
+    for day, data in (store.get("days") or {}).items():
+        profiles = (data or {}).get("profiles") or {}
+        if any(_is_unset_profile(pid) for pid in profiles):
+            days.append(str(day))
+    return sorted(days)
+
+
 def get_summary() -> Dict[str, Any]:
     """Return today + rolling-24h usage per profile."""
     scrape_openclaw_sessions()
+    rewrite_unattributed_rolling()
     store = _read_store()
     today = _utc_day()
     today_data = (store.get("days") or {}).get(today, {})
@@ -477,6 +518,7 @@ def get_summary() -> Dict[str, Any]:
             for k in agg:
                 agg[k] += int((counts or {}).get(k) or 0)
 
+    unattributed = _unattributed_historical_days(store)
     return {
         "updated_ms": store.get("updated_ms"),
         "utc_day": today,
@@ -488,6 +530,13 @@ def get_summary() -> Dict[str, Any]:
         "today_by_source": by_source_today,
         "rolling_24h_by_profile": rolling,
         "profiles_configured": [p for p, _ in _load_profile_ids()],
+        "unattributed_historical_days": unattributed,
+        "unattributed_note": (
+            "Day-bucket totals for these UTC days include nvidia:unknown/unknown "
+            "with no stored model id; they were not rewritten. Never invent nvidia:keyN."
+            if unattributed
+            else None
+        ),
     }
 
 

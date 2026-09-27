@@ -45,6 +45,7 @@ function curlJson(method, url, body, headers, maxTimeSec) {
     '-sS',
     '-X', method,
     '-H', 'Content-Type: application/json',
+    '--connect-timeout', '8',
     '--max-time', String(maxTimeSec || 60),
     '-w', '\n%{http_code}',
   ];
@@ -160,7 +161,7 @@ async function backendsGet(path) {
   try {
     const raw = execFileSync(
       '/usr/bin/curl',
-      ['-sS', '--max-time', '15', '-w', '\n%{http_code}', `${base}${path}`],
+      ['-sS', '--connect-timeout', '8', '--max-time', '15', '-w', '\n%{http_code}', `${base}${path}`],
       { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 }
     );
     const nl = raw.lastIndexOf('\n');

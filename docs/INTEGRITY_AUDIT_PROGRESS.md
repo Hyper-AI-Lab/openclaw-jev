@@ -79,4 +79,17 @@ Append-only. Each plan step adds a dated entry below. Do not rewrite prior entri
 - **Verification:** `./venv/bin/pytest -q tests/test_web_capability.py tests/test_notify_user.py` — 19 passed. `cmp` plugin copies identical. Idle restart via `ops/controlled_capability_restart.sh --gateway --rmp-if-idle` (0 active user tasks).
 - **Still product-risk (not this follow-up):** `message_received` still does not return `{ handled: true }` (mitigated by `inbound_claim` / `before_dispatch`).
 
+---
+
+## 2026-09-09 — Pointer: product-risk close
+
+Named leftover product/ops risks from the integrity close were executed in [`docs/PRODUCT_RISK_PROGRESS.md`](PRODUCT_RISK_PROGRESS.md) (fail-closed `message_received`, single-node Temporal WAL, quota pools, memory-canary honesty, Galaxy fail-soft, usage unknown-as-unset, this-host sockets runbook). This file is not rewritten. The Aura roadmap is not finished.
+
+---
+
+## 2026-09-27 — Pointer: vision integrity close
+
+The founding-path close is in [`docs/VISION_CLOSE_PROGRESS.md`](VISION_CLOSE_PROGRESS.md). This file is not rewritten.
+
+
 

@@ -28,7 +28,7 @@ def broker_env(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_reserve_respects_max_concurrent(broker_env):
-    settings = {"llm_quota": {"max_concurrent": 2, "min_interval_sec": 0, "max_wait_sec": 5}}
+    settings = {"llm_quota": {"max_concurrent": 3, "min_interval_sec": 0, "max_wait_sec": 5}}
 
     p1, s1 = await qb.reserve_profile(session_key="agent:main:one", settings=settings)
     p2, s2 = await qb.reserve_profile(session_key="agent:main:two", settings=settings)

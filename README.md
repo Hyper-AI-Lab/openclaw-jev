@@ -1,14 +1,14 @@
-# Aura
+# Reliable memory and operation kit for OpenClaw
 
-![Aura: The Reliability & Memory Plane for Production Slack Agents](docs/assets/AI_Agent_Reliability_Architecture.jpg)
+![Reliable memory and operation kit for OpenClaw](docs/assets/AI_Agent_Reliability_Architecture.jpg)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](requirements.txt)
 [![OpenClaw](https://img.shields.io/badge/runtime-OpenClaw-0ea5e9.svg)](https://github.com/openclaw/openclaw)
 [![Org](https://img.shields.io/badge/org-Hyper--AI--Lab-111827.svg)](https://github.com/Hyper-AI-Lab)
 
-**Aura is a reliability & memory control plane for a production Slack agent.**  
-It sits beside [OpenClaw](https://github.com/openclaw/openclaw) and turns every user turn into a durable Temporal workflow: intake routing, process memory, evidence gates, idempotent Slack delivery, multi-key LLM orchestration, and a routed galaxy web-research stack.
+**Aura is a reliable memory and operation kit for [OpenClaw](https://github.com/openclaw/openclaw).**  
+It sits beside OpenClaw and turns every user turn into a durable Temporal workflow: intake routing, process memory, evidence gates, idempotent Slack delivery, multi-key LLM orchestration, and a routed galaxy web-research stack.
 
 Built by [Hyper-AI-Lab](https://github.com/Hyper-AI-Lab) · Homepage: [hyperailab.com](https://hyperailab.com/)
 

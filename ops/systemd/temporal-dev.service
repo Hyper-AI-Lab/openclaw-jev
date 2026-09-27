@@ -1,0 +1,16 @@
+[Unit]
+Description=Temporal dev server for RMP
+After=network.target postgresql.service
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+LimitNOFILE=65535
+ExecStart=/root/.temporalio/bin/temporal server start-dev --ip 127.0.0.1 --port 7233 --ui-port 8233 --db-filename /root/.openclaw/rmp/data/temporal.db --sqlite-pragma journal_mode=WAL --sqlite-pragma synchronous=NORMAL
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

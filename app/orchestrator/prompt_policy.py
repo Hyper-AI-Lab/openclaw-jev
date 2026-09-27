@@ -145,6 +145,13 @@ def build_catalog_step_prompt(
     context_block: str,
     step_prompt: str,
 ) -> str:
+    from app.orchestrator.web_capability import obscura_available
+
+    interact = (
+        "For interact steps prefer OpenClaw `browser`, then `browser_use`, then `obscura_browse`."
+        if obscura_available()
+        else "For interact steps prefer OpenClaw `browser`, then `browser_use`. obscura_browse is omitted because CDP is down."
+    )
     mem = memory_block or "PROCESS-SCOPED MEMORY: (none yet)\n"
     web_block = ""
     return f"""User Request: {user_intent}
@@ -156,7 +163,7 @@ def build_catalog_step_prompt(
 
 {MEMORY_FIRST_UNIVERSAL}
 Instructions:
-1. Complete ONLY this step. Use tools as needed (prefer at most 3 tool calls unless the step requires more). Use `read` with `file_path` for files (not `read_file`). For interact steps prefer OpenClaw `browser`, then `browser_use`, then `obscura_browse`.
+1. Complete ONLY this step. Use tools as needed (prefer at most 3 tool calls unless the step requires more). Use `read` with `file_path` for files (not `read_file`). {interact}
 2. Reply in clear English — concise, no internal planning monologue or metadata blocks.
 3. Put facts JSON ONLY in a final fenced block:
 ```json

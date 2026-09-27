@@ -51,8 +51,9 @@ def probe_backends() -> Dict[str, Any]:
 
     status["crawlee"] = {
         "available": True,
-        "detail": "python_bfs_crawler",
-        "node_crawlee": os.path.exists("/usr/bin/npx"),
+        "detail": "in-memory python BFS; jobs are lost when this process restarts",
+        "engine": "python_bfs",
+        "durable": False,
     }
 
     obscura_url = (os.environ.get("OBSCURA_CDP_URL") or "").strip()

@@ -113,33 +113,41 @@ async def execute_evaluator_tool(name: str, *, intent: str = "") -> Dict[str, An
 
             analysis = analyze_web_capability(intent or "")
             stack = await _local_get("http://127.0.0.1:8791/health")
+            stack_ok = bool(stack.get("ok")) and not stack.get("denied")
+            body = stack.get("body") if isinstance(stack.get("body"), dict) else {}
+            if isinstance(body, dict) and body.get("ok") is False:
+                stack_ok = False
+            obscura = False
+            backends = body.get("backends") if isinstance(body, dict) else {}
+            if isinstance(backends, dict):
+                obscura = bool((backends.get("obscura") or {}).get("available"))
             return {
                 "tool": "web_capability_status",
-                "ok": True,
+                "ok": stack_ok,
+                "obscura_available": obscura,
                 "analysis": {
-                    "intent_class": analysis.get("intent_class"),
+                    "intent_class": analysis.get("web_intent") or analysis.get("intent_class"),
                     "preferred_tools": analysis.get("preferred_tools"),
+                    "obscura_available": analysis.get("obscura_available"),
                 },
                 "stack": stack,
             }
         if name == "web_search":
             q = quote((intent or "")[:200])
-            return {
-                "tool": "web_search",
-                **(await _local_get(f"http://127.0.0.1:8791/v1/search?q={q}")),
-            }
+            fetched = await _local_get(f"http://127.0.0.1:8791/v1/search?q={q}")
+            body = fetched.get("body") if isinstance(fetched.get("body"), dict) else {}
+            ok = bool(fetched.get("ok")) and body.get("ok") is not False
+            return {"tool": "web_search", "ok": ok, "status": fetched.get("status"), "body": body}
         if name == "jina_reader":
             target = _intent_url(intent)
             if not target:
                 return {"tool": "jina_reader", "ok": False, "error": "no url in ask"}
-            return {
-                "tool": "jina_reader",
-                **(
-                    await _local_get(
-                        f"http://127.0.0.1:8791/v1/jina?url={quote(target, safe='')}"
-                    )
-                ),
-            }
+            fetched = await _local_get(
+                f"http://127.0.0.1:8791/v1/jina?url={quote(target, safe='')}"
+            )
+            body = fetched.get("body") if isinstance(fetched.get("body"), dict) else {}
+            ok = bool(fetched.get("ok")) and body.get("ok") is not False
+            return {"tool": "jina_reader", "ok": ok, "status": fetched.get("status"), "body": body}
     except Exception as exc:
         logger.info("Evaluator tool %s failed soft: %s", name, exc)
         return {"tool": name, "ok": False, "error": str(exc)[:300]}
@@ -162,11 +170,15 @@ def format_tool_results(results: List[Dict[str, Any]]) -> str:
 
 async def collect_situational_context(payload: Dict[str, Any]) -> str:
     intent = payload.get("user_intent") or ""
-    names = ["health", "readiness", "web_capability_status"]
-    if _needs_external_fact(intent):
-        names.append("web_search")
-    if _intent_url(intent):
-        names.append("jina_reader")
+    names = ["health", "readiness"]
+    from app.orchestrator.web_capability import classify_web_intent
+
+    if classify_web_intent(intent) != "none":
+        names.append("web_capability_status")
+        if _needs_external_fact(intent):
+            names.append("web_search")
+        if _intent_url(intent):
+            names.append("jina_reader")
     results = [await execute_evaluator_tool(name, intent=intent) for name in names]
     await _log_tool_use(payload, results)
     return format_tool_results(results)

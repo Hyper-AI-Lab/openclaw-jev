@@ -35,7 +35,7 @@ async def crawlee_start(
         "errors": [],
     }
     asyncio.create_task(_run_job(job_id, start_url, max_pages, max_depth))
-    return {"ok": True, "job_id": job_id, "status": "running"}
+    return {"ok": True, "job_id": job_id, "status": "running", "durable": False, "engine": "python_bfs"}
 
 
 async def crawlee_status(job_id: str) -> Dict[str, Any]:

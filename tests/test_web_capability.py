@@ -48,6 +48,42 @@ def test_interact_intent():
     assert a["preferred_tools"][0] == "browser"
 
 
+def test_obscura_omitted_from_brief_when_cdp_down(monkeypatch):
+    from app.orchestrator import web_capability as wc
+
+    monkeypatch.setattr(wc, "obscura_available", lambda: False)
+    a = analyze_web_capability("click the login button and fill the form")
+    assert "obscura_browse" not in a["preferred_tools"]
+    assert "obscura_browse" not in a["fallbacks"]
+    assert a["obscura_available"] is False
+    assert "omitted" in a["web_brief"]
+    assert "CDP down" in a["web_brief"]
+
+
+def test_catalog_prompt_omits_obscura_when_cdp_down(monkeypatch):
+    from app.orchestrator import web_capability as wc
+    from app.orchestrator.prompt_policy import build_catalog_step_prompt
+
+    monkeypatch.setattr(wc, "obscura_available", lambda: False)
+    text = build_catalog_step_prompt(
+        user_intent="click login",
+        memory_block="",
+        context_block="",
+        step_prompt="open the form",
+    )
+    assert "obscura_browse is omitted" in text
+    assert "then `obscura_browse`" not in text
+
+
+def test_chat_still_has_no_brief_when_obscura_down(monkeypatch):
+    from app.orchestrator import web_capability as wc
+
+    monkeypatch.setattr(wc, "obscura_available", lambda: False)
+    a = analyze_web_capability("are you here")
+    assert a["web_intent"] == "none"
+    assert a["web_brief"] == ""
+
+
 def test_meta_tools_question_not_interact():
     # Asking about tools should not force browser catalog or dump a tool brief
     intent = "what web-search tools do you have?"

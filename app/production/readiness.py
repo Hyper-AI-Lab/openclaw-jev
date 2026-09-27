@@ -29,7 +29,7 @@ from app.config import (
 RMP_API = "http://127.0.0.1:8000"
 TEMPORAL_ADDR = "localhost:7233"
 SYSTEMD_UNITS = [
-    "temporal-dev.service",
+    "temporal.service",
     "rmp-api.service",
     "rmp-worker.service",
     "openclaw-gateway.service",
@@ -294,33 +294,84 @@ def check_backup_recency(max_hours: int = 26) -> CheckResult:
     )
 
 
+def _temporal_journal_mode(db_path: str) -> str:
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            return str(row[0]).lower() if row else ""
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+
+
+def _temporal_postgres_schemas() -> Dict[str, bool]:
+    """True when the official server's databases accept a connection."""
+    password = os.environ.get("TEMPORAL_POSTGRES_PWD", "")
+    if not password:
+        return {"temporal": False, "temporal_visibility": False}
+    try:
+        import psycopg2
+    except Exception:
+        return {"temporal": False, "temporal_visibility": False}
+    found: Dict[str, bool] = {}
+    for name in ("temporal", "temporal_visibility"):
+        try:
+            conn = psycopg2.connect(
+                host="127.0.0.1",
+                port=5432,
+                dbname=name,
+                user="temporal",
+                password=password,
+                connect_timeout=3,
+            )
+            conn.close()
+            found[name] = True
+        except Exception:
+            found[name] = False
+    return found
+
+
 def check_temporal_persistence() -> CheckResult:
-    db_path = os.path.join(RMP_DATA_DIR, "temporal.db")
-    svc_path = "/etc/systemd/system/temporal-dev.service"
+    svc_path = "/etc/systemd/system/temporal.service"
     try:
         with open(svc_path) as f:
             content = f.read()
-        if "--db-filename" in content:
-            if os.path.isfile(db_path):
-                size = os.path.getsize(db_path)
-                return CheckResult(
-                    "temporal_persistence",
-                    "pass",
-                    f"Temporal using persistent store ({size} bytes)",
-                    {"path": db_path},
-                )
-            return CheckResult(
-                "temporal_persistence",
-                "warn",
-                "Persistent flag set but DB file not yet created",
-            )
+    except OSError as exc:
         return CheckResult(
             "temporal_persistence",
             "warn",
-            "Temporal dev server without --db-filename (workflows lost on restart)",
+            f"Temporal unit missing: {exc}",
         )
-    except Exception as e:
-        return CheckResult("temporal_persistence", "warn", str(e))
+    if "start-dev" in content:
+        return CheckResult(
+            "temporal_persistence",
+            "warn",
+            "Temporal unit still runs start-dev",
+        )
+    if "postgres12" not in content:
+        return CheckResult(
+            "temporal_persistence",
+            "warn",
+            "Temporal unit is not the Postgres server",
+        )
+    schemas = _temporal_postgres_schemas()
+    if schemas.get("temporal") and schemas.get("temporal_visibility"):
+        return CheckResult(
+            "temporal_persistence",
+            "pass",
+            "Temporal Postgres schemas reachable",
+            schemas,
+        )
+    return CheckResult(
+        "temporal_persistence",
+        "warn",
+        "Temporal Postgres schemas not reachable",
+        schemas,
+    )
 
 
 def check_telemetry_export() -> CheckResult:
@@ -465,11 +516,25 @@ def check_memory_canary_recency(max_hours: int = 25) -> CheckResult:
     except Exception:
         return CheckResult("memory_canary", "warn", "Invalid canary timestamp")
     age = datetime.utcnow() - ts
+    if data.get("status") == "inconclusive":
+        return CheckResult(
+            "memory_canary",
+            "warn",
+            "Last memory canary inconclusive (transcript missing)",
+            data,
+        )
     if data.get("status") != "completed":
         return CheckResult(
             "memory_canary",
             "warn",
             f"Last memory canary status={data.get('status')}",
+            data,
+        )
+    if not data.get("memory_ok") or not data.get("prompt_ok"):
+        return CheckResult(
+            "memory_canary",
+            "warn",
+            "Last memory canary completed but memory/prompt not proven",
             data,
         )
     if age > timedelta(hours=max_hours):
@@ -640,6 +705,35 @@ def check_task_registry_index_fresh() -> CheckResult:
     )
 
 
+def check_safe_harbor_peripheral() -> CheckResult:
+    """Safe Harbor is not on the Slack path. Warn if auto-restart is on."""
+    from app.config import load_settings
+
+    harbor = os.environ.get("AURA_SAFE_HARBOR", "/root/aura_safe_harbor")
+    auto = bool(
+        (load_settings().get("production") or {}).get("scanner_auto_restart")
+    )
+    if auto and not os.path.isdir(harbor):
+        return CheckResult(
+            "safe_harbor",
+            "warn",
+            "scanner_auto_restart is on but Safe Harbor path is missing",
+            {"path": harbor},
+        )
+    if auto:
+        return CheckResult(
+            "safe_harbor",
+            "warn",
+            "scanner_auto_restart is on; Safe Harbor stays peripheral to Slack",
+        )
+    return CheckResult(
+        "safe_harbor",
+        "pass",
+        "Safe Harbor peripheral; scanner_auto_restart off",
+        {"path": harbor},
+    )
+
+
 def check_runtime_code_sync() -> CheckResult:
     """Fail when app/ code on disk is newer than running API/worker boot stamps."""
     from app.production.runtime_sync import runtime_sync_status
@@ -689,6 +783,7 @@ async def run_all_checks() -> Dict[str, Any]:
         check_task_registry_index_fresh(),
         check_runtime_code_sync(),
         check_openai_key(),
+        check_safe_harbor_peripheral(),
     ]
     async_checks = await asyncio.gather(
         check_systemd_services(),

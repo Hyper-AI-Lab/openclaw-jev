@@ -60,3 +60,105 @@ async def test_non_local_url_denied_inside_get():
     out = await _local_get("https://example.com/health")
     assert out.get("denied") is True
     assert out.get("ok") is False
+
+
+@pytest.mark.asyncio
+async def test_chat_context_skips_web_stack(monkeypatch):
+    from app.orchestrator.evaluator_tools import collect_situational_context
+
+    called = []
+
+    async def fake_exec(name, *, intent=""):
+        called.append(name)
+        return {"tool": name, "ok": True, "body": {}}
+
+    monkeypatch.setattr(
+        "app.orchestrator.evaluator_tools.execute_evaluator_tool", fake_exec
+    )
+    monkeypatch.setattr(
+        "app.orchestrator.evaluator_tools._log_tool_use", AsyncMock()
+    )
+    await collect_situational_context({"user_intent": "hello"})
+    assert called == ["health", "readiness"]
+
+
+@pytest.mark.asyncio
+async def test_web_intent_probes_capability_status(monkeypatch):
+    from app.orchestrator.evaluator_tools import collect_situational_context
+
+    called = []
+
+    async def fake_exec(name, *, intent=""):
+        called.append(name)
+        return {"tool": name, "ok": True, "body": {}}
+
+    monkeypatch.setattr(
+        "app.orchestrator.evaluator_tools.execute_evaluator_tool", fake_exec
+    )
+    monkeypatch.setattr(
+        "app.orchestrator.evaluator_tools._log_tool_use", AsyncMock()
+    )
+    await collect_situational_context(
+        {"user_intent": "search the web for OpenClaw plugins"}
+    )
+    assert "web_capability_status" in called
+    assert called[0:2] == ["health", "readiness"]
+
+
+@pytest.mark.asyncio
+async def test_web_capability_status_stack_down_is_not_ok(monkeypatch):
+    async def fake_get(url, headers=None):
+        return {"ok": False, "denied": False, "error": "down"}
+
+    monkeypatch.setattr(
+        "app.orchestrator.evaluator_tools._local_get", fake_get
+    )
+    monkeypatch.setattr(
+        "app.orchestrator.web_capability.obscura_available", lambda: False
+    )
+    out = await execute_evaluator_tool(
+        "web_capability_status", intent="search the web for x"
+    )
+    assert out["ok"] is False
+    assert out["obscura_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_web_search_calls_local_search_route(monkeypatch):
+    seen = []
+
+    async def fake_get(url, headers=None):
+        seen.append(url)
+        return {"ok": True, "status": 200, "body": {"ok": True, "results": []}}
+
+    monkeypatch.setattr("app.orchestrator.evaluator_tools._local_get", fake_get)
+    out = await execute_evaluator_tool("web_search", intent="latest weather")
+    assert seen and "/v1/search?q=" in seen[0]
+    assert "/v1/jina" not in seen[0]
+    assert out["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_web_search_body_failure_is_not_ok(monkeypatch):
+    async def fake_get(url, headers=None):
+        return {"ok": True, "status": 200, "body": {"ok": False, "error": "search key missing"}}
+
+    monkeypatch.setattr("app.orchestrator.evaluator_tools._local_get", fake_get)
+    out = await execute_evaluator_tool("web_search", intent="latest weather")
+    assert out["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_jina_reader_calls_local_jina_route(monkeypatch):
+    seen = []
+
+    async def fake_get(url, headers=None):
+        seen.append(url)
+        return {"ok": True, "status": 200, "body": {"ok": True, "markdown": "hi"}}
+
+    monkeypatch.setattr("app.orchestrator.evaluator_tools._local_get", fake_get)
+    out = await execute_evaluator_tool(
+        "jina_reader", intent="read https://example.com/docs"
+    )
+    assert seen and "/v1/jina?url=" in seen[0]
+    assert out["ok"] is True

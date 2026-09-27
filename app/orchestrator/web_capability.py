@@ -163,24 +163,50 @@ def analyze_web_capability(
 
     route = ROUTING[web_intent]
     preferred = list(route["preferred_tools"])
+    fallbacks = list(route.get("fallbacks") or [])
     if web_intent == "none":
         preferred = []
+        fallbacks = []
+    obscura_ok = obscura_available()
+    if not obscura_ok:
+        preferred = [t for t in preferred if t != "obscura_browse"]
+        fallbacks = [t for t in fallbacks if t != "obscura_browse"]
 
-    brief = format_web_capability_brief(web_intent, preferred, route.get("fallbacks") or [])
+    brief = format_web_capability_brief(
+        web_intent, preferred, fallbacks, obscura_available=obscura_ok
+    )
     return {
         "web_intent": web_intent,
         "preferred_tools": preferred,
-        "fallbacks": list(route.get("fallbacks") or []),
+        "fallbacks": fallbacks,
         "catalog_hint": route.get("catalog_hint"),
         "tool_budget": route.get("tool_budget"),
         "web_brief": brief,
+        "obscura_available": obscura_ok,
     }
+
+
+def obscura_available() -> bool:
+    """Galaxy CDP is optional. Slack path must not depend on it."""
+    try:
+        import httpx
+
+        r = httpx.get("http://127.0.0.1:8791/health", timeout=2.0)
+        body = r.json() if r.status_code < 400 else {}
+        obscura = (body.get("backends") or {}).get("obscura") or body.get("obscura") or {}
+        if isinstance(obscura, dict):
+            return bool(obscura.get("available"))
+        return False
+    except Exception:
+        return False
 
 
 def format_web_capability_brief(
     web_intent: str,
     preferred: List[str],
     fallbacks: List[str],
+    *,
+    obscura_available: bool = True,
 ) -> str:
     if web_intent == "none" or not preferred:
         return ""
@@ -196,7 +222,11 @@ def format_web_capability_brief(
         "fetch→jina_reader then web_fetch then crawl4ai; "
         "crawl→crawl4ai then crawlee_crawl; "
         "adaptive→scrapling; schema→scrapegraph_extract; "
-        "interact→browser then browser_use then obscura_browse."
+        + (
+            "interact→browser then browser_use (obscura_browse omitted; CDP down)."
+            if not obscura_available
+            else "interact→browser then browser_use then obscura_browse."
+        )
     )
     lines.append("- For tool inventory/health call web_capability_status.")
     return "\n".join(lines) + "\n"

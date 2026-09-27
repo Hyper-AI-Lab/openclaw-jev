@@ -8,7 +8,7 @@ API_KEY="$(python3 -c "import json; print(json.load(open('${SETTINGS}'))['api_ke
 
 FAIL=0
 
-for unit in rmp-qdrant temporal-dev rmp-api rmp-worker openclaw-gateway; do
+for unit in rmp-qdrant temporal rmp-api rmp-worker openclaw-gateway; do
   if ! systemctl is-active --quiet "${unit}.service"; then
     echo "FAIL: ${unit} not active"
     FAIL=1
@@ -46,6 +46,11 @@ tot = d.get('today_totals') or {}
 print(f\"llm_usage: requests={tot.get('requests',0)} tokens={tot.get('total_tokens',0)} (today UTC)\")
 for pid, counts in sorted((d.get('today_by_profile') or {}).items()):
     print(f\"  {pid}: req={counts.get('requests',0)} tok={counts.get('total_tokens',0)} rl={counts.get('rate_limits',0)}\")
+note = d.get('unattributed_note')
+if note:
+    print('  unattributed:', note)
+    for day in d.get('unattributed_historical_days') or []:
+        print(f\"  unattributed_day: {day}\")
 " 2>/dev/null || true
 
 exit "${FAIL}"

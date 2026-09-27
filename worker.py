@@ -1,7 +1,6 @@
 import asyncio
 import logging
 
-from temporalio.client import Client
 from temporalio.worker import Worker
 
 from app.activities.db_activities import (
@@ -34,7 +33,8 @@ from app.activities.openclaw_activities import (
 )
 from app.activities.intake_activities import classify_task_intake_activity
 from app.activities.plan_activities import generate_process_plan, save_process_plan
-from app.telemetry import get_temporal_client_kwargs, init_telemetry
+from app.telemetry import init_telemetry
+from app.temporal_control import connect_temporal_with_retry
 from app.workflows.catalog_step_child import CatalogStepChildWorkflow
 from app.workflows.catalog_task import CatalogTaskWorkflow
 from app.workflows.generic_execute_child import GenericExecuteChildWorkflow
@@ -53,7 +53,7 @@ async def main():
         mark_runtime_boot("rmp-worker")
     except Exception as exc:
         logging.warning("runtime boot stamp failed: %s", exc)
-    client = await Client.connect("localhost:7233", **get_temporal_client_kwargs())
+    client = await connect_temporal_with_retry()
     worker = Worker(
         client,
         task_queue="openclaw-tasks",

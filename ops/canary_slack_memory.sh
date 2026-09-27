@@ -25,6 +25,54 @@ maybe_mark_memory_canary_deferred(reason='active_user_tasks', active_users=int('
 " || true
   exit 0
 fi
+USER_SLOTS=$(
+  cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.llm.quota_broker import _count_kind_slots, _read_state
+print(_count_kind_slots(_read_state())[0])
+" 2>/dev/null || echo 0
+)
+if [[ "${USER_SLOTS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CANARY SKIP: ${USER_SLOTS} user LLM slot(s) in use — deferring memory canary"
+  cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.production.canary_sentinel import maybe_mark_memory_canary_deferred
+maybe_mark_memory_canary_deferred(reason='user_llm_slots', active_users=int('${USER_SLOTS}'))
+" || true
+  exit 0
+fi
+
+# Hourly health canary starts at :07 and holds the single canary slot for ~30s.
+# Wait for that slot instead of creating a task that compensates.
+for _ in $(seq 1 12); do
+  SLOT_COUNTS=$(
+    cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.llm.quota_broker import _count_kind_slots, _read_state
+print('%s %s' % _count_kind_slots(_read_state()))
+" 2>/dev/null || echo "0 0"
+  )
+  USER_NOW="${SLOT_COUNTS%% *}"
+  CANARY_NOW="${SLOT_COUNTS##* }"
+  if [[ "${USER_NOW}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "CANARY SKIP: ${USER_NOW} user LLM slot(s) in use — deferring memory canary"
+    cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.production.canary_sentinel import maybe_mark_memory_canary_deferred
+maybe_mark_memory_canary_deferred(reason='user_llm_slots', active_users=int('${USER_NOW}'))
+" || true
+    exit 0
+  fi
+  if [[ ! "${CANARY_NOW}" =~ ^[1-9][0-9]*$ ]]; then
+    break
+  fi
+  echo "CANARY WAIT: ${CANARY_NOW} canary LLM slot(s) in use"
+  sleep 5
+done
+if [[ "${CANARY_NOW:-0}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CANARY SKIP: canary LLM slot still busy — deferring memory canary"
+  cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.production.canary_sentinel import maybe_mark_memory_canary_deferred
+maybe_mark_memory_canary_deferred(reason='canary_llm_slot', active_users=0)
+" || true
+  exit 0
+fi
 
 RESP=$(curl -sf -X POST "http://127.0.0.1:8000/tasks" \
   -H "Content-Type: application/json" \
@@ -66,47 +114,19 @@ for i in $(seq 1 72); do
 done
 
 RMP_SESSION="agent:main:rmp_task_${TASK_ID}"
-SESSION_FILE=""
-SESSION_FILE=$(python3 -c "
-import json, os, sys
-task_id = sys.argv[1]
-session_dir = sys.argv[2]
-index_path = os.path.join(session_dir, 'sessions.json')
-session_key = f'agent:main:rmp_task_{task_id}'
-try:
-    data = json.load(open(index_path))
-    entry = data.get(session_key) or {}
-    sid = entry.get('sessionId') or entry.get('id') or ''
-    if sid:
-        print(os.path.join(session_dir, f'{sid}.jsonl'))
-except Exception:
-    pass
-" "$TASK_ID" "$SESSION_DIR" 2>/dev/null || true)
-
-MEMORY_OK=0
-SEARCH_BAD=0
-PROMPT_OK=0
-if [[ -n "$SESSION_FILE" && -f "$SESSION_FILE" ]]; then
-  echo "Session transcript: ${SESSION_FILE}"
-  if grep -qi "PROCESS-SCOPED MEMORY" "$SESSION_FILE"; then
-    MEMORY_OK=1
-    echo "PASS: PROCESS-SCOPED MEMORY found in session"
-  else
-    echo "WARN: PROCESS-SCOPED MEMORY not found in session"
-  fi
-  if grep -qi "do not use memory_search\|Do NOT use memory_search" "$SESSION_FILE"; then
-    PROMPT_OK=1
-    echo "PASS: memory-first instruction present in dispatch prompt"
-  fi
-  if grep -qi 'memory_search' "$SESSION_FILE" && [[ "$PROMPT_OK" -eq 0 ]]; then
-    SEARCH_BAD=1
-    echo "FAIL: workspace memory_search used without memory-first guard"
-  else
-    echo "PASS: no unconstrained workspace memory_search detected"
-  fi
-else
-  echo "WARN: rmp_task session transcript not found at ${SESSION_FILE:-unknown}"
-fi
+INSPECT=$(
+  cd "${RMP_ROOT}" && ./venv/bin/python -c "
+import json
+from app.production.canary_sentinel import inspect_memory_canary_transcript
+print(json.dumps(inspect_memory_canary_transcript('${TASK_ID}')))
+"
+)
+SESSION_FILE=$(echo "$INSPECT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('session_file') or '')")
+MEMORY_OK=$(echo "$INSPECT" | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('memory_ok') or 0))")
+PROMPT_OK=$(echo "$INSPECT" | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('prompt_ok') or 0))")
+SEARCH_BAD=$(echo "$INSPECT" | python3 -c "import json,sys; print(int(json.load(sys.stdin).get('search_bad') or 0))")
+HAS_TRANSCRIPT=$(echo "$INSPECT" | python3 -c "import json,sys; print(int(bool(json.load(sys.stdin).get('has_transcript'))))")
+echo "Transcript inspect: ${INSPECT}"
 
 CTX=$(curl -sf -H "X-RMP-API-Key: ${API_KEY}" "http://127.0.0.1:8000/memory/process/${PROCESS_RUN}/context" 2>/dev/null || echo '{}')
 echo "Memory context API count: $(echo "$CTX" | python3 -c "import json,sys; print(json.load(sys.stdin).get('count',0))" 2>/dev/null || echo 0)"
@@ -156,14 +176,65 @@ if [[ "$SEARCH_BAD" -eq 1 ]]; then
   exit 1
 fi
 
-echo "CANARY OK (status=${STATUS}, memory_ok=${MEMORY_OK}, prompt_ok=${PROMPT_OK})"
-
 RESULT_FILE="${RMP_ROOT}/data/last_memory_canary.json"
 mkdir -p "$(dirname "${RESULT_FILE}")"
+if [[ "${HAS_TRANSCRIPT}" -eq 0 ]]; then
+  echo "CANARY INCONCLUSIVE: dispatch completed but transcript missing"
+  python3 -c "
+import json, datetime
+print(json.dumps({
+  'status': 'inconclusive',
+  'dispatch_ok': 1,
+  'task_id': '${TASK_ID}',
+  'process_run_id': '${PROCESS_RUN}',
+  'memory_ok': ${MEMORY_OK},
+  'prompt_ok': ${PROMPT_OK},
+  'search_bad': ${SEARCH_BAD},
+  'session_file': '${SESSION_FILE}',
+  'finished_at': datetime.datetime.utcnow().isoformat() + 'Z',
+}))
+" > "${RESULT_FILE}"
+  if [[ "${RMP_CANARY_SKIP_SENTINEL:-0}" != "1" ]]; then
+    (
+      cd "${RMP_ROOT}"
+      ./venv/bin/python -m app.production.canary_sentinel --trigger memory_canary
+    ) || true
+  fi
+  exit 1
+fi
+
+if [[ "$MEMORY_OK" -ne 1 || "$PROMPT_OK" -ne 1 ]]; then
+  echo "CANARY UNPROVEN: completed but memory_ok=${MEMORY_OK} prompt_ok=${PROMPT_OK}"
+  python3 -c "
+import json, datetime
+print(json.dumps({
+  'status': 'completed',
+  'dispatch_ok': 1,
+  'task_id': '${TASK_ID}',
+  'process_run_id': '${PROCESS_RUN}',
+  'memory_ok': ${MEMORY_OK},
+  'prompt_ok': ${PROMPT_OK},
+  'search_bad': ${SEARCH_BAD},
+  'session_file': '${SESSION_FILE}',
+  'finished_at': datetime.datetime.utcnow().isoformat() + 'Z',
+}))
+" > "${RESULT_FILE}"
+  echo "Wrote ${RESULT_FILE} (not claiming recall is proven)"
+  if [[ "${RMP_CANARY_SKIP_SENTINEL:-0}" != "1" ]]; then
+    (
+      cd "${RMP_ROOT}"
+      ./venv/bin/python -m app.production.canary_sentinel --trigger memory_canary
+    ) || true
+  fi
+  exit 1
+fi
+
+echo "CANARY OK (status=${STATUS}, memory_ok=${MEMORY_OK}, prompt_ok=${PROMPT_OK})"
 python3 -c "
 import json, datetime
 print(json.dumps({
-  'status': 'completed' if '${STATUS}' == 'completed' else '${STATUS}',
+  'status': 'completed',
+  'dispatch_ok': 1,
   'task_id': '${TASK_ID}',
   'process_run_id': '${PROCESS_RUN}',
   'memory_ok': ${MEMORY_OK},

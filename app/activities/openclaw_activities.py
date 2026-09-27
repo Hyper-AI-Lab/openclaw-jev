@@ -355,6 +355,8 @@ async def _dispatch_openclaw_session(
     require_terminal: bool = True,
     task_id: Optional[str] = None,
     model: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    task_type: Optional[str] = None,
 ) -> str:
     """Gate on LLM quota, dispatch to OpenClaw, poll JSONL; retry on rate limits."""
     settings = load_settings()
@@ -400,6 +402,8 @@ async def _dispatch_openclaw_session(
             settings=settings,
             heartbeat=activity.heartbeat,
             model=model,
+            tags=tags,
+            task_type=task_type,
         )
         try:
             record_request(profile_id, "openclaw_hook")
@@ -598,6 +602,8 @@ async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
     message = payload.get("message", "") + "\n\n[INTERNAL_RMP]"
     # User-facing / plan execute turns use policy primary unless caller overrides.
     model = payload.get("model") or get_primary_agent_model()
+    tags = payload.get("tags") or []
+    task_type = payload.get("task_type") or ""
 
     text_content = await _dispatch_openclaw_session(
         internal_session_key,
@@ -606,6 +612,8 @@ async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
         require_terminal=True,
         task_id=task_id if task_id != "unknown" else None,
         model=model,
+        tags=tags,
+        task_type=task_type,
     )
     return {"result": {"payloads": [{"text": text_content}]}}
 

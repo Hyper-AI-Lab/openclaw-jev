@@ -36,6 +36,7 @@ COOLDOWN_STEPS_SEC = (15, 30, 60, 120)
 DEFAULT_MIN_INTERVAL_SEC = 5.0
 DEFAULT_MAX_WAIT_SEC = 1800.0
 DEFAULT_MAX_CONCURRENT = 3
+CANARY_MAX_WAIT_SEC = 60.0
 
 RMP_TASK_SESSION_RE = re.compile(
     r"rmp_task_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
@@ -580,26 +581,72 @@ def _profile_ready_in_ms(
     return 0.0
 
 
-def _session_is_user_priority(session_key: Optional[str]) -> bool:
+def classify_slot_kind(
+    session_key: Optional[str] = None,
+    *,
+    tags: Optional[List[str]] = None,
+    task_type: Optional[str] = None,
+    kind: Optional[str] = None,
+) -> str:
+    """Stamp user vs canary/heartbeat from tags/task_type, not UUID substring."""
+    if kind in ("user", "canary", "heartbeat"):
+        return kind
+    tag_set = {str(t).lower() for t in (tags or [])}
+    tt = (task_type or "").lower()
+    if tt == "canary" or "canary" in tag_set or "memory-canary" in tag_set:
+        return "canary"
+    if tt == "heartbeat" or "heartbeat" in tag_set:
+        return "heartbeat"
     sk = (session_key or "").lower()
-    if not sk or "canary" in sk or "heartbeat" in sk:
-        return False
-    return "rmp_intake_" in sk or "rmp_task_" in sk or "rmp_verify_" in sk
+    if "heartbeat" in sk:
+        return "heartbeat"
+    if "canary" in sk:
+        return "canary"
+    return "user"
+
+
+def _pool_caps(max_concurrent: int) -> tuple[int, int]:
+    """Split max_concurrent: 2 user + 1 canary when cap is 3."""
+    cap = max(1, int(max_concurrent))
+    if cap >= 3:
+        return cap - 1, 1
+    if cap == 2:
+        return 1, 1
+    return 1, 0
+
+
+def _count_kind_slots(state: Dict[str, Any]) -> tuple[int, int]:
+    user_n = 0
+    canary_n = 0
+    for slot in ((state.get("global") or {}).get("active_slots") or {}).values():
+        k = str(slot.get("kind") or "") or classify_slot_kind(
+            slot.get("session_key")
+        )
+        if k in ("canary", "heartbeat"):
+            canary_n += 1
+        else:
+            user_n += 1
+    return user_n, canary_n
 
 
 def _slot_is_canary(slot: Dict[str, Any]) -> bool:
+    k = str(slot.get("kind") or "")
+    if k in ("canary", "heartbeat"):
+        return True
+    if k == "user":
+        return False
     sk = str(slot.get("session_key") or "")
     sk_lower = sk.lower()
     if "canary" in sk_lower or "heartbeat" in sk_lower:
         return True
-    task_id = _task_id_from_rmp_session(sk)
-    if task_id:
-        return bool(_task_looks_like_canary_sync(task_id))
     return False
 
 
-def _preempt_canary_slot(state: Dict[str, Any]) -> bool:
-    """Drop one canary/heartbeat slot so user intake/task work can reserve."""
+def _preempt_canary_slot(state: Dict[str, Any]) -> Optional[str]:
+    """Drop one canary/heartbeat slot so user intake/task work can reserve.
+
+    Returns the canary task_id to cancel (if any), else None.
+    """
     g = state.setdefault("global", {})
     slots = g.get("active_slots") or {}
     by_session = g.get("session_slots") or {}
@@ -615,26 +662,39 @@ def _preempt_canary_slot(state: Dict[str, Any]) -> bool:
             entry = state.setdefault("keys", {}).setdefault(pid, {})
             entry["in_flight"] = max(0, int(entry.get("in_flight", 0) or 0) - 1)
         logger.info("Preempted canary LLM slot session=%s", sk or slot_id)
-        return True
-    return False
+        return _task_id_from_rmp_session(sk)
+    return None
 
 
 def _mutate_reserve(
     session_key: Optional[str],
     profiles: List[str],
     cfg: QuotaConfig,
+    kind: str = "user",
 ) -> Optional[tuple[str, str]]:
+    preempted: List[str] = []
+
     def _apply(state: Dict[str, Any]) -> Optional[tuple[str, str]]:
         if session_key:
             existing = _existing_session_slot(state, session_key)
             if existing and existing[0]:
                 return existing
 
-        if _active_slot_count(state) >= max(1, cfg.max_concurrent):
-            if _session_is_user_priority(session_key):
-                _preempt_canary_slot(state)
-        if _active_slot_count(state) >= max(1, cfg.max_concurrent):
-            return None
+        user_n, canary_n = _count_kind_slots(state)
+        user_cap, canary_cap = _pool_caps(cfg.max_concurrent)
+        total_cap = max(1, cfg.max_concurrent)
+
+        if kind in ("canary", "heartbeat"):
+            if canary_n >= canary_cap or _active_slot_count(state) >= total_cap:
+                return None
+        else:
+            if user_n >= user_cap or _active_slot_count(state) >= total_cap:
+                tid = _preempt_canary_slot(state)
+                if tid:
+                    preempted.append(tid)
+                user_n, canary_n = _count_kind_slots(state)
+            if user_n >= user_cap or _active_slot_count(state) >= total_cap:
+                return None
 
         now_ms = _now_ms()
         pid = _pick_key(state, profiles, now_ms, rotation_mode=cfg.rotation_mode)
@@ -649,6 +709,7 @@ def _mutate_reserve(
             "profile_id": pid,
             "started_ms": now_ms,
             "session_key": session_key or "",
+            "kind": kind,
         }
         if session_key:
             g.setdefault("session_slots", {})[session_key] = slot_id
@@ -661,7 +722,15 @@ def _mutate_reserve(
         g["last_profile_id"] = pid
         return pid, slot_id
 
-    return _mutate_state(_apply)
+    result = _mutate_state(_apply)
+    for tid in preempted:
+        try:
+            from app.production.canary_sentinel import cancel_task_sync
+
+            cancel_task_sync(tid, "user_preempt_canary")
+        except Exception as exc:
+            logger.warning("canary cancel after preempt failed: %s", exc)
+    return result
 
 
 def release_profile_sync(
@@ -793,7 +862,11 @@ def get_orchestration_status(settings: Optional[Dict[str, Any]] = None) -> Dict[
     slots = g.get("active_slots") or {}
     return {
         "max_concurrent": cfg.max_concurrent,
+        "user_slots": _pool_caps(cfg.max_concurrent)[0],
+        "canary_slots": _pool_caps(cfg.max_concurrent)[1],
         "active_slots": len(slots),
+        "user_active": _count_kind_slots(state)[0],
+        "canary_active": _count_kind_slots(state)[1],
         "rotation_mode": cfg.rotation_mode,
         "min_interval_sec": cfg.min_interval_sec,
         "sessions": {
@@ -812,16 +885,27 @@ async def reserve_profile(
     settings: Optional[Dict[str, Any]] = None,
     heartbeat=None,
     model: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    task_type: Optional[str] = None,
+    kind: Optional[str] = None,
 ) -> tuple[str, str]:
     """Reserve a concurrency slot and balanced NVIDIA profile for an agent run."""
     cfg = QuotaConfig.from_settings(settings)
     profiles = [p for p, _ in _load_env_keys()] or ["nvidia:default"]
-    deadline = time.time() + cfg.max_wait_sec
+    slot_kind = classify_slot_kind(
+        session_key, tags=tags, task_type=task_type, kind=kind
+    )
+    wait_cap = (
+        min(float(cfg.max_wait_sec), CANARY_MAX_WAIT_SEC)
+        if slot_kind in ("canary", "heartbeat")
+        else cfg.max_wait_sec
+    )
+    deadline = time.time() + wait_cap
     last_reap_ms = 0.0
 
     async with _lock:
         while time.time() < deadline:
-            result = _mutate_reserve(session_key, profiles, cfg)
+            result = _mutate_reserve(session_key, profiles, cfg, kind=slot_kind)
             if result:
                 profile_id, slot_id = result
                 if session_key:
@@ -831,15 +915,20 @@ async def reserve_profile(
                         assign_openclaw_session_profile(session_key, profile_id)
                 _patch_auth_last_good(profile_id)
                 logger.debug(
-                    "LLM reserve: profile=%s slot=%s session=%s active=%s",
+                    "LLM reserve: profile=%s slot=%s session=%s kind=%s active=%s",
                     profile_id,
                     slot_id[:8],
                     session_key or "-",
+                    slot_kind,
                     _active_slot_count(_read_state()),
                 )
                 return profile_id, slot_id
 
-            # Opportunistically free slots held by dead/old work so intake isn't starved.
+            if slot_kind in ("canary", "heartbeat"):
+                raise TimeoutError(
+                    "LLM quota: canary/heartbeat slot unavailable (user work has priority)"
+                )
+
             now_ms = _now_ms()
             if now_ms - last_reap_ms > 15_000:
                 last_reap_ms = now_ms
@@ -864,7 +953,7 @@ async def reserve_profile(
             await asyncio.sleep(sleep_sec)
 
     raise TimeoutError(
-        f"LLM quota: no slot/profile available within {cfg.max_wait_sec:.0f}s"
+        f"LLM quota: no slot/profile available within {wait_cap:.0f}s"
     )
 
 

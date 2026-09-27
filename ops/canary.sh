@@ -24,6 +24,20 @@ maybe_mark_health_canary_deferred(reason='active_user_tasks', active_users=int('
 " || true
   exit 0
 fi
+USER_SLOTS=$(
+  cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.llm.quota_broker import _count_kind_slots, _read_state
+print(_count_kind_slots(_read_state())[0])
+" 2>/dev/null || echo 0
+)
+if [[ "${USER_SLOTS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CANARY SKIP: ${USER_SLOTS} user LLM slot(s) in use — deferring hourly canary"
+  cd "${RMP_ROOT}" && ./venv/bin/python -c "
+from app.production.canary_sentinel import maybe_mark_health_canary_deferred
+maybe_mark_health_canary_deferred(reason='user_llm_slots', active_users=int('${USER_SLOTS}'))
+" || true
+  exit 0
+fi
 
 write_result() {
   local status="$1"
@@ -79,9 +93,17 @@ echo "Canary task created: ${TASK_ID}"
 MAX_POLLS="${RMP_CANARY_MAX_POLLS:-36}"
 for i in $(seq 1 "${MAX_POLLS}"); do
   sleep 10
-  STATUS=$(curl -sf -H "X-RMP-API-Key: ${API_KEY}" "http://127.0.0.1:8000/tasks/${TASK_ID}" \
-    | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))")
-  echo "  poll ${i}: ${STATUS}"
+  BODY=$(curl -sf -H "X-RMP-API-Key: ${API_KEY}" "http://127.0.0.1:8000/tasks/${TASK_ID}" || true)
+  if [[ -z "${BODY}" ]]; then
+    echo "  poll ${i}: empty response"
+    continue
+  fi
+  STATUS=$(printf '%s' "${BODY}" | python3 -c "import json,sys
+try:
+    print(json.load(sys.stdin).get('status',''))
+except Exception:
+    print('')" || true)
+  echo "  poll ${i}: ${STATUS:-unparsed}"
   if [[ "$STATUS" == "completed" ]]; then
     write_result completed "${TASK_ID}"
     echo "CANARY OK"

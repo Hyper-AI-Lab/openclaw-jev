@@ -12,6 +12,7 @@ from app.adapters.crawlee_adapter import crawlee_start, crawlee_status
 from app.adapters.obscura_adapter import obscura_browse
 from app.adapters.scrapegraph_adapter import scrapegraph_extract
 from app.adapters.scrapling_adapter import scrapling_fetch
+from app.adapters.search_fetch import jina_read, web_search
 from app.adapters.status import probe_backends
 
 app = FastAPI(title="Aura Web Stack", version="1.0.0")
@@ -50,6 +51,9 @@ class BrowserUseRequest(BaseModel):
 class ObscuraRequest(BaseModel):
     url: str
     action: str = "fetch"
+    selector: str = ""
+    text: str = ""
+    key: str = ""
 
 
 @app.get("/health")
@@ -63,6 +67,16 @@ async def health() -> Dict[str, Any]:
         "available_count": available,
         "total_count": len(backends),
     }
+
+
+@app.get("/v1/search")
+async def v1_search(q: str = "") -> Dict[str, Any]:
+    return web_search(q)
+
+
+@app.get("/v1/jina")
+async def v1_jina(url: str = "") -> Dict[str, Any]:
+    return jina_read(url)
 
 
 @app.post("/v1/crawl4ai")
@@ -100,7 +114,13 @@ async def v1_browser_use(body: BrowserUseRequest) -> Dict[str, Any]:
 
 @app.post("/v1/obscura")
 async def v1_obscura(body: ObscuraRequest) -> Dict[str, Any]:
-    return await obscura_browse(body.url, action=body.action)
+    return await obscura_browse(
+        body.url,
+        action=body.action,
+        selector=body.selector,
+        text=body.text,
+        key=body.key,
+    )
 
 
 ROUTING_CHEATSHEET = {

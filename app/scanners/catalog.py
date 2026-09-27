@@ -21,6 +21,26 @@ LOG_OVERRIDES = {
     "real_moltbook_scanner": os.path.join(_WORKSPACE, "moltbook_research_log.md"),
 }
 
+_MOCK_IDS = frozenset(
+    {"moltbook_continuous", "moltbook_4hr_swarm", "moltbook_swarm_10"}
+)
+
+
+def _is_mock_script(path: str) -> bool:
+    if Path(path).stem in _MOCK_IDS:
+        return True
+    try:
+        head = Path(path).read_text(encoding="utf-8", errors="ignore")[:800].lower()
+    except OSError:
+        return False
+    return "scanning placeholder" in head or "simulating" in head
+
+
+def _prefer_safe_harbor(paths: List[str]) -> List[str]:
+    harbor = os.path.abspath(_SAFE_HARBOR)
+    kept = [p for p in paths if os.path.abspath(p).startswith(harbor + os.sep) or os.path.abspath(p) == harbor]
+    return kept or list(paths)
+
 DEFAULT_LOG = os.path.join(_WORKSPACE, "moltbook_research_log.md")
 
 
@@ -47,7 +67,11 @@ def _discover_scanners() -> Dict[str, ScannerDefinition]:
 
     catalog: Dict[str, ScannerDefinition] = {}
     for scanner_id, paths in sorted(by_id.items()):
-        unique_paths = tuple(sorted(set(paths)))
+        real_paths = [p for p in paths if not _is_mock_script(p)]
+        real_paths = _prefer_safe_harbor(real_paths)
+        if not real_paths:
+            continue
+        unique_paths = tuple(sorted(set(real_paths)))
         log_path = LOG_OVERRIDES.get(scanner_id, DEFAULT_LOG)
         catalog[scanner_id] = ScannerDefinition(
             scanner_id=scanner_id,

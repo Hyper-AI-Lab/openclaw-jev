@@ -32,7 +32,7 @@ SERVICE_UNITS = (
     "rmp-api",
     "rmp-worker",
     "openclaw-gateway",
-    "temporal-dev",
+    "temporal",
     "rmp-qdrant",
 )
 
@@ -104,6 +104,39 @@ def evaluate_health_canary() -> Optional[CanaryIssue]:
     return None
 
 
+def inspect_memory_canary_transcript(task_id: str) -> Dict[str, Any]:
+    """Read rmp_task transcript via SQLite/jsonl. Three facts: dispatch vs prompt vs memory."""
+    from app.openclaw_sessions import get_session_entry, read_transcript_lines
+
+    key = f"agent:main:rmp_task_{task_id}"
+    entry = get_session_entry(key)
+    sid = str(entry.get("sessionId") or entry.get("id") or "")
+    lines = read_transcript_lines(sid) if sid else []
+    blob = "\n".join(lines)
+    low = blob.lower()
+    has = bool(blob.strip())
+    memory_ok = "process-scoped memory" in low
+    prompt_ok = (
+        "do not use memory_search" in low or "do not use `memory_search`" in low
+    )
+    search_bad = ("memory_search" in low) and not prompt_ok
+    jsonl = ""
+    if sid:
+        from app.openclaw_sessions import SESSIONS_DIR
+
+        candidate = SESSIONS_DIR / f"{sid}.jsonl"
+        if candidate.is_file():
+            jsonl = str(candidate)
+    return {
+        "session_file": jsonl,
+        "session_id": sid,
+        "has_transcript": has,
+        "memory_ok": int(memory_ok),
+        "prompt_ok": int(prompt_ok),
+        "search_bad": int(search_bad),
+    }
+
+
 def evaluate_memory_canary() -> Optional[CanaryIssue]:
     data = _read_json(MEMORY_CANARY_PATH)
     if not data:
@@ -128,6 +161,13 @@ def evaluate_memory_canary() -> Optional[CanaryIssue]:
                 data,
             )
         return None
+    if status == "inconclusive":
+        return CanaryIssue(
+            "memory_canary",
+            "inconclusive",
+            "Memory canary transcript missing (inconclusive)",
+            data,
+        )
     # Transcript checks are the memory canary's purpose. A Temporal timeout
     # after memory_ok/prompt_ok is a dispatch-completion issue (health canary).
     transcript_ok = bool(data.get("memory_ok")) and bool(data.get("prompt_ok")) and not data.get(
@@ -147,6 +187,13 @@ def evaluate_memory_canary() -> Optional[CanaryIssue]:
             "memory_canary",
             "memory_path",
             "Memory canary detected workspace memory_search dominance",
+            data,
+        )
+    if not transcript_ok:
+        return CanaryIssue(
+            "memory_canary",
+            "memory_unproven",
+            "Memory canary completed but memory_ok/prompt_ok not proven",
             data,
         )
     if age > timedelta(hours=MEMORY_MAX_AGE_HOURS):

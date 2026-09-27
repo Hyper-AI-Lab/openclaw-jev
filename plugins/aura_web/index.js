@@ -208,13 +208,22 @@ module.exports = {
         type: 'object',
         properties: {
           url: { type: 'string' },
-          action: { type: 'string' },
+          action: { type: 'string', description: 'fetch, goto, read, click, type, or press' },
+          selector: { type: 'string' },
+          text: { type: 'string' },
+          key: { type: 'string', description: 'key for press, such as Enter' },
         },
         required: ['url'],
       },
       execute: async (params) =>
         textResult(
-          await backendsPost('/v1/obscura', { url: params.url, action: params.action || 'fetch' })
+          await backendsPost('/v1/obscura', {
+            url: params.url,
+            action: params.action || 'fetch',
+            selector: params.selector || '',
+            text: params.text || '',
+            key: params.key || '',
+          })
         ),
     });
 

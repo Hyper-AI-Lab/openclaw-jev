@@ -23,34 +23,17 @@ echo "[2/6] Purging stale Temporal workflows..."
 cd "${RMP_ROOT}"
 PYTHONPATH="${RMP_ROOT}" "${VENV}" ops/temporal_purge_running.py --force-recovery || true
 
-echo "[3/6] Restarting Temporal dev server..."
-systemctl restart temporal-dev.service
+echo "[3/5] Restarting Temporal server..."
+systemctl restart temporal.service
 sleep 5
 
-if [[ -f "${DB}" ]]; then
-  echo "[4/6] SQLite maintenance (WAL checkpoint + VACUUM)..."
-  systemctl stop temporal-dev.service
-  PYTHONPATH="${RMP_ROOT}" "${VENV}" -c "
-import sqlite3
-conn = sqlite3.connect('${DB}')
-conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-conn.execute('VACUUM')
-conn.close()
-print('SQLite VACUUM ok')
-"
-  systemctl start temporal-dev.service
-  sleep 5
-else
-  echo "[4/6] Skipping VACUUM (db missing)"
-fi
-
-echo "[5/6] Temporal health probe..."
+echo "[4/5] Temporal health probe..."
 "${VENV}" ops/temporal_healthcheck.py --recover || {
   echo "Temporal health probe failed after recovery" >&2
   exit 1
 }
 
-echo "[6/6] Starting RMP + gateway..."
+echo "[5/5] Starting RMP + gateway..."
 systemctl restart rmp-api.service rmp-worker.service openclaw-gateway.service
 sleep 5
 

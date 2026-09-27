@@ -136,8 +136,15 @@ async def notify_slack_user_safe(task: Task, message: str) -> None:
 
 async def _get_temporal() -> Client:
     global _temporal_client
-    if _temporal_client is None:
-        _temporal_client = await Client.connect("localhost:7233")
+    if _temporal_client is not None:
+        try:
+            await _temporal_client.service_client.check_health()
+            return _temporal_client
+        except Exception:
+            _temporal_client = None
+    from app.temporal_control import connect_temporal_with_retry
+
+    _temporal_client = await connect_temporal_with_retry(attempts=4, delay_sec=0.5)
     return _temporal_client
 
 

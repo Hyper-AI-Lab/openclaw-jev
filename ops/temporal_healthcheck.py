@@ -32,7 +32,7 @@ async def probe_temporal(timeout_sec: float = 8.0) -> tuple[bool, str]:
 
 def restart_temporal_stack() -> None:
     subprocess.run(
-        ["systemctl", "restart", "temporal-dev.service"],
+        ["systemctl", "restart", "temporal.service"],
         check=False,
     )
     time.sleep(5)
@@ -48,7 +48,7 @@ def main() -> int:
     parser.add_argument(
         "--recover",
         action="store_true",
-        help="Restart temporal-dev (+ rmp api/worker) if probe fails once",
+        help="Restart temporal.service (+ rmp api/worker) if probe fails once",
     )
     args = parser.parse_args()
 
@@ -59,7 +59,7 @@ def main() -> int:
 
     print(f"Temporal health FAIL: {msg}", file=sys.stderr)
     if args.recover:
-        print("Attempting temporal-dev restart...", file=sys.stderr)
+        print("Attempting temporal.service restart...", file=sys.stderr)
         restart_temporal_stack()
         ok2, msg2 = asyncio.run(probe_temporal())
         if ok2:

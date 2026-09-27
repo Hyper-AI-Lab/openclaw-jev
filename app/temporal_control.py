@@ -1,6 +1,7 @@
 """Temporal workflow lifecycle helpers (shared by API and task registry)."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -10,9 +11,31 @@ from app.telemetry import get_temporal_client_kwargs
 
 logger = logging.getLogger("rmp.temporal_control")
 
+TEMPORAL_ADDR = "localhost:7233"
+
 
 async def connect_temporal() -> Client:
-    return await Client.connect("localhost:7233", **get_temporal_client_kwargs())
+    return await Client.connect(TEMPORAL_ADDR, **get_temporal_client_kwargs())
+
+
+async def connect_temporal_with_retry(
+    *,
+    attempts: int = 8,
+    delay_sec: float = 1.0,
+) -> Client:
+    last: Exception | None = None
+    wait = delay_sec
+    for i in range(1, attempts + 1):
+        try:
+            return await Client.connect(TEMPORAL_ADDR, **get_temporal_client_kwargs())
+        except Exception as exc:
+            last = exc
+            logger.warning("Temporal connect %s/%s failed: %s", i, attempts, exc)
+            if i < attempts:
+                await asyncio.sleep(wait)
+                wait = min(wait * 2, 8.0)
+    assert last is not None
+    raise last
 
 
 async def terminate_task_workflow(task_id: str, reason: str = "superseded") -> bool:

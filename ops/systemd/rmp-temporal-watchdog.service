@@ -1,0 +1,11 @@
+[Unit]
+Description=RMP Temporal health watchdog
+After=temporal.service rmp-api.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=180
+ExecStart=/bin/bash -c '/root/.openclaw/rmp/ops/temporal_healthcheck.sh --recover || /root/.openclaw/rmp/ops/temporal_recover.sh'
+
+[Install]
+WantedBy=multi-user.target

@@ -21,7 +21,7 @@ echo "=== RMP Restore from $SRC ==="
 read -r -p "This will overwrite live data. Continue? [y/N] " confirm
 [[ "$confirm" == "y" || "$confirm" == "Y" ]] || exit 0
 
-systemctl stop rmp-api rmp-worker || true
+systemctl stop rmp-api rmp-worker temporal || true
 
 if [[ -f "${SRC}/rmp_db.dump" && -s "${SRC}/rmp_db.dump" ]]; then
   echo "Restoring Postgres..."
@@ -44,12 +44,16 @@ if [[ -f "${SRC}/artifacts.tar.gz" ]]; then
 fi
 
 if [[ -f "${SRC}/temporal.db" ]]; then
+  echo "Restoring Temporal DB (temporal-dev stopped)..."
+  rm -f "${RMP_DATA}/temporal.db-wal" "${RMP_DATA}/temporal.db-shm"
   cp -a "${SRC}/temporal.db" "${RMP_DATA}/temporal.db"
+  [[ -f "${SRC}/temporal.db-wal" ]] && cp -a "${SRC}/temporal.db-wal" "${RMP_DATA}/temporal.db-wal"
+  [[ -f "${SRC}/temporal.db-shm" ]] && cp -a "${SRC}/temporal.db-shm" "${RMP_DATA}/temporal.db-shm"
 fi
 
 if [[ -f "${SRC}/settings.json" ]]; then
   cp -a "${SRC}/settings.json" /root/.openclaw/rmp/settings.json
 fi
 
-systemctl restart temporal-dev rmp-api rmp-worker openclaw-gateway
+systemctl restart temporal rmp-api rmp-worker openclaw-gateway
 echo "Restore complete."

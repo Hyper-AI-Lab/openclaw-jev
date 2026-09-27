@@ -61,6 +61,13 @@ def _apply_temporal_decay(
     return decayed
 
 
+def include_in_active_snapshot(context: object) -> bool:
+    """Intake reservations are not running work."""
+    if not isinstance(context, dict):
+        return True
+    return not bool(context.get("intake_reserved"))
+
+
 async def fetch_active_tasks(
     *,
     session_key: Optional[str] = None,
@@ -84,6 +91,8 @@ async def fetch_active_tasks(
         rows = []
         for t in result.scalars().all():
             ctx = t.supplementary_context or {}
+            if not include_in_active_snapshot(ctx):
+                continue
             rows.append(
                 {
                     "task_id": t.id,

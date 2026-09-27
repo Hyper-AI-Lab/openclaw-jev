@@ -1,0 +1,19 @@
+[Unit]
+Description=Temporal production server (Postgres, one frontend)
+After=network.target postgresql.service docker.service
+Requires=docker.service postgresql.service
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/openclaw/openclaw.env
+ExecStartPre=-/usr/bin/docker rm -f temporal-server
+ExecStart=/bin/bash -c 'exec /usr/bin/docker run --name temporal-server --network host -v /root/.openclaw/rmp/ops/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig:ro -e DB=postgres12 -e DB_PORT=5432 -e POSTGRES_USER=temporal -e POSTGRES_PWD="$TEMPORAL_POSTGRES_PWD" -e POSTGRES_SEEDS=127.0.0.1 -e SQL_PASSWORD="$TEMPORAL_POSTGRES_PWD" -e BIND_ON_IP=127.0.0.1 -e DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml temporalio/server:1.30.1'
+ExecStop=/usr/bin/docker stop temporal-server
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

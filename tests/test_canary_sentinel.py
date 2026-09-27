@@ -81,7 +81,7 @@ def test_evaluate_memory_canary_stale(tmp_path, monkeypatch):
     monkeypatch.setattr("app.production.canary_sentinel.MEMORY_CANARY_PATH", path)
     old = (datetime.utcnow() - timedelta(hours=30)).isoformat() + "Z"
     path.write_text(
-        json.dumps({"status": "completed", "finished_at": old, "search_bad": 0})
+        json.dumps({"status": "completed", "finished_at": old, "search_bad": 0, "memory_ok": 1, "prompt_ok": 1})
     )
     issue = evaluate_memory_canary()
     assert issue is not None
@@ -105,6 +105,78 @@ def test_evaluate_memory_timeout_with_transcript_ok_is_not_an_issue(tmp_path, mo
         )
     )
     assert evaluate_memory_canary() is None
+
+
+def test_evaluate_memory_inconclusive_is_issue(tmp_path, monkeypatch):
+    import json
+
+    path = tmp_path / "memory.json"
+    monkeypatch.setattr("app.production.canary_sentinel.MEMORY_CANARY_PATH", path)
+    path.write_text(
+        json.dumps(
+            {
+                "status": "inconclusive",
+                "finished_at": datetime.utcnow().isoformat() + "Z",
+                "memory_ok": 0,
+                "prompt_ok": 0,
+            }
+        )
+    )
+    issue = evaluate_memory_canary()
+    assert issue is not None
+    assert issue.status == "inconclusive"
+
+
+def test_evaluate_memory_completed_unproven_is_issue(tmp_path, monkeypatch):
+    import json
+
+    path = tmp_path / "memory.json"
+    monkeypatch.setattr("app.production.canary_sentinel.MEMORY_CANARY_PATH", path)
+    path.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "finished_at": datetime.utcnow().isoformat() + "Z",
+                "memory_ok": 0,
+                "prompt_ok": 0,
+                "search_bad": 0,
+            }
+        )
+    )
+    issue = evaluate_memory_canary()
+    assert issue is not None
+    assert issue.status == "memory_unproven"
+
+
+def test_inspect_memory_canary_uses_sqlite(monkeypatch, tmp_path):
+    from app.production.canary_sentinel import inspect_memory_canary_transcript
+    from tests.test_openclaw_sessions import _make_agent_db
+    from app import openclaw_sessions as osess
+
+    db = _make_agent_db(tmp_path)
+    monkeypatch.setattr(osess, "AGENT_DB_PATH", db)
+    monkeypatch.setattr(osess, "SESSIONS_JSON_PATH", tmp_path / "missing-sessions.json")
+    monkeypatch.setattr(osess, "SESSIONS_DIR", tmp_path)
+    out = inspect_memory_canary_transcript("not-the-intake-id")
+    assert out["has_transcript"] is False
+    # reuse intake session key shape by inspecting via get_session_entry
+    from app.openclaw_sessions import get_session_entry, read_transcript_lines
+
+    entry = get_session_entry("agent:main:rmp_intake_x")
+    lines = read_transcript_lines(entry["sessionId"])
+    assert "hello" in lines[0]
+
+
+def test_memory_canary_readiness_warns_unproven(monkeypatch, tmp_path):
+    from app.production import readiness as rd
+
+    path = tmp_path / "last_memory_canary.json"
+    path.write_text(
+        '{"status":"completed","finished_at":"2099-01-01T00:00:00Z","memory_ok":0,"prompt_ok":0}'
+    )
+    monkeypatch.setattr(rd, "MEMORY_CANARY_RESULT_PATH", str(path))
+    r = rd.check_memory_canary_recency()
+    assert r.status == "warn"
 
 
 def test_evaluate_health_deferred_recent_is_ok(tmp_path, monkeypatch):

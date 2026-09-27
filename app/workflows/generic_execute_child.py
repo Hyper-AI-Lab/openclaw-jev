@@ -84,7 +84,13 @@ class GenericExecuteChildWorkflow:
         try:
             execution_response = await workflow.execute_activity(
                 send_to_openclaw,
-                {"message": prompt, "task_id": task_id, "session_key": session_key},
+                {
+                    "message": prompt,
+                    "task_id": task_id,
+                    "session_key": session_key,
+                    "task_type": payload.get("task_type") or "",
+                    "tags": payload.get("tags") or [],
+                },
                 start_to_close_timeout=timedelta(minutes=45),
                 retry_policy=RetryPolicy(maximum_attempts=2, backoff_coefficient=2.0),
                 heartbeat_timeout=timedelta(minutes=12),

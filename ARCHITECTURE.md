@@ -13,6 +13,7 @@ Related logs:
 - [`docs/history/DEVELOPMENT_PLAN.md`](docs/history/DEVELOPMENT_PLAN.md) — Phases 0–11 (historical)
 - [`docs/history/PRODUCTION_PLAN.md`](docs/history/PRODUCTION_PLAN.md) — Phases 12–20 (historical)
 - [`docs/CONTROL_PLANE_PROGRESS.md`](docs/CONTROL_PLANE_PROGRESS.md) — Analyst control-plane log (append-only)
+- [`docs/runbooks/slack-sockets.md`](docs/runbooks/slack-sockets.md) — this-host Slack sockets only; never `apps.connections.open`
 
 ---
 
@@ -96,9 +97,9 @@ Aura is a **three-layer system** on one machine:
 | `openclaw-gateway` | Slack + agent gateway; env from `/etc/openclaw/openclaw.env`; **ExecStartPre:** `ops/sync_nvidia_keys.py` |
 | `rmp-api` | FastAPI; `/etc/rmp/rmp.env` + `/etc/openclaw/openclaw.env`; key sync pre-start |
 | `rmp-worker` | Temporal worker (`openclaw-tasks` queue); same env + key sync |
-| `temporal-dev` | Persistent dev server (`/root/.openclaw/rmp/data/temporal.db`) |
+| `temporal` | Official Temporal server 1.30.1 on this host's Postgres (`temporal`, `temporal_visibility`), frontend `127.0.0.1:7233`. One node, not Temporal Cloud. |
 | `rmp-canary.timer` | Hourly health check (`*:07` — staggered from heartbeat) |
-| `rmp-memory-canary.timer` | Scheduled memory/vector canary (6h) |
+| `rmp-memory-canary.timer` | Memory canary at 04:37, 10:37, 16:37, 22:37 CEST |
 | `rmp-janitor.timer` | Daily workflow janitor (`ops/workflow_janitor.py`) |
 | `rmp-backup.timer` | Daily Postgres backup |
 
@@ -146,6 +147,7 @@ Success/failure is logged internally; **no Slack notification** to Kirill (canar
 | Auth profiles | Shared SQLite `authProfiles.store` in `state/openclaw.sqlite` (2026.9+); synced from env via `ops/sync_nvidia_keys.py`. Do not recreate leftover `auth-profiles.json` (triggers AUTH_PROFILE_MIGRATION_REQUIRED). |
 | Auth rotation order | `auth.order.openai`: `openai:default`. `auth.order.nvidia`: `nvidia:default` → `nvidia:key2` → `nvidia:key3`. Never pin `nvidia:keyN` on `openai/*` sessions.
 | Plugin | `/root/.openclaw/plugins/rmp_adapter/index.js` |
+| Slack sockets | This host: exactly one `openclaw-gateway`. See [`docs/runbooks/slack-sockets.md`](docs/runbooks/slack-sockets.md). Never `apps.connections.open`. Other hosts undetectable. |
 | Slack streaming | `{"mode":"off","nativeTransport":false}` (RMP owns Slack delivery; object form required by OpenClaw 2026.7+) |
 | OpenClaw version | `2026.9.1` (requires Node ≥ 22.22.3) |
 | Hook sessions | `/hooks/agent` uses `sessionMode: persistent` plus `hooks.allowedSessionKeyPrefixes: ["hook:", "agent:main:rmp_"]` (2026.9 defaults isolated and will not persist `rmp_*` keys otherwise) |
@@ -420,7 +422,7 @@ The orchestrator keeps **program logic** in charge; the LLM proposes actions and
 
 | Component | File / unit | Behavior |
 |-----------|-------------|----------|
-| **Reconciler** | `app/reconciler.py` | Cron activity: stale tasks (>20m), stuck RUNNING workflows (>15m terminate + repair), orphan `*-plan-*` child cleanup; skips internal/canary Slack nudges |
+| **Reconciler** | `app/reconciler.py` | Cron activity: stale tasks (>20m), stuck RUNNING workflows (>45m terminate + repair), orphan `*-plan-*` child cleanup; skips internal/canary Slack nudges |
 | **Workflow janitor** | `ops/workflow_janitor.py`, `rmp-janitor.timer` | Daily sweep of orphaned Temporal executions >24h |
 | **Canary timers** | `rmp-canary.timer`, `rmp-memory-canary.timer` | Hourly E2E + 6h memory/vector canary; results in logs + `data/last_memory_canary.json` |
 | **Readiness** | `GET /api/production/readiness` | Stuck workflow count, canary freshness, LLM orchestration snapshot |
@@ -520,6 +522,7 @@ Tracks **requests + tokens** per key per day, by source:
 - **State:** `/root/.openclaw/rmp/data/llm_usage.json`
 - **Scrape:** Also reads OpenClaw session JSONL for gateway turns not captured by hooks
 - **Report:** `ops/llm_usage_report.py`, `GET /api/llm/usage`; healthcheck prints daily per-key summary
+- **Honesty:** `nvidia:unknown` is treated as unset when a model id is present (`openai/` → `openai:default`, `nvidia/` → `nvidia:default`). Only `rolling_24h` events with a model are rewritten. Day-bucket `nvidia:unknown` totals stay; summary annotates those UTC days. Never invent `nvidia:keyN`.
 
 **Design choice:** Chat and embeddings share one key pool — avoids total quota overrun; bulk vector seeding may pace Slack turns slightly. Balanced rotation **aims for equal load** but instant parity is not guaranteed under burst traffic.
 
@@ -618,7 +621,7 @@ Scanner catalog synced by RMP (`app/scanners/`) when `development_mode: false`.
 | Daily backup | ✅ `ops/backup.sh` |
 | Runbooks | ✅ `docs/runbooks/` |
 | OTLP trace backend | ✅ Phoenix + OTel collector (`make observability`); `telemetry.otlp_endpoint` set |
-| Production Temporal cluster | ⏳ Using persistent dev server |
+| Production Temporal | One official server on Postgres. Not a cluster and not Temporal Cloud. |
 | Alerting webhook | ⏳ Config present; disabled by default |
 
 ### Operator commands
@@ -636,7 +639,7 @@ make rollback               # return to dev quiet mode (ops/rollback_dev.sh)
 python3 ops/llm_usage_report.py      # daily per-key usage by source
 python3 ops/nvidia_key_probe.py      # live NVIDIA smoke test on all keys
 
-systemctl status temporal-dev rmp-api rmp-worker openclaw-gateway
+systemctl status temporal rmp-api rmp-worker openclaw-gateway
 systemctl status rmp-memory-canary.timer rmp-janitor.timer rmp-canary.timer
 journalctl -u rmp-worker -f
 journalctl -u openclaw-gateway -f
@@ -689,7 +692,7 @@ cat /root/.openclaw/rmp/data/llm_usage.json   # daily usage ledger
 
 - **Vector search timeout** (20s) — postgres-only fallback via `MemoryRouter`  
 - **Memory built once per plan loop** — refresh only after completed steps; `skip_vector` for canaries  
-- **Reconciler active repair** — terminate stuck RUNNING workflows after 15m; orphan `*-plan-*` child cleanup  
+- **Reconciler active repair** — terminate stuck RUNNING workflows after 45m; orphan `*-plan-*` child cleanup  
 - **Daily workflow janitor** — `ops/workflow_janitor.py` + `rmp-janitor.timer`  
 - **`STALE_TASK_MINUTES` = 20** — internal/canary tasks skip Slack nudge spam  
 - **Scheduled memory canary** — `rmp-memory-canary.timer` (6h); readiness checks `last_memory_canary.json` age  
@@ -724,12 +727,12 @@ cat /root/.openclaw/rmp/data/llm_usage.json   # daily usage ledger
 | Area | Gap |
 |------|-----|
 | **OTLP live backend** | Phoenix UI at `http://127.0.0.1:6006`; OTLP HTTP `4318`; RMP exports to `http://127.0.0.1:4318/v1/traces` |
-| **Production Temporal** | Dev server with SQLite persistence (Phase 7) |
+| **Production Temporal** | Official server on this host's Postgres. Single frontend. Not Cloud and not a second node. |
 | **Safe harbor integration** | `deep_core` compact wired; `auditor.js` / `memory_chunker.js` exist under `/root/aura_safe_harbor` (deeper consolidation optional) |
 | **72h soak** | Recommended post-go-live; not formally signed off (Phase 7) |
 | **NVIDIA free-tier quota** | Mitigated by 3-key balanced rotation + concurrency cap + usage monitor; org-level TPM may still cap throughput |
 | **Live Slack memory canary** | Scheduled via `rmp-memory-canary.timer`; result file at `data/last_memory_canary.json` |
-| **Stuck Temporal workflows** | Reconciler terminates at 15m; daily janitor for orphans >24h |
+| **Stuck Temporal workflows** | Reconciler terminates at 45m; daily janitor for orphans >24h |
 
 **Phase 6 completed:** spawn leg lineage (`parent_process_run_id`), skip_noop/supersede fast paths, MoltMarket skill symlink, intake canaries including attach/wait and supersede.
 

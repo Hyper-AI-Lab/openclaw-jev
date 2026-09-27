@@ -1,5 +1,6 @@
 """Tests for LLM usage monitor."""
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,69 @@ def test_resolve_usage_profile_id_defaults():
     assert um.resolve_usage_profile_id(None, model="nvidia/deepseek-ai/deepseek-v4-flash-0731") == "nvidia:default"
     assert um.resolve_usage_profile_id("nvidia:key2") == "nvidia:key2"
     assert um.resolve_usage_profile_id(None) == "unknown"
+    assert (
+        um.resolve_usage_profile_id("nvidia:unknown", model="openai/gpt-5-nano")
+        == "openai:default"
+    )
+    assert (
+        um.resolve_usage_profile_id("nvidia:unknown", model="nvidia/minimaxai/minimax-m3")
+        == "nvidia:default"
+    )
+    assert um.resolve_usage_profile_id("nvidia:unknown") == "unknown"
+
+
+def test_rewrite_rolling_unknown_with_model_leaves_day_buckets(usage_paths):
+    now_ms = int(time.time() * 1000)
+    um._mutate_store(
+        lambda store: (
+            store["days"].update(
+                {
+                    "2026-09-05": {
+                        "profiles": {
+                            "nvidia:unknown": {
+                                "by_source": {},
+                                "totals": um._zero_counts(),
+                            }
+                        },
+                        "totals": um._zero_counts(),
+                    }
+                }
+            ),
+            store["rolling_24h"].extend(
+                [
+                    {
+                        "ts_ms": now_ms,
+                        "profile_id": "nvidia:unknown",
+                        "source": "openclaw_llm",
+                        "model": "openai/gpt-5-nano",
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                        "is_rate_limit": False,
+                    },
+                    {
+                        "ts_ms": now_ms,
+                        "profile_id": "nvidia:unknown",
+                        "source": "openclaw_llm",
+                        "model": "",
+                        "input_tokens": 3,
+                        "output_tokens": 0,
+                        "total_tokens": 3,
+                        "is_rate_limit": False,
+                    },
+                ]
+            ),
+        )
+    )
+    summary = um.get_summary()
+    store = json.loads(usage_paths.read_text())
+    rolling_pids = {e["profile_id"] for e in store["rolling_24h"]}
+    assert "openai:default" in rolling_pids
+    assert "nvidia:unknown" in store["days"]["2026-09-05"]["profiles"]
+    assert "nvidia:key2" not in rolling_pids
+    assert "2026-09-05" in summary["unattributed_historical_days"]
+    assert summary["unattributed_note"]
+    assert "openai:default" in summary["rolling_24h_by_profile"]
 
 
 def test_record_request_openai_model_not_nvidia_unknown(usage_paths):

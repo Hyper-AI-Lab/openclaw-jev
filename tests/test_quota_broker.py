@@ -216,6 +216,9 @@ def test_user_intake_preempts_canary_slot(monkeypatch, tmp_path):
     monkeypatch.setattr(qb, "OPENCLAW_ENV_PATH", env_file)
     monkeypatch.setattr(qb, "_today_usage_by_profile", lambda: {})
     monkeypatch.setattr(qb, "_task_looks_like_canary_sync", lambda _tid: False)
+    monkeypatch.setattr(
+        "app.production.canary_sentinel.cancel_task_sync", lambda *_a, **_k: True
+    )
 
     now_ms = time.time() * 1000
     state_file.write_text(
@@ -234,6 +237,7 @@ def test_user_intake_preempts_canary_slot(monkeypatch, tmp_path):
                             "profile_id": "nvidia:default",
                             "started_ms": now_ms,
                             "session_key": "agent:main:rmp_task_canary_health",
+                            "kind": "canary",
                         }
                     },
                     "session_slots": {
@@ -307,3 +311,118 @@ def test_user_does_not_preempt_other_user_slot(monkeypatch, tmp_path):
     assert result is None
     state = json.loads(state_file.read_text())
     assert "slot-user" in state["global"]["active_slots"]
+
+
+def test_canary_cannot_take_both_user_slots(monkeypatch, tmp_path):
+    state_file = tmp_path / "llm_quota.json"
+    env_file = tmp_path / "openclaw.env"
+    env_file.write_text("NVIDIA_API_KEY=k1\n")
+    monkeypatch.setattr(qb, "STATE_PATH", state_file)
+    monkeypatch.setattr(qb, "LOCK_PATH", tmp_path / ".llm_quota.lock")
+    monkeypatch.setattr(qb, "OPENCLAW_ENV_PATH", env_file)
+    monkeypatch.setattr(qb, "_today_usage_by_profile", lambda: {})
+    monkeypatch.setattr(qb, "_task_looks_like_canary_sync", lambda _tid: False)
+    state_file.write_text(json.dumps({"keys": {}, "global": {"active_slots": {}, "session_slots": {}}}))
+    cfg = qb.QuotaConfig(max_concurrent=3, min_interval_sec=0.0)
+    a = qb._mutate_reserve("agent:main:rmp_task_canary_one", ["nvidia:default"], cfg, kind="canary")
+    b = qb._mutate_reserve("agent:main:rmp_task_canary_two", ["nvidia:default"], cfg, kind="canary")
+    assert a is not None
+    assert b is None
+    state = json.loads(state_file.read_text())
+    kinds = [s.get("kind") for s in state["global"]["active_slots"].values()]
+    assert kinds.count("canary") == 1
+
+
+@pytest.mark.asyncio
+async def test_canary_reserve_does_not_wait_1800s(monkeypatch, tmp_path):
+    state_file = tmp_path / "llm_quota.json"
+    env_file = tmp_path / "openclaw.env"
+    env_file.write_text("NVIDIA_API_KEY=k1\n")
+    monkeypatch.setattr(qb, "STATE_PATH", state_file)
+    monkeypatch.setattr(qb, "LOCK_PATH", tmp_path / ".llm_quota.lock")
+    monkeypatch.setattr(qb, "OPENCLAW_ENV_PATH", env_file)
+    monkeypatch.setattr(qb, "_today_usage_by_profile", lambda: {})
+    monkeypatch.setattr(
+        qb,
+        "assign_openclaw_session_profile",
+        lambda session_key, profile_id: None,
+    )
+    now_ms = time.time() * 1000
+    state_file.write_text(
+        json.dumps(
+            {
+                "keys": {"nvidia:default": {"last_used_ms": 0, "in_flight": 1}},
+                "global": {
+                    "active_slots": {
+                        "slot-c": {
+                            "profile_id": "nvidia:default",
+                            "started_ms": now_ms,
+                            "session_key": "agent:main:rmp_task_canary_held",
+                            "kind": "canary",
+                        }
+                    },
+                    "session_slots": {"agent:main:rmp_task_canary_held": "slot-c"},
+                },
+            }
+        )
+    )
+    settings = {"llm_quota": {"max_concurrent": 3, "min_interval_sec": 0, "max_wait_sec": 1800}}
+    t0 = time.time()
+    with pytest.raises(TimeoutError, match="canary"):
+        await qb.reserve_profile(
+            session_key="agent:main:rmp_task_canary_second",
+            settings=settings,
+            tags=["canary"],
+            task_type="canary",
+        )
+    assert time.time() - t0 < 5
+
+
+def test_user_reserve_cancels_canary_task(monkeypatch, tmp_path):
+    state_file = tmp_path / "llm_quota.json"
+    env_file = tmp_path / "openclaw.env"
+    env_file.write_text("NVIDIA_API_KEY=k1\n")
+    monkeypatch.setattr(qb, "STATE_PATH", state_file)
+    monkeypatch.setattr(qb, "LOCK_PATH", tmp_path / ".llm_quota.lock")
+    monkeypatch.setattr(qb, "OPENCLAW_ENV_PATH", env_file)
+    monkeypatch.setattr(qb, "_today_usage_by_profile", lambda: {})
+    cancelled = []
+
+    def fake_cancel(tid, reason="x"):
+        cancelled.append((tid, reason))
+        return True
+
+    monkeypatch.setattr(
+        "app.production.canary_sentinel.cancel_task_sync", fake_cancel
+    )
+    canary_tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    now_ms = time.time() * 1000
+    state_file.write_text(
+        json.dumps(
+            {
+                "keys": {"nvidia:default": {"last_used_ms": 0, "in_flight": 1}},
+                "global": {
+                    "active_slots": {
+                        "slot-c": {
+                            "profile_id": "nvidia:default",
+                            "started_ms": now_ms,
+                            "session_key": f"agent:main:rmp_task_{canary_tid}",
+                            "kind": "canary",
+                        }
+                    },
+                    "session_slots": {
+                        f"agent:main:rmp_task_{canary_tid}": "slot-c"
+                    },
+                },
+            }
+        )
+    )
+    cfg = qb.QuotaConfig(max_concurrent=1, min_interval_sec=0.0)
+    result = qb._mutate_reserve(
+        "agent:main:rmp_intake_user_abcd1234",
+        ["nvidia:default"],
+        cfg,
+        kind="user",
+    )
+    assert result is not None
+    assert cancelled == [(canary_tid, "user_preempt_canary")]

@@ -49,11 +49,29 @@ if [[ -d "${ART}" ]]; then
   tar -czf "${DEST}/artifacts.tar.gz" -C "${RMP_ROOT}/data" artifacts 2>>"${LOG}" || true
 fi
 
-# Temporal persistent DB if present
+# Temporal persistent DB if present (SQLite backup API, not a hot cp)
 TEMPORAL_DB="${RMP_ROOT}/data/temporal.db"
 if [[ -f "${TEMPORAL_DB}" ]]; then
-  log "Copying Temporal DB..."
-  cp -a "${TEMPORAL_DB}" "${DEST}/temporal.db"
+  log "Backing up Temporal DB..."
+  if PYTHONPATH="${RMP_ROOT}" "${RMP_ROOT}/venv/bin/python" - <<PY
+import sqlite3
+src = sqlite3.connect("${TEMPORAL_DB}", timeout=10)
+dst = sqlite3.connect("${DEST}/temporal.db")
+try:
+    src.backup(dst)
+    print("temporal sqlite backup ok")
+finally:
+    dst.close()
+    src.close()
+PY
+  then
+    :
+  else
+    log "WARN: sqlite backup API failed; copying files"
+    cp -a "${TEMPORAL_DB}" "${DEST}/temporal.db"
+    [[ -f "${TEMPORAL_DB}-wal" ]] && cp -a "${TEMPORAL_DB}-wal" "${DEST}/temporal.db-wal"
+    [[ -f "${TEMPORAL_DB}-shm" ]] && cp -a "${TEMPORAL_DB}-shm" "${DEST}/temporal.db-shm"
+  fi
 fi
 
 # Config snapshots

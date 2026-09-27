@@ -267,11 +267,10 @@ Isolated session `heartbeat`. Plugin does **not** create RMP tasks for internal 
 
 ## 12. Residual product risks (not unfinished constitution)
 
-These may remain after this constitution is encoded and integrity-aligned. They are **product/ops**, not missing sections of this document:
+These are the limits this VPS still cannot remove. They are not unfinished code on the Slack path.
 
-- Hourly canary can still occupy an OpenClaw lane while a user DM needs intake.
-- Dual Slack socket connections if another host or stale gateway is connected.
-- Usage ledger may record `nvidia:unknown` for some turns.
-- Temporal is a single-node `temporal-dev`, not an HA cluster.
+- Slack Socket Mode on **other hosts** is undetectable from this VPS. This host expects exactly one `openclaw-gateway`. Never `apps.connections.open`. See [`runbooks/slack-sockets.md`](runbooks/slack-sockets.md).
+- Historical day-bucket `nvidia:unknown` totals have no stored model id and were not rewritten.
+- Temporal is one official server on this host's Postgres. There is no second node and no Temporal Cloud account here.
 
-Do not “fix” those by violating §4 (raising idle, native Slack, attaching users to canaries).
+Galaxy tools that are advertised run or say they failed. Obscura stays optional. Safe Harbor scanners stay off the DM path. Do not “fix” the leftovers above by violating §4 (raising idle, native Slack, attaching users to canaries, inventing `nvidia:keyN`).
