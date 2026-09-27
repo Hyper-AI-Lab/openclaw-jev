@@ -23,7 +23,9 @@ def _connect(db: Path, readonly: bool) -> sqlite3.Connection:
     return con
 
 
-def _sqlite_sessions_available(db: Path = AGENT_DB_PATH) -> bool:
+def _sqlite_sessions_available(db: Optional[Path] = None) -> bool:
+    if db is None:
+        db = AGENT_DB_PATH
     if not db.is_file():
         return False
     try:

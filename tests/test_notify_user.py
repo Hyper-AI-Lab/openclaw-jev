@@ -102,7 +102,11 @@ def test_plugin_fail_closed_sends_rmp_notice_not_native():
     repo = Path(__file__).resolve().parents[1]
     copies = [repo / "plugins/rmp_adapter/index.js"]
     live = Path("/root/.openclaw/plugins/rmp_adapter/index.js")
-    if live.is_file():
+    try:
+        include_live = live.is_file()
+    except OSError:
+        include_live = False
+    if include_live:
         copies.append(live)
     for path in copies:
         src = path.read_text()
