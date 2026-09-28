@@ -39,8 +39,9 @@ def context(intent="How is the invoice export going?", running=True, finished=Tr
         "memory_hits": [{"snippet": "Kirill prefers metric units"}], "tags": ["user-request"], "task_type": "user"}
 
 
-def answer(choice, confidence=.97, is_max=True):
-    return {"type": "choice", "choice": choice, "confidence": confidence, "probabilities": {}, "choice_is_max": is_max}
+def answer(choice, confidence=.97, is_max=True, probabilities=None):
+    return {"type": "choice", "choice": choice, "confidence": confidence,
+        "probabilities": probabilities or {choice: confidence}, "choice_is_max": is_max}
 
 
 def answers(**overrides):
@@ -112,23 +113,36 @@ def test_task_text_in_criteria_is_redacted():
     ({"relation": answer("finished"), "finished_target": answer("F1")}, "create_guided", None, [DONE_ID]),
     ({"relation": answer("memory")}, "create_guided", None, []),
     ({"relation": answer("new")}, "create_fresh", None, []),
+    ({"relation": answer("finished"), "finished_target": answer("none")}, "create_fresh", None, []),
 ])
 def test_composition_maps_onto_intake_decisions(overrides, decision, target, similar):
     result = intake.compose_intake_result(answers(**overrides), ALIASES, Policy())
     assert result["decision"] == decision and result["target_task_id"] == target
     assert result["similar_task_ids"] == similar and result["decision_source"] == "jev"
-    assert result["confidence"] == 97 and result["relation_class"] == answers(**overrides)["relation"]["choice"]
+    assert result["confidence"] == 97 and result["relation_class"] in ("running", "finished", "memory", "new")
+
+
+def test_running_decisions_do_not_need_an_execution_mode():
+    result = intake.compose_intake_result(answers(execution_mode=answer("conversational", .1)), ALIASES, Policy())
+    assert result["decision"] == "wait_active" and result["execution_mode"] is None
+
+
+def test_split_between_new_and_finished_is_a_fresh_task_in_the_same_conversation():
+    split = answer("new", .2, probabilities={"new": .55, "finished": .42, "running": .02, "unclear": .01})
+    no_running = answers(relation=split, running_target=None, running_action=None)
+    result = intake.compose_intake_result(no_running, ALIASES, Policy())
+    assert result["decision"] == "create_fresh" and result["confidence"] == 97
 
 
 @pytest.mark.parametrize("overrides", [
     {"relation": answer("unclear")},
-    {"relation": answer("new", .8)},
-    {"execution_mode": answer("conversational", .8)},
+    {"relation": answer("new", .8, probabilities={"new": .8, "running": .15, "unclear": .05})},
+    {"relation": answer("new", .88, probabilities={"new": .88, "finished": .02, "unclear": .1})},
+    {"relation": answer("new"), "execution_mode": answer("conversational", .8)},
     {"running_target": answer("none")},
     {"running_target": answer("R1", .9)},
     {"relation": answer("running", .9)},
     {"running_target": None, "running_action": None},
-    {"relation": answer("finished"), "finished_target": answer("none")},
     {"relation": answer("new", is_max=False)},
 ])
 def test_composition_abstains_to_the_llm(overrides):
@@ -147,9 +161,10 @@ def test_catalog_needs_structured_work_and_high_confidence(mode, catalog, expect
 
 
 def test_confidence_is_the_weakest_required_answer_and_web_intent_is_gated():
+    relation = answer("new", .9, probabilities={"new": .9, "finished": .03, "running": .05, "unclear": .02})
     result = intake.compose_intake_result(
-        answers(relation=answer("new", .9), web_intent=answer("search", .5)), ALIASES, Policy())
-    assert result["confidence"] == 90 and result["web_intent"] is None
+        answers(relation=relation, web_intent=answer("search", .5)), ALIASES, Policy())
+    assert result["confidence"] == 93 and result["web_intent"] is None
 
 
 async def test_off_internal_and_empty_messages_never_call(provider):
@@ -260,6 +275,7 @@ async def test_intake_eval_flags_harmful_attach_and_fails_the_gate(monkeypatch):
             "answers": {qid: answer(chosen[qid]) for qid in questions}}, latency_ms=300.0)
     monkeypatch.setattr(jev_eval, "get_client", lambda: type("Fake", (), {"evaluate": staticmethod(evaluate)})())
     monkeypatch.setattr(jev_eval, "close_jev_client", AsyncMock())
+    monkeypatch.setattr(jev_eval, "MIN_REQUEST_SPACING_SEC", 0)
     report = await jev_eval.run_intake(cases, Policy(cache_ttl_sec=0))
     by_id = {r["id"]: r for r in report["records"]}
     assert by_id["run-status-export"]["correct"] and not by_id["run-status-export"]["harmful"]

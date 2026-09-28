@@ -125,9 +125,10 @@ def build_intake_request(
              "new": "It is a new request or ordinary conversation that no listed task covers.",
              "unclear": "The evidence does not settle which of the other options applies."}),
         "execution_mode": choice(
-            "What kind of work does state.message ask Aura for?",
-            {"conversational": "A short conversational reply: a greeting, thanks, an opinion, or a question about Aura or its status, with no deliverable.",
-             "structured_work": "Real work with a deliverable: tools, files, websites, research, code or several steps."}),
+            "Can Aura answer state.message directly from the conversation and its own knowledge, "
+            "or does the answer need tools, web access, files, code or several steps?",
+            {"conversational": "A direct reply is enough: a greeting, thanks, an opinion, or a question about Aura itself.",
+             "structured_work": "The answer needs tools, web access, files, code or several steps."}),
         "catalog": choice(
             "Does state.message ask Aura to carry out one of these workflow templates now? "
             "A question about a capability is not a request to run it.",
@@ -158,43 +159,47 @@ def _passes(answer: dict | None, threshold: float) -> bool:
 def compose_intake_result(answers: dict, aliases: dict, policy: Policy) -> dict | None:
     """Map typed answers onto the intake LLM result, or None to leave the message to the LLM."""
     relation, mode = answers["relation"], answers["execution_mode"]
-    kind = relation["choice"]
-    if kind == "unclear" or not _passes(relation, policy.intake_min_confidence):
+    kind, strict = relation["choice"], policy.intake_attach_min_confidence
+    if not relation["choice_is_max"]:
         return None
-    if not _passes(mode, policy.intake_min_confidence):
-        return None
-    required, target, similar = [relation, mode], None, []
+    target, similar = None, []
     if kind == "running":
         tgt, act = answers.get("running_target"), answers.get("running_action")
-        strict = policy.intake_attach_min_confidence
         if not (_passes(relation, strict) and _passes(tgt, strict) and _passes(act, strict)) or tgt["choice"] == "none":
             return None
         target = aliases[tgt["choice"]]
         decision, similar = RUNNING_ACTIONS[act["choice"]], [target]
-        required += [tgt, act]
+        support = [relation["confidence"], tgt["confidence"], act["confidence"]]
         rationale = f"Intake (Jev): this message is about running task {target[:8]}."
-    elif kind == "finished":
-        tgt = answers.get("finished_target")
-        if not _passes(tgt, policy.intake_min_confidence) or tgt["choice"] == "none":
-            return None
-        decision, similar = "create_guided", [aliases[tgt["choice"]]]
-        required.append(tgt)
-        rationale = f"Intake (Jev): this message follows up on finished task {similar[0][:8]}."
-    elif kind == "memory":
-        decision = "create_guided"
-        rationale = "Intake (Jev): this message relies on remembered facts about Kirill, not on a listed task."
     else:
-        decision = "create_fresh"
-        rationale = "Intake (Jev): this is a new request in the same conversation."
+        # Not about a running task once little probability is left on running or unclear;
+        # a rival workflow next to running work needs the stricter bar.
+        settled = 1 - relation["probabilities"].get("running", 0) - relation["probabilities"].get("unclear", 0)
+        bar = strict if "running_target" in answers else policy.intake_min_confidence
+        if kind == "unclear" or settled < bar or not _passes(mode, policy.intake_min_confidence):
+            return None
+        tgt = answers.get("finished_target")
+        support = [settled, mode["confidence"]]
+        if kind == "finished" and _passes(tgt, policy.intake_min_confidence) and tgt["choice"] != "none":
+            kind, decision, similar = "finished", "create_guided", [aliases[tgt["choice"]]]
+            support.append(tgt["confidence"])
+            rationale = f"Intake (Jev): this message follows up on finished task {similar[0][:8]}."
+        elif kind == "memory" and _passes(relation, policy.intake_min_confidence):
+            decision = "create_guided"
+            rationale = "Intake (Jev): this message relies on remembered facts about Kirill, not on a listed task."
+        else:
+            kind, decision = "new", "create_fresh"
+            rationale = "Intake (Jev): this is a new request in the same conversation."
+    execution_mode = mode["choice"] if _passes(mode, policy.intake_min_confidence) else None
     catalog, web = answers["catalog"], answers["web_intent"]
     catalog_hint = None
-    if mode["choice"] == "structured_work" and catalog["choice"] != "none" and _passes(catalog, CATALOG_MIN_CONFIDENCE):
+    if execution_mode == "structured_work" and catalog["choice"] != "none" and _passes(catalog, CATALOG_MIN_CONFIDENCE):
         catalog_hint = catalog["choice"]
     return {
         "decision": decision,
         "relation_class": kind,
-        "execution_mode": mode["choice"],
-        "confidence": int(100 * min(a["confidence"] for a in required)),
+        "execution_mode": execution_mode,
+        "confidence": int(100 * min(support)),
         "rationale": rationale,
         "similar_task_ids": similar,
         "target_task_id": target,

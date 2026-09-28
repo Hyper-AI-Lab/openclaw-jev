@@ -20,6 +20,9 @@ from app.memory.promotion import validate_fact
 ROOT = Path(__file__).resolve().parents[1]
 EVAL_NOW = datetime(2026, 9, 28, 5, 0, tzinfo=timezone.utc)
 EVAL_SESSION = "agent:main:slack:channel:eval"
+EVAL_POLICY = Policy(cache_ttl_sec=0, requests_per_minute=120)
+# Spacing that keeps a sequential run under the per-process limit above.
+MIN_REQUEST_SPACING_SEC = 60 / EVAL_POLICY.requests_per_minute
 RUNNING_DECISIONS = frozenset({"attach_active", "wait_active", "rebuild_stale"})
 INTAKE_DECISIONS = RUNNING_DECISIONS | {"create_fresh", "create_guided", "clarify", "abstain"}
 EXECUTION_MODES = frozenset({"conversational", "structured_work"})
@@ -45,12 +48,19 @@ def load_cases(path: Path, max_cases: int) -> list[dict]:
     return cases
 
 
+async def _evaluate_paced(state: dict, questions: dict, *, purpose: str, rubric: str, policy: Policy):
+    started = asyncio.get_running_loop().time()
+    ev = await get_client().evaluate(state, questions, purpose=purpose, rubric=rubric, policy=policy)
+    await asyncio.sleep(max(0.0, MIN_REQUEST_SPACING_SEC - (asyncio.get_running_loop().time() - started)))
+    return ev
+
+
 async def run(cases: list[dict], policy: Policy) -> dict:
     records = []
     try:
         for case in cases:
             state, questions = build_promotion_request(case["source"], case["candidates"])
-            ev = await get_client().evaluate(state, questions, purpose="eval." + case["id"],
+            ev = await _evaluate_paced(state, questions, purpose="eval." + case["id"],
                 rubric=PROMOTION_RUBRIC, policy=policy)
             record = {"id": case["id"], "operation": case["operation"], "status": ev.status,
                 "reason": ev.reason, "latency_ms": ev.latency_ms, "request_hash": ev.request_hash,
@@ -173,7 +183,7 @@ async def run_intake(cases: list[dict], policy: Policy) -> dict:
         for case in cases:
             context, dialogue = intake_context(case)
             state, questions, aliases = build_intake_request(context, dialogue, now=EVAL_NOW)
-            ev = await get_client().evaluate(state, questions, purpose="eval." + case["id"],
+            ev = await _evaluate_paced(state, questions, purpose="eval." + case["id"],
                 rubric=INTAKE_RUBRIC, policy=policy)
             answers = ev.result["answers"] if ev.status == "ok" else {}
             proposal = compose_intake_result(answers, aliases, policy) if answers else None
@@ -216,7 +226,7 @@ def main():
     if args.intake:
         paths = args.dataset or [ROOT / "tests/fixtures/jev_intake_eval.jsonl"]
         cases, unlabeled = load_intake_cases(paths, args.max_cases or 250)
-        result = asyncio.run(run_intake(cases, Policy(cache_ttl_sec=0))) if args.live else {
+        result = asyncio.run(run_intake(cases, EVAL_POLICY)) if args.live else {
             "live": False, "validated_cases": len(cases), "unlabeled_skipped": unlabeled, "model": MODEL,
             "message": "Dataset structure validated. No model called; no accuracy or latency measured."}
         if args.live:
@@ -224,7 +234,7 @@ def main():
     else:
         path = (args.dataset or [ROOT / "tests/fixtures/jev_memory_eval.jsonl"])[0]
         cases = load_cases(path, args.max_cases or 20)
-        result = asyncio.run(run(cases, Policy(cache_ttl_sec=0))) if args.live else {
+        result = asyncio.run(run(cases, EVAL_POLICY)) if args.live else {
             "live": False, "validated_cases": len(cases), "model": MODEL,
             "message": "Dataset structure validated. No model called; no accuracy or latency measured."}
     rendered = json.dumps(result, indent=2, allow_nan=False, ensure_ascii=False)

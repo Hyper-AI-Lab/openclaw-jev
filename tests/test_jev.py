@@ -249,6 +249,7 @@ async def test_eval_metrics_include_false_holds(monkeypatch):
     fake=type('Fake',(),{'evaluate':AsyncMock(return_value=Evaluation('unavailable','test'))})()
     monkeypatch.setattr(jev_eval,'get_client',lambda:fake)
     monkeypatch.setattr(jev_eval,'close_jev_client',AsyncMock())
+    monkeypatch.setattr(jev_eval,'MIN_REQUEST_SPACING_SEC',0)
     metrics=await jev_eval.run(cases,Policy(cache_ttl_sec=0))
     assert metrics['unavailable']==7
     assert metrics['promotion']['false_holds']==2
