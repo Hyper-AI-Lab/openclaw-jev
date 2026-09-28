@@ -67,7 +67,7 @@ MODEL_CATALOG = {
     "anthropic": ["claude-3-5-haiku-latest", "claude-3-7-sonnet-latest"],
     "mistral": ["mistral-large-latest", "mistral-large-2512", "mistral-medium-2505"],
     "nvidia": [
-        "minimaxai/minimax-m3",
+        "openai/gpt-oss-20b",
         "nvidia/nemotron-3-nano-30b-a3b",
     ],
 }

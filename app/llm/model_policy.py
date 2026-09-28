@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 PRIMARY_MODEL = "openai/gpt-5-nano"
-FALLBACK_MODELS = ("nvidia/minimaxai/minimax-m3",)
+# NVIDIA-hosted, so it uses NVIDIA auth and key rotation despite the "openai/" model id.
+FALLBACK_MODELS = ("nvidia/openai/gpt-oss-20b",)
 # Hook-created sessions without a model (the Process Evaluator) run on the subagent model.
 SUBAGENT_MODEL = PRIMARY_MODEL
 GLM_MODEL = "nvidia/z-ai/glm-5.2"
-# DeepSeek V4 Flash reached end of life on NVIDIA on 2026-09-21 (HTTP 410).
-RETIRED_MODEL_MARKERS = ("glm", "deepseek")
+# NVIDIA ended MiniMax M3 on 2026-09-09 and DeepSeek V4 Flash on 2026-09-21 (HTTP 410).
+RETIRED_MODEL_MARKERS = ("glm", "deepseek", "minimax")
 OPENAI_MODEL_ID = "gpt-5-nano"
 OPENAI_PROVIDER_BASE_URL = "https://api.openai.com/v1"
 OPENAI_AUTH_PROFILE = "openai:default"
@@ -39,6 +40,17 @@ _OPENAI_MODEL_ROW = {
     "api": "openai-completions",
 }
 
+_NVIDIA_FALLBACK_ROW = {
+    "id": FALLBACK_MODELS[0].removeprefix("nvidia/"),
+    "name": "GPT-OSS 20B (NVIDIA NIM)",
+    "reasoning": True,
+    "input": ["text"],
+    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+    "contextWindow": 128000,
+    "maxTokens": 8192,
+    "api": "openai-completions",
+}
+
 _MODEL_ALIASES = {
     PRIMARY_MODEL: {
         "alias": "GPT-5 nano (OpenAI primary)",
@@ -46,7 +58,7 @@ _MODEL_ALIASES = {
         # thinking=medium first-token often exceeds the 5s idle patch.
         "params": {"thinking": "low"},
     },
-    FALLBACK_MODELS[0]: {"alias": "MiniMax M3 (NVIDIA fallback)"},
+    FALLBACK_MODELS[0]: {"alias": "GPT-OSS 20B (NVIDIA fallback)"},
 }
 
 
@@ -88,20 +100,23 @@ def _is_retired_ref(value: str) -> bool:
     return any(marker in (value or "").lower() for marker in RETIRED_MODEL_MARKERS)
 
 
-def _ensure_openai_model_row(openai_cfg: Dict[str, Any]) -> bool:
-    models = openai_cfg.setdefault("models", [])
+def _ensure_model_row(provider_cfg: Dict[str, Any], canonical: Dict[str, Any]) -> bool:
+    models = provider_cfg.setdefault("models", [])
     if not isinstance(models, list):
-        openai_cfg["models"] = [_OPENAI_MODEL_ROW]
+        provider_cfg["models"] = [dict(canonical)]
         return True
     for idx, row in enumerate(models):
-        if isinstance(row, dict) and str(row.get("id") or "") == OPENAI_MODEL_ID:
-            canonical = dict(_OPENAI_MODEL_ROW)
+        if isinstance(row, dict) and str(row.get("id") or "") == canonical["id"]:
             if row != canonical:
-                models[idx] = canonical
+                models[idx] = dict(canonical)
                 return True
             return False
-    models.insert(0, dict(_OPENAI_MODEL_ROW))
+    models.insert(0, dict(canonical))
     return True
+
+
+def _ensure_openai_model_row(openai_cfg: Dict[str, Any]) -> bool:
+    return _ensure_model_row(openai_cfg, _OPENAI_MODEL_ROW)
 
 
 def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
@@ -189,6 +204,8 @@ def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
             if len(filtered) != len(nmodels):
                 nvidia["models"] = filtered
                 changed.append("models.providers.nvidia.drop-retired")
+        if _ensure_model_row(nvidia, _NVIDIA_FALLBACK_ROW):
+            changed.append("models.providers.nvidia.models:fallback")
 
     auth = cfg.setdefault("auth", {})
     profiles = auth.setdefault("profiles", {})

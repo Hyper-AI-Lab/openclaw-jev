@@ -173,7 +173,7 @@ class VectorMemoryService:
                 "provider": "openai",
                 "config": {
                     "api_key": api_key,
-                    "model": "minimaxai/minimax-m3",
+                    "model": "openai/gpt-oss-20b",
                     "openai_base_url": NVIDIA_API_BASE,
                 },
             }

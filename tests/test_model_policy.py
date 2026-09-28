@@ -6,21 +6,23 @@ from app.llm import model_policy as mp
 
 def test_policy_shape():
     assert mp.PRIMARY_MODEL == "openai/gpt-5-nano"
-    assert mp.FALLBACK_MODELS == ("nvidia/minimaxai/minimax-m3",)
+    assert mp.FALLBACK_MODELS == ("nvidia/openai/gpt-oss-20b",)
     assert mp.SUBAGENT_MODEL == mp.PRIMARY_MODEL
     assert mp.GLM_MODEL not in mp.allowed_models()
     assert "deepseek" not in json.dumps(mp.allowed_models())
+    assert "minimax" not in json.dumps(mp.allowed_models())
     assert mp.intake_model_chain() == [
         "openai/gpt-5-nano",
-        "nvidia/minimaxai/minimax-m3",
+        "nvidia/openai/gpt-oss-20b",
     ]
 
 
 def test_should_pin_nvidia_only_for_nvidia_models():
-    assert mp.should_pin_nvidia_profile("nvidia/minimaxai/minimax-m3", "nvidia:key2")
+    # gpt-oss-20b is NVIDIA-hosted: NVIDIA key rotation applies despite the "openai/" id.
+    assert mp.should_pin_nvidia_profile("nvidia/openai/gpt-oss-20b", "nvidia:key2")
     assert not mp.should_pin_nvidia_profile("openai/gpt-5-nano", "nvidia:key2")
     assert not mp.should_pin_nvidia_profile(None, "nvidia:key2")
-    assert not mp.should_pin_nvidia_profile("nvidia/minimaxai/minimax-m3", "openai:default")
+    assert not mp.should_pin_nvidia_profile("nvidia/openai/gpt-oss-20b", "openai:default")
 
 
 def test_drop_unwired_openai(monkeypatch):
@@ -106,6 +108,9 @@ def test_apply_openclaw_policy_writes_combo_and_drops_retired_models(tmp_path):
     assert "gpt-5-nano" in ids
     nvidia_ids = [m["id"] for m in cfg["models"]["providers"]["nvidia"]["models"]]
     assert "z-ai/glm-5.2" not in nvidia_ids
+    assert "minimax" not in json.dumps(cfg)
+    assert "openai/gpt-oss-20b" in nvidia_ids
+    assert "models.providers.nvidia.models:fallback" in result["changed"]
     assert cfg["auth"]["order"]["openai"] == ["openai:default"]
     assert "openai" in cfg["plugins"]["allow"]
     assert cfg.get("memory", {}).get("search", {}).get("enabled") is False

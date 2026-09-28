@@ -402,3 +402,49 @@ Each step appends one entry below. Earlier entries are never rewritten.
 - **Not changed (noted):** `temporal_recover.sh` itself still stops user work without an
   idle check and backs up the retired `data/temporal.db`. With the false trigger gone, it
   runs only when Temporal is really down.
+
+## Extra step — Replace the dead MiniMax fallback (2026-09-28, approved by Kirill)
+
+- **Finding:**
+  - NVIDIA returns 410 for `minimaxai/minimax-m3` ("end of life on 2026-09-09"), and
+    MiniMax is gone from the catalog (81 models listed).
+  - A live tool-call probe on this account:
+
+    | Model | Result |
+    |---|---|
+    | `openai/gpt-oss-20b` | 200, correct tool call, 2.2–2.5 s |
+    | `nemotron-3-ultra-550b` | 200 in 6.4 s |
+    | `nemotron-3.5-lightning` | 200 in 22.8 s |
+    | `kimi-k3` | timed out at 60 s |
+    | `kimi-k2.6`, `mistral-large`, `nemotron-nano-3` | not available to this account |
+    | `nemotron-3-super` | 500 |
+
+  - Kirill chose `nvidia/openai/gpt-oss-20b`. History check: GPT-OSS 20B was intake and
+    subagent backup on 10 Aug, then dropped the same day for "DeepSeek V4 Flash only", with
+    no quality problem recorded. `test_intake_models` only enforced that choice.
+- **Change:**
+  - `app/llm/model_policy.py`: `FALLBACK_MODELS = ("nvidia/openai/gpt-oss-20b",)` with an
+    alias, and `minimax` joins `RETIRED_MODEL_MARKERS`.
+  - The policy now also guarantees the NVIDIA provider row for the fallback. It matches the
+    live row, so there is no churn. `_ensure_model_row` serves both providers.
+  - `nvidia/*` refs keep NVIDIA auth and key rotation. The rule "never pin `nvidia:keyN` on
+    `openai/*`" is unaffected, since the ref starts with `nvidia/`.
+  - The same model replaces MiniMax in the API model catalog, the unused NVIDIA branch of
+    `app/memory/vector.py`, and `ops/nvidia_key_probe.py`. One `config.py` comment is
+    updated.
+- **Applied:**
+  - `settings.json` (backup in `data/backups/`): `task_registry.intake_model_fallbacks`
+    changed on one line. `settings.example.json` got the same change.
+  - `openclaw.json` (backup `openclaw.json.pre-gpt-oss-fallback.20260928T141934Z`): the dry
+    run on a copy matched the live apply. Fallbacks, alias and allow list moved to
+    gpt-oss-20b; the MiniMax alias and model row were dropped.
+  - The gateway hot-reloaded the config, and Slack reconnected in 1 s.
+- **Docs:** CONCEPT_TREE §4, §8 and §10, both `rmp-architecture.mdc` copies (identical),
+  README, ARCHITECTURE and the patcher's messages. Historical records are unchanged.
+- **Tests:** `test_model_policy` checks the new chain, the pinning rule for the NVIDIA-hosted
+  fallback, and that MiniMax is dropped while the fallback row is ensured. `test_intake_models`
+  now asserts gpt-oss-20b in the chain and no MiniMax. Full suite: 492 passed, 3 skipped.
+- **Live check:** one intake-style turn on `nvidia/openai/gpt-oss-20b` through
+  `_dispatch_openclaw_session`. The gateway logged `status=200`, first byte in 865 ms, and
+  RMP read the JSON reply in 6.2 s. The last MiniMax 410 was at 13:14Z. The reloader
+  restarted the API and worker at 14:18:48Z, and runtime sync reports no stale services.

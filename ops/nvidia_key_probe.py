@@ -12,7 +12,7 @@ from app.llm.quota_broker import _load_env_keys, api_key_for_profile
 from app.llm.usage_monitor import record_request
 
 BASE = "https://integrate.api.nvidia.com/v1"
-MODEL = "minimaxai/minimax-m3"
+MODEL = "openai/gpt-oss-20b"
 
 
 def probe(profile_id: str) -> dict:

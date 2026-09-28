@@ -11,10 +11,10 @@ def test_intake_models_default_order():
 
     if openai_key_present():
         assert models[0] == PRIMARY_MODEL
-        assert "nvidia/minimaxai/minimax-m3" in models
+        assert "nvidia/openai/gpt-oss-20b" in models
         assert not any("deepseek" in m for m in models)
     else:
         assert models == [FALLBACK_MODELS[0]]
         assert not any(m.startswith("openai/") for m in models)
     assert "glm" not in "".join(models).lower()
-    assert "gpt-oss" not in "".join(models)
+    assert "minimax" not in "".join(models).lower()
