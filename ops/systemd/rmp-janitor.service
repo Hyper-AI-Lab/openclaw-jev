@@ -1,0 +1,16 @@
+[Unit]
+Description=RMP daily workflow janitor
+After=network.target temporal.service
+Wants=temporal.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/.openclaw/rmp
+Environment=PYTHONPATH=/root/.openclaw/rmp
+EnvironmentFile=-/etc/rmp/rmp.env
+EnvironmentFile=-/etc/openclaw/openclaw.env
+ExecStart=/root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/workflow_janitor.py
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly Temporal SQLite VACUUM for RMP
+After=temporal.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/.openclaw/rmp/ops/temporal_vacuum.sh
+
+[Install]
+WantedBy=multi-user.target

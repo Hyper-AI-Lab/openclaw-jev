@@ -24,3 +24,17 @@ Each step appends one entry below. Earlier entries are never rewritten.
 - **Live check:** watcher restarted with the new script. A non-`.py` file under `app/`
   caused no reload. Re-saving `app/production/canary_sentinel.py` while idle logged
   `change detected (app/production/canary_sentinel.py)`, restarted both units, health ok.
+
+## Step 2 — Temporal unit cleanup (2026-09-28)
+
+- **Finding:** `rmp-api.service`, `rmp-janitor.service` and `rmp-janitor-frequent.service`
+  still had `Wants=temporal-dev.service` (and `rmp-temporal-vacuum.service` an `After=`), so
+  every API restart launched the retired start-dev server, which crash-looped because the
+  Postgres-backed `temporal.service` owns port 7233. None of these units had a repo copy.
+- **Change:** added the four units to `ops/systemd/` with `After/Wants=temporal.service`
+  (everything else copied verbatim), installed them to `/etc/systemd/system`,
+  `daemon-reload`, and cleared the stale failed state of `temporal-dev.service`, which
+  stays disabled.
+- **Live check:** `temporal-dev` has no `WantedBy`/`RequiredBy`. An idle `rmp-api` restart
+  produced no `temporal-dev` activity; `rmp-api`, `rmp-worker`, `temporal` active,
+  `temporal-dev` inactive, health ok.

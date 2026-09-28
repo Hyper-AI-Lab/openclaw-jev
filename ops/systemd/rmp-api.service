@@ -1,0 +1,19 @@
+[Unit]
+Description=RMP FastAPI server
+After=network.target postgresql.service temporal.service rmp-qdrant.service
+Wants=temporal.service rmp-qdrant.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.openclaw/rmp
+Environment=PYTHONPATH=/root/.openclaw/rmp
+EnvironmentFile=-/etc/rmp/rmp.env
+EnvironmentFile=-/etc/openclaw/openclaw.env
+ExecStartPre=/root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/sync_nvidia_keys.py
+ExecStart=/root/.openclaw/rmp/venv/bin/uvicorn app.api.server:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
