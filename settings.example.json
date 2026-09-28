@@ -68,8 +68,7 @@
     "intake_llm_timeout_sec": 40,
     "intake_model": "openai/gpt-5-nano",
     "intake_model_fallbacks": [
-      "nvidia/minimaxai/minimax-m3",
-      "nvidia/deepseek-ai/deepseek-v4-flash-0731"
+      "nvidia/minimaxai/minimax-m3"
     ],
     "intake_vector_deadline_sec": 10,
     "qdrant_query_timeout_sec": 8,

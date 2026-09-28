@@ -12,7 +12,7 @@ def test_intake_models_default_order():
     if openai_key_present():
         assert models[0] == PRIMARY_MODEL
         assert "nvidia/minimaxai/minimax-m3" in models
-        assert "nvidia/deepseek-ai/deepseek-v4-flash-0731" in models
+        assert not any("deepseek" in m for m in models)
     else:
         assert models == [FALLBACK_MODELS[0]]
         assert not any(m.startswith("openai/") for m in models)

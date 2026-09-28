@@ -12,7 +12,7 @@ from app.llm.quota_broker import _load_env_keys, api_key_for_profile
 from app.llm.usage_monitor import record_request
 
 BASE = "https://integrate.api.nvidia.com/v1"
-MODEL = "deepseek-ai/deepseek-v4-flash-0731"
+MODEL = "minimaxai/minimax-m3"
 
 
 def probe(profile_id: str) -> dict:

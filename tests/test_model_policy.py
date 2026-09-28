@@ -6,15 +6,13 @@ from app.llm import model_policy as mp
 
 def test_policy_shape():
     assert mp.PRIMARY_MODEL == "openai/gpt-5-nano"
-    assert mp.FALLBACK_MODELS == (
-        "nvidia/minimaxai/minimax-m3",
-        "nvidia/deepseek-ai/deepseek-v4-flash-0731",
-    )
+    assert mp.FALLBACK_MODELS == ("nvidia/minimaxai/minimax-m3",)
+    assert mp.SUBAGENT_MODEL == mp.PRIMARY_MODEL
     assert mp.GLM_MODEL not in mp.allowed_models()
+    assert "deepseek" not in json.dumps(mp.allowed_models())
     assert mp.intake_model_chain() == [
         "openai/gpt-5-nano",
         "nvidia/minimaxai/minimax-m3",
-        "nvidia/deepseek-ai/deepseek-v4-flash-0731",
     ]
 
 
@@ -32,7 +30,7 @@ def test_drop_unwired_openai(monkeypatch):
     assert mp.drop_unwired_openai(mp.intake_model_chain()) == mp.intake_model_chain()
 
 
-def test_apply_openclaw_policy_writes_combo_and_drops_glm(tmp_path):
+def test_apply_openclaw_policy_writes_combo_and_drops_retired_models(tmp_path):
     cfg_path = tmp_path / "openclaw.json"
     cfg_path.write_text(
         json.dumps(
@@ -54,8 +52,13 @@ def test_apply_openclaw_policy_writes_combo_and_drops_glm(tmp_path):
                         },
                         "models": {
                             "nvidia/z-ai/glm-5.2": {"alias": "GLM"},
+                            "nvidia/deepseek-ai/deepseek-v4-flash-0731": {"alias": "DeepSeek"},
                         },
                         "modelPolicy": {"allow": ["nvidia/z-ai/glm-5.2"]},
+                        "subagents": {
+                            "maxConcurrent": 2,
+                            "model": "nvidia/deepseek-ai/deepseek-v4-flash-0731",
+                        },
                     }
                 },
                 "models": {
@@ -80,6 +83,8 @@ def test_apply_openclaw_policy_writes_combo_and_drops_glm(tmp_path):
     allow = cfg["agents"]["defaults"]["modelPolicy"]["allow"]
     assert allow == mp.allowed_models()
     assert "nvidia/z-ai/glm-5.2" not in json.dumps(cfg)
+    assert "deepseek" not in json.dumps(cfg)
+    assert cfg["agents"]["defaults"]["subagents"] == {"maxConcurrent": 2, "model": mp.PRIMARY_MODEL}
     runtime = cfg["agents"]["defaults"]["models"]["openai/gpt-5-nano"]["agentRuntime"]
     assert runtime == {"id": "openclaw"}
     assert cfg["agents"]["defaults"]["models"]["openai/gpt-5-nano"]["params"] == {

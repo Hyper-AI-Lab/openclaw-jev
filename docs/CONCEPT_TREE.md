@@ -114,7 +114,7 @@ RMP chat.postMessage (idempotent)
 - Attempts: 1–9 rework; ~10 strategy change; 11–19 continue; ~20 stop and Slack a diagnosis.
 - Process-scoped memory is injected on execute. Across `create_fresh`, prior same-conversation Slack turns are injected (RECENT DIALOGUE). “This is new” labels a **new task row**, not a new person.
 - User-local clock is a **fact** (`USER LOCAL TIME` / Japan Standard Time). Server Europe/Berlin is not Kirill’s clock.
-- Primary model: `openai/gpt-5-nano`. Fallbacks: MiniMax M3 → DeepSeek V4 Flash. Intake: when `jev.intake_mode` is `enforce`, the pinned decision model `jev-1.13.0` answers typed intake questions first and counts only above program thresholds; otherwise the same chain decides. `apply_intake_policy` stays the authority either way.
+- Primary model: `openai/gpt-5-nano`. Fallback: MiniMax M3. Subagent sessions, including the Process Evaluator, run on `openai/gpt-5-nano`. Intake: when `jev.intake_mode` is `enforce`, the pinned decision model `jev-1.13.0` answers typed intake questions first and counts only above program thresholds; otherwise the same chain decides. `apply_intake_policy` stays the authority either way.
 - LLM idle ~5s then rotate keys/models. HTTP 410 is skip (next model), not an idle retry.
 - OpenAI key only in `/etc/openclaw/openclaw.env` → SQLite `openai:default`. Never `openclaw.json` interpolations, git, or Slack. Never pin `nvidia:keyN` on an `openai/*` session.
 - After `npm install -g openclaw`, run `ops/upgrade_openclaw.sh`. Never `openclaw onboard`, never `doctor --force`, never hand-edit dist.
@@ -202,7 +202,8 @@ Isolated session `heartbeat`. Plugin does **not** create RMP tasks for internal 
 | Item | Live law |
 |------|----------|
 | Primary | `openai/gpt-5-nano` (`agentRuntime.id: openclaw`) |
-| Fallbacks | MiniMax M3 → DeepSeek V4 Flash. No GLM. No Gemini unless configured. |
+| Fallbacks | MiniMax M3. No GLM. No DeepSeek. No Gemini unless configured. |
+| Subagents / Process Evaluator | `openai/gpt-5-nano` (`agents.defaults.subagents.model`). |
 | Idle | ~5s then rotate. Do not restore 120s. |
 | HTTP 410 | Skip to next model. |
 | 429 | Rotate NVIDIA keys; wait on true quota after rotation; do not hop providers for 429. |
@@ -234,7 +235,8 @@ Isolated session `heartbeat`. Plugin does **not** create RMP tasks for internal 
 | Old claim | Winning claim | Why |
 |-----------|---------------|-----|
 | “I won’t add OpenAI” (Jun 2026) | gpt-5-nano primary | Latest instruction Sep 2026; NVIDIA chat models were insufficient. |
-| MiniMax M3 primary / GLM fallbacks | gpt-5-nano → MiniMax → DeepSeek; no GLM | GLM 410; keys module. Nested `rmp/.cursor/rules` copy was stale. |
+| MiniMax M3 primary / GLM fallbacks | gpt-5-nano → MiniMax; no GLM | GLM 410; keys module. Nested `rmp/.cursor/rules` copy was stale. |
+| DeepSeek V4 Flash as last fallback and subagent/evaluator model | `openai/gpt-5-nano` wherever DeepSeek was | Sep 28 2026: `deepseek-v4-flash-0731` reached end of life on Sep 21 (HTTP 410); every evaluator run failed. |
 | Disable model fallbacks | Ordered fallbacks required | Idle/410/unavailable models. |
 | Ask user at 10 | Strategy change at 10; user diagnosis at 20 | `request_2`. |
 | Conversational = Slack-first / skip evaluator | Conversational = short RMP plan, still gated | Aug 12 + Sep 5 stone. |

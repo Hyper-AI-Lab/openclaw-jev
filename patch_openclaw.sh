@@ -7,7 +7,7 @@
 #   - allowUnsafe passthrough for RMP JSON intake
 #   - LLM idle 5s (fail fast, rotate NVIDIA keys)
 #   - HTTP 410 skip (model_not_found, not idle-timeout retry)
-# Model fallbacks (gpt-5-nano → MiniMax → DeepSeek) are INTENTIONAL — do not disable them.
+# Model fallbacks (gpt-5-nano → MiniMax) are INTENTIONAL — do not disable them.
 set -euo pipefail
 
 DIST_DIR="/usr/lib/node_modules/openclaw/dist"
@@ -294,7 +294,7 @@ done
 
 echo ""
 echo "Done. Patched/restored $PATCHED files."
-echo "Note: model fallbacks left ENABLED (gpt-5-nano → MiniMax → DeepSeek)."
+echo "Note: model fallbacks left ENABLED (gpt-5-nano → MiniMax)."
 
 require_marker() {
     local pattern="$1"

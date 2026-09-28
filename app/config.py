@@ -183,7 +183,7 @@ def get_intake_models() -> list[str]:
 
     chain = drop_unwired_openai([primary] + fallbacks if primary else fallbacks)
     # OpenClaw already walks the same fallbacks. When OpenAI is unwired, one
-    # MiniMax turn (then OpenClaw→DeepSeek) beats two sequential 5s-idle budgets.
+    # MiniMax turn beats two sequential 5s-idle budgets.
     if chain and not any(m.startswith("openai/") for m in chain):
         return chain[:1]
     return chain

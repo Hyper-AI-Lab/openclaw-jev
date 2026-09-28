@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 PRIMARY_MODEL = "openai/gpt-5-nano"
-FALLBACK_MODELS = (
-    "nvidia/minimaxai/minimax-m3",
-    "nvidia/deepseek-ai/deepseek-v4-flash-0731",
-)
+FALLBACK_MODELS = ("nvidia/minimaxai/minimax-m3",)
+# Hook-created sessions without a model (the Process Evaluator) run on the subagent model.
+SUBAGENT_MODEL = PRIMARY_MODEL
 GLM_MODEL = "nvidia/z-ai/glm-5.2"
+# DeepSeek V4 Flash reached end of life on NVIDIA on 2026-09-21 (HTTP 410).
+RETIRED_MODEL_MARKERS = ("glm", "deepseek")
 OPENAI_MODEL_ID = "gpt-5-nano"
 OPENAI_PROVIDER_BASE_URL = "https://api.openai.com/v1"
 OPENAI_AUTH_PROFILE = "openai:default"
@@ -44,7 +45,6 @@ _MODEL_ALIASES = {
         "params": {"thinking": "low"},
     },
     FALLBACK_MODELS[0]: {"alias": "MiniMax M3 (NVIDIA fallback)"},
-    FALLBACK_MODELS[1]: {"alias": "DeepSeek V4 Flash (NVIDIA fallback)"},
 }
 
 
@@ -82,8 +82,8 @@ def drop_unwired_openai(models: List[str]) -> List[str]:
     return [m for m in kept if not m.startswith("openai/")]
 
 
-def _is_glm_ref(value: str) -> bool:
-    return "glm" in (value or "").lower() or value == GLM_MODEL
+def _is_retired_ref(value: str) -> bool:
+    return any(marker in (value or "").lower() for marker in RETIRED_MODEL_MARKERS)
 
 
 def _ensure_openai_model_row(openai_cfg: Dict[str, Any]) -> bool:
@@ -137,9 +137,14 @@ def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
         if aliases.get(ref) != meta:
             aliases[ref] = dict(meta)
             changed.append(f"agents.defaults.models:{ref}")
-    for dead in [k for k in list(aliases) if _is_glm_ref(str(k))]:
+    for dead in [k for k in list(aliases) if _is_retired_ref(str(k))]:
         aliases.pop(dead, None)
         changed.append(f"drop-alias:{dead}")
+
+    subagents = defaults.setdefault("subagents", {})
+    if subagents.get("model") != SUBAGENT_MODEL:
+        subagents["model"] = SUBAGENT_MODEL
+        changed.append("agents.defaults.subagents.model")
 
     policy = defaults.setdefault("modelPolicy", {})
     allow = allowed_models()
@@ -171,12 +176,12 @@ def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
                 row
                 for row in nmodels
                 if not (
-                    isinstance(row, dict) and _is_glm_ref(str(row.get("id") or ""))
+                    isinstance(row, dict) and _is_retired_ref(str(row.get("id") or ""))
                 )
             ]
             if len(filtered) != len(nmodels):
                 nvidia["models"] = filtered
-                changed.append("models.providers.nvidia.drop-glm")
+                changed.append("models.providers.nvidia.drop-retired")
 
     auth = cfg.setdefault("auth", {})
     profiles = auth.setdefault("profiles", {})
@@ -214,5 +219,6 @@ def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
         "changed": changed,
         "primary": PRIMARY_MODEL,
         "fallbacks": list(FALLBACK_MODELS),
+        "subagent_model": SUBAGENT_MODEL,
         "path": str(path),
     }

@@ -51,7 +51,7 @@ Evidence from live code plus [Audit SoT vs live path](9d363fde-4b3d-4075-88f9-f3
 | Keywords / `GENERIC_PROFILES` assign catalogs | **SUPERSEDED** | Intake LLM assigns; plugin sends no `process_type_hint` |
 | `create_fresh` = empty mind | **SUPERSEDED** | New Task row + RECENT DIALOGUE |
 | Ask user at attempt 10 | **SUPERSEDED** | Strategy change at 10; diagnosis at 20 |
-| MiniMax/GLM as primary; no OpenAI | **SUPERSEDED** | `openai/gpt-5-nano` → MiniMax → DeepSeek; no GLM |
+| MiniMax/GLM as primary; no OpenAI | **SUPERSEDED** | `openai/gpt-5-nano` → MiniMax; no GLM, no DeepSeek |
 | `nv-embed-v1` working | **SUPERSEDED** | Honest vector not-ready (HTTP 410) |
 | `auth-profiles.json` is the store | **SUPERSEDED** | SQLite `authProfiles.store`; live JSON file absent |
 

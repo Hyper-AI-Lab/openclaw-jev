@@ -68,7 +68,6 @@ MODEL_CATALOG = {
     "mistral": ["mistral-large-latest", "mistral-large-2512", "mistral-medium-2505"],
     "nvidia": [
         "minimaxai/minimax-m3",
-        "deepseek-ai/deepseek-v4-flash-0731",
         "nvidia/nemotron-3-nano-30b-a3b",
     ],
 }
