@@ -115,7 +115,7 @@ RMP chat.postMessage (idempotent)
 - Process-scoped memory is injected on execute. Across `create_fresh`, prior same-conversation Slack turns are injected (RECENT DIALOGUE). “This is new” labels a **new task row**, not a new person.
 - User-local clock is a **fact** (`USER LOCAL TIME` / Japan Standard Time). Server Europe/Berlin is not Kirill’s clock.
 - Primary model: `openai/gpt-5-nano`. Fallback: MiniMax M3. Subagent sessions, including the Process Evaluator, run on `openai/gpt-5-nano`. Intake: when `jev.intake_mode` is `enforce`, the pinned decision model `jev-1.13.0` answers typed intake questions first and counts only above program thresholds; otherwise the same chain decides. `apply_intake_policy` stays the authority either way.
-- LLM idle ~5s then rotate keys/models. HTTP 410 is skip (next model), not an idle retry.
+- LLM idle ~5s then rotate keys/models. OpenAI alone gets 20s for the first byte; gaps between chunks stay 5s for every provider. HTTP 410 is skip (next model), not an idle retry.
 - OpenAI key only in `/etc/openclaw/openclaw.env` → SQLite `openai:default`. Never `openclaw.json` interpolations, git, or Slack. Never pin `nvidia:keyN` on an `openai/*` session.
 - After `npm install -g openclaw`, run `ops/upgrade_openclaw.sh`. Never `openclaw onboard`, never `doctor --force`, never hand-edit dist.
 - Canaries are health checks: green → silent; failure → fix if possible else alert Kirill. They are not user work (`wait_active` / `attach_active` must ignore them). `CANARY_OK` must not appear in user Slack.
@@ -206,7 +206,7 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 | Primary | `openai/gpt-5-nano` (`agentRuntime.id: openclaw`) |
 | Fallbacks | MiniMax M3. No GLM. No DeepSeek. No Gemini unless configured. |
 | Subagents / Process Evaluator | `openai/gpt-5-nano` (`agents.defaults.subagents.model`). |
-| Idle | ~5s then rotate. Do not restore 120s. |
+| Idle | ~5s then rotate. Do not restore 120s. First byte: OpenAI 20s (`RMP_OPENAI_FIRST_BYTE_20S`, stream creation, first chunk and the provider's first-event guard), since gpt-5-nano needs about 4s median and up to 5s; NVIDIA 5s, where key rotation exists. Gaps between chunks: 5s for all. |
 | HTTP 410 | Skip to next model. |
 | 429 | Rotate NVIDIA keys; wait on true quota after rotation; do not hop providers for 429. |
 | OpenAI auth | Env `OPENAI_API_KEY` → SQLite `openai:default`. Never pin NVIDIA profiles on OpenAI sessions. |

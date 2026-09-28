@@ -5,7 +5,7 @@
 #   - suppress native announce/Slack for RMP-owned sessions
 #   - minimal bootstrap for RMP internal sessions (task/verify/intake)
 #   - allowUnsafe passthrough for RMP JSON intake
-#   - LLM idle 5s (fail fast, rotate NVIDIA keys)
+#   - LLM idle 5s (fail fast, rotate NVIDIA keys); OpenAI first byte 20s
 #   - HTTP 410 skip (model_not_found, not idle-timeout retry)
 # Model fallbacks (gpt-5-nano → MiniMax) are INTENTIONAL — do not disable them.
 set -euo pipefail
@@ -212,6 +212,83 @@ PY
         fi
     fi
 
+    # Patch 6c: OpenAI gets 20s for the first byte (stream creation, first chunk, and
+    # the provider's first-event guard). gpt-5-nano's first byte takes about 4s at the
+    # median and up to 5s, so a 5s cut re-billed the prompt on roughly half the calls.
+    # Gaps between chunks, and every other provider, keep the 5s rule.
+    if grep -q 'function streamWithIdleTimeout(baseFn, timeoutMs, onIdleTimeout, opts) {' "$f" 2>/dev/null \
+       && ! grep -q 'RMP_OPENAI_FIRST_BYTE_20S' "$f" 2>/dev/null; then
+        python3 - "$f" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+if "RMP_OPENAI_FIRST_BYTE_20S" in text:
+    raise SystemExit(0)
+edits = [
+    (
+        "const CLOUD_LLM_FIRST_EVENT_TIMEOUT_MS = DEFAULT_LLM_IDLE_TIMEOUT_MS;",
+        "const CLOUD_LLM_FIRST_EVENT_TIMEOUT_MS = DEFAULT_LLM_IDLE_TIMEOUT_MS;\n"
+        "const RMP_OPENAI_FIRST_BYTE_MS = 2e4; /* RMP_OPENAI_FIRST_BYTE_20S */",
+    ),
+    (
+        "isSelfHostedRuntimeModel ? LOCAL_LLM_FIRST_EVENT_TIMEOUT_MS : CLOUD_LLM_FIRST_EVENT_TIMEOUT_MS, ...timeoutBounds));",
+        "isSelfHostedRuntimeModel ? LOCAL_LLM_FIRST_EVENT_TIMEOUT_MS : params?.model?.provider === \"openai\" ? RMP_OPENAI_FIRST_BYTE_MS : CLOUD_LLM_FIRST_EVENT_TIMEOUT_MS, ...timeoutBounds));",
+    ),
+    (
+        "\treturn (model, context, options) => {\n"
+        "\t\tconst createIdleTimeoutError = () => /* @__PURE__ */ new Error(`LLM idle timeout (${Math.floor(timeoutMs / 1e3)}s): no response from model`);",
+        "\treturn (model, context, options) => {\n"
+        "\t\tconst firstByteMs = model?.provider === \"openai\" ? Math.max(timeoutMs, RMP_OPENAI_FIRST_BYTE_MS) : timeoutMs;\n"
+        "\t\tconst createIdleTimeoutError = (windowMs = timeoutMs) => /* @__PURE__ */ new Error(`LLM idle timeout (${Math.floor(windowMs / 1e3)}s): no response from model`);",
+    ),
+    (
+        "\t\t\t\tconst timer = setTimeout(() => {\n"
+        "\t\t\t\t\tconst error = createIdleTimeoutError();\n"
+        "\t\t\t\t\tabortStream(error);\n"
+        "\t\t\t\t\tonIdleTimeout?.(error);\n"
+        "\t\t\t\t\treject(error);\n"
+        "\t\t\t\t}, timeoutMs);",
+        "\t\t\t\tconst timer = setTimeout(() => {\n"
+        "\t\t\t\t\tconst error = createIdleTimeoutError(firstByteMs);\n"
+        "\t\t\t\t\tabortStream(error);\n"
+        "\t\t\t\t\tonIdleTimeout?.(error);\n"
+        "\t\t\t\t\treject(error);\n"
+        "\t\t\t\t}, firstByteMs);",
+    ),
+    (
+        "\t\t\t\t\tconst recentActivity = activeToolMs > 0 && Date.now() - activeToolMs < timeoutMs;\n"
+        "\t\t\t\t\tconst isFirstStreamArm = firstArmPending && !streamFirstArmDone;\n"
+        "\t\t\t\t\tconst effectiveTimeout = isFirstStreamArm && recentActivity ? Math.max(1, timeoutMs - Math.max(0, Date.now() - activeToolMs)) : timeoutMs;\n"
+        "\t\t\t\t\tfirstArmPending = false;\n"
+        "\t\t\t\t\tif (isFirstStreamArm) streamFirstArmDone = true;\n"
+        "\t\t\t\t\tidleTimer = setTimeout(() => {\n"
+        "\t\t\t\t\t\tidleTimer = null;\n"
+        "\t\t\t\t\t\tconst error = createIdleTimeoutError();",
+        "\t\t\t\t\tconst isFirstStreamArm = firstArmPending && !streamFirstArmDone;\n"
+        "\t\t\t\t\tconst armMs = isFirstStreamArm ? firstByteMs : timeoutMs;\n"
+        "\t\t\t\t\tconst recentActivity = activeToolMs > 0 && Date.now() - activeToolMs < armMs;\n"
+        "\t\t\t\t\tconst effectiveTimeout = isFirstStreamArm && recentActivity ? Math.max(1, armMs - Math.max(0, Date.now() - activeToolMs)) : armMs;\n"
+        "\t\t\t\t\tfirstArmPending = false;\n"
+        "\t\t\t\t\tif (isFirstStreamArm) streamFirstArmDone = true;\n"
+        "\t\t\t\t\tidleTimer = setTimeout(() => {\n"
+        "\t\t\t\t\t\tidleTimer = null;\n"
+        "\t\t\t\t\t\tconst error = createIdleTimeoutError(armMs);",
+    ),
+]
+missing = [old[:60] for old, _ in edits if text.count(old) != 1]
+if missing:
+    print("skip openai-first-byte (dist shape changed): " + "; ".join(missing))
+    raise SystemExit(0)
+for old, new in edits:
+    text = text.replace(old, new, 1)
+path.write_text(text)
+print("patched-openai-first-byte")
+PY
+        if grep -q 'RMP_OPENAI_FIRST_BYTE_20S' "$f" 2>/dev/null; then
+            applied="${applied} openai-first-byte-20s"
+        fi
+    fi
+
     # Patch 7: 2026.9 session_nodes.entry_valid=0/-1 rows fail-closed the entire
     # store (every /hooks/agent). Keep placeholders skippable and allow parseable
     # pending rows through the canonical scan.
@@ -314,6 +391,7 @@ require_marker '__RMP_SUPPRESS_NATIVE_SLACK' 'slack-rmp-suppress'
 require_marker 'RMP_ALLOW_UNSAFE_EXTERNAL' 'allow-unsafe-passthrough'
 require_marker 'RMP_FORCE_ALLOW_UNSAFE' 'allow-unsafe-rmp-force'
 require_marker 'RMP_LLM_IDLE_5S' 'llm-idle-5s'
+require_marker 'RMP_OPENAI_FIRST_BYTE_20S' 'openai-first-byte-20s'
 require_marker 'RMP_410_SKIP' '410-skip-model-not-found'
 require_marker 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
 require_marker 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'

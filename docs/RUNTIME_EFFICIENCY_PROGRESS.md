@@ -188,3 +188,65 @@ Each step appends one entry below. Earlier entries are never rewritten.
 - **Expected effect:** the heartbeat was 83.4M of 94M transcript tokens (89%): 48 runs a day,
   each re-billing a context that grew from 37k to 172k tokens, often several times after
   first-byte cuts. Step 7's accounting will measure the before/after.
+
+## Step 6 — OpenAI first-byte allowance (2026-09-28)
+
+- **Finding (dist `builtin-openclaw-zQV8Wwjr.js`):**
+  - `streamWithIdleTimeout` used one 5 s window for three phases: stream creation (waiting
+    for response headers), the first chunk, and every gap between chunks.
+  - `resolveLlmFirstEventTimeoutMs` separately gave the transport's first-event guard
+    (`@openclaw/ai`, openai-completions) `CLOUD_LLM_FIRST_EVENT_TIMEOUT_MS` = 5 s.
+  - gpt-5-nano holds its response headers until the first token, so nearly every cut
+    happened at creation.
+  - `worker/worker.mjs` is the hashed cloud-worker bundle. Local turns don't run through it,
+    and the existing patches never touched it, so this patch leaves it alone too.
+- **Change (`patch_openclaw.sh`, Patch 6c, marker `RMP_OPENAI_FIRST_BYTE_20S`):**
+  - `RMP_OPENAI_FIRST_BYTE_MS = 2e4`.
+  - For `provider === "openai"`, the creation timer and the first iterator arm use
+    `max(idle, 20 s)`, and `resolveLlmFirstEventTimeoutMs` returns 20 s, still capped by
+    run and agent timeouts.
+  - Later arms (gaps between chunks) keep the idle window, and non-OpenAI providers are
+    byte-for-byte unchanged. The timeout message now shows the window that fired.
+  - The patch applies all five edits or none, and prints `skip … (dist shape changed)` if
+    any target moved. `require_marker` in the patcher and `check_present` in
+    `ops/verify_openclaw_patch.sh` then fail loudly.
+- **Pre-flight on a copy of the dist file:**
+  - The patch applied, a second run changed nothing, and `node --check` passed.
+  - I ran a harness on the extracted original and patched functions with stubbed
+    dependencies and scaled windows (idle 100 ms, first byte 400 ms):
+
+    | Case | Original | Patched |
+    |------|----------|---------|
+    | OpenAI, slow headers | cut | passes |
+    | OpenAI, slow first chunk | cut | passes |
+    | OpenAI, slow gap between chunks | cut | cut |
+    | OpenAI, first chunk beyond the allowance | cut | cut |
+    | NVIDIA, slow headers or first chunk | cut | cut |
+
+  - Transport first-event timeout: OpenAI gets the allowance, NVIDIA keeps 5 s, and an
+    agent timeout still caps it.
+- **Applied:** `patch_openclaw.sh` patched 1 file and `verify_openclaw_patch.sh` passed.
+  The gateway restarted while idle at 12:58:41Z; it logged `[heartbeat] disabled`, and
+  Slack connected at 12:59:32Z.
+- **Docs:** CONCEPT_TREE §4 and §8 state the rule (OpenAI 20 s first byte, NVIDIA 5 s,
+  gaps 5 s for all). Both `rmp-architecture.mdc` copies carry the same sentence and are
+  byte-identical.
+- **Measured (gateway `[model-fetch]` log):**
+
+  | | OpenAI requests | Idle cuts | Headers after |
+  |---|---|---|---|
+  | Before (27–28 Sep) | 340 | 183 (54%) at 5 s | 157 at p50 3,988 ms, p90 4,800 ms, max 4,998 ms (clipped by the cut) |
+  | After, 8 tiny turns | 8 | 0 | 1.8–3.5 s |
+  | After, 4 realistic intake previews | 6 | 0 | 5.9, 9.8, 2.2, 6.8, 5.6 and 3.7 s |
+
+  - Four of the six intake calls would have been cut under the old rule.
+  - Intake previews on the LLM path took 26.0, 14.8 and 17.1 s; Jev decided the fourth
+    in 1.9 s.
+- **New findings, outside this step:**
+  - **Dead fallback:** NVIDIA returns 410 for `minimaxai/minimax-m3` on every call: "reached
+    its end of life on 2026-09-09T09:00:00Z" (10/10 calls on 27–28 Sep). Intake's fallback
+    attempt (`…_fb1`) failed this way during the measurement. The configured chain
+    gpt-5-nano → MiniMax has had no working fallback since 9 Sep. This bears on Step 9.
+  - **Startup freeze:** it is not the heartbeat. With the heartbeat disabled and its session
+    archived, this start still froze for 101 s (13:00:30–13:02:11Z, RSS +~700 MB), about
+    66 s after `listening`. It happens on restarts only, not on DMs.
