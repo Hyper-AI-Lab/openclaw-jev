@@ -93,6 +93,10 @@ sudo -u postgres psql -d rmp_db -c "select created_at, decision,
 7. When the gate passes, set `jev.intake_mode` to `enforce`. Send one test DM and
    check that its row has `llm_raw.decision_source = jev`.
 
+The intake LLM path stays covered while Jev enforces: `ops/canary_intake_latency.sh`
+(part of `make production-check`) calls `POST /tasks/intake/preview?bypass_jev=true`
+and must see an LLM decision within 45 s. Only the preview accepts the flag.
+
 Rollback: set the mode to `off` (takes effect on the next call), or set
 `AURA_JEV_MODE=off` in the service environment and restart when idle.
 

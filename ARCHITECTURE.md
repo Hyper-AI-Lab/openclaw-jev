@@ -50,7 +50,7 @@ Aura is a **three-layer system** on one machine:
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  OpenClaw Gateway (:18789)          /root/.openclaw/openclaw.json           │
 │  • Slack provider                                                           │
-│  • Heartbeat (30m, session: heartbeat, target: none)                        │
+│  • Heartbeat off (every "0m", enforced by RMP model_policy)                 │
 │  • Cron (MoltMarket notifications, etc.)                                    │
 │  • Plugin: rmp_adapter (/root/.openclaw/plugins/rmp_adapter)                │
 │  • auth.order: nvidia:default → nvidia:key2 → nvidia:key3                   │
@@ -98,7 +98,10 @@ Aura is a **three-layer system** on one machine:
 | `rmp-api` | FastAPI; `/etc/rmp/rmp.env` + `/etc/openclaw/openclaw.env`; key sync pre-start |
 | `rmp-worker` | Temporal worker (`openclaw-tasks` queue); same env + key sync |
 | `temporal` | Official Temporal server 1.30.1 on this host's Postgres (`temporal`, `temporal_visibility`), frontend `127.0.0.1:7233`. One node, not Temporal Cloud. |
-| `rmp-canary.timer` | Hourly health check (`*:07` — staggered from heartbeat) |
+| `rmp-canary.timer` | Hourly health check (`*:07`) |
+| `rmp-canary-sentinel.timer` | Every 30 min: health/memory canaries, runtime code sync, LLM usage (24 h budget, live context > 60k, abort rate > 10%) → ops Slack alert with a 4 h cooldown |
+| `rmp-temporal-watchdog.timer` | Every 5 min Temporal probe. Full recovery (`ops/temporal_recover.sh`) only when the probe itself exits 1 |
+| `rmp-code-watch` | Restarts `rmp-api` + `rmp-worker` on `app/*.py` or `worker.py` changes, only once no user task is active |
 | `rmp-memory-canary.timer` | Memory canary at 04:37, 10:37, 16:37, 22:37 CEST |
 | `rmp-janitor.timer` | Daily workflow janitor (`ops/workflow_janitor.py`) |
 | `rmp-backup.timer` | Daily Postgres backup |
@@ -124,7 +127,7 @@ Same path via plugin (`tags: cron`). OpenClaw cron job uses `delivery.mode: none
 
 ### 3.3 Heartbeat
 
-Every 30 minutes OpenClaw runs heartbeat on **isolated session** `heartbeat` (not the Slack DM session). The plugin **does not** create RMP tasks for internal heartbeat triggers (avoids workflow/API floods). When heartbeat text is routed, **`HEARTBEAT_OK`** completions are **not** delivered to Slack. LLM **reserve/release** hooks also skip `trigger === 'heartbeat'`.
+**Off.** `apply_openclaw_policy` enforces `agents.defaults.heartbeat.every: "0m"`, so OpenClaw keeps its `heartbeat-main` monitor job disabled across upgrades. RMP canaries own liveness. The old `agent:main:heartbeat` session is archived with its transcript kept. It never used a tool, yet it re-billed its growing context every 30 minutes (89% of transcript tokens). If a heartbeat ever runs again, the plugin still creates no RMP task, **`HEARTBEAT_OK`** is not delivered, and reserve/release skip `trigger === 'heartbeat'`.
 
 ### 3.4 Hourly canary
 
@@ -139,7 +142,7 @@ Success/failure is logged internally; **no Slack notification** to Kirill (canar
 |------|------------------|
 | Config | `/root/.openclaw/openclaw.json` |
 | Workspace | `/root/.openclaw/workspace` (`USER.md`, `MEMORY.md`, `memory/*.md`, `HEARTBEAT.md`) |
-| Agent sessions | `/root/.openclaw/agents/main/sessions/*.jsonl` |
+| Agent sessions | SQLite `/root/.openclaw/agents/main/agent/openclaw-agent.sqlite` (`session_nodes`, `session_windows`, `transcript_events`); legacy JSONL under `agents/main/sessions/` |
 | Primary model | `openai/gpt-5-nano` (`agentRuntime.id: "openclaw"`); fallback `nvidia/openai/gpt-oss-20b`; intake same chain; subagents gpt-5-nano |
 | Model fallbacks | gpt-5-nano → gpt-oss-20b on NVIDIA (no GLM, no DeepSeek, no MiniMax). HTTP 410 = skip to next model |
 | Concurrency | OpenClaw `maxConcurrent: 2`; RMP `max_concurrent: 3`, `min_interval_sec: 5` |
@@ -159,13 +162,15 @@ OpenClaw also has built-in profile cooldown/rotation on 429; RMP’s quota broke
 
 | Hook | Behavior |
 |------|----------|
-| `message_received` / `inbound_claim` | Slack DM → `POST /tasks`; claim turn so native OpenClaw never replies (fail closed) |
-| `before_message_write` | Block Slack DM / assistant writes while RMP owns delivery; cron task create; skip internal heartbeat routing |
+| `message_received` / `inbound_claim` / `before_dispatch` | Slack DM → mark claimed and return `{ handled: true }` at once (native OpenClaw never replies); `POST /tasks` runs in the background, one route per session in arrival order, with timeout recovery and RMP notices (fail closed) |
+| `before_message_write` | Synchronous (OpenClaw ignores a returned Promise). Blocks Slack DM / assistant writes while RMP owns delivery; cron task creation runs after the hook returns; skips internal heartbeat routing |
 | `message_sending` | Suppress native Slack during active RMP user task; strip interim tool-planning text; cancel pure-ack messages |
 | `before_agent_run` | **`POST /api/llm/reserve`** — balanced key + concurrency slot for gateway sessions (not `rmp_task_*`, `rmp_verify_*`, `rmp_intake_*`, Slack/main, heartbeat) |
 | `agent_end` | **`POST /api/llm/release`** — free slot for same session exclusions |
 | `llm_output` | **`POST /api/llm/record-gateway`** — token/request accounting for gateway LLM turns |
 | Assistant ack block | Pure system acks not written to `agent:main:main` transcript |
+
+The plugin never blocks the gateway's event loop: every RMP call is async `fetch` with `AbortSignal.timeout`, and the session-key lookup reads the OpenClaw store in-process (`node:sqlite`). The same gateway serves intake's LLM leg while `POST /tasks` waits on it; a synchronous call froze it for the whole intake (~70 s).
 
 On task create the plugin also **prefetches** process memory (`GET /memory/process/{id}/context`) and passes `initial_memory_block` into the workflow payload.
 
@@ -199,12 +204,13 @@ Run: `bash /root/.openclaw/rmp/ops/upgrade_openclaw.sh` (`make upgrade-openclaw`
 | Slack suppress | `deliverReplies` calls `__RMP_SUPPRESS_NATIVE_SLACK` so RMP owns delivery |
 | allowUnsafe passthrough | OpenClaw 2026.7 dropped `allowUnsafeExternalContent` from HTTP `/hooks/agent` normalize; RMP needs it (or auto-enable for `rmp_*` keys) to avoid EXTERNAL wrap → `NO_REPLY` on JSON intake |
 | LLM idle 5s | `DEFAULT_LLM_IDLE_TIMEOUT_MS` 120s → 5s so idle silence fails fast and NVIDIA keys rotate |
+| OpenAI first byte 20s | `RMP_OPENAI_FIRST_BYTE_20S`: for `provider === "openai"` stream creation, the first chunk and the provider first-event guard wait up to 20s (gpt-5-nano's first byte is ~4s median, often over 5s on intake prompts). Gaps between chunks and every other provider keep 5s |
 | Session canonical scan | Skip in-flight `{}` placeholders with `entry_valid != 1`; do not fail-closed the whole store on parseable pending rows (2026.9 `entry_valid` triggers otherwise poison every `/hooks/agent`) |
 | Session timestamp drift | Ignore `session_nodes.updated_at` vs JSON `updatedAt` mismatch (often tens of ms); stock parser returns null and `/hooks/agent` throws `SESSION_CANONICAL_KEY_MIGRATION_REQUIRED` |
 | HTTP 410 skip | Classify 410 as `model_not_found` (next fallback), not timeout/idle retry |
 | Model fallbacks | **Left enabled** — gpt-5-nano → gpt-oss-20b (do not re-apply legacy no-fallback disable; do not restore GLM, DeepSeek or MiniMax) |
 
-Upgrade checklist: `ops/upgrade_openclaw.sh` (backup → Node ≥ 22.22.3 → `npm install -g openclaw@latest` → `OPENCLAW_SERVICE_REPAIR_POLICY=external openclaw doctor --fix --non-interactive` → restore RMP config keys / `TOOLS.md` → `ops/settle_openclaw_sessions.py` (never drop `session_nodes` entry_valid triggers) → `patch_openclaw.sh` → verify → skills → restart if no user tasks → `make production-check`). Do not run `openclaw update` (it re-runs doctor/restart on its own).
+Upgrade checklist: `ops/upgrade_openclaw.sh` (backup → Node ≥ 22.22.3 → `npm install -g openclaw@latest` → `openclaw plugins update --all` (newest plugin versions compatible with the core) → `OPENCLAW_SERVICE_REPAIR_POLICY=external openclaw doctor --fix --non-interactive` → restore RMP config keys / `TOOLS.md` → `ops/settle_openclaw_sessions.py` (never drop `session_nodes` entry_valid triggers) → `patch_openclaw.sh` → verify → skills → restart if no user tasks → `make production-check`). Do not run `openclaw update` (it re-runs doctor/restart on its own).
 
 ---
 
@@ -221,7 +227,7 @@ Two **non-Aura** RMP agents own judgment. Retrieval is **evidence only** — nev
 | Role | Session | Job |
 |------|---------|-----|
 | **Intake Analyst** | `agent:main:rmp_intake_*` | Classify each user message against running work, finished work, global memory, or “this is new.” If unsure, **clarify** via RMP Slack. |
-| **Process Evaluator** | `agent:main:rmp_verify_*` | Aura never reaches Slack first. Dual gate: deterministic evidence, then semantic judge. Fail closed on parse/tool errors. |
+| **Process Evaluator** | `agent:main:rmp_verify_*` | Aura never reaches Slack first. Dual gate: deterministic evidence, then semantic judge. Walks gpt-5-nano → `nvidia/openai/gpt-oss-20b` with an explicit model, own session per model, within its activity deadline. Fail closed on parse/tool errors. |
 | **Aura** | `agent:main:rmp_task_*` | Execution engine only (tools, code, search, replies). |
 
 **Four relation classes (intake):**
@@ -254,7 +260,7 @@ Before `POST /tasks` starts Aura execution, intake runs when `task_registry.enab
 
 **Durable tasks:** `task_kind=durable` + `spawn_leg`; `spawn_process` API; legs linked via `ProcessRun.parent_process_run_id`.
 
-Supplementary user/cron text is stored in `task_messages`. Terminal tasks indexed into `task_registry_entries` + Qdrant (including evaluator summary).
+Supplementary user/cron text is stored in `task_messages`. Terminal tasks are indexed into `task_registry_entries` + Qdrant (including evaluator summary) on every terminal path: workflow status updates, reconciler repairs and orphaned-reply recovery (after its commit), and `POST /tasks/{id}/cancel`. `ops/backfill_task_registry.py --task-id …` indexes specific tasks.
 
 **Completion rework:** global attempt counter on the process run; strategy change at 10; user diagnosis at 20. Canaries exempt.
 
@@ -488,6 +494,7 @@ All RMP-issued NVIDIA calls (worker dispatch, embeddings, quality review) and ga
 | **Rotation mode** | `balanced` — pick key with lowest daily load score: `requests + tokens/5000 + in_flight×50` |
 | **Per-key pacing** | `min_interval_sec: 5` (live settings); no global gap across all keys beyond broker pacing |
 | **Concurrency** | `max_concurrent: 3` — `reserve_profile()` / `release_profile()` track `active_slots`, `session_slots`, per-key `in_flight` |
+| **Waits** | The broker lock covers one attempt, never a sleep, so releases are never blocked by a waiting reserve. Callers pass a `deadline` (intake and the evaluator: their activity budget). Waits over 2 s are logged with their reason (slots full, key cooling down, key pacing) |
 | **On 429** | Escalating cooldown per key (15s → 30s → 60s → 120s); rotate; retry up to 6× (embed) or 12× (chat) |
 | **Session pinning** | `assign_openclaw_session_profile()` sets `authProfileOverride` on the SQLite auth store (do not recreate leftover `auth-profiles.json`) |
 | **State** | `/root/.openclaw/rmp/data/llm_quota.json` |
@@ -520,8 +527,9 @@ Tracks **requests + tokens** per key per day, by source:
 | `probe` | `nvidia_key_probe.py` |
 
 - **State:** `/root/.openclaw/rmp/data/llm_usage.json`
-- **Scrape:** Also reads OpenClaw session JSONL for gateway turns not captured by hooks
-- **Report:** `ops/llm_usage_report.py`, `GET /api/llm/usage`; healthcheck prints daily per-key summary
+- **Scrape:** Reads OpenClaw's SQLite `transcript_events` (resumes by rowid; first run starts 24 h back) for gateway turns not captured by hooks
+- **Transcript report:** `transcript_usage(hours)` per UTC day and category (heartbeat, intake, evaluator, task, canary, cron, slack_main, other). Aborted attempts record no usage, so their sent prompt is counted separately as `aborted_prompt_tokens` (an upper bound on re-billing). It also reports the largest live session context. `usage_alerts()` flags a 24 h prompt budget breach (`llm_usage.input_budget_24h`, default 5M), a live context above 60k and an abort rate above 10%. Budget and abort breaches must still hold in the last 2 h
+- **Report:** `ops/llm_usage_report.py`, `GET /api/llm/usage` (`transcripts_24h`, `transcript_alerts`); healthcheck prints the per-key summary, an `llm_transcripts_24h:` line per category and `WARN: llm_usage …` per breach
 - **Honesty:** `nvidia:unknown` is treated as unset when a model id is present (`openai/` → `openai:default`, `nvidia/` → `nvidia:default`). Only `rolling_24h` events with a model are rewritten. Day-bucket `nvidia:unknown` totals stay; summary annotates those UTC days. Never invent `nvidia:keyN`.
 
 **Design choice:** Chat and embeddings share one key pool — avoids total quota overrun; bulk vector seeding may pace Slack turns slightly. Balanced rotation **aims for equal load** but instant parity is not guaranteed under burst traffic.
@@ -628,7 +636,7 @@ Scanner catalog synced by RMP (`app/scanners/`) when `development_mode: false`.
 
 ```bash
 cd /root/.openclaw/rmp
-make production-check       # health + OpenClaw patch verify
+make production-check       # health, LLM usage, patch verify, intake canaries (LLM path ≤ 45 s)
 make canary                 # manual E2E canary
 make readiness              # full readiness JSON
 make backup

@@ -504,3 +504,53 @@ Each step appends one entry below. Earlier entries are never rewritten.
   canary runs passed on the LLM path in 12 s, 11 s and 10 s (confidence 72) against the
   45 s target. The same path timed out at 70 s before Step 3 and took 29 s during Step 3,
   when two 5 s first-byte cuts still hit it.
+
+## Step 11 — Close (2026-09-28)
+
+- **Docs:**
+  - ARCHITECTURE: the diagram and §3.3 (heartbeat off), and a units table covering the
+    sentinel, the Temporal watchdog and the code watch.
+  - ARCHITECTURE: plugin hooks (claim at once, background routing, no blocking calls) and
+    patches (OpenAI first byte 20 s).
+  - ARCHITECTURE: the upgrade checklist (`plugins update --all`), broker waits, the usage
+    monitor (SQLite scrape, transcript report, alerts), where sessions live, registry
+    indexing on every terminal path, the evaluator fallback, and the production-check line.
+  - Runbooks: `openclaw-update.md` (plugin realignment and rollback) and `jev.md` (the
+    LLM-path canary's preview bypass).
+- **Tests:** full pytest 499 passed, 3 skipped. Node 11 of 11 passed. CI runs both after the
+  push.
+- **`make production-check`:** passed.
+  - Readiness 22 pass, 2 warn, 0 fail. `temporal_persistence` warned only because I ran it
+    from a shell without the env file. `telemetry` (no OTLP endpoint) is pre-existing.
+  - All patch markers present, including `RMP_OPENAI_FIRST_BYTE_20S`. Chain:
+    gpt-5-nano → gpt-oss-20b.
+  - Intake execution-mode canary passed. LLM-path canary: 8 s against 45 s.
+  - `WARN: llm_usage` on the 24 h budget: the window still holds the pre-fix heartbeat burn,
+    and my verification runs filled the last 2 h. The abort-rate warning had cleared.
+- **LLM-path DM (Jev temporarily in shadow; `settings.json` backed up):**
+  - Kirill's "Aura, quick final check — are you OK?" at 14:41:23Z was claimed in 16 ms. The
+    intake LLM decided `create_guided` (72) at 14:41:36Z, 13 s after the DM. Jev recorded
+    shadow, not accepted.
+  - The task was created at 14:41:38Z, and the reply delivered at 14:41:53Z (30 s after the
+    DM).
+  - No `process was frozen` and no `reading 'catch'` since 14:39Z.
+  - Jev set back to `enforce`; `settings.json` is identical to the pre-shadow backup.
+- **Before / after tokens (transcripts, `transcript_usage`):**
+
+  | Window | Heartbeat | Canary | Intake / task / evaluator | Abort rate |
+  |---|---|---|---|---|
+  | 24 h to 12:49Z (heartbeat on, 5 s first byte) | 158 attempts, 75% aborted: 6.76M prompt recorded + 20.0M sent on aborts | 0.62M | 0.36M + 0.16M sent on aborts | 61% |
+  | 12:59Z to 14:43Z (1.73 h) | none | 42k, projecting 0.59M/day | 0.49M, mostly my verification runs | 4% (1 of 25: the last MiniMax 410, 0 OpenAI cuts) |
+
+  Recorded 24 h prompts before: 7.74M, plus up to 20.3M sent on aborts. OpenAI's dashboard
+  showed a 13.08M/day peak, between those two figures. Expected results check: intake on
+  the LLM path now takes 8–13 s (was a 70 s timeout), and idle input projects to about
+  0.6M/day of canaries (was 5–13M/day). OpenAI first-byte cuts are gone. Kirill should see
+  the drop on the OpenAI dashboard from 29 Sep.
+- **Open:**
+  - The gateway startup freeze (70–100 s after each start) is the approved extra step that
+    comes next. It now happens only on real restarts, since the watchdog fix stopped the
+    19-per-week spurious ones.
+  - Not in scope, noted: `temporal_recover.sh` has no idle check; `_pick_key` ignores key
+    pacing; `openclaw.json` still holds inline Brave, LangSearch and Jina API keys, against
+    "secrets only in `/etc/openclaw/openclaw.env`".
