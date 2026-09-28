@@ -125,12 +125,18 @@ async def classify_task_intake_deterministic(payload: Dict[str, Any]) -> Dict[st
         payload, context, recurrence_key=recurrence_key, fp=fp
     )
     if not llm_result:
-        llm_result = {
-            "decision": "create_fresh",
-            "confidence": 0,
-            "rationale": "Intake workflow unavailable; deterministic fallback only",
-            "similar_task_ids": [],
-        }
+        from app.decisions.intake import review_intake
+
+        llm_result, jev_record = await review_intake(context, tags=tags)
+        if not llm_result:
+            llm_result = {
+                "decision": "create_fresh",
+                "confidence": 0,
+                "rationale": "Intake workflow unavailable; deterministic fallback only",
+                "similar_task_ids": [],
+            }
+            if jev_record:
+                llm_result["jev"] = jev_record
 
     result = apply_intake_policy(llm_result, context, tags=tags)
     result["recurrence_key"] = recurrence_key
@@ -161,6 +167,12 @@ async def classify_task_intake(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     _safe_activity_heartbeat()
 
+    jev_record = None
+    if not llm_result:
+        from app.decisions.intake import review_intake
+
+        llm_result, jev_record = await review_intake(context, tags=tags)
+
     if not llm_result:
         from app.activities.openclaw_activities import _execute_intake_llm, _safe_activity_heartbeat
 
@@ -180,6 +192,8 @@ async def classify_task_intake(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "rationale": f"Intake LLM error: {exc}",
                 "similar_task_ids": [],
             }
+        if jev_record:
+            llm_result["jev"] = jev_record
         _safe_activity_heartbeat()
 
     result = apply_intake_policy(llm_result, context, tags=tags)
