@@ -243,6 +243,43 @@ async def test_api_fallback_uses_an_accepted_jev_decision(hooks):
     assert "degraded_intake_create_fresh" not in result["policy_overrides"]
 
 
+async def test_preview_bypass_measures_the_llm_even_when_jev_would_decide(hooks):
+    hooks["jev"]((hooks["proposal"], hooks["record"]))
+    result = await intake_activities.classify_task_intake({**hooks["payload"], "bypass_jev": True})
+    intake.review_intake.assert_not_awaited()
+    hooks["llm"].assert_awaited_once()
+    assert result["decision"] == "create_fresh" and result["confidence"] > 0
+    assert "jev" not in (result.get("llm_raw") or {})
+
+
+async def test_preview_bypass_on_the_api_fallback_stays_degraded(hooks):
+    hooks["jev"]((hooks["proposal"], hooks["record"]))
+    payload = {**hooks["payload"], "bypass_jev": True}
+    result = await intake_activities.classify_task_intake_deterministic(payload)
+    intake.review_intake.assert_not_awaited()
+    assert result["confidence"] == 0
+
+
+async def test_only_the_preview_forwards_the_jev_bypass(monkeypatch):
+    import inspect
+
+    from app.api import server
+
+    captured = {}
+
+    async def fake_intake(payload):
+        captured.update(payload)
+        return {"decision": "create_fresh", "confidence": 80}
+
+    monkeypatch.setattr("app.task_registry.intake_runner.run_classify_task_intake", fake_intake)
+    request = server.TaskRequest(intent="Aura latency canary: hello", tags=["user-request"])
+    out = await server.preview_task_intake(request, bypass_jev=True, db=None)
+    assert out["preview"] is True and captured["bypass_jev"] is True
+    await server.preview_task_intake(request, db=None)
+    assert captured["bypass_jev"] is False
+    assert "bypass_jev" not in inspect.getsource(server.create_task)
+
+
 async def test_api_fallback_without_jev_stays_degraded(hooks):
     hooks["jev"]((None, hooks["record"]))
     result = await intake_activities.classify_task_intake_deterministic(hooks["payload"])

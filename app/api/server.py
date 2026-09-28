@@ -343,9 +343,13 @@ async def get_telemetry_status():
 
 @app.post("/tasks/intake/preview")
 async def preview_task_intake(
-    request: TaskRequest, db: AsyncSession = Depends(get_db)
+    request: TaskRequest, bypass_jev: bool = False, db: AsyncSession = Depends(get_db)
 ):
-    """Dry-run universal task intake — no task or workflow created."""
+    """Dry-run universal task intake — no task or workflow created.
+
+    ``?bypass_jev=true`` skips the decision model so the LLM-path canary measures
+    the intake LLM turn. Only the preview accepts it; POST /tasks never forwards it.
+    """
     intent = request.intent
     if intent.startswith("[cron:"):
         intent = intent.split("]", 1)[-1].strip() if "]" in intent else intent
@@ -368,6 +372,7 @@ async def preview_task_intake(
             "process_type_hint": request.process_type_hint,
             "recurrence_key": recurrence_key,
             "task_type": preview_task_type,
+            "bypass_jev": bypass_jev,
         }
     )
     return {"preview": True, "intake": result}

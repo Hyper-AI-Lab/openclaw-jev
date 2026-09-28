@@ -477,3 +477,30 @@ Each step appends one entry below. Earlier entries are never rewritten.
 - **Step 6 follow-up from the same log:** there has been no OpenAI idle cut since the 12:58Z
   patch. All later OpenAI calls returned 200, including first bytes of 5.2–9.8 s that the
   old rule would have cut.
+
+## Step 10 — Intake LLM-path canary (2026-09-28)
+
+- **Finding:** `ops/canary_intake_latency.sh`, run by `make production-check`, previewed a
+  hello message with a 180 s limit. With Jev in enforce mode, Jev can decide such a message
+  in about 2 s, so the canary no longer proved the intake LLM path. That path had been
+  timing out at 70 s before Step 3.
+- **Change:**
+  - `POST /tasks/intake/preview?bypass_jev=true` puts `bypass_jev` in the intake payload.
+    `classify_task_intake` (worker) and `classify_task_intake_deterministic` (API fallback)
+    then skip `review_intake`. The payload reaches the activity unchanged through
+    `IntakeWorkflow`.
+  - Only the preview accepts the flag. `create_task` builds its own payload and never
+    forwards it.
+  - The canary calls the preview with the flag, sets `MAX_SEC=45`, and asserts the LLM path:
+    no `jev` in `llm_raw`, confidence above 0, conversational mode.
+- **Tests (`tests/test_jev_intake.py`, 3 new):**
+  - With the bypass, Jev is not consulted even when it would decide, and the LLM decides.
+  - The API fallback with the bypass stays degraded (confidence 0).
+  - The preview forwards the flag (true, and false by default), and `create_task` never
+    mentions it.
+
+  39 passed in the file. Full suite: 499 passed, 3 skipped.
+- **Live:** the reloader restarted the API and worker at 14:32:49Z (runtime sync ok). Three
+  canary runs passed on the LLM path in 12 s, 11 s and 10 s (confidence 72) against the
+  45 s target. The same path timed out at 70 s before Step 3 and took 29 s during Step 3,
+  when two 5 s first-byte cuts still hit it.

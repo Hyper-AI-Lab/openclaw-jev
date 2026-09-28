@@ -127,7 +127,10 @@ async def classify_task_intake_deterministic(payload: Dict[str, Any]) -> Dict[st
     if not llm_result:
         from app.decisions.intake import review_intake
 
-        llm_result, jev_record = await review_intake(context, tags=tags)
+        # bypass_jev is set only by the intake preview (LLM-path canary).
+        llm_result, jev_record = (
+            (None, None) if payload.get("bypass_jev") else await review_intake(context, tags=tags)
+        )
         if not llm_result:
             llm_result = {
                 "decision": "create_fresh",
@@ -168,7 +171,7 @@ async def classify_task_intake(payload: Dict[str, Any]) -> Dict[str, Any]:
     _safe_activity_heartbeat()
 
     jev_record = None
-    if not llm_result:
+    if not llm_result and not payload.get("bypass_jev"):
         from app.decisions.intake import review_intake
 
         llm_result, jev_record = await review_intake(context, tags=tags)
