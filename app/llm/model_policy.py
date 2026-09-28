@@ -20,6 +20,8 @@ OPENAI_MODEL_ID = "gpt-5-nano"
 OPENAI_PROVIDER_BASE_URL = "https://api.openai.com/v1"
 OPENAI_AUTH_PROFILE = "openai:default"
 OPENCLAW_AGENT_RUNTIME = {"id": "openclaw"}
+# "0m" makes OpenClaw keep its heartbeat monitor job disabled. RMP canaries own liveness.
+HEARTBEAT_EVERY = "0m"
 
 _OPENAI_MODEL_ROW = {
     "id": OPENAI_MODEL_ID,
@@ -103,7 +105,7 @@ def _ensure_openai_model_row(openai_cfg: Dict[str, Any]) -> bool:
 
 
 def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
-    """Write OpenClaw primary, fallbacks, allowlist, openai row, and auth.order.
+    """Write OpenClaw primary, fallbacks, allowlist, openai row, auth.order, and heartbeat.
 
     Does not write API keys into openclaw.json.
     """
@@ -145,6 +147,11 @@ def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
     if subagents.get("model") != SUBAGENT_MODEL:
         subagents["model"] = SUBAGENT_MODEL
         changed.append("agents.defaults.subagents.model")
+
+    heartbeat = defaults.setdefault("heartbeat", {})
+    if heartbeat.get("every") != HEARTBEAT_EVERY:
+        heartbeat["every"] = HEARTBEAT_EVERY
+        changed.append("agents.defaults.heartbeat.every")
 
     policy = defaults.setdefault("modelPolicy", {})
     allow = allowed_models()

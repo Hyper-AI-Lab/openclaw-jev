@@ -55,6 +55,7 @@ def test_apply_openclaw_policy_writes_combo_and_drops_retired_models(tmp_path):
                             "nvidia/deepseek-ai/deepseek-v4-flash-0731": {"alias": "DeepSeek"},
                         },
                         "modelPolicy": {"allow": ["nvidia/z-ai/glm-5.2"]},
+                        "heartbeat": {"every": "30m", "target": "none", "session": "heartbeat"},
                         "subagents": {
                             "maxConcurrent": 2,
                             "model": "nvidia/deepseek-ai/deepseek-v4-flash-0731",
@@ -91,6 +92,12 @@ def test_apply_openclaw_policy_writes_combo_and_drops_retired_models(tmp_path):
         "thinking": "low"
     }
     assert cfg["agents"]["defaults"]["thinkingDefault"] == "low"
+    assert cfg["agents"]["defaults"]["heartbeat"] == {
+        "every": "0m",
+        "target": "none",
+        "session": "heartbeat",
+    }
+    assert "agents.defaults.heartbeat.every" in result["changed"]
     openai = cfg["models"]["providers"]["openai"]
     assert openai["baseUrl"] == "https://api.openai.com/v1"
     assert openai["api"] == "openai-completions"

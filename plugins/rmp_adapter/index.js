@@ -788,7 +788,7 @@ module.exports = {
           return { block: true };
         }
 
-        // Internal heartbeats must not spawn RMP workflows (they were flooding the worker).
+        // Heartbeat is off by policy (every "0m"). If one runs anyway, it must not spawn RMP workflows.
         if (isHeartbeat && !isSlackDM) {
           log('SKIP RMP routing for internal heartbeat');
           return { block: true };

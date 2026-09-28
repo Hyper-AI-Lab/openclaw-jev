@@ -155,3 +155,36 @@ Each step appends one entry below. Earlier entries are never rewritten.
 - **Observation, not changed here:** `_pick_key` ranks keys by load only. It can pick a key
   still inside its 5 s pacing interval while another key is free, and the attempt then
   waits. The new wait log will show how often that happens (`… paced (…s left)`).
+
+## Step 5 — Heartbeat off (2026-09-28)
+
+- **Research (OpenClaw 2026.9.1 dist and docs):**
+  - `resolveHeartbeatIntervalMs` treats a zero interval as "no heartbeat". The heartbeat
+    runs as a system-owned cron job, `heartbeat-main`, that OpenClaw rebuilds from config:
+    with `every: "0m"` it is kept but set to `enabled: false`.
+  - `openclaw sessions archive <key>` is the supported path. It is the same
+    `sessions.patch` operation as the Control UI, keeps the transcript, marks the session
+    archived, and drops it from the active list. Only an agent's main session is protected.
+- **Change:** `apply_openclaw_policy` (`app/llm/model_policy.py`) enforces
+  `agents.defaults.heartbeat.every = "0m"` and leaves the other heartbeat keys alone.
+  `ops/upgrade_openclaw.sh` already runs it, so upgrades keep the heartbeat off. The test
+  asserts the key and its change entry.
+- **Applied:**
+  - I backed up `openclaw.json`
+    (`data/backups/openclaw.json.pre-heartbeat-off.20260928T124858Z`). A dry run on a copy
+    changed only `agents.defaults.heartbeat.every`, and then I applied it live at 12:48:58Z.
+  - The gateway hot-reloaded it: `[heartbeat] disabled`, then `config hot reload applied`.
+    The Slack channel restarted and reconnected in 1 s. `openclaw cron list --all` shows
+    `heartbeat-main enabled=False`.
+  - The archive dry run returned `would_archive`. The real run archived
+    `agent:main:heartbeat` (`archived_at` 12:50:15Z), and all 11,588 transcript events of
+    session `4c67f9dd…` are kept.
+  - I moved the stray `workspace/HEARTBEAT.md_append` (a 106-byte stock
+    "reply HEARTBEAT_OK" line) to `data/backups/workspace/`, which is gitignored.
+- **Docs:** CONCEPT_TREE §3.2 marks the heartbeat actor off, and §5.3 records the policy,
+  the archive and the reason. The plugin's heartbeat note says it is off by policy; the
+  guard stays. Both plugin copies are identical.
+- **Tests:** `test_model_policy.py` and `test_notify_user.py`: 15 passed. Node: 11 passed.
+- **Expected effect:** the heartbeat was 83.4M of 94M transcript tokens (89%): 48 runs a day,
+  each re-billing a context that grew from 37k to 172k tokens, often several times after
+  first-byte cuts. Step 7's accounting will measure the before/after.

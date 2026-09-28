@@ -83,7 +83,7 @@ RMP chat.postMessage (idempotent)
 | Intake Analyst | `agent:main:rmp_intake_*` | Clarify questions via RMP notify only |
 | Aura | `agent:main:rmp_task_*` | Never first. Never native gateway delivery. |
 | Process Evaluator | `agent:main:rmp_verify_*` | Diagnosis at attempt 20 via RMP |
-| Heartbeat | isolated `heartbeat` | `HEARTBEAT_OK` suppressed |
+| Heartbeat | off (`heartbeat.every: "0m"`); old `heartbeat` session archived | No |
 | Health canary | tags `canary` / `system` | Silent on success; not user work |
 
 ### 3.3 Data stores
@@ -165,7 +165,9 @@ Same RMP path with cron tags. OpenClaw cron `delivery.mode: none`. RMP owns Slac
 
 ### 5.3 Heartbeat
 
-Isolated session `heartbeat`. Plugin does **not** create RMP tasks for internal heartbeat. `HEARTBEAT_OK` is not delivered. Stock OpenClaw “reach out after 8h / deliver cron to a channel” text in workspace files is **not** live policy.
+**Off.** `apply_openclaw_policy` enforces `agents.defaults.heartbeat.every: "0m"`, so OpenClaw keeps its `heartbeat-main` monitor job disabled across upgrades. RMP canaries own liveness. The old `agent:main:heartbeat` session is archived with its transcript kept. It never used a tool in 1,200+ runs, yet it re-billed its whole growing context every 30 minutes, which was 89% of transcript tokens.
+
+If a heartbeat ever runs again, the plugin still creates no RMP task for it and `HEARTBEAT_OK` is not delivered. Stock OpenClaw “reach out after 8h / deliver cron to a channel” text in workspace files is **not** live policy.
 
 ### 5.4 Health canary
 
