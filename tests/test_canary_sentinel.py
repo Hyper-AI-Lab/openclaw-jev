@@ -195,6 +195,7 @@ async def test_run_sentinel_alerts_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(canary_sentinel, "MEMORY_CANARY_PATH", tmp_path / "mem.json")
     monkeypatch.setattr(canary_sentinel, "ALERT_STATE_PATH", tmp_path / "alerts.json")
     monkeypatch.setattr(canary_sentinel, "evaluate_runtime_code_sync", lambda: None)
+    monkeypatch.setattr(canary_sentinel, "evaluate_llm_usage", lambda: None)
     canary_sentinel.write_health_canary_result(status="failed", task_id="x", error="boom")
 
     with patch.object(canary_sentinel, "attempt_remediation", return_value=[]):
@@ -224,6 +225,7 @@ async def test_run_sentinel_recovery_rerun_clears_timeout_without_alert(tmp_path
     monkeypatch.setattr(canary_sentinel, "MEMORY_CANARY_PATH", mem_path)
     monkeypatch.setattr(canary_sentinel, "ALERT_STATE_PATH", tmp_path / "alerts.json")
     monkeypatch.setattr(canary_sentinel, "evaluate_runtime_code_sync", lambda: None)
+    monkeypatch.setattr(canary_sentinel, "evaluate_llm_usage", lambda: None)
     canary_sentinel.write_health_canary_result(status="timeout", task_id="stuck", error="poll timeout")
     mem_path.write_text(
         json.dumps(
@@ -256,3 +258,65 @@ async def test_run_sentinel_recovery_rerun_clears_timeout_without_alert(tmp_path
     assert result.get("recovery_canary_ok") is True
     notify.assert_not_awaited()
     alert.assert_not_awaited()
+
+
+def _usage_report(hours, *, prompt=0, attempts=0, aborted=0, ctx=0):
+    return {
+        "available": True,
+        "window_hours": hours,
+        "totals": {
+            "attempts": attempts,
+            "aborted": aborted,
+            "input_tokens": prompt,
+            "cache_read_tokens": 0,
+            "output_tokens": 0,
+            "aborted_prompt_tokens": 0,
+        },
+        "abort_rate": (aborted / attempts) if attempts else 0.0,
+        "max_live_context": {"session_key": "agent:main:rmp_task_x", "tokens": ctx},
+    }
+
+
+def test_evaluate_llm_usage_flags_an_ongoing_burn(monkeypatch):
+    from app.llm import usage_monitor
+    from app.production import canary_sentinel
+
+    reports = {
+        24: _usage_report(24, prompt=9_000_000, attempts=100, aborted=40),
+        usage_monitor.RECENT_WINDOW_HOURS: _usage_report(
+            usage_monitor.RECENT_WINDOW_HOURS, prompt=1_000_000, attempts=10, aborted=4
+        ),
+    }
+    monkeypatch.setattr(usage_monitor, "transcript_usage", lambda hours=24, **_: reports[hours])
+    monkeypatch.setattr(usage_monitor, "_input_budget_24h", lambda: 5_000_000)
+    issue = canary_sentinel.evaluate_llm_usage()
+    assert issue is not None and issue.name == "llm_usage"
+    assert "over budget 5,000,000" in issue.message
+    assert "abort rate 40%" in issue.message
+
+
+def test_evaluate_llm_usage_ignores_a_burn_that_already_stopped(monkeypatch):
+    from app.llm import usage_monitor
+    from app.production import canary_sentinel
+
+    reports = {
+        24: _usage_report(24, prompt=9_000_000, attempts=100, aborted=40),
+        usage_monitor.RECENT_WINDOW_HOURS: _usage_report(
+            usage_monitor.RECENT_WINDOW_HOURS, prompt=50_000, attempts=10, aborted=0
+        ),
+    }
+    monkeypatch.setattr(usage_monitor, "transcript_usage", lambda hours=24, **_: reports[hours])
+    monkeypatch.setattr(usage_monitor, "_input_budget_24h", lambda: 5_000_000)
+    assert canary_sentinel.evaluate_llm_usage() is None
+
+
+def test_evaluate_llm_usage_flags_a_large_live_context(monkeypatch):
+    from app.llm import usage_monitor
+    from app.production import canary_sentinel
+
+    recent = usage_monitor.RECENT_WINDOW_HOURS
+    reports = {24: _usage_report(24, ctx=75_000), recent: _usage_report(recent)}
+    monkeypatch.setattr(usage_monitor, "transcript_usage", lambda hours=24, **_: reports[hours])
+    issue = canary_sentinel.evaluate_llm_usage()
+    assert issue is not None
+    assert "75,000 context tokens" in issue.message

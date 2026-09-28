@@ -51,6 +51,15 @@ if note:
     print('  unattributed:', note)
     for day in d.get('unattributed_historical_days') or []:
         print(f\"  unattributed_day: {day}\")
+tr = d.get('transcripts_24h') or {}
+if tr.get('available'):
+    t = tr['totals']
+    ctx = tr.get('max_live_context') or {}
+    print(f\"llm_transcripts_24h: prompt={t['input_tokens'] + t['cache_read_tokens']:,} aborted_prompt={t['aborted_prompt_tokens']:,} output={t['output_tokens']:,} attempts={t['attempts']} aborted={t['aborted']} ({tr.get('abort_rate', 0):.0%}) max_live_context={ctx.get('tokens', 0):,} ({ctx.get('session_key') or '-'})\")
+    for cat, c in sorted((tr.get('by_category') or {}).items()):
+        print(f\"  {cat}: attempts={c['attempts']} aborted={c['aborted']} prompt={c['input_tokens'] + c['cache_read_tokens']:,} aborted_prompt={c['aborted_prompt_tokens']:,}\")
+for alert in d.get('transcript_alerts') or []:
+    print(f'WARN: llm_usage {alert}')
 " 2>/dev/null || true
 
 exit "${FAIL}"

@@ -5,6 +5,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -18,12 +19,23 @@ logger = logging.getLogger("rmp.llm_usage")
 USAGE_PATH = Path(RMP_DATA_DIR) / "llm_usage.json"
 CURSOR_PATH = Path(RMP_DATA_DIR) / "llm_usage_scrape_cursor.json"
 LOCK_PATH = USAGE_PATH.parent / ".llm_usage.lock"
-SESSIONS_DIR = Path(OPENCLAW_HOME) / "agents" / "main" / "sessions"
-SESSIONS_JSON = SESSIONS_DIR / "sessions.json"
+# OpenClaw 2026.9+ keeps transcripts in SQLite (transcript_events), not session JSONL.
+AGENT_DB_PATH = Path(OPENCLAW_HOME) / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+
+DEFAULT_INPUT_BUDGET_24H = 5_000_000
+LIVE_CONTEXT_MAX_TOKENS = 60_000
+ABORT_RATE_MAX = 0.10
+ABORT_RATE_MIN_ATTEMPTS = 20
+RECENT_WINDOW_HOURS = 2
+ABORTED_STOP_REASONS = frozenset({"aborted", "error"})
+_RMP_TASK_RE = re.compile(
+    r"rmp_task_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
 
 # Sources:
 #   embed              — RMP vector embedding API calls
-#   openclaw_llm       — OpenClaw gateway chat/completions (from session JSONL)
+#   openclaw_llm       — OpenClaw gateway chat/completions (from SQLite transcripts)
 #   openclaw_hook      — RMP /hooks/agent dispatch (triggers gateway work)
 #   rate_limit_429     — NVIDIA 429 observed (RMP path)
 #   probe              — manual health probes
@@ -175,46 +187,134 @@ def record_request(
         logger.debug("Unknown usage source %r; recording anyway", source)
     pid = resolve_usage_profile_id(profile_id, model=model)
     now = ts if ts is not None else time.time()
-    day = _utc_day(now)
 
-    def _apply(store: Dict[str, Any]) -> None:
-        bucket = _profile_bucket(store, day, pid)
-        src_bucket = bucket["by_source"].setdefault(
-            source, _zero_counts()
-        )
-        req_inc = 0 if is_rate_limit else 1
-        rl_inc = 1 if is_rate_limit else 0
-        for target in (src_bucket, bucket["totals"], store["days"][day]["totals"]):
-            _add_counts(
-                target,
-                requests=req_inc,
+    try:
+        _mutate_store(
+            lambda store: _record_into(
+                store,
+                pid,
+                source,
+                now,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,
-                rate_limits=rl_inc,
+                model=model,
+                is_rate_limit=is_rate_limit,
             )
-
-        store.setdefault("rolling_24h", []).append(
-            {
-                "ts_ms": int(now * 1000),
-                "profile_id": pid,
-                "source": source,
-                "model": model,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": total_tokens or (input_tokens + output_tokens),
-                "is_rate_limit": is_rate_limit,
-            }
         )
-        cutoff_ms = int((now - 86400) * 1000)
-        store["rolling_24h"] = [
-            e for e in store["rolling_24h"] if e.get("ts_ms", 0) >= cutoff_ms
-        ][-5000:]
-
-    try:
-        _mutate_store(_apply)
     except Exception as exc:
         logger.warning("Failed to record LLM usage: %s", exc)
+
+
+def _record_into(
+    store: Dict[str, Any],
+    pid: str,
+    source: str,
+    now: float,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    model: str = "",
+    is_rate_limit: bool = False,
+) -> None:
+    day = _utc_day(now)
+    bucket = _profile_bucket(store, day, pid)
+    src_bucket = bucket["by_source"].setdefault(
+        source, _zero_counts()
+    )
+    req_inc = 0 if is_rate_limit else 1
+    rl_inc = 1 if is_rate_limit else 0
+    for target in (src_bucket, bucket["totals"], store["days"][day]["totals"]):
+        _add_counts(
+            target,
+            requests=req_inc,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            rate_limits=rl_inc,
+        )
+
+    store.setdefault("rolling_24h", []).append(
+        {
+            "ts_ms": int(now * 1000),
+            "profile_id": pid,
+            "source": source,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens or (input_tokens + output_tokens),
+            "is_rate_limit": is_rate_limit,
+        }
+    )
+    cutoff_ms = int((now - 86400) * 1000)
+    store["rolling_24h"] = [
+        e for e in store["rolling_24h"] if e.get("ts_ms", 0) >= cutoff_ms
+    ][-5000:]
+
+
+def _assistant_llm_turn(
+    entry: Dict[str, Any],
+    *,
+    profile_id: Optional[str] = None,
+    session_key: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Usage fields of one assistant LLM message, or None if the entry is not one."""
+    if entry.get("type") != "message":
+        return None
+    msg = entry.get("message") or {}
+    if msg.get("role") != "assistant":
+        return None
+    provider = str(msg.get("provider") or "")
+    model = str(msg.get("model") or "")
+    if not provider and not model:
+        return None
+    usage = msg.get("usage") or {}
+    input_t = int(usage.get("input") or 0)
+    output_t = int(usage.get("output") or 0)
+    stop_reason = entry.get("stopReason") or msg.get("stopReason") or ""
+    err = msg.get("errorMessage") or ""
+    return {
+        "msg_id": entry.get("id") or "",
+        "pid": resolve_usage_profile_id(
+            profile_id, model=model, provider=provider, session_key=session_key
+        ),
+        "ts": _parse_jsonl_ts(entry),
+        "input_tokens": input_t,
+        "output_tokens": output_t,
+        "total_tokens": int(usage.get("totalTokens") or (input_t + output_t)),
+        "model": model,
+        "is_rate_limit": stop_reason == "error" and (
+            "429" in err or "rate limit" in err.lower() or "too many" in err.lower()
+        ),
+    }
+
+
+def _record_turns_into(store: Dict[str, Any], turns: List[Dict[str, Any]]) -> int:
+    seen: List[str] = store.setdefault("seen_message_ids", [])
+    seen_set = set(seen)
+    logged = 0
+    for turn in turns:
+        msg_id = turn["msg_id"]
+        if msg_id:
+            if msg_id in seen_set:
+                continue
+            seen_set.add(msg_id)
+            seen.append(msg_id)
+        _record_into(
+            store,
+            turn["pid"],
+            "openclaw_llm",
+            turn["ts"],
+            input_tokens=turn["input_tokens"],
+            output_tokens=turn["output_tokens"],
+            total_tokens=turn["total_tokens"],
+            model=turn["model"],
+            is_rate_limit=turn["is_rate_limit"],
+        )
+        logged += 1
+    store["seen_message_ids"] = seen[-10000:]
+    return logged
 
 
 def record_openclaw_jsonl_message(
@@ -224,57 +324,10 @@ def record_openclaw_jsonl_message(
     session_key: str = "",
 ) -> bool:
     """Record one assistant JSONL message for an LLM provider. Returns True if logged."""
-    if entry.get("type") != "message":
+    turn = _assistant_llm_turn(entry, profile_id=profile_id, session_key=session_key)
+    if turn is None:
         return False
-    msg = entry.get("message") or {}
-    if msg.get("role") != "assistant":
-        return False
-    provider = str(msg.get("provider") or "")
-    model = str(msg.get("model") or "")
-    if not provider and not model:
-        return False
-
-    msg_id = entry.get("id") or ""
-    if msg_id:
-        def _dedupe(store: Dict[str, Any]) -> bool:
-            seen: List[str] = store.setdefault("seen_message_ids", [])
-            if msg_id in seen:
-                return False
-            seen.append(msg_id)
-            store["seen_message_ids"] = seen[-10000:]
-            return True
-
-        if not _mutate_store(_dedupe):
-            return False
-
-    usage = msg.get("usage") or {}
-    input_t = int(usage.get("input") or 0)
-    output_t = int(usage.get("output") or 0)
-    total_t = int(usage.get("totalTokens") or (input_t + output_t))
-    stop_reason = entry.get("stopReason") or msg.get("stopReason") or ""
-    err = msg.get("errorMessage") or ""
-    is_rl = stop_reason == "error" and (
-        "429" in err or "rate limit" in err.lower() or "too many" in err.lower()
-    )
-
-    ts = _parse_jsonl_ts(entry)
-    pid = resolve_usage_profile_id(
-        profile_id,
-        model=model,
-        provider=provider,
-        session_key=session_key,
-    )
-    record_request(
-        pid,
-        "openclaw_llm",
-        input_tokens=input_t,
-        output_tokens=output_t,
-        total_tokens=total_t,
-        model=str(msg.get("model") or ""),
-        is_rate_limit=is_rl,
-        ts=ts,
-    )
-    return True
+    return bool(_mutate_store(lambda store: _record_turns_into(store, [turn])))
 
 
 def _parse_jsonl_ts(entry: Dict[str, Any]) -> float:
@@ -304,21 +357,6 @@ def _profile_for_session_key(session_key: str) -> Optional[str]:
         return str(pin) if pin else None
     except Exception:
         return None
-
-
-def _profile_for_session_id(session_id: str) -> Optional[str]:
-    if not session_id:
-        return None
-    try:
-        from app.openclaw_sessions import iter_session_entries
-
-        for _key, entry in iter_session_entries():
-            if (entry or {}).get("sessionId") == session_id:
-                pin = (entry or {}).get("authProfileOverride")
-                return str(pin) if pin else None
-    except Exception:
-        pass
-    return None
 
 
 def resolve_usage_profile_id(
@@ -365,82 +403,307 @@ def _write_cursor(cursor: Dict[str, Any]) -> None:
     CURSOR_PATH.write_text(json.dumps(cursor, indent=2), encoding="utf-8")
 
 
-def scrape_openclaw_sessions(limit_files: int = 200) -> Dict[str, Any]:
-    """Scan session JSONL files for new LLM usage (heartbeats, Slack, etc.)."""
+def _open_agent_db():
+    import sqlite3
+
+    return sqlite3.connect(f"file:{AGENT_DB_PATH}?mode=ro", uri=True, timeout=10)
+
+
+def scrape_openclaw_sessions(limit_events: int = 5000) -> Dict[str, Any]:
+    """Record new assistant LLM turns from OpenClaw's SQLite transcripts in the usage store.
+
+    Resumes from the last ``transcript_events`` rowid. The first run starts 24 h back.
+    """
+    if not AGENT_DB_PATH.is_file():
+        return {"new_events": 0, "scanned_events": 0, "source": "missing"}
     cursor = _read_cursor()
-    file_cursors: Dict[str, Any] = cursor.setdefault("files", {})
-    logged = 0
-    scanned = 0
-
-    jsonl_files = sorted(
-        SESSIONS_DIR.glob("*.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:limit_files]
-
-    session_key_by_id: Dict[str, str] = {}
-    if SESSIONS_JSON.is_file():
+    last_rowid = int(cursor.get("transcript_rowid") or 0)
+    try:
+        db = _open_agent_db()
         try:
-            for sk, entry in json.loads(
-                SESSIONS_JSON.read_text(encoding="utf-8")
-            ).items():
-                sid = (entry or {}).get("sessionId")
-                if sid:
-                    session_key_by_id[sid] = sk
-        except Exception:
-            pass
+            if not last_rowid:
+                since_ms = int((time.time() - 86400) * 1000)
+                row = db.execute(
+                    "SELECT MIN(rowid) FROM transcript_events WHERE created_at >= ?",
+                    (since_ms,),
+                ).fetchone()
+                last_rowid = max(0, int(row[0] or 1) - 1)
+            rows = db.execute(
+                "SELECT e.rowid, e.session_id, e.event_json, "
+                "(SELECT w.session_key FROM session_windows w WHERE w.session_id = e.session_id) "
+                "FROM transcript_events e WHERE e.rowid > ? ORDER BY e.rowid LIMIT ?",
+                (last_rowid, limit_events),
+            ).fetchall()
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.debug("Could not scrape OpenClaw transcripts: %s", exc)
+        return {"new_events": 0, "scanned_events": 0, "source": "error"}
 
-    for path in jsonl_files:
-        scanned += 1
-        path_str = str(path)
-        stat = path.stat()
-        prev = file_cursors.get(path_str, {})
-        offset = int(prev.get("offset", 0))
-        if prev.get("size") == stat.st_size and prev.get("mtime") == stat.st_mtime:
-            continue
-        if offset > stat.st_size:
-            offset = 0
-
-        session_id = path.stem
-        session_key = session_key_by_id.get(session_id, "")
-        profile_id = _profile_for_session_id(session_id)
-
+    turns: List[Dict[str, Any]] = []
+    for rowid, session_id, event_json, session_key in rows:
+        last_rowid = int(rowid)
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                if offset:
-                    handle.seek(offset)
-                for line in handle:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if record_openclaw_jsonl_message(
-                        entry,
-                        profile_id=profile_id,
-                        session_key=session_key,
-                    ):
-                        logged += 1
-                new_offset = handle.tell()
-        except OSError as exc:
-            logger.debug("Could not scrape %s: %s", path, exc)
+            entry = json.loads(event_json)
+        except (TypeError, json.JSONDecodeError):
             continue
+        turn = _assistant_llm_turn(
+            entry,
+            profile_id=_profile_for_session_key(session_key or ""),
+            session_key=session_key or "",
+        )
+        if turn is not None:
+            turns.append(turn)
 
-        file_cursors[path_str] = {
-            "offset": new_offset,
-            "size": stat.st_size,
-            "mtime": stat.st_mtime,
-        }
-
+    logged = int(_mutate_store(lambda store: _record_turns_into(store, turns)) or 0) if turns else 0
+    cursor["transcript_rowid"] = last_rowid
     cursor["last_scrape_ms"] = int(time.time() * 1000)
     _write_cursor(cursor)
-    return {"scanned_files": scanned, "new_events": logged}
+    return {"new_events": logged, "scanned_events": len(rows), "source": "sqlite"}
+
+
+def _session_category(session_key: str, task_kinds: Dict[str, str]) -> str:
+    key = (session_key or "").lower()
+    if key.endswith(":heartbeat"):
+        return "heartbeat"
+    if ":rmp_intake_" in key:
+        return "intake"
+    if ":rmp_verify_" in key:
+        return "evaluator"
+    match = _RMP_TASK_RE.search(key)
+    if match:
+        return "canary" if task_kinds.get(match.group(1).lower()) == "canary" else "task"
+    if ":cron:" in key:
+        return "cron"
+    if ":slack:" in key or key.endswith(":main"):
+        return "slack_main"
+    return "other"
+
+
+def _task_kinds_sync(task_ids: List[str]) -> Dict[str, str]:
+    """task_id -> "canary" | "user", with the same canary rule as the quota broker."""
+    if not task_ids:
+        return {}
+    try:
+        from sqlalchemy import create_engine, text
+
+        from app.db.database import DATABASE_URL
+
+        engine = create_engine(DATABASE_URL.replace("+asyncpg", "+psycopg2"))
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text("SELECT id::text, task_type, goal FROM tasks WHERE id::text = ANY(:ids)"),
+                    {"ids": list(task_ids)},
+                ).fetchall()
+        finally:
+            engine.dispose()
+    except Exception as exc:
+        logger.debug("task kind lookup failed: %s", exc)
+        return {}
+    kinds: Dict[str, str] = {}
+    for task_id, task_type, goal in rows:
+        goal_u = (goal or "").upper()
+        is_canary = (task_type or "").lower() == "canary" or "RMP CANARY" in goal_u or "MEMORY CANARY" in goal_u
+        kinds[str(task_id).lower()] = "canary" if is_canary else "user"
+    return kinds
+
+
+def _zero_attribution() -> Dict[str, int]:
+    return {
+        "attempts": 0,
+        "aborted": 0,
+        "input_tokens": 0,
+        "cache_read_tokens": 0,
+        "output_tokens": 0,
+        "aborted_prompt_tokens": 0,
+    }
+
+
+def transcript_usage(hours: float = 24, *, now_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Per-category LLM usage from OpenClaw's SQLite transcripts, aborted attempts included.
+
+    An aborted attempt records no usage, yet its prompt was sent. ``aborted_prompt_tokens``
+    takes that prompt from the next successful call in the same session (retries resend the
+    same prompt), else the previous one. It is an upper bound on re-billing: the provider
+    does not bill every aborted request.
+    """
+    now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    since_ms = now_ms - int(hours * 3600 * 1000)
+    report: Dict[str, Any] = {
+        "available": False,
+        "window_hours": hours,
+        "since_ms": since_ms,
+        "days": {},
+        "by_category": {},
+        "totals": _zero_attribution(),
+        "abort_rate": 0.0,
+        "max_live_context": {"session_key": None, "tokens": 0},
+    }
+    if not AGENT_DB_PATH.is_file():
+        return report
+    try:
+        db = _open_agent_db()
+        try:
+            rows = db.execute(
+                "SELECT e.session_id, e.seq, e.event_json, e.created_at, "
+                "(SELECT w.session_key FROM session_windows w WHERE w.session_id = e.session_id) "
+                "FROM transcript_events e WHERE e.created_at >= ? AND e.created_at <= ? "
+                "ORDER BY e.session_id, e.seq",
+                (since_ms, now_ms),
+            ).fetchall()
+            live = dict(
+                db.execute(
+                    "SELECT current_session_id, session_key FROM session_nodes "
+                    "WHERE archived_at IS NULL AND current_session_id IS NOT NULL"
+                ).fetchall()
+            )
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.debug("transcript usage query failed: %s", exc)
+        return report
+    report["available"] = True
+
+    turns: List[Dict[str, Any]] = []
+    for session_id, _seq, event_json, created_at, session_key in rows:
+        try:
+            entry = json.loads(event_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        msg = entry.get("message") or {}
+        if entry.get("type") != "message" or msg.get("role") != "assistant":
+            continue
+        if not msg.get("model") or msg.get("provider") == "openclaw":
+            continue
+        usage = msg.get("usage") or {}
+        stop = str(msg.get("stopReason") or entry.get("stopReason") or "")
+        turns.append(
+            {
+                "session_id": session_id,
+                "session_key": session_key or live.get(session_id) or "",
+                "day": _utc_day(int(created_at) / 1000.0),
+                "aborted": stop in ABORTED_STOP_REASONS,
+                "input": int(usage.get("input") or 0),
+                "cache_read": int(usage.get("cacheRead") or 0),
+                "prompt": int(usage.get("input") or 0)
+                + int(usage.get("cacheRead") or 0)
+                + int(usage.get("cacheWrite") or 0),
+                "output": int(usage.get("output") or 0),
+            }
+        )
+
+    task_ids = sorted(
+        {m.group(1).lower() for t in turns for m in [_RMP_TASK_RE.search(t["session_key"])] if m}
+    )
+    task_kinds = _task_kinds_sync(task_ids)
+
+    by_session: Dict[str, List[Dict[str, Any]]] = {}
+    for turn in turns:
+        by_session.setdefault(turn["session_id"], []).append(turn)
+    latest_prompt: Dict[str, int] = {}
+    for session_id, session_turns in by_session.items():
+        pending: List[Dict[str, Any]] = []
+        previous = 0
+        for turn in session_turns:
+            if turn["aborted"]:
+                turn["sent"] = previous
+                pending.append(turn)
+                continue
+            if turn["prompt"]:
+                for aborted in pending:
+                    aborted["sent"] = turn["prompt"]
+                pending = []
+                previous = turn["prompt"]
+                latest_prompt[session_id] = turn["prompt"]
+
+    for turn in turns:
+        category = _session_category(turn["session_key"], task_kinds)
+        day_bucket = report["days"].setdefault(turn["day"], {}).setdefault(
+            category, _zero_attribution()
+        )
+        for bucket in (
+            day_bucket,
+            report["by_category"].setdefault(category, _zero_attribution()),
+            report["totals"],
+        ):
+            bucket["attempts"] += 1
+            bucket["aborted"] += int(turn["aborted"])
+            bucket["input_tokens"] += turn["input"]
+            bucket["cache_read_tokens"] += turn["cache_read"]
+            bucket["output_tokens"] += turn["output"]
+            bucket["aborted_prompt_tokens"] += int(turn.get("sent") or 0)
+
+    attempts = report["totals"]["attempts"]
+    report["abort_rate"] = (report["totals"]["aborted"] / attempts) if attempts else 0.0
+    for session_id, tokens in latest_prompt.items():
+        key = live.get(session_id)
+        if key and tokens > report["max_live_context"]["tokens"]:
+            report["max_live_context"] = {"session_key": key, "tokens": tokens}
+    return report
+
+
+def _input_budget_24h() -> int:
+    try:
+        from app.config import load_settings
+
+        return int((load_settings().get("llm_usage") or {}).get("input_budget_24h") or DEFAULT_INPUT_BUDGET_24H)
+    except Exception:
+        return DEFAULT_INPUT_BUDGET_24H
+
+
+def _prompt_tokens(totals: Dict[str, int]) -> int:
+    return totals["input_tokens"] + totals["cache_read_tokens"] + totals["aborted_prompt_tokens"]
+
+
+def usage_alerts(
+    report: Dict[str, Any],
+    *,
+    recent: Optional[Dict[str, Any]] = None,
+    input_budget: Optional[int] = None,
+) -> List[str]:
+    """Threshold breaches in a 24 h ``transcript_usage`` report; empty when healthy.
+
+    With ``recent`` (a shorter report), the budget and abort-rate breaches count only while
+    they are still happening, so a burn that already stopped does not keep re-alerting until
+    it leaves the 24 h window.
+    """
+    if not report.get("available"):
+        return []
+    budget = int(input_budget if input_budget is not None else _input_budget_24h())
+    totals = report.get("totals") or _zero_attribution()
+    recent_totals = (recent or {}).get("totals") or _zero_attribution()
+    recent_hours = float((recent or {}).get("window_hours") or 24)
+    alerts: List[str] = []
+
+    prompt = _prompt_tokens(totals)
+    still_burning = recent is None or _prompt_tokens(recent_totals) * 24 / recent_hours > budget
+    if prompt > budget and still_burning:
+        alerts.append(f"24 h prompt tokens {prompt:,} over budget {budget:,}")
+
+    ctx = report.get("max_live_context") or {}
+    if int(ctx.get("tokens") or 0) > LIVE_CONTEXT_MAX_TOKENS:
+        alerts.append(
+            f"live session {ctx.get('session_key')} carries {int(ctx['tokens']):,} context tokens "
+            f"(limit {LIVE_CONTEXT_MAX_TOKENS:,})"
+        )
+
+    attempts = totals["attempts"]
+    rate = float(report.get("abort_rate") or 0.0)
+    recent_min = max(5, round(ABORT_RATE_MIN_ATTEMPTS * recent_hours / 24))
+    still_aborting = recent is None or (
+        recent_totals["attempts"] >= recent_min
+        and float(recent.get("abort_rate") or 0.0) > ABORT_RATE_MAX
+    )
+    if attempts >= ABORT_RATE_MIN_ATTEMPTS and rate > ABORT_RATE_MAX and still_aborting:
+        alerts.append(
+            f"abort rate {rate:.0%} ({totals['aborted']}/{attempts} attempts) over {ABORT_RATE_MAX:.0%}"
+        )
+    return alerts
 
 
 def get_today_load_by_profile() -> Dict[str, Dict[str, int]]:
-    """Today's usage totals per profile (no JSONL scrape)."""
+    """Today's usage totals per profile (no transcript scrape)."""
     store = _read_store()
     today = _utc_day()
     profiles = (store.get("days") or {}).get(today, {}).get("profiles") or {}
@@ -519,6 +782,7 @@ def get_summary() -> Dict[str, Any]:
                 agg[k] += int((counts or {}).get(k) or 0)
 
     unattributed = _unattributed_historical_days(store)
+    transcripts = transcript_usage(hours=24)
     return {
         "updated_ms": store.get("updated_ms"),
         "utc_day": today,
@@ -536,6 +800,10 @@ def get_summary() -> Dict[str, Any]:
             "with no stored model id; they were not rewritten. Never invent nvidia:keyN."
             if unattributed
             else None
+        ),
+        "transcripts_24h": transcripts,
+        "transcript_alerts": usage_alerts(
+            transcripts, recent=transcript_usage(hours=RECENT_WINDOW_HOURS)
         ),
     }
 

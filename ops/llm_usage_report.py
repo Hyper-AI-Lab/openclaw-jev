@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print NVIDIA per-key usage summary (requests + tokens, incl. gateway JSONL scrape)."""
+"""Print LLM usage per key and per category (requests + tokens, incl. OpenClaw transcript scrape)."""
 import json
 import sys
 

@@ -229,9 +229,34 @@ def evaluate_runtime_code_sync() -> Optional[CanaryIssue]:
     )
 
 
+def evaluate_llm_usage() -> Optional[CanaryIssue]:
+    """Token budget, live context size and abort rate from OpenClaw's transcripts."""
+    from app.llm.usage_monitor import RECENT_WINDOW_HOURS, transcript_usage, usage_alerts
+
+    day = transcript_usage(hours=24)
+    alerts = usage_alerts(day, recent=transcript_usage(hours=RECENT_WINDOW_HOURS))
+    if not alerts:
+        return None
+    return CanaryIssue(
+        "llm_usage",
+        "over_threshold",
+        "; ".join(alerts),
+        {
+            "totals": day.get("totals"),
+            "abort_rate": day.get("abort_rate"),
+            "max_live_context": day.get("max_live_context"),
+        },
+    )
+
+
 def evaluate_canaries() -> List[CanaryIssue]:
     issues: List[CanaryIssue] = []
-    for fn in (evaluate_health_canary, evaluate_memory_canary, evaluate_runtime_code_sync):
+    for fn in (
+        evaluate_health_canary,
+        evaluate_memory_canary,
+        evaluate_runtime_code_sync,
+        evaluate_llm_usage,
+    ):
         issue = fn()
         if issue:
             issues.append(issue)

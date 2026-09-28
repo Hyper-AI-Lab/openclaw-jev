@@ -250,3 +250,78 @@ Each step appends one entry below. Earlier entries are never rewritten.
   - **Startup freeze:** it is not the heartbeat. With the heartbeat disabled and its session
     archived, this start still froze for 101 s (13:00:30–13:02:11Z, RSS +~700 MB), about
     66 s after `listening`. It happens on restarts only, not on DMs.
+- **Decisions (Kirill, after this step):** replace MiniMax with `nvidia/openai/gpt-oss-20b`
+  (added as its own step before Step 9). Investigate the startup freeze as an extra step
+  after the plan.
+
+## Step 7 — Token visibility (2026-09-28)
+
+- **Finding:**
+  - `app/llm/usage_monitor.py` scraped `sessions/*.jsonl`, which OpenClaw 2026.9 no longer
+    writes, so gateway LLM turns went unrecorded. The broker's balanced key choice read
+    those empty per-profile totals.
+  - In the SQLite store (`transcript_events`), an aborted attempt carries zero usage, so the
+    prompts re-sent after 5 s cuts appeared nowhere. That's why the OpenAI dashboard ran far
+    above what transcripts showed.
+- **Change (`app/llm/usage_monitor.py`):**
+  - `scrape_openclaw_sessions()` now reads `transcript_events`: it resumes from the last
+    rowid, starts 24 h back on its first run, and writes the store once per scrape (the old
+    path wrote it twice per event). Session keys come from `session_windows`.
+  - `transcript_usage(hours)` reports per UTC day and per category: heartbeat, intake,
+    evaluator, task, canary (from the task row, by the broker's canary rule), cron,
+    slack_main, other. For each it counts attempts, aborted, input, cache-read, output and
+    `aborted_prompt_tokens`, and it reports the largest live context.
+    - `aborted_prompt_tokens` takes the prompt of the next successful call in the same
+      session (retries resend it), else the previous one. It is an upper bound on
+      re-billing, since not every aborted request is billed.
+    - "Live" means an unarchived session with a successful call in the window.
+  - `usage_alerts()` checks three things:
+    - 24 h prompt tokens sent over budget (`llm_usage.input_budget_24h`, default 5M);
+    - a live context above 60,000 tokens;
+    - an abort rate above 10% (at least 20 attempts).
+
+    The budget and abort-rate breaches must still hold in the last 2 h
+    (`RECENT_WINDOW_HOURS`), so a burn that already stopped does not re-alert every 4 h
+    until it leaves the 24 h window.
+  - `get_summary()` (the `/api/llm/usage` endpoint and `ops/llm_usage_report.py`) adds
+    `transcripts_24h` and `transcript_alerts`. The JSONL-only helpers the port orphaned are
+    removed.
+- **Change (sentinel and production-check):** `evaluate_llm_usage()` joins
+  `evaluate_canaries()` and alerts through the existing ops Slack path with its 4 h
+  cooldown. `ops/healthcheck.sh` (the first stage of `make production-check`) prints an
+  `llm_transcripts_24h:` line, one line per category, and a `WARN: llm_usage …` per breach.
+- **Tests:** 9 new in `test_usage_monitor.py` against a temp store shaped like OpenClaw's,
+  covering:
+  - categories and canary vs task;
+  - aborted-prompt attribution, next and previous;
+  - the window cut-off and archived sessions excluded from live context;
+  - the missing store;
+  - alert thresholds, including a stopped burn and small samples;
+  - the scraper resuming without double counting.
+
+  3 new in `test_canary_sentinel.py` (an ongoing burn, a stopped burn, a large context). The
+  two `run_sentinel` tests stub the new check, as they already stub runtime sync. Full
+  suite: 484 passed, 3 skipped.
+- **Live attribution (last 48 h, before the fixes had aged out):**
+
+  | Category | Attempts | Aborted | Prompt recorded | Prompt sent on aborts |
+  |---|---|---|---|---|
+  | heartbeat | 307 | 227 | 13.3M | 37.7M |
+  | canary | 63 | — | 1.20M | — |
+  | intake | 46 | — | 0.93M | — |
+  | task | 10 | — | 0.23M | — |
+  | evaluator | 9 | — | 0.07M | — |
+
+  The dashboard's 13.08M/day peak sits between recorded prompts (about 7M/day) and recorded
+  plus aborted-sent (about 26M/day), so part of the aborted prompts was billed. The largest
+  live context is now 40.9k (an intake session); the heartbeat's 172k session is archived.
+- **Alert timing:** at 14:03Z the check still saw pre-fix data (24 h: 27.3M sent, 57%
+  aborts; last 2 h: 11 of 29 aborted). Every OpenAI idle cut in those 2 h came before the
+  12:58Z patch; the rest was the 12:33Z heartbeat and one MiniMax 410. Kirill is informed
+  here, so I recorded the `llm_usage` incident in the sentinel's alert state (its normal 4 h
+  cooldown). The pre-fix data leaves the 2 h window by about 14:34Z.
+- **Incident (caused by me):** sourcing `/etc/openclaw/openclaw.env` with `set -a` for the
+  NVIDIA probes left every key in that file exported in my shell. One later pytest run then
+  called the live Jev API, and `test_intake_deterministic` got confidence 100 instead of 0.
+  I unset all of the file's variables by name (nothing was printed), and the suite passes
+  clean. From now on, keys are read into one-command subshells only.
