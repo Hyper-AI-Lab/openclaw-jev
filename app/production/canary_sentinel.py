@@ -291,8 +291,12 @@ def _record_remediation(key: str = "restart_runtime") -> None:
     REMEDIATION_STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
-def count_active_user_tasks_sync() -> int:
-    """Count non-terminal user tasks that would be hurt by a worker restart."""
+def count_active_user_tasks_sync(*, strict: bool = False) -> int:
+    """Count non-terminal user tasks that would be hurt by a worker restart.
+
+    ``strict`` raises when the lookup fails, so a caller about to restart can
+    treat an unknown count as busy instead of idle.
+    """
     try:
         from sqlalchemy import create_engine, text
 
@@ -315,6 +319,8 @@ def count_active_user_tasks_sync() -> int:
             count += 1
         return count
     except Exception as exc:
+        if strict:
+            raise
         logger.warning("count_active_user_tasks_sync failed: %s", exc)
         return 0
 

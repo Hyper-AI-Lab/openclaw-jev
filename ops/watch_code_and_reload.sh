@@ -19,14 +19,17 @@ fi
 
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) rmp-code-watch: watching ${APP_DIR} ${WORKER_PY}" >>"${LOG_FILE}"
 
-# -q: quieter; -r recursive; -m monitor forever
-# close_write|moved_to|create covers editor save patterns
-inotifywait -m -r -e close_write,moved_to,create,delete \
+# -m monitor forever, -r recursive; close_write|moved_to|create covers editor save patterns.
+# Only Python sources are imported by the processes, so other files never reload them.
+inotifywait -m -r -e close_write,moved_to,create,delete --format '%w%f' \
   --exclude '(/__pycache__/|\.pyc$|/\.git/)' \
-  "${APP_DIR}" "${WORKER_PY}" 2>>"${LOG_FILE}" | while read -r _directory _events _file; do
+  "${APP_DIR}" "${WORKER_PY}" 2>>"${LOG_FILE}" | while read -r changed; do
+    [[ "${changed}" == *.py ]] || continue
     # Coalesce bursts: drain rapidly queued events after first hit
     sleep "${DEBOUNCE_SEC}"
     while read -r -t 0.1 _; do :; done || true
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) rmp-code-watch: change detected — reloading" >>"${LOG_FILE}"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) rmp-code-watch: change detected (${changed#"${RMP_ROOT}"/}) — reloading" >>"${LOG_FILE}"
     /bin/bash "${RELOAD_SCRIPT}" >>"${LOG_FILE}" 2>&1 || true
+    # Edits queued while the reload waited for idle were on disk before the restart.
+    while read -r -t 0.1 _; do :; done || true
   done
