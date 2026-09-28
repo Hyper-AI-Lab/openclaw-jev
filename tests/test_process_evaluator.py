@@ -92,3 +92,18 @@ def test_catalog_evidence_failure_enters_rework_not_instant_fail():
     assert ev_idx != -1
     assert rework_idx != -1
     assert rework_idx < fail_idx
+
+
+async def test_evaluator_results_decode_the_way_the_workflow_receives_them():
+    import typing
+
+    from temporalio.converter import DataConverter
+
+    from app.activities.openclaw_activities import verify_response_quality
+
+    # The workflow decodes the activity result with this annotation.
+    return_type = typing.get_type_hints(verify_response_quality)["return"]
+    for raw in ('{"verdict": "accept", "quality": "pass", "reason": "ok"}', "not json at all"):
+        result = parse_evaluator_response(raw)
+        payloads = await DataConverter.default.encode([result])
+        assert await DataConverter.default.decode(payloads, [return_type]) == [result]

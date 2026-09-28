@@ -750,7 +750,7 @@ async def check_intermediate_updates_enabled(payload: Dict[str, Any]) -> bool:
 
 
 @traced_activity("openclaw.verify_quality")
-async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, str]:
+async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
     from app.orchestrator.process_evaluator import (
         build_evaluator_prompt,
         parse_evaluator_response,

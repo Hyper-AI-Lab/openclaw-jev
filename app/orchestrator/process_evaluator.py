@@ -19,7 +19,7 @@ EVALUATOR_JSON_SCHEMA = {
 }
 
 
-def evaluator_error_result(reason: str = "evaluator error") -> Dict[str, str]:
+def evaluator_error_result(reason: str = "evaluator error") -> Dict[str, Any]:
     return {
         "verdict": "rework",
         "quality": "fail",
@@ -60,7 +60,7 @@ def _extract_json_object(text: str) -> Optional[str]:
     return None
 
 
-def parse_evaluator_response(text: str) -> Dict[str, str]:
+def parse_evaluator_response(text: str) -> Dict[str, Any]:
     """Fail closed: unparsable judge output is rework, never accept."""
     raw = text or ""
     if raw.lower().startswith("error:"):
