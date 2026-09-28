@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import subprocess
 import sys
 import time
@@ -70,4 +71,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # The Temporal client's native threads can abort interpreter finalization
+    # (PyGILState_Release) after the verdict is known; a crash there must not
+    # read as "unhealthy" and trigger a full recovery.
+    os._exit(code)

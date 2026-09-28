@@ -5,7 +5,8 @@ After=temporal.service rmp-api.service
 [Service]
 Type=oneshot
 TimeoutStartSec=180
-ExecStart=/bin/bash -c '/root/.openclaw/rmp/ops/temporal_healthcheck.sh --recover || /root/.openclaw/rmp/ops/temporal_recover.sh'
+# Full recovery only when the probe itself reports Temporal unhealthy (exit 1).
+ExecStart=/bin/bash -c '/root/.openclaw/rmp/ops/temporal_healthcheck.sh --recover; rc=$$?; if [ "$$rc" -eq 1 ]; then exec /root/.openclaw/rmp/ops/temporal_recover.sh; fi; exit "$$rc"'
 
 [Install]
 WantedBy=multi-user.target

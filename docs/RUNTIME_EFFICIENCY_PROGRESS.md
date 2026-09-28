@@ -363,3 +363,42 @@ Each step appends one entry below. Earlier entries are never rewritten.
     remaining 5 being the rows excluded above.
 - **Deploy:** the idle-aware reloader restarted `rmp-api` and `rmp-worker` at 14:12:56Z,
   health OK.
+
+## Extra step — Spurious Temporal full recoveries (2026-09-28, approved by Kirill)
+
+- **Finding:** the gateway PID changed at 13:11Z with no action of mine. The cause was
+  `rmp-temporal-watchdog` (every 5 min, `temporal_healthcheck.sh --recover ||
+  temporal_recover.sh`).
+  - At 13:10:55Z the probe printed `Temporal health: ok`, then its Python process aborted
+    during interpreter finalization (`Fatal Python error: PyGILState_Release … finalizing`,
+    core dumped). That is the Temporal SDK's native threads outliving shutdown.
+  - The `||` read the abort as unhealthy and ran the full recovery. It stops the API and
+    worker without checking for user work, runs `temporal_purge_running.py
+    --force-recovery`, and restarts Temporal, the API, the worker and the gateway.
+  - It happened 19 times in 7 days, each paired with the same abort. Today it ran at 06:30,
+    09:25, 09:35, 11:45 and 15:10 CEST. That accounts for the gateway restarts, and their
+    70–100 s startup freezes, that Step 3 attributed to other causes.
+  - It very likely also caused in-flight workflows to vanish. The reconciler finished 11
+    September user tasks by orphaned-reply recovery, for example the 07:44Z DM on 27 Sep
+    with a recovery at 07:54Z.
+- **Change:**
+  - `ops/temporal_healthcheck.py` flushes and ends with `os._exit(code)` once the verdict is
+    known, skipping the finalization that aborts.
+  - `ops/systemd/rmp-temporal-watchdog.service` runs `temporal_recover.sh` only when the
+    probe exits 1, which is its own "still unhealthy after the soft restart" verdict. Any
+    other code passes through as a failed unit without touching the stack. `$` is escaped
+    as `$$` for systemd.
+  - Installed to `/etc/systemd/system` and ran `daemon-reload`; `systemd-analyze verify`
+    is clean.
+- **Tests (`tests/test_temporal_watchdog.py`, 6):**
+  - The real `ExecStart` command runs against stub scripts: exit 1 recovers; exits 0, 2
+    and 134 do not, and pass through.
+  - The probe runs against a fake `temporalio` whose client registers an exit hook that
+    aborts, standing in for the finalization crash. The probe still exits 0 with `ok`.
+    With the old probe restored, this test fails.
+  - An unreachable Temporal exits 1.
+- **Live check:** a manual run at 14:24:39Z printed `ok` and the unit finished successfully,
+  with no recovery. All services active.
+- **Not changed (noted):** `temporal_recover.sh` itself still stops user work without an
+  idle check and backs up the retired `data/temporal.db`. With the false trigger gone, it
+  runs only when Temporal is really down.
