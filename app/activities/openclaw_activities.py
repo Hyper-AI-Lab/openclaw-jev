@@ -796,17 +796,40 @@ async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _execute_on_internal_session(task_id: str, message: str) -> str:
-    internal_session_key = f"agent:main:rmp_verify_{task_id}"
-    try:
-        return await _dispatch_openclaw_session(
-            internal_session_key,
-            message,
-            poll_timeout_sec=180,
-            require_terminal=False,
-            deadline=_activity_deadline(ACTIVITY_WRAP_UP_SEC),
+    """Process Evaluator turn: gpt-5-nano, then the NVIDIA fallback, each with an explicit model."""
+    from app.llm.model_policy import FALLBACK_MODELS, SUBAGENT_MODEL, drop_unwired_openai
+    from app.orchestrator.process_evaluator import parse_evaluator_response
+
+    deadline = _activity_deadline(ACTIVITY_WRAP_UP_SEC)
+    models = drop_unwired_openai([SUBAGENT_MODEL, *FALLBACK_MODELS]) or [None]
+    last = "Error: evaluator produced no verdict"
+    for idx, model in enumerate(models):
+        # A separate session per model, as intake does: no sticky model override or
+        # half-written failed turn carries over to the fallback.
+        suffix = "" if idx == 0 else f"_fb{idx}"
+        try:
+            text = await _dispatch_openclaw_session(
+                f"agent:main:rmp_verify_{task_id}{suffix}",
+                message,
+                poll_timeout_sec=180,
+                require_terminal=False,
+                model=model,
+                deadline=deadline,
+            )
+        except (OpenClawError, TimeoutError) as e:
+            last = f"Error: {str(e)}"
+            activity.logger.warning(
+                "evaluator model %s failed: %s", model or "default", last
+            )
+            continue
+        if not parse_evaluator_response(text).get("parse_error"):
+            return text
+        last = text
+        activity.logger.warning(
+            "evaluator model %s returned no usable verdict; trying next",
+            model or "default",
         )
-    except (OpenClawError, TimeoutError) as e:
-        return f"Error: {str(e)}"
+    return last
 
 
 async def _execute_intake_llm(intake_id: str, prompt: str) -> str:

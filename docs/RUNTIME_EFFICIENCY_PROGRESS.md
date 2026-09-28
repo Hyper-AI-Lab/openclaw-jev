@@ -448,3 +448,32 @@ Each step appends one entry below. Earlier entries are never rewritten.
   `_dispatch_openclaw_session`. The gateway logged `status=200`, first byte in 865 ms, and
   RMP read the JSON reply in 6.2 s. The last MiniMax 410 was at 13:14Z. The reloader
   restarted the API and worker at 14:18:48Z, and runtime sync reports no stale services.
+
+## Step 9 — Evaluator fallback (2026-09-28)
+
+- **Finding:** `_execute_on_internal_session` made one turn on `rmp_verify_{task}` with no
+  model. Any gateway error, quota timeout or unparseable verdict came back as `Error:`,
+  which fails closed into rework. Intake already walks its model chain.
+- **Change (`app/activities/openclaw_activities.py`):**
+  - The evaluator walks `drop_unwired_openai([SUBAGENT_MODEL, *FALLBACK_MODELS])`: gpt-5-nano,
+    then `nvidia/openai/gpt-oss-20b` (MiniMax per the plan, replaced per Kirill's decision).
+    Each turn passes an explicit `model`.
+  - Like intake, each fallback gets its own session (`rmp_verify_{task}_fb1`), so no sticky
+    model override or half-written failed turn carries over.
+  - It moves on after `OpenClawError`, a `TimeoutError`, or a reply that
+    `parse_evaluator_response` marks `parse_error`. All attempts share the Step 4 activity
+    deadline. If every model fails, it returns the last error, so the existing fail-closed
+    verdict is unchanged.
+- **Tests (`tests/test_llm_orchestration.py`):**
+  - 4 new: fallback after a gateway error (asserting session keys and explicit models);
+    fallback after an unparseable verdict; a good first verdict skips the fallback; every
+    model failing returns the last error as `parse_error`.
+  - The Step 4 deadline test now expects the deadline on both attempts. The OpenAI key check
+    is pinned in these tests so CI behaves the same.
+  - Full suite: 496 passed, 3 skipped.
+- **Live check:** one evaluator-style turn through `_execute_on_internal_session` returned
+  `accept` (`parse_error` False) in 7.1 s. The gateway logged gpt-5-nano `status=200` with
+  the first byte in 3.1 s.
+- **Step 6 follow-up from the same log:** there has been no OpenAI idle cut since the 12:58Z
+  patch. All later OpenAI calls returned 200, including first bytes of 5.2–9.8 s that the
+  old rule would have cut.

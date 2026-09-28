@@ -166,6 +166,7 @@ async def test_intake_and_evaluator_bound_the_quota_wait_by_their_activity(monke
 
     started = datetime.now(timezone.utc)
     monkeypatch.setattr(oa.activity, "info", lambda: _Info(started, 70))
+    monkeypatch.setattr("app.llm.model_policy.openai_key_present", lambda: True)
     seen = []
 
     async def reserve_times_out(**kwargs):
@@ -177,12 +178,77 @@ async def test_intake_and_evaluator_bound_the_quota_wait_by_their_activity(monke
 
     out = await oa._execute_on_internal_session("t-1", "judge this")
     assert out.startswith("Error: LLM quota")
-    assert seen == [pytest.approx(expected)]
+    # Both evaluator models share the one activity deadline.
+    assert seen == [pytest.approx(expected), pytest.approx(expected)]
 
     seen.clear()
     with pytest.raises(TimeoutError):
         await oa._execute_intake_llm("fp123", "classify this")
     assert seen and seen[0] == pytest.approx(expected)
+
+
+VERDICT = '{"verdict": "accept", "quality": "pass", "reason": "answers the question"}'
+
+
+def _evaluator_dispatch(monkeypatch, replies):
+    """Stub the gateway turn: each call pops the next reply (an Exception is raised)."""
+    from app.activities import openclaw_activities as oa
+
+    monkeypatch.setattr("app.llm.model_policy.openai_key_present", lambda: True)
+    calls = []
+
+    async def dispatch(session_key, message, **kwargs):
+        calls.append((session_key, kwargs.get("model")))
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(oa, "_dispatch_openclaw_session", dispatch)
+    return oa, calls
+
+
+@pytest.mark.asyncio
+async def test_evaluator_walks_to_the_fallback_with_an_explicit_model(monkeypatch):
+    from app.activities.openclaw_activities import OpenClawError
+    from app.llm.model_policy import FALLBACK_MODELS, SUBAGENT_MODEL
+
+    oa, calls = _evaluator_dispatch(
+        monkeypatch, [OpenClawError("LLM request timed out."), VERDICT]
+    )
+    out = await oa._execute_on_internal_session("t-9", "judge this")
+    assert out == VERDICT
+    assert calls == [
+        ("agent:main:rmp_verify_t-9", SUBAGENT_MODEL),
+        ("agent:main:rmp_verify_t-9_fb1", FALLBACK_MODELS[0]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_evaluator_moves_on_from_an_unparseable_verdict(monkeypatch):
+    oa, calls = _evaluator_dispatch(monkeypatch, ["I think it is fine.", VERDICT])
+    assert await oa._execute_on_internal_session("t-8", "judge this") == VERDICT
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_evaluator_first_good_verdict_skips_the_fallback(monkeypatch):
+    oa, calls = _evaluator_dispatch(monkeypatch, [VERDICT])
+    assert await oa._execute_on_internal_session("t-7", "judge this") == VERDICT
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluator_returns_the_last_error_when_every_model_fails(monkeypatch):
+    from app.orchestrator.process_evaluator import parse_evaluator_response
+
+    oa, calls = _evaluator_dispatch(
+        monkeypatch, [TimeoutError("LLM quota: no slot"), TimeoutError("LLM quota: still no slot")]
+    )
+    out = await oa._execute_on_internal_session("t-6", "judge this")
+    assert out == "Error: LLM quota: still no slot"
+    assert parse_evaluator_response(out)["parse_error"] is True
+    assert len(calls) == 2
 
 
 def test_no_deadline_outside_an_activity():
