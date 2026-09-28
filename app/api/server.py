@@ -929,6 +929,9 @@ async def cancel_task(task_id: str, db: AsyncSession = Depends(get_db)):
         )
     )
     await db.commit()
+    from app.task_registry.hooks import index_terminal_task_async
+
+    await index_terminal_task_async(task_id)
     return {"status": "cancelled", "task_id": task_id}
 
 

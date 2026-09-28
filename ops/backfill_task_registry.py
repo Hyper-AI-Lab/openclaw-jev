@@ -125,6 +125,12 @@ async def main() -> int:
         default=0.0,
         help="Pause between successful indexes (quota pacing)",
     )
+    parser.add_argument(
+        "--task-id",
+        action="append",
+        default=[],
+        help="Index exactly these terminal tasks (repeatable); skips window selection",
+    )
     args = parser.parse_args()
 
     if args.reembed:
@@ -136,12 +142,15 @@ async def main() -> int:
     limit = args.limit if args.limit > 0 else None
     missing_only = not args.all
 
-    task_ids = (
-        await _missing_task_ids(cutoff, limit)
-        if missing_only
-        else await _all_task_ids(cutoff, limit)
-    )
-    mode = "missing-only" if missing_only else "all"
+    if args.task_id:
+        task_ids = list(args.task_id)
+        mode = "task-ids"
+    elif missing_only:
+        task_ids = await _missing_task_ids(cutoff, limit)
+        mode = "missing-only"
+    else:
+        task_ids = await _all_task_ids(cutoff, limit)
+        mode = "all"
     print(f"Backfill start: mode={mode} candidates={len(task_ids)} days={days}")
 
     indexed = 0

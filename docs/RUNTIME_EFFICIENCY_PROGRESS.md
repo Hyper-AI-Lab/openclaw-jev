@@ -325,3 +325,41 @@ Each step appends one entry below. Earlier entries are never rewritten.
   called the live Jev API, and `test_intake_deterministic` got confidence 100 instead of 0.
   I unset all of the file's variables by name (nothing was printed), and the suite passes
   clean. From now on, keys are read into one-command subshells only.
+
+## Step 8 — Registry on every terminal path (2026-09-28)
+
+- **Finding:**
+  - `reconcile_once` sets terminal statuses itself on three paths, commits once at the end,
+    and never indexes. The paths are orphaned-reply recovery (`completed`), a stale task
+    whose workflow completed, and a stale task whose workflow failed, was terminated or
+    was cancelled.
+  - Stuck repair already indexes, through `finalize_task_failure` and `record_compensation`
+    in `db_activities`.
+  - `POST /tasks/{id}/cancel` is a fourth terminal path without indexing.
+  - September coverage before the fix: user tasks 2 of 20 indexed, and tasks finalized by
+    the reconciler 0 of 11.
+- **Change:**
+  - `reconcile_once` collects the tasks it finalizes and indexes each after its single
+    commit (the indexer reads the committed row). `stats["registry_indexed"]` counts them.
+  - The cancel endpoint indexes after its commit.
+  - `ops/backfill_task_registry.py` gains `--task-id` (repeatable) to index exactly the given
+    tasks.
+- **Tests:**
+  - `test_reconciler_indexes_the_tasks_it_completes_after_commit` covers the orphaned-reply
+    and stale-completed paths. It asserts the call order commit, index, index.
+  - `test_task_cancel_api.py` asserts commit, then index.
+  - Full suite: 486 passed, 3 skipped.
+- **Backfill (September, real user work):** 13 tasks via `--task-id`, run with the worker's
+  env files sourced only in the child process: 13 indexed, 0 errors, all with vectors.
+  - Indexed: the 11 reconciler completions (5 Sep, 27 Sep and 28 Sep), plus 2 tasks
+    cancelled through the API (5 Sep, and today's second test DM).
+  - Deliberately left out:
+    - my 6 accidental "summarize inbox" rows from the test leak (3 user, 3 cron);
+    - an intake attach-cancellation (merged into another task);
+    - an intake placeholder row;
+    - 40 September canaries. The normal path indexes canaries, so 715 of 755 are already
+      there. These are health checks that intake then cites as prior work.
+  - After: reconciler-finalized tasks 11 of 11 indexed; user tasks 15 of 20, with the
+    remaining 5 being the rows excluded above.
+- **Deploy:** the idle-aware reloader restarted `rmp-api` and `rmp-worker` at 14:12:56Z,
+  health OK.

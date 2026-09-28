@@ -145,3 +145,70 @@ async def test_janitor_terminates_old_orphan():
             db.execute = AsyncMock(return_value=result)
             stats = await janitor_mod.janitor_once(max_age_hours=24)
     assert stats["terminated"] == 1
+
+
+def _rows(items):
+    result = MagicMock()
+    result.scalars.return_value.all.return_value = list(items)
+    return result
+
+
+@pytest.mark.asyncio
+async def test_reconciler_indexes_the_tasks_it_completes_after_commit():
+    from temporalio.client import WorkflowExecutionStatus
+
+    from app import reconciler
+
+    now = datetime.utcnow()
+
+    class FakeTask:
+        def __init__(self, task_id, status, age_min):
+            self.id = task_id
+            self.status = status
+            self.updated_at = now - timedelta(minutes=age_min)
+            self.correlation_id = task_id
+            self.goal = "Summarize my inbox"
+            self.task_type = "user"
+            self.next_check_at = None
+            self.openclaw_session_key = "agent:main:slack:channel:d0test"
+
+    orphan = FakeTask("orphan-reply", "running", 3)
+    stale_done = FakeTask("stale-done", "created", 25)
+
+    async def recover(client, db, task, now_, stats):
+        task.status = "completed"
+        return True
+
+    order = MagicMock()
+    db = AsyncMock()
+    db.add = MagicMock()
+    db.execute = AsyncMock(
+        side_effect=[
+            _rows([orphan]),  # orphaned-reply candidates
+            _rows([]),  # stuck running workflows
+            _rows([stale_done]),  # stale tasks
+            _rows([]),  # process runs of the stale task
+            _rows([]),  # process runs due for a check
+        ]
+    )
+    db.commit = AsyncMock(side_effect=lambda: order.commit())
+    desc = MagicMock(status=WorkflowExecutionStatus.COMPLETED)
+    client = MagicMock()
+    client.get_workflow_handle.return_value.describe = AsyncMock(return_value=desc)
+    index = AsyncMock(side_effect=lambda task_id: order.index(task_id))
+
+    with patch("app.config.is_development_mode", return_value=False), \
+         patch.object(reconciler, "reap_stale_llm_slots_sync", return_value=[]), \
+         patch.object(reconciler, "_get_temporal", new_callable=AsyncMock, return_value=client), \
+         patch.object(reconciler, "AsyncSessionLocal") as session, \
+         patch.object(reconciler, "_recover_orphaned_session_reply", side_effect=recover), \
+         patch.object(reconciler, "_cleanup_orphan_plan_children", new_callable=AsyncMock, return_value=0), \
+         patch.object(reconciler, "_notify_repair", new_callable=AsyncMock), \
+         patch("app.task_registry.hooks.index_terminal_task_async", index):
+        session.return_value.__aenter__.return_value = db
+        stats = await reconciler.reconcile_once()
+
+    assert stale_done.status == "completed"
+    assert stats["registry_indexed"] == 2
+    assert [c[0] for c in order.mock_calls] == ["commit", "index", "index"]
+    assert [c.args[0] for c in index.await_args_list] == ["orphan-reply", "stale-done"]

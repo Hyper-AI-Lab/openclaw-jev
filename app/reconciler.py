@@ -321,6 +321,8 @@ async def reconcile_once() -> dict:
     now = datetime.utcnow()
     threshold = now - timedelta(minutes=STALE_TASK_MINUTES)
     repair_threshold = now - timedelta(minutes=STUCK_REPAIR_MINUTES)
+    # Tasks this pass moves to a terminal status itself (stuck repair indexes in db_activities).
+    terminal_task_ids: list = []
 
     client = await _get_temporal()
 
@@ -330,7 +332,8 @@ async def reconcile_once() -> dict:
             select(Task).where(Task.status.in_(["running", "created"]))
         )
         for task in orphan_candidates.scalars().all():
-            await _recover_orphaned_session_reply(client, db, task, now, stats)
+            if await _recover_orphaned_session_reply(client, db, task, now, stats):
+                terminal_task_ids.append(task.id)
 
         stuck_result = await db.execute(
             select(Task).where(
@@ -391,6 +394,7 @@ async def reconcile_once() -> dict:
                         task,
                         f"Task {task.id[:8]} was stale but workflow completed — status repaired to completed.",
                     )
+                    terminal_task_ids.append(task.id)
                     continue
                 if desc.status in (
                     WorkflowExecutionStatus.FAILED,
@@ -438,6 +442,7 @@ async def reconcile_once() -> dict:
                         task,
                         f"Task {task.id[:8]} was stale — workflow ended ({desc.status.name}); status updated.",
                     )
+                    terminal_task_ids.append(task.id)
                     continue
             except Exception as e:
                 logger.debug("Workflow describe failed for %s: %s", task.id, e)
@@ -517,6 +522,12 @@ async def reconcile_once() -> dict:
 
         await db.commit()
 
+    # The registry index reads the committed task row.
+    from app.task_registry.hooks import index_terminal_task_async
+
+    for task_id in terminal_task_ids:
+        await index_terminal_task_async(task_id)
+    stats["registry_indexed"] = len(terminal_task_ids)
     return stats
 
 
