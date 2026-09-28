@@ -56,3 +56,136 @@ async def test_reserve_idempotent_per_session(broker_env):
     assert qb.get_orchestration_status(settings)["active_slots"] == 1
 
     await qb.release_profile(session_key="agent:main:main")
+
+
+FULL = {"llm_quota": {"max_concurrent": 3, "min_interval_sec": 0, "max_wait_sec": 1800}}
+
+
+@pytest.fixture
+def full_broker(broker_env, monkeypatch):
+    """Both user slots taken (max_concurrent 3 = 2 user + 1 canary)."""
+    monkeypatch.setattr(qb, "reap_stale_llm_slots_sync", lambda **_: [])
+    monkeypatch.setattr(qb, "_patch_auth_last_good", lambda profile_id: None)
+
+    async def _fill():
+        await qb.reserve_profile(session_key="agent:main:one", settings=FULL)
+        await qb.reserve_profile(session_key="agent:main:two", settings=FULL)
+
+    return _fill
+
+
+@pytest.mark.asyncio
+async def test_release_is_not_blocked_by_a_waiting_reserve(full_broker):
+    import asyncio
+
+    await full_broker()
+    waiter = asyncio.create_task(
+        qb.reserve_profile(session_key="agent:main:three", settings=FULL)
+    )
+    await asyncio.sleep(0.3)
+    assert not waiter.done()
+
+    await asyncio.wait_for(qb.release_profile(session_key="agent:main:one"), timeout=1.0)
+    profile_id, _slot = await asyncio.wait_for(waiter, timeout=3.0)
+    assert profile_id
+
+
+@pytest.mark.asyncio
+async def test_reserve_gives_up_at_the_callers_deadline(full_broker, caplog):
+    import logging
+    import time
+
+    await full_broker()
+    t0 = time.time()
+    with caplog.at_level(logging.WARNING, logger="rmp.llm_quota"):
+        with pytest.raises(TimeoutError, match="user slots full"):
+            await qb.reserve_profile(
+                session_key="agent:main:three", settings=FULL, deadline=t0 + 1.0
+            )
+    assert time.time() - t0 < 2.0
+    assert "LLM reserve gave up after" in caplog.text
+    assert "user slots full (2/2, 2/3 total)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_reserve_logs_a_long_wait_with_its_reason(full_broker, caplog):
+    import asyncio
+    import logging
+
+    await full_broker()
+
+    async def _release_later():
+        await asyncio.sleep(2.3)
+        await qb.release_profile(session_key="agent:main:two")
+
+    releaser = asyncio.create_task(_release_later())
+    with caplog.at_level(logging.INFO, logger="rmp.llm_quota"):
+        profile_id, _slot = await qb.reserve_profile(
+            session_key="agent:main:three", settings=FULL
+        )
+    await releaser
+    assert profile_id
+    assert "LLM reserve waited" in caplog.text
+    assert "last_reason=user slots full" in caplog.text
+
+
+def test_mutate_reserve_says_why_it_failed(broker_env, monkeypatch):
+    import time
+
+    monkeypatch.setattr(qb, "_load_env_keys", lambda: [("nvidia:default", "k1")])
+    cfg = qb.QuotaConfig(min_interval_sec=60, max_concurrent=3)
+    assert qb._mutate_reserve("agent:main:a", ["nvidia:default"], cfg)
+    why = []
+    assert qb._mutate_reserve("agent:main:b", ["nvidia:default"], cfg, why=why) is None
+    assert why and why[-1].startswith("nvidia:default paced (")
+
+    until = time.time() * 1000 + 60_000
+    qb._mutate_state(
+        lambda s: s.setdefault("keys", {}).setdefault("nvidia:default", {}).update(
+            {"cooldown_until_ms": until}
+        )
+    )
+    why.clear()
+    assert qb._mutate_reserve("agent:main:c", ["nvidia:default"], cfg, why=why) is None
+    assert why == ["every key is cooling down"]
+
+
+class _Info:
+    def __init__(self, started, timeout_sec):
+        from datetime import timedelta
+
+        self.started_time = started
+        self.start_to_close_timeout = timedelta(seconds=timeout_sec)
+
+
+@pytest.mark.asyncio
+async def test_intake_and_evaluator_bound_the_quota_wait_by_their_activity(monkeypatch):
+    from datetime import datetime, timezone
+
+    from app.activities import openclaw_activities as oa
+
+    started = datetime.now(timezone.utc)
+    monkeypatch.setattr(oa.activity, "info", lambda: _Info(started, 70))
+    seen = []
+
+    async def reserve_times_out(**kwargs):
+        seen.append(kwargs.get("deadline"))
+        raise TimeoutError("LLM quota: no slot/profile available within 1s (user slots full)")
+
+    monkeypatch.setattr(oa, "reserve_profile", reserve_times_out)
+    expected = started.timestamp() + 70 - oa.ACTIVITY_WRAP_UP_SEC
+
+    out = await oa._execute_on_internal_session("t-1", "judge this")
+    assert out.startswith("Error: LLM quota")
+    assert seen == [pytest.approx(expected)]
+
+    seen.clear()
+    with pytest.raises(TimeoutError):
+        await oa._execute_intake_llm("fp123", "classify this")
+    assert seen and seen[0] == pytest.approx(expected)
+
+
+def test_no_deadline_outside_an_activity():
+    from app.activities import openclaw_activities as oa
+
+    assert oa._activity_deadline(5.0) is None

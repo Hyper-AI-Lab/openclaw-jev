@@ -37,6 +37,7 @@ DEFAULT_MIN_INTERVAL_SEC = 5.0
 DEFAULT_MAX_WAIT_SEC = 1800.0
 DEFAULT_MAX_CONCURRENT = 3
 CANARY_MAX_WAIT_SEC = 60.0
+RESERVE_WAIT_LOG_SEC = 2.0
 
 RMP_TASK_SESSION_RE = re.compile(
     r"rmp_task_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
@@ -671,8 +672,15 @@ def _mutate_reserve(
     profiles: List[str],
     cfg: QuotaConfig,
     kind: str = "user",
+    why: Optional[List[str]] = None,
 ) -> Optional[tuple[str, str]]:
+    """Try one reservation. On failure, append the reason to ``why`` if given."""
     preempted: List[str] = []
+
+    def _fail(reason: str) -> None:
+        if why is not None:
+            why.append(reason)
+        return None
 
     def _apply(state: Dict[str, Any]) -> Optional[tuple[str, str]]:
         if session_key:
@@ -686,7 +694,10 @@ def _mutate_reserve(
 
         if kind in ("canary", "heartbeat"):
             if canary_n >= canary_cap or _active_slot_count(state) >= total_cap:
-                return None
+                return _fail(
+                    f"canary slots full ({canary_n}/{canary_cap}, "
+                    f"{_active_slot_count(state)}/{total_cap} total)"
+                )
         else:
             if user_n >= user_cap or _active_slot_count(state) >= total_cap:
                 tid = _preempt_canary_slot(state)
@@ -694,14 +705,18 @@ def _mutate_reserve(
                     preempted.append(tid)
                 user_n, canary_n = _count_kind_slots(state)
             if user_n >= user_cap or _active_slot_count(state) >= total_cap:
-                return None
+                return _fail(
+                    f"user slots full ({user_n}/{user_cap}, "
+                    f"{_active_slot_count(state)}/{total_cap} total)"
+                )
 
         now_ms = _now_ms()
         pid = _pick_key(state, profiles, now_ms, rotation_mode=cfg.rotation_mode)
         if not pid:
-            return None
-        if _profile_ready_in_ms(state, pid, now_ms, cfg.min_interval_sec) > 0:
-            return None
+            return _fail("every key is cooling down")
+        ready_in_ms = _profile_ready_in_ms(state, pid, now_ms, cfg.min_interval_sec)
+        if ready_in_ms > 0:
+            return _fail(f"{pid} paced ({ready_in_ms / 1000:.1f}s left)")
 
         slot_id = str(uuid.uuid4())
         g = state.setdefault("global", {})
@@ -888,8 +903,12 @@ async def reserve_profile(
     tags: Optional[List[str]] = None,
     task_type: Optional[str] = None,
     kind: Optional[str] = None,
+    deadline: Optional[float] = None,
 ) -> tuple[str, str]:
-    """Reserve a concurrency slot and balanced NVIDIA profile for an agent run."""
+    """Reserve a concurrency slot and balanced NVIDIA profile for an agent run.
+
+    ``deadline`` (epoch seconds) is the caller's own budget; the wait never outlives it.
+    """
     cfg = QuotaConfig.from_settings(settings)
     profiles = [p for p, _ in _load_env_keys()] or ["nvidia:default"]
     slot_kind = classify_slot_kind(
@@ -900,12 +919,19 @@ async def reserve_profile(
         if slot_kind in ("canary", "heartbeat")
         else cfg.max_wait_sec
     )
-    deadline = time.time() + wait_cap
+    started = time.time()
+    give_up_at = started + wait_cap
+    if deadline is not None:
+        give_up_at = min(give_up_at, deadline)
     last_reap_ms = 0.0
+    why: List[str] = []
+    last_reason = "slow reservation attempt"
 
-    async with _lock:
-        while time.time() < deadline:
-            result = _mutate_reserve(session_key, profiles, cfg, kind=slot_kind)
+    while True:
+        why.clear()
+        # One attempt per lock hold: release_profile needs the same lock.
+        async with _lock:
+            result = _mutate_reserve(session_key, profiles, cfg, kind=slot_kind, why=why)
             if result:
                 profile_id, slot_id = result
                 if session_key:
@@ -914,46 +940,69 @@ async def reserve_profile(
                     if should_pin_nvidia_profile(model, profile_id):
                         assign_openclaw_session_profile(session_key, profile_id)
                 _patch_auth_last_good(profile_id)
-                logger.debug(
-                    "LLM reserve: profile=%s slot=%s session=%s kind=%s active=%s",
-                    profile_id,
-                    slot_id[:8],
+        if result:
+            waited = time.time() - started
+            if waited > RESERVE_WAIT_LOG_SEC:
+                logger.info(
+                    "LLM reserve waited %.1fs session=%s kind=%s last_reason=%s",
+                    waited,
                     session_key or "-",
                     slot_kind,
-                    _active_slot_count(_read_state()),
+                    last_reason,
                 )
-                return profile_id, slot_id
-
-            if slot_kind in ("canary", "heartbeat"):
-                raise TimeoutError(
-                    "LLM quota: canary/heartbeat slot unavailable (user work has priority)"
-                )
-
-            now_ms = _now_ms()
-            if now_ms - last_reap_ms > 15_000:
-                last_reap_ms = now_ms
-                try:
-                    reap_stale_llm_slots_sync(max_age_ms=10 * 60 * 1000)
-                except Exception as exc:
-                    logger.debug("stale slot reap during reserve failed: %s", exc)
-
-            state = _read_state()
-            wait_ms = _soonest_ready_ms(
-                state, profiles, _now_ms(), cfg.min_interval_sec
+            logger.debug(
+                "LLM reserve: profile=%s slot=%s session=%s kind=%s active=%s",
+                profile_id,
+                slot_id[:8],
+                session_key or "-",
+                slot_kind,
+                _active_slot_count(_read_state()),
             )
-            if _active_slot_count(state) >= cfg.max_concurrent:
-                wait_ms = max(wait_ms, 1000.0)
+            return profile_id, slot_id
+        last_reason = why[-1] if why else "unknown"
 
-            sleep_sec = min(max(wait_ms / 1000.0, 0.25), 30.0)
-            if heartbeat:
-                try:
-                    heartbeat()
-                except Exception:
-                    pass
-            await asyncio.sleep(sleep_sec)
+        if slot_kind in ("canary", "heartbeat"):
+            raise TimeoutError(
+                "LLM quota: canary/heartbeat slot unavailable (user work has priority)"
+            )
 
+        remaining = give_up_at - time.time()
+        if remaining <= 0:
+            break
+
+        now_ms = _now_ms()
+        if now_ms - last_reap_ms > 15_000:
+            last_reap_ms = now_ms
+            try:
+                reap_stale_llm_slots_sync(max_age_ms=10 * 60 * 1000)
+            except Exception as exc:
+                logger.debug("stale slot reap during reserve failed: %s", exc)
+
+        state = _read_state()
+        wait_ms = _soonest_ready_ms(
+            state, profiles, _now_ms(), cfg.min_interval_sec
+        )
+        if _active_slot_count(state) >= cfg.max_concurrent:
+            wait_ms = max(wait_ms, 1000.0)
+
+        sleep_sec = min(max(wait_ms / 1000.0, 0.25), 30.0, remaining)
+        if heartbeat:
+            try:
+                heartbeat()
+            except Exception:
+                pass
+        await asyncio.sleep(sleep_sec)
+
+    waited = time.time() - started
+    logger.warning(
+        "LLM reserve gave up after %.1fs session=%s kind=%s reason=%s",
+        waited,
+        session_key or "-",
+        slot_kind,
+        last_reason,
+    )
     raise TimeoutError(
-        f"LLM quota: no slot/profile available within {wait_cap:.0f}s"
+        f"LLM quota: no slot/profile available within {waited:.0f}s ({last_reason})"
     )
 
 

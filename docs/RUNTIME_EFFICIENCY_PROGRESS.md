@@ -111,3 +111,47 @@ Each step appends one entry below. Earlier entries are never rewritten.
     Afterwards the first heartbeat run spent 14 s in prep on the 11,570-event heartbeat
     session, then failed after three first-byte cuts. It is not DM-related. I'll re-check at
     the Step 6 restart, after Step 5 archives that session.
+
+## Step 4 — Broker waits (2026-09-28)
+
+- **Finding:** `reserve_profile` held the process-wide asyncio `_lock` across its whole
+  wait loop, and `release_profile` takes the same lock. One waiting reserve therefore
+  blocked every other reserve and every release in that process until it gave up (up to
+  `max_wait_sec` = 1800 s). A slot freed in the same process could not reach the waiter.
+  Replaying the committed broker against a temp state with 2/2 user slots held, a release
+  waited 3.9 s behind a waiter with a 4 s cap, and the waiter then timed out anyway.
+- **Change (`app/llm/quota_broker.py`):**
+  - The lock covers one attempt (the reservation and the profile pin); sleeps happen
+    outside it.
+  - `reserve_profile(deadline=...)` takes the caller's epoch deadline. The wait ends at the
+    earlier of the deadline and the configured cap, and the last sleep is shortened to fit.
+  - `_mutate_reserve(why=...)` reports why an attempt failed: user or canary slots full
+    (with counts), every key cooling down, or a key still inside its pacing interval.
+  - A reserve that waited more than 2 s logs `LLM reserve waited …s … last_reason=…` at
+    INFO. Giving up logs `LLM reserve gave up after …s … reason=…` at WARNING, and the
+    `TimeoutError` carries the reason.
+- **Change (`app/activities/openclaw_activities.py`):**
+  - `_activity_deadline()` reads the activity's own start-to-close budget from Temporal
+    (`started_time` + `start_to_close_timeout`), minus 5 s for parsing and persisting.
+  - Intake (`_execute_intake_llm`, all model attempts) and the evaluator
+    (`_execute_on_internal_session`) pass it to `_dispatch_openclaw_session`, which uses it
+    for the quota wait and to cap the reply poll. Before, a second intake model could poll
+    past the 70 s activity limit.
+  - The evaluator returns its usual `Error: …` when the quota wait runs out, as it already
+    did for dispatch errors.
+- **Tests (`tests/test_llm_orchestration.py`, 6 new):**
+  - a release completes within 1 s while a reserve waits, and the waiter then gets the slot;
+  - the caller's deadline ends the wait with the reason in both the error and the warning;
+  - a 2.3 s wait is logged with `last_reason=user slots full`;
+  - `_mutate_reserve` reports pacing and cooldown;
+  - intake and the evaluator pass the activity deadline (evaluator degrades to `Error:`);
+  - there is no deadline outside an activity.
+
+  Broker suites: 20 passed. Full suite: 475 passed, 3 skipped.
+- **Deploy:** the idle-aware reloader held the restart while intake's clarifying question
+  for the second test DM was open (task `5d724ea3`, one active user task). With Kirill's
+  approval I cancelled that test task via `POST /tasks/{id}/cancel`. The reloader then
+  restarted `rmp-api` and `rmp-worker` at 12:44:16Z, health OK.
+- **Observation, not changed here:** `_pick_key` ranks keys by load only. It can pick a key
+  still inside its 5 s pacing interval while another key is free, and the attempt then
+  waits. The new wait log will show how often that happens (`… paced (…s left)`).

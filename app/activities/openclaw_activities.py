@@ -44,6 +44,8 @@ from app.telemetry import traced_activity
 TERMINAL_STOP_REASONS = frozenset({"stop", "error", "maxTokens"})
 # OpenClaw/Kimi use "toolUse"; older transcripts may say "toolCalls".
 NON_TERMINAL_STOP_REASONS = frozenset({"toolCalls", "toolUse"})
+# Left of an activity's start-to-close budget for parsing and persisting after the LLM turn.
+ACTIVITY_WRAP_UP_SEC = 5.0
 
 # Interim phrases Kimi sometimes emits before tool calls; not a finished RMP turn.
 _INTERIM_RMP_PHRASES = (
@@ -347,6 +349,21 @@ def _clean_slack_text(message: str) -> str:
     return clean
 
 
+def _activity_deadline(margin_sec: float) -> Optional[float]:
+    """Epoch seconds when this activity's start-to-close budget runs out, less ``margin_sec``."""
+    try:
+        info = activity.info()
+    except RuntimeError:
+        return None
+    if not info.start_to_close_timeout:
+        return None
+    return (
+        info.started_time.timestamp()
+        + info.start_to_close_timeout.total_seconds()
+        - margin_sec
+    )
+
+
 async def _dispatch_openclaw_session(
     internal_session_key: str,
     message: str,
@@ -357,8 +374,12 @@ async def _dispatch_openclaw_session(
     model: Optional[str] = None,
     tags: Optional[List[str]] = None,
     task_type: Optional[str] = None,
+    deadline: Optional[float] = None,
 ) -> str:
-    """Gate on LLM quota, dispatch to OpenClaw, poll JSONL; retry on rate limits."""
+    """Gate on LLM quota, dispatch to OpenClaw, poll JSONL; retry on rate limits.
+
+    ``deadline`` (epoch seconds) bounds the quota wait and the reply poll.
+    """
     settings = load_settings()
     quota_cfg = get_llm_quota_config()
     headers = {
@@ -404,6 +425,7 @@ async def _dispatch_openclaw_session(
             model=model,
             tags=tags,
             task_type=task_type,
+            deadline=deadline,
         )
         try:
             record_request(profile_id, "openclaw_hook")
@@ -481,6 +503,8 @@ async def _dispatch_openclaw_session(
             seen_session_ids: List[str] = []
             text_content = ""
             poll_deadline = time.time() + poll_timeout_sec
+            if deadline is not None:
+                poll_deadline = min(poll_deadline, deadline)
             saw_rate_limit = False
             last_jsonl_activity = time.time()
             stall_after_sec = 45
@@ -779,8 +803,9 @@ async def _execute_on_internal_session(task_id: str, message: str) -> str:
             message,
             poll_timeout_sec=180,
             require_terminal=False,
+            deadline=_activity_deadline(ACTIVITY_WRAP_UP_SEC),
         )
-    except OpenClawError as e:
+    except (OpenClawError, TimeoutError) as e:
         return f"Error: {str(e)}"
 
 
@@ -792,6 +817,7 @@ async def _execute_intake_llm(intake_id: str, prompt: str) -> str:
     models = get_intake_models()
     if not models:
         models = [None]
+    deadline = _activity_deadline(ACTIVITY_WRAP_UP_SEC)
     last = "Error: intake LLM failed"
     for idx, model in enumerate(models):
         # Distinct session keys avoid sticky session modelOverride and poisoned
@@ -806,6 +832,7 @@ async def _execute_intake_llm(intake_id: str, prompt: str) -> str:
                 poll_timeout_sec=budget["openclaw_poll_sec"],
                 require_terminal=False,
                 model=model,
+                deadline=deadline,
             )
         except OpenClawError as e:
             last = f"Error: {str(e)}"
