@@ -1,152 +1,129 @@
-# Jev pilot for Aura
+# Jev decisions for Aura
 
-Base: `09502006211d6ba6442fe8c5c051b5b0259dbd1c` (2026-09-27).
-The adapter pins the direct TypeSafe endpoint and `jev-1.13.0`.
-Both consumers default to **off**. No OpenClaw upgrade, database migration,
-new service, inbound port, or new production dependency is required.
+Model `jev-1.13.0` (pinned), endpoint `https://api.typesafe.ai/v1/systemone`.
+Two consumers, each `off` / `shadow` / `enforce` under `settings.json` → `jev`.
+Both default to `off`. Settings are read on every call, so a mode change applies
+without a restart. No OpenClaw upgrade, database migration, new service, inbound
+port or dependency is involved.
 
-## Behavior
+## What each consumer does
 
-| Consumer | Placement | Enforce behavior | Failure behavior |
-| --- | --- | --- | --- |
-| Evidence rerank | After hybrid evidence-pack assembly | Stable relevance ordering; retains every row, citation, liveness flag and RRF score | Original order |
-| Global promotion review | Between extraction and existing write gates | Requires support, durability and explicit user-level scope | Holds semantic/pinned promotion |
+**Intake (`intake_mode`).** Runs after the deterministic gates, in
+`classify_task_intake` on the worker and in the API fallback
+`classify_task_intake_deterministic`. One request with up to seven Choice
+questions (see `app/decisions/intake.py`). In `enforce`, an accepted answer
+becomes the same `llm_result` the intake LLM returns and goes through
+`apply_intake_policy` unchanged, so the OpenClaw `rmp_intake_*` turn and its LLM
+quota slot are skipped. Everything else keeps the existing path. Shadow runs and
+abstentions store the proposal in `task_intake_decisions.llm_raw.jev`.
 
-The reranker applies to the intake evidence pack, not all process-memory reads.
-It cannot assign tasks or workflows. The promotion guard covers semantic and
-pinned copies only. Existing procedural copies remain outside this pilot.
-Held candidates are not deleted, but there is no new retry queue. Existing
-source records and Temporal activity history support investigation within their
-retention windows.
+An answer is accepted only when:
 
-Shadow retains original behavior, including original promotion risks, while
-recording proposed decisions. Shadow sends evidence to TypeSafe and incurs
-charges. It is an observation mode, not a protection mode.
+- `relation` is not `unclear` and reaches `intake_min_confidence` (0.85), and so does `execution_mode`;
+- a running-task decision has relation, target and action at `intake_attach_min_confidence` (0.92);
+- a finished-work follow-up names a listed finished task;
+- every required label is the provider's top estimate.
 
-Promotion review checks entailment against supplied prose; it does not prove
-that an agent's claimed outcome occurred. Existing evidence requirements,
-the independent completion evaluator, and Slack delivery ownership still apply.
+`catalog_hint` is kept only for `structured_work` at 0.9 or above. `web_intent`
+is kept at 0.85 or above. Canary, system and heartbeat tags never call Jev.
 
-## Verification
+**Memory promotion (`promotion_mode`).** Runs after `validate_fact` and before
+semantic or pinned writes. Three Choices per fact (support, durability, user
+scope), each at 0.95 confidence and probability. `enforce` holds the rest.
+Procedural copies are unchanged.
 
-Use Aura's Python environment with the repository requirements, from its root:
+## Evaluation
 
-```bash
-python -m pytest -q tests/test_jev.py tests/test_hybrid_retriever.py tests/test_promotion.py tests/test_memory_policy.py tests/test_memory_writes.py tests/test_intake_bounded_context.py
-python -m ops.jev_eval
-```
-
-The second command validates ten synthetic labeled cases without a model call.
-Mock tests and synthetic labels do not establish Jev accuracy. Run the full
-pytest suite before merging. A test host using a SOCKS proxy may need optional
-`socksio` for existing embedding-client tests.
-
-## Remote VNC host rollout
-
-VNC is the administrative interface. Run the integration in Aura's API and
-Temporal worker processes on the remote machine, independent of the desktop
-session. It needs outbound HTTPS to `api.typesafe.ai:443` and TypeSafe credits;
-no GPU is required. A VNC terminal export does not change an already-running
-systemd service's environment.
-
-1. Record `git rev-parse HEAD` and `openclaw --version`. Back up settings and
-   the database with the existing Aura runbook. Apply on an isolated branch,
-   first checking `git apply --check /path/to/aura-jev-integration.patch`.
-2. Run tests with both modes off. This change needs no OpenClaw dist patch or
-   upgrade. Do not run `openclaw onboard`.
-3. Supply `TYPESAFE_API_KEY` through the existing protected environment source
-   for the Aura API and worker. Keep it out of JSON, command arguments and git.
-   Only this key is read; chat and embedding keys are not reused.
-4. Merge the `jev` block in `settings.example.json` into actual settings; start
-   with both modes `shadow`. Preserve all other settings.
-5. In an idle maintenance window, restart the actual API/worker units using the
-   existing runbook, then check readiness and canaries. Do not restart a busy
-   worker merely to enable this pilot.
-6. In the configured service environment, run the explicit paid evaluation:
+Structure checks, no model call:
 
 ```bash
-python -m ops.jev_eval --live --output data/jev-live-synthetic.json
+cd /root/.openclaw/rmp
+./venv/bin/python -m ops.jev_eval            # memory promotion fixtures
+./venv/bin/python -m ops.jev_eval --intake   # intake fixtures
 ```
 
-The default dataset is synthetic. The command performs no database, memory,
-workflow or Slack mutations. Reports include unavailable calls, served model,
-latency, input-token cost estimate, false promotions, false holds and NDCG@3
-against original input order. Costs of failed/unreported calls may be missing.
+Replay cases from past DMs (read-only on the database). The file holds Kirill's
+messages, lives under git-ignored `data/`, and must never be committed. Labels
+in `expect` are drafts to review.
 
-7. Label representative authorized Aura cases in the same JSONL format. Keep
-   a time-separated holdout untouched while tuning. Compare baseline, Jev,
-   and deterministic fixes alone. Include actual deployment languages and
-   adversarial text. The default CLI limit is 20 cases; raise `--max-cases`
-   explicitly for a reviewed batch.
-8. Enable consumers separately after measurement. Proposed trial criteria:
-   no false global promotions in at least 300 accepted holdout decisions;
-   report false holds and coverage as well. Zero errors in 300 independent,
-   representative accepted decisions gives approximately a 1% one-sided 95%
-   binomial upper error bound, not a guarantee. Require improved NDCG@3 without
-   worse task relations and measure full server-side p95 and total bills.
-   These criteria have not yet been demonstrated by this implementation.
+```bash
+./venv/bin/python -m ops.jev_replay_export   # writes data/jev_intake_replay.jsonl
+```
 
-## Limits and data handling
+Paid live run, no database or Slack writes:
 
-| Control | Default / fixed bound |
-| --- | --- |
-| Deadline, including queue and full body read | 1 second; configurable 0.05–5 seconds |
-| Concurrent requests per process | 2 |
-| Requests per rolling minute per process | 60; configurable 1–120 |
-| Complete request / response | 24,000 / 65,536 bytes |
-| Questions | 32 maximum; promotion uses three per candidate |
-| Shortlists | 12 ranking candidates / 8 promotion candidates |
-| Successful response cache | 128 entries, 30-second TTL, RAM only |
-| Circuit | 30 seconds after three consecutive transport/contract errors |
-| HTTP 429 / 529 | At least 30 seconds; honors a longer Retry-After |
-| Ranking gate | All answers confident at 0.80; any unknown preserves baseline |
-| Promotion gate | Each required Choice confidence AND selected probability >=0.95 |
+```bash
+TYPESAFE_API_KEY="$(sed -n 's/^TYPESAFE_API_KEY=//p' /etc/openclaw/openclaw.env)" \
+  ./venv/bin/python -m ops.jev_eval --intake --live \
+  --dataset tests/fixtures/jev_intake_eval.jsonl --dataset data/jev_intake_replay.jsonl \
+  --output data/jev-intake-live.json
+```
 
-Thresholds are provisional. Limits and caches are per process, so a multiworker
-deployment multiplies aggregate allowances. Oversized inputs are rejected,
-not truncated. No hot-path retries occur. Cancellation propagates without a
-replacement model call. These consumers add model calls; the reranker retains
-all evidence rows and does not reduce prompt-token volume.
+Intake may move to `enforce` only when the report's `gate.passed` is true:
 
-Only shortlisted query/snippet/outcome text or episode/candidate text is sent.
-The component collects no screenshots, ambient conversation, filesystem files
-or whole memory database. IDs and credentials are not evidence. Existing Aura
-secret patterns redact recognized secrets; they are not comprehensive PII
-filtering or a prompt-injection defense. Evidence must be suitable for the
-provider. Jev judgments never grant effect permission.
+- zero harmful errors (an accepted attach, wait or rebuild on the wrong task, or a wrong catalog template);
+- accuracy on accepted decisions of at least 0.9;
+- coverage of at least 0.5;
+- p95 latency below 1500 ms.
 
-Logs contain request hashes, model/rubric IDs, status, timing, order indices
-and typed promotion judgments. Raw prompts, response bodies, credentials and
-unknown response fields are excluded. Cache identity includes scope, request,
-rubric and credential. Cached usage describes the original request: exclude
-`cache_hit=true` from new billable-token totals. The evaluation CLI disables
-this cache.
+Promotion stays in `shadow` until its own evaluation shows zero false global
+promotions.
 
-The client ignores HTTP proxy environment variables and refuses redirects.
-If the server requires a proxy, an explicitly approved transport needs testing
-before activation. Gateways and local models are not enabled in this pilot;
-provider changes require contract tests and fresh threshold calibration.
+## Rollout on this host
 
-## Rollback and remaining work
+VNC is only the admin desktop. The consumers run inside the `rmp-api` and
+`rmp-worker` systemd units.
 
-Set both modes to `off`; settings are checked on each call. Alternatively set
-`AURA_JEV_MODE=off` in the service environment and safely restart. Off restores
-old behavior, without undoing existing memories or automatically promoting held
-candidates. Invalid Jev configuration also disables the consumers with a bounded
-warning. This restores the old promotion policy rather than adding protection.
+1. Record `git rev-parse HEAD` and `openclaw --version`.
+2. Add `TYPESAFE_API_KEY=...` to `/etc/openclaw/openclaw.env`. Both units load
+   that file; keep the key out of JSON, git and command arguments.
+3. Run the live evaluation above.
+4. Set `jev.intake_mode` and `jev.promotion_mode` to `shadow` in `settings.json`.
+5. Restart only when no user task is active (`count_active_user_tasks_sync() == 0`):
+   `systemctl restart rmp-api rmp-worker`, then `make production-check` and `make canary`.
+6. Compare shadow proposals with the decisions that ran:
 
-A separate lifecycle audit is needed: the original PostgreSQL memory read query
-does not filter `valid_to`, and graph/vector deletion semantics need checking
-together. This pilot does not make a partial lifecycle fix. Jev cannot repair
-embedding outages or reliably order dates. The README's old NVIDIA outage note
-also differs from the current OpenAI embedding defaults; inspect live readiness.
+```bash
+sudo -u postgres psql -d rmp_db -c "select created_at, decision,
+  llm_raw::jsonb->'jev'->'proposal'->>'decision' as jev_decision,
+  llm_raw::jsonb->'jev'->>'accepted' as accepted, llm_raw::jsonb->'jev'->>'latency_ms' as ms
+  from task_intake_decisions where llm_raw::jsonb ? 'jev' order by created_at desc limit 20;"
+```
 
-Future candidates: a typed intake cascade retaining the original LLM fallback;
-source-receipt support checks before completion review; web-backend selection
-from textual DOM/tool results. Keep network I/O in activities or API operations,
-never Temporal workflow code. Jev 1.13 is text-only, so VNC screenshots still
-need the existing vision path or separately tested text extraction.
+7. When the gate passes, set `jev.intake_mode` to `enforce`. Send one test DM and
+   check that its row has `llm_raw.decision_source = jev`.
+
+Rollback: set the mode to `off` (takes effect on the next call), or set
+`AURA_JEV_MODE=off` in the service environment and restart when idle.
+
+## Limits
+
+- Deadline, including queueing and the full body read: 3 s (configurable 0.05–5 s).
+- Per process: 2 concurrent requests and 60 requests per minute.
+- Request / response size: 24,000 / 65,536 bytes; oversized input is rejected, never truncated.
+- Questions: at most 32; intake uses up to 7; promotion uses 3 per fact for up to 8 facts.
+- Cache: 128 successful results for 30 s, in RAM only.
+- Circuit: 30 s after three consecutive transport or contract errors; 429/529 wait at least 30 s and honor `Retry-After`.
+- No hot-path retries; cancellation propagates without a fallback call.
+
+## Data handling
+
+Intake sends the DM text, the last four same-session turns, up to four running
+task goals, five finished-task summaries and three memory snippets. Aliases
+(`R1`, `F1`) replace task ids. Promotion sends the episode and candidate facts.
+Recognized secret patterns are redacted; this is not full PII filtering.
+TypeSafe states it does not train on requests; zero data retention is an
+enterprise option. Logs keep request hashes, rubric ids, status, latency and
+typed answers, never raw text or credentials.
+
+## Known gaps
+
+- User tasks since September have no `task_registry_entries` rows, so
+  finished-work evidence for recent follow-ups is missing for the LLM analyst and
+  for Jev alike.
+- DMs where Jev abstains still take the slot-gated OpenClaw intake turn.
+- The original PostgreSQL memory read path does not filter `valid_to`.
 
 References: [API](https://docs.typesafe.ai/api),
 [limitations](https://docs.typesafe.ai/model-jaggedness/jev-1.13),
-[OpenClaw role](https://docs.openclaw.ai/concepts/decision-models).
+[confidence](https://docs.typesafe.ai/confidence).

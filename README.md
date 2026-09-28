@@ -173,9 +173,10 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). Issues and PRs welcome for docs, tests
 
 [MIT](LICENSE) © Hyper-AI-Lab
 
-## Optional Jev pilot
+## Jev decisions
 
-A disabled-by-default TypeSafe Jev integration reviews semantic/pinned memory
-promotion and can reorder the intake evidence shortlist. Existing deterministic
-policy remains authoritative. See [the Jev runbook](docs/runbooks/jev.md) for
-modes, limits, evaluation, remote-host rollout and rollback.
+TypeSafe Jev can answer the intake analyst's typed questions (new work, follow-up,
+running task, catalog) in one HTTPS request without an OpenClaw session, with the
+LLM analyst handling the uncertain cases, and can review memory promotion. Both
+start `off`; deterministic policy stays authoritative. See
+[the Jev runbook](docs/runbooks/jev.md).

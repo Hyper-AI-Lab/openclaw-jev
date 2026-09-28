@@ -247,7 +247,7 @@ Before `POST /tasks` starts Aura execution, intake runs when `task_registry.enab
 
 1. **Layer 1 — Fast path** — idempotency; duplicate same-session intent → `attach_active`; active recurrence → `wait_active`; health-canary LLM bypass; deterministic `skip_valid` / `skip_noop` / `supersede` for recurrent jobs (still logged + ack)
 2. **Layer 2 — Hybrid evidence pack** — FTS + dense + memory + active metadata (RRF). Vector similarity is **advisory**; it must not auto-attach or auto-create.
-3. **Layer 3 — Intake Analyst LLM** — `classify_task_intake` on `rmp_intake_*`
+3. **Layer 3 — Intake Analyst** — first one typed Jev request (`app/decisions/intake.py`, `jev.intake_mode`), used only above its thresholds; otherwise the LLM turn `classify_task_intake` on `rmp_intake_*`. The API fallback also asks Jev before `create_fresh` at confidence 0.
 4. **Policy engine** (`intake_decision_engine.py`) — validates catalog ids, low-confidence clarify, modes: `off` | `shadow` | `enforce`
 
 **Plugin:** all Slack DMs route through `POST /tasks`; stop commands still signal directly.
@@ -833,9 +833,17 @@ Do not commit secrets to git.
 
 *For day-to-day status, run `make production-check` and inspect the dashboard at `http://127.0.0.1:8000/` (localhost only).*
 
-## Optional Jev pilot
+## Jev decisions
 
-A disabled-by-default TypeSafe Jev integration reviews semantic/pinned memory
-promotion and can reorder the intake evidence shortlist. Existing deterministic
-policy remains authoritative. See [the Jev runbook](docs/runbooks/jev.md) for
-modes, limits, evaluation, remote-host rollout and rollback.
+TypeSafe Jev (`jev-1.13.0`) answers typed questions in two places, each with its
+own `off` / `shadow` / `enforce` mode under `settings.json` `jev`:
+
+- **Intake** — one request per DM (relation, target task, action, execution mode,
+  catalog, web intent). An answer above its thresholds becomes the same result the
+  intake LLM returns, so `apply_intake_policy` still decides; anything else goes to
+  the LLM turn. Shadow stores the proposal in `task_intake_decisions.llm_raw.jev`.
+- **Memory promotion** — support, durability and user-scope checks before a fact
+  becomes semantic or pinned user memory.
+
+Jev calls use no OpenClaw session and no LLM quota slot. See
+[the Jev runbook](docs/runbooks/jev.md) for evaluation, rollout and rollback.

@@ -1,7 +1,7 @@
 # Aura / RMP concept tree (source of truth)
 
 **Status:** Binding constitution for this host.  
-**Last updated:** 2026-09-05  
+**Last updated:** 2026-09-28  
 **How to use:** This document is *why* and *what must remain true*. [`ARCHITECTURE.md`](../ARCHITECTURE.md) is *how it is built*. Cursor rules are *must not violate while coding*. Aura-facing [`TOOLS.md`](/root/.openclaw/workspace/TOOLS.md) is executor notes, not this constitution.
 
 If a later chat, plan, or nested rule disagrees with this file, this file wins after applying the conflict law in §2.
@@ -114,7 +114,7 @@ RMP chat.postMessage (idempotent)
 - Attempts: 1–9 rework; ~10 strategy change; 11–19 continue; ~20 stop and Slack a diagnosis.
 - Process-scoped memory is injected on execute. Across `create_fresh`, prior same-conversation Slack turns are injected (RECENT DIALOGUE). “This is new” labels a **new task row**, not a new person.
 - User-local clock is a **fact** (`USER LOCAL TIME` / Japan Standard Time). Server Europe/Berlin is not Kirill’s clock.
-- Primary model: `openai/gpt-5-nano`. Fallbacks: MiniMax M3 → DeepSeek V4 Flash. Intake uses the same chain.
+- Primary model: `openai/gpt-5-nano`. Fallbacks: MiniMax M3 → DeepSeek V4 Flash. Intake: when `jev.intake_mode` is `enforce`, the pinned decision model `jev-1.13.0` answers typed intake questions first and counts only above program thresholds; otherwise the same chain decides. `apply_intake_policy` stays the authority either way.
 - LLM idle ~5s then rotate keys/models. HTTP 410 is skip (next model), not an idle retry.
 - OpenAI key only in `/etc/openclaw/openclaw.env` → SQLite `openai:default`. Never `openclaw.json` interpolations, git, or Slack. Never pin `nvidia:keyN` on an `openai/*` session.
 - After `npm install -g openclaw`, run `ops/upgrade_openclaw.sh`. Never `openclaw onboard`, never `doctor --force`, never hand-edit dist.
@@ -150,7 +150,7 @@ RMP chat.postMessage (idempotent)
 1. OpenClaw Slack provider receives the DM (`agent:main:slack:channel:…`).
 2. `rmp_adapter` claims (`inbound_claim` / `before_dispatch` / `message_received`) and `POST /tasks` with **full text**. `{ handled: true }` even on error (no native reply).
 3. `before_message_write` blocks native persistence/assistant turns while RMP owns delivery.
-4. Intake: fast path (idempotency, duplicates, recurrence, canary bypass) → hybrid evidence pack → Intake Analyst LLM → policy (`enforce` in production).
+4. Intake: fast path (idempotency, duplicates, recurrence, canary bypass) → hybrid evidence pack → Intake Analyst (Jev typed decision above thresholds, else LLM) → policy (`enforce` in production).
 5. Outcomes: clarify (RMP question, no Aura yet); attach/wait/rebuild on **user** actives; create_guided / create_fresh; skip with ack.
 6. If work proceeds: Generic or Catalog Temporal workflow. Conversational → usually one deliver step (still RMP).
 7. Aura in `rmp_task_*`. Program-owned plan and code predicates advance steps.
@@ -209,6 +209,7 @@ Isolated session `heartbeat`. Plugin does **not** create RMP tasks for internal 
 | OpenAI auth | Env `OPENAI_API_KEY` → SQLite `openai:default`. Never pin NVIDIA profiles on OpenAI sessions. |
 | NVIDIA auth | `nvidia:default` → `key2` → `key3`, balanced. |
 | OmniRoute | Not in the live Slack path. |
+| Decision model | `jev-1.13.0` (TypeSafe), pinned. Typed intake and memory-promotion decisions only; never writes text. `TYPESAFE_API_KEY` in `/etc/openclaw/openclaw.env`. Modes in `settings.json` `jev`; `AURA_JEV_MODE=off` disables both. |
 
 ---
 
@@ -224,6 +225,7 @@ Isolated session `heartbeat`. Plugin does **not** create RMP tasks for internal 
 8. Raising idle to hide a stuck model.
 9. MiniMax- or Kimi- or GLM-as-primary in a second rule file.
 10. Declaring production-complete while leaving placeholders, dual MiniMax/gpt-5-nano rules, or `/health` claiming a 410 embedder is ready.
+11. The decision model (Jev) as a chat model, an answer-quality judge in place of the Process Evaluator, or a chat-model router.
 
 ---
 
@@ -245,6 +247,7 @@ Isolated session `heartbeat`. Plugin does **not** create RMP tasks for internal 
 | `auth-profiles.json` is the store | SQLite `authProfiles.store` | OpenClaw 2026.9. |
 | `nv-embed-v1` is the working embedder | Honest health: working replacement or not-ready | NVIDIA NIM deprecated (HTTP 410). |
 | Aura owns Slack because she is independent | Independence ≠ owning delivery | Feb constitution vs RMP era: Aura executes; RMP judges and delivers. |
+| Intake decides only through the LLM chain | Jev typed decision first; LLM chain below thresholds | Sep 28 2026: 11 of 14 DMs in 30 days fell to the zero-confidence fallback. |
 
 ---
 

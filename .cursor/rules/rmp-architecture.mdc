@@ -9,6 +9,6 @@ Read `/root/.openclaw/rmp/docs/CONCEPT_TREE.md` before adding routing, prompt ba
 
 1. Every user Slack DM: plugin claim → `POST /tasks` → intake → Temporal → evaluator → RMP `chat.postMessage`. No native OpenClaw Slack. Fail closed (claim + suppress). No intake-failure gateway reply.
 2. OpenClaw is the execution engine only (`rmp_task_*`, `rmp_verify_*`, `rmp_intake_*`). `conversational` is a short **RMP** plan, still gated — not a native reply.
-3. Primary model `openai/gpt-5-nano`; MiniMax then DeepSeek; no GLM. Idle ~5s then rotate. HTTP 410 is skip. Never pin `nvidia:keyN` on `openai/*`. Secrets only in `/etc/openclaw/openclaw.env`.
+3. Primary model `openai/gpt-5-nano`; MiniMax then DeepSeek; no GLM. Idle ~5s then rotate. HTTP 410 is skip. Never pin `nvidia:keyN` on `openai/*`. Secrets only in `/etc/openclaw/openclaw.env`. Decision model `jev-1.13.0` answers typed intake and memory-promotion questions only (never chat, judging or routing); below its thresholds the LLM chain decides.
 4. Do not add static narrow-case rules (greeting-word locks, crawler bans, keyword catalog assignment). Intake LLM + program-owned workflows decide the situation.
 5. Dist only via `patch_openclaw.sh` / `ops/upgrade_openclaw.sh`. Nested copy of this file under `rmp/.cursor/rules` must stay identical.
