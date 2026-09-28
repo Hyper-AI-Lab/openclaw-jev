@@ -128,20 +128,24 @@ async def promote_completion_memory(
     candidates = extract_semantic_facts(episodic_content, process_type)
     stats["extracted"] = len(candidates)
 
+    valid = []
+    for fact in candidates:
+        ok, reason = validate_fact(fact)
+        if not ok:
+            stats["rejected"] += 1
+            continue
+        valid.append(fact)
+
     from app.decisions.memory import review_promotions
 
     review = await review_promotions(
-        episodic_content, candidates,
+        episodic_content, valid,
         scope_key=f"{user_scope_id}:{process_run_id}:{task_id}",
     )
     if review["mode"] != "off":
         stats["jev_review"] = review
         stats["jev_held"] = 0
-    for candidate_index, fact in enumerate(candidates):
-        ok, reason = validate_fact(fact)
-        if not ok:
-            stats["rejected"] += 1
-            continue
+    for candidate_index, fact in enumerate(valid):
         if candidate_index not in review["allowed_indices"]:
             stats["jev_held"] += 1
             continue
