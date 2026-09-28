@@ -258,6 +258,13 @@ async def hybrid_search_bounded(
         except Exception as exc:
             logger.warning("Evidence pack fusion skipped: %s", exc)
             pack = {}
+    if pack.get("ranked"):
+        from app.decisions.memory import rerank_evidence
+
+        # Its own deadline: a failed Jev call must not erase a good evidence pack.
+        pack["ranked"] = await rerank_evidence(
+            intent, pack["ranked"], scope_key=session_key or "default"
+        )
     return {
         "active_tasks": active,
         "recent_registry": recent,

@@ -1,4 +1,14 @@
 {
+  "jev": {
+    "rerank_mode": "off",
+    "promotion_mode": "off",
+    "timeout_sec": 1.0,
+    "cache_ttl_sec": 30.0,
+    "requests_per_minute": 60,
+    "rerank_min_confidence": 0.8,
+    "promotion_min_confidence": 0.95,
+    "promotion_min_probability": 0.95
+  },
   "development_mode": false,
   "intermediate_updates": true,
   "suspend_slack_notifications": false,

@@ -832,3 +832,10 @@ Do not commit secrets to git.
 ---
 
 *For day-to-day status, run `make production-check` and inspect the dashboard at `http://127.0.0.1:8000/` (localhost only).*
+
+## Optional Jev pilot
+
+A disabled-by-default TypeSafe Jev integration reviews semantic/pinned memory
+promotion and can reorder the intake evidence shortlist. Existing deterministic
+policy remains authoritative. See [the Jev runbook](docs/runbooks/jev.md) for
+modes, limits, evaluation, remote-host rollout and rollback.

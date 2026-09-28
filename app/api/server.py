@@ -108,6 +108,9 @@ async def lifespan(app: FastAPI):
         _cron_stop.set()
     if _cron_task:
         await _cron_task
+    from app.decisions.jev import close_jev_client
+
+    await close_jev_client()
 
 
 app = FastAPI(lifespan=lifespan)

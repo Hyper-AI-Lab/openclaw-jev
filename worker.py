@@ -94,7 +94,12 @@ async def main():
             classify_task_intake_activity,
         ],
     )
-    await worker.run()
+    try:
+        await worker.run()
+    finally:
+        from app.decisions.jev import close_jev_client
+
+        await close_jev_client()
 
 
 if __name__ == "__main__":

@@ -172,3 +172,10 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md). Issues and PRs welcome for docs, tests
 ## License
 
 [MIT](LICENSE) © Hyper-AI-Lab
+
+## Optional Jev pilot
+
+A disabled-by-default TypeSafe Jev integration reviews semantic/pinned memory
+promotion and can reorder the intake evidence shortlist. Existing deterministic
+policy remains authoritative. See [the Jev runbook](docs/runbooks/jev.md) for
+modes, limits, evaluation, remote-host rollout and rollback.
