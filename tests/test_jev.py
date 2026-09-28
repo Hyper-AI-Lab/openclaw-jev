@@ -17,7 +17,7 @@ def response(questions=QUESTIONS, choices=None):
     answers = {}
     for key, q in questions.items():
         labels = list(q["criteria"])
-        default = {"support": "supported", "durability": "durable", "scope": "user", "relevance": "direct"}.get(key.split("_")[0], labels[0])
+        default = {"support": "supported", "durability": "durable", "scope": "user"}.get(key.split("_")[0], labels[0])
         selected = (choices or {}).get(key, default)
         answers[key] = {"type": "choice", "choice": selected, "confidence": .99,
             "probabilities": {label: .99 if label == selected else .01 / (len(labels)-1) for label in labels}}
@@ -46,7 +46,6 @@ async def evaluate(client, state=None, **kw):
     (("answers","q","choice"), "other"), (("answers","q","type"), "score"),
     (("answers","q","confidence"), float('nan')), (("answers","q","confidence"), True),
     (("answers","q","confidence"), 1.01), (("answers","q","probabilities"), {"yes":.8,"no":.1}),
-    (("answers","q","probabilities"), {"yes":.1,"no":.9}),
     (("answers","q","probabilities"), {"yes":True,"no":0}),
 ])
 def test_contract_rejects_drift(path,value):
@@ -68,6 +67,26 @@ def test_contract_discards_echoed_fields_and_accepts_rounding():
     with pytest.raises(ValueError): validate_response(body,QUESTIONS)
 
 
+def test_many_option_rounding_is_accepted():
+    labels=[f'o{i}' for i in range(10)]
+    qs={'q':{'type':'choice','criteria':{label:None for label in labels}}}
+    probabilities={label:(.59 if label=='o0' else .05) for label in labels}
+    body={'model':MODEL,'usage':{'input_tokens':10,'output_tokens':0},'answers':{
+        'q':{'type':'choice','choice':'o0','probabilities':probabilities,'confidence':.5}}}
+    assert abs(sum(probabilities.values())-1)>0.021
+    assert validate_response(body,qs)['answers']['q']['choice_is_max']
+
+
+async def test_reported_choice_below_maximum_is_flagged_not_failed(clients):
+    body=response()
+    body['answers']['q']['probabilities']={'yes':.1,'no':.9}
+    c=clients(lambda req:httpx.Response(200,json=body))
+    ev=await evaluate(c)
+    assert ev.status=='ok' and ev.result['answers']['q']['choice_is_max'] is False
+    assert c.failures==0 and c.blocked_until==0
+    await c.aclose()
+
+
 def test_score_and_noul_contract():
     qs={'s':{'type':'score','criteria':['bad','good']},'b':{'type':'noul'}}
     body={'model':MODEL,'usage':{'input_tokens':10,'output_tokens':0},'answers':{
@@ -79,7 +98,8 @@ def test_score_and_noul_contract():
 
 
 @pytest.mark.parametrize('field,value', [('timeout_sec',0),('timeout_sec',float('nan')),('cache_ttl_sec',301),
-    ('requests_per_minute',True),('requests_per_minute',1.5),('promotion_mode','yes'),('rerank_min_confidence',-1)])
+    ('requests_per_minute',True),('requests_per_minute',1.5),('promotion_mode','yes'),('intake_mode','on'),
+    ('intake_min_confidence',-1),('intake_attach_min_confidence',1.5)])
 def test_policy_bounds(field,value):
     with pytest.raises(ValueError): Policy(**{field:value})
 
@@ -88,7 +108,7 @@ def test_config_off_override(monkeypatch):
     import app.config
     monkeypatch.setattr(app.config,'load_settings',lambda:{'jev':{'promotion_mode':'enforce'}})
     monkeypatch.setenv('AURA_JEV_MODE','off')
-    assert jev.get_policy().promotion_mode=='off'
+    assert jev.get_policy().promotion_mode=='off' and jev.get_policy().intake_mode=='off'
     monkeypatch.setenv('AURA_JEV_MODE','invalid')
     assert jev.get_policy()==Policy()
 
@@ -178,41 +198,6 @@ async def test_rate_and_cache_limits(clients):
 
 
 @pytest.mark.parametrize('mode',['off','shadow','enforce'])
-async def test_rerank_modes_preserve_all_metadata(clients,monkeypatch,mode):
-    rows=[{'snippet':'a','task_id':'1','score':.9},{'snippet':'b','task_id':'2','score':.4}]
-    calls=[]
-    def handler(req):
-        payload=json.loads(req.content)
-        assert 'task_id' not in json.dumps(payload)
-        calls.append(req)
-        return httpx.Response(200,json=response(payload['questions'],{'relevance_0':'related','relevance_1':'direct'}))
-    c=clients(handler)
-    monkeypatch.setattr(memory,'get_client',lambda:c)
-    monkeypatch.setattr(memory,'get_policy',lambda:Policy(rerank_mode=mode))
-    result=await memory.rerank_evidence('query',rows,scope_key='private-session')
-    assert result==([rows[1],rows[0]] if mode=='enforce' else rows)
-    assert len(calls)==(0 if mode=='off' else 1)
-    assert all(any(r is original for original in rows) for r in result)
-    await c.aclose()
-
-
-@pytest.mark.parametrize('reason',['unknown','low_confidence','outage'])
-async def test_rank_uncertainty_preserves_baseline(clients,monkeypatch,reason):
-    rows=[{'snippet':'a'},{'snippet':'b'}]
-    def handler(req):
-        if reason=='outage': return httpx.Response(529)
-        body=response(json.loads(req.content)['questions'])
-        if reason=='unknown': body=response(json.loads(req.content)['questions'],{'relevance_0':'unknown'})
-        else: body['answers']['relevance_0']['confidence']=.2
-        return httpx.Response(200,json=body)
-    c=clients(handler)
-    monkeypatch.setattr(memory,'get_client',lambda:c)
-    monkeypatch.setattr(memory,'get_policy',lambda:Policy(rerank_mode='enforce'))
-    assert await memory.rerank_evidence('q',rows) is rows
-    await c.aclose()
-
-
-@pytest.mark.parametrize('mode',['off','shadow','enforce'])
 async def test_promotion_modes(clients,monkeypatch,mode):
     calls=[]
     def handler(req):
@@ -228,7 +213,7 @@ async def test_promotion_modes(clients,monkeypatch,mode):
     await c.aclose()
 
 
-@pytest.mark.parametrize('fault',['outage','unknown','low_probability','model_drift'])
+@pytest.mark.parametrize('fault',['outage','unknown','low_probability','model_drift','not_maximum'])
 async def test_promotion_holds_uncertain_facts(clients,monkeypatch,fault):
     def handler(req):
         if fault=='outage': return httpx.Response(529)
@@ -236,6 +221,7 @@ async def test_promotion_holds_uncertain_facts(clients,monkeypatch,fault):
         body=response(q,{'scope_0':'unknown'} if fault=='unknown' else None)
         if fault=='low_probability': body['answers']['support_0']['probabilities']={'supported':.8,'unsupported':.1,'unknown':.1}
         if fault=='model_drift': body['model']='jev-latest'
+        if fault=='not_maximum': body['answers']['scope_0']['probabilities']={'user':.3,'local':.6,'unknown':.1}
         return httpx.Response(200,json=body)
     c=clients(handler)
     monkeypatch.setattr(memory,'get_client',lambda:c)
@@ -264,10 +250,9 @@ async def test_eval_metrics_include_false_holds(monkeypatch):
     monkeypatch.setattr(jev_eval,'get_client',lambda:fake)
     monkeypatch.setattr(jev_eval,'close_jev_client',AsyncMock())
     metrics=await jev_eval.run(cases,Policy(cache_ttl_sec=0))
-    assert metrics['unavailable']==10
+    assert metrics['unavailable']==7
     assert metrics['promotion']['false_holds']==2
     assert metrics['promotion']['precision_on_accepted'] is None
-    assert metrics['rerank']['baseline_ndcg3']==metrics['rerank']['jev_ndcg3']
 
 
 async def test_concurrency_queue_is_inside_total_deadline(clients):
@@ -315,13 +300,11 @@ async def test_cache_rubric_and_disable(clients):
 
 
 async def test_empty_and_oversized_consumers_do_not_call(monkeypatch):
-    monkeypatch.setattr(memory,'get_policy',lambda:Policy(promotion_mode='enforce',rerank_mode='enforce'))
+    monkeypatch.setattr(memory,'get_policy',lambda:Policy(promotion_mode='enforce'))
     monkeypatch.setattr(memory,'get_client',lambda:pytest.fail('unexpected provider call'))
     assert (await memory.review_promotions('episode',[],scope_key='p'))['allowed_indices']==[]
     report=await memory.review_promotions('episode',[{'content':'x'}]*9,scope_key='p')
     assert report['allowed_indices']==[] and report['reason']=='candidate_limit'
-    rows=[{'snippet':'x'}]*13
-    assert await memory.rerank_evidence('query',rows) is rows
 
 
 async def test_pooled_client_cleanup():

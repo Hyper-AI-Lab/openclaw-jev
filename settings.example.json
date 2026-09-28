@@ -1,11 +1,12 @@
 {
   "jev": {
-    "rerank_mode": "off",
+    "intake_mode": "off",
     "promotion_mode": "off",
-    "timeout_sec": 1.0,
+    "timeout_sec": 3.0,
     "cache_ttl_sec": 30.0,
     "requests_per_minute": 60,
-    "rerank_min_confidence": 0.8,
+    "intake_min_confidence": 0.85,
+    "intake_attach_min_confidence": 0.92,
     "promotion_min_confidence": 0.95,
     "promotion_min_probability": 0.95
   },
