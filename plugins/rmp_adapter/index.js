@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
 
 const LOG = '/tmp/rmp_plugin_debug.log';
 const RMP_API = 'http://127.0.0.1:8000';
@@ -35,27 +34,25 @@ function rmpHeaders() {
   return headers;
 }
 
-function sleepSync(ms) {
-  const sec = Math.max(1, Math.ceil(Number(ms) / 1000));
-  try {
-    execFileSync('/bin/sleep', [String(sec)], { stdio: 'ignore' });
-  } catch (_) {}
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isLikelyTimeoutError(err) {
+  // AbortSignal.timeout rejects fetch with a DOMException named TimeoutError.
+  if (err && err.name === 'TimeoutError') return true;
   const msg = String(err && err.message ? err.message : err || '');
-  // curl exit 28 → "Command failed: ... --max-time ..."
-  return /max-time|timed?\s*out|ETIMEDOUT|timeout/i.test(msg) || /Command failed:[\s\S]*--max-time/i.test(msg);
+  return /timed?\s*out|ETIMEDOUT|timeout/i.test(msg);
 }
 
 /** RMP chat.postMessage without Aura. Fail closed if this also fails. */
-function notifyRmpUser(sessionKey, reason, content) {
+async function notifyRmpUser(sessionKey, reason, content) {
   try {
     const idem = crypto.createHash('sha256')
       .update(`${sessionKey}:${reason}:${content || ''}`)
       .digest('hex')
       .slice(0, 32);
-    const data = rmpFetchSync('POST', '/api/notify-user', {
+    const data = await rmpFetch('POST', '/api/notify-user', {
       session_key: sessionKey,
       reason,
       idempotency_key: idem,
@@ -85,39 +82,29 @@ function intakePostTimeoutSec() {
   }
 }
 
-/** Synchronous RMP HTTP — before_message_write must not return a Promise. */
-function rmpFetchSync(method, urlPath, body, opts) {
-  const key = getApiKey();
-  const maxTime = String(
-    (opts && opts.maxTimeSec)
-      || (method === 'POST' && urlPath === '/tasks' ? intakePostTimeoutSec() : 15)
-  );
-  const args = [
-    '-sS',
-    '-X', method,
-    '-H', 'Content-Type: application/json',
-    '-H', `X-RMP-API-Key: ${key}`,
-    '--max-time', maxTime,
-    '-w', '\n%{http_code}',
-  ];
+/**
+ * RMP HTTP. Never block the event loop: the same gateway serves the intake
+ * LLM leg (POST /hooks/agent) while POST /tasks is still waiting on it.
+ */
+async function rmpFetch(method, urlPath, body, opts) {
+  const maxTimeSec = (opts && opts.maxTimeSec)
+    || (method === 'POST' && urlPath === '/tasks' ? intakePostTimeoutSec() : 15);
+  const init = {
+    method,
+    headers: rmpHeaders(),
+    signal: AbortSignal.timeout(maxTimeSec * 1000),
+  };
   if (body !== undefined) {
-    args.push('-d', JSON.stringify(body));
+    init.body = JSON.stringify(body);
   }
-  args.push(`${RMP_API}${urlPath}`);
-  const raw = execFileSync('/usr/bin/curl', args, { encoding: 'utf8', maxBuffer: 1024 * 1024 });
-  const nl = raw.lastIndexOf('\n');
-  const httpCode = raw.slice(nl + 1).trim();
-  const text = raw.slice(0, nl);
+  const res = await fetch(`${RMP_API}${urlPath}`, init);
+  const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
-  if (httpCode.startsWith('4') || httpCode.startsWith('5')) {
-    throw new Error(data.detail || data.raw || `HTTP ${httpCode}`);
+  if (res.status >= 400) {
+    throw new Error(data.detail || data.raw || `HTTP ${res.status}`);
   }
   return data;
-}
-
-async function rmpFetch(method, urlPath, body) {
-  return rmpFetchSync(method, urlPath, body);
 }
 
 function extractText(msg) {
@@ -160,18 +147,18 @@ function findSlackSessionKeyFromStore() {
   } catch (_) {}
   if (!found) {
     try {
-      const py = [
-        'import sqlite3,sys',
-        'con=sqlite3.connect(sys.argv[1])',
-        "rows=con.execute(\"select session_key from session_nodes where session_key like '%slack:channel:%'\").fetchall()",
-        'keys=[r[0] for r in rows]',
-        'keys.sort(key=lambda k: (0 if "slack:channel:d" in k.lower() else 1, k.lower()))',
-        'print(keys[0] if keys else "")',
-      ].join('\n');
-      found = String(execFileSync('python3', ['-c', py, AGENT_SQLITE], {
-        encoding: 'utf8',
-        timeout: 4000,
-      })).trim();
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(AGENT_SQLITE, { readOnly: true });
+      try {
+        const keys = db.prepare("select session_key from session_nodes where session_key like '%slack:channel:%'")
+          .all()
+          .map((row) => String(row.session_key));
+        const sortKey = (k) => `${k.toLowerCase().includes('slack:channel:d') ? 0 : 1}${k.toLowerCase()}`;
+        keys.sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : 0));
+        found = keys[0] || '';
+      } finally {
+        db.close();
+      }
     } catch (_) {
       found = '';
     }
@@ -280,9 +267,9 @@ function inboundIdempotencyKey(sessionKey, rawText, intent, heartbeatKey) {
   return crypto.createHash('sha256').update(`${sessionKey}:${rawText || intent}`).digest('hex');
 }
 
-function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeatKey }) {
+async function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeatKey }) {
   const idemKey = inboundIdempotencyKey(sessionKey, rawText, intent, heartbeatKey);
-  const data = rmpFetchSync('POST', '/tasks', {
+  const data = await rmpFetch('POST', '/tasks', {
     intent: (rawText || intent || "").slice(0, 20000),
     tags: tags || ['user-request'],
     user_id: 'slack_user',
@@ -316,12 +303,12 @@ function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeat
     return data;
   }
   if (data.task_id) {
-    prefetchProcessMemory(data.task_id, data.process_run_id);
+    await prefetchProcessMemory(data.task_id, data.process_run_id);
   }
   const terminal = new Set(['failed', 'completed', 'stopped_by_user', 'cancelled']);
   if (data.deduplicated && terminal.has(data.status)) {
     log(`Prior task ${data.task_id} is ${data.status}; retrying`);
-    const retried = rmpFetchSync('POST', `/tasks/${data.task_id}/retry`);
+    const retried = await rmpFetch('POST', `/tasks/${data.task_id}/retry`);
     log(`Retried as task ${retried.task_id}`);
   } else {
     log(`Created task ${data.task_id} (dedup=${!!data.deduplicated})`);
@@ -329,7 +316,7 @@ function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeat
   return data;
 }
 
-function routeSlackDmToRmp(content, sessionKey) {
+async function routeSlackDmToRmp(content, sessionKey) {
   if (isDevSuspended()) {
     log('DEV MODE: Slack DM absorbed (no task, no delivery)');
     return true;
@@ -339,21 +326,21 @@ function routeSlackDmToRmp(content, sessionKey) {
 
   if (isStopCommand(intent)) {
     try {
-      const activeData = rmpFetchSync('GET', `/sessions/${encodeURIComponent(sessionKey)}/active_user_task`);
+      const activeData = await rmpFetch('GET', `/sessions/${encodeURIComponent(sessionKey)}/active_user_task`);
       if (activeData.active_task?.id) {
-        rmpFetchSync('POST', `/tasks/${activeData.active_task.id}/signal`, {
+        await rmpFetch('POST', `/tasks/${activeData.active_task.id}/signal`, {
           signal_type: 'user_input',
           message: intent,
         });
         log(`SIGNALED stop to task ${activeData.active_task.id}`);
-      } else if (notifyRmpUser(sessionKey, 'stop_idle', intent)) {
+      } else if (await notifyRmpUser(sessionKey, 'stop_idle', intent)) {
         log(`Stop with no active task; RMP ack on ${sessionKey}`);
       } else {
         log(`Stop with no active task; RMP notice was not delivered on ${sessionKey}`);
       }
     } catch (e) {
       log(`Signal error: ${e.message}`);
-      notifyRmpUser(sessionKey, 'intake_unavailable', intent);
+      await notifyRmpUser(sessionKey, 'intake_unavailable', intent);
       throw e;
     }
     return true;
@@ -366,18 +353,18 @@ function routeSlackDmToRmp(content, sessionKey) {
     rawText: intent,
   };
   try {
-    createRmpTaskFromInbound(payload);
+    await createRmpTaskFromInbound(payload);
     return true;
   } catch (e) {
-    // curl --max-time can abort while POST /tasks is still running intake LLM.
+    // The fetch deadline can fire while POST /tasks is still running intake LLM.
     // Server may still create the task; recover via idempotent re-POST. Never
     // hand the turn back to native OpenClaw.
     if (isLikelyTimeoutError(e)) {
       log(`Intake POST timed out; recovering via idempotent re-POST: ${e.message}`);
       for (const waitMs of [2000, 3000, 5000]) {
-        sleepSync(waitMs);
+        await sleep(waitMs);
         try {
-          const data = createRmpTaskFromInbound(payload);
+          const data = await createRmpTaskFromInbound(payload);
           log(`Recovered RMP ownership after timeout (task=${data?.task_id || '?'})`);
           return true;
         } catch (e2) {
@@ -385,7 +372,7 @@ function routeSlackDmToRmp(content, sessionKey) {
         }
         try {
           const idemKey = inboundIdempotencyKey(sessionKey, intent, intent);
-          const found = rmpFetchSync('GET', `/tasks/by-idempotency/${encodeURIComponent(idemKey)}`);
+          const found = await rmpFetch('GET', `/tasks/by-idempotency/${encodeURIComponent(idemKey)}`);
           if (found && found.task_id) {
             log(`Recovered RMP ownership via idempotency ${found.task_id}`);
             return true;
@@ -393,9 +380,21 @@ function routeSlackDmToRmp(content, sessionKey) {
         } catch (_) {}
       }
     }
-    notifyRmpUser(sessionKey, 'intake_unavailable', intent);
+    await notifyRmpUser(sessionKey, 'intake_unavailable', intent);
     throw e;
   }
+}
+
+/** One route at a time per session, in arrival order, so a stop sees the task it stops. */
+const routeChains = new Map();
+function routeInBackground(hookName, content, sessionKey) {
+  const next = (routeChains.get(sessionKey) || Promise.resolve())
+    .then(() => routeSlackDmToRmp(content, sessionKey))
+    .catch((e) => log(`${hookName} route error (claimed; no native): ${e.message}`));
+  routeChains.set(sessionKey, next);
+  next.then(() => {
+    if (routeChains.get(sessionKey) === next) routeChains.delete(sessionKey);
+  });
 }
 
 /** Recent Slack DMs claimed by inbound_claim — avoid a second POST from the same event. */
@@ -439,23 +438,31 @@ function isRmpOwnedSlackSession(sessionKey) {
   return isMainChatSession(key) || key.includes('slack:');
 }
 
-function getActiveRmpUserTask(sessionKey) {
+/** Last known active user task per session, for hooks that must answer synchronously. */
+const activeUserTasks = new Map();
+
+async function getActiveRmpUserTask(sessionKey) {
   if (!isRmpOwnedSlackSession(sessionKey)) return null;
   try {
-    const data = rmpFetchSync(
+    // Callers run inside message_sending / before_agent_run, which allow 15 s per handler.
+    const data = await rmpFetch(
       'GET',
-      `/sessions/${encodeURIComponent(sessionKey)}/active_user_task`
+      `/sessions/${encodeURIComponent(sessionKey)}/active_user_task`,
+      undefined,
+      { maxTimeSec: 5 }
     );
-    return data.active_task || null;
+    const task = data.active_task || null;
+    activeUserTasks.set(sessionKey, task);
+    return task;
   } catch (_) {
     return null;
   }
 }
 
-function prefetchProcessMemory(taskId, processRunId) {
+async function prefetchProcessMemory(taskId, processRunId) {
   if (!processRunId) return null;
   try {
-    const ctx = rmpFetchSync('GET', `/memory/process/${encodeURIComponent(processRunId)}/context`);
+    const ctx = await rmpFetch('GET', `/memory/process/${encodeURIComponent(processRunId)}/context`);
     const path = `/tmp/rmp_ctx_${taskId}.json`;
     fs.writeFileSync(path, JSON.stringify({ task_id: taskId, process_run_id: processRunId, ...ctx }));
     log(`Prefetched memory context for ${taskId} -> ${path}`);
@@ -492,17 +499,17 @@ function pinSessionProfile(sessionKey, profileId) {
   }
 }
 
-function reserveLlmSlot(sessionKey) {
-  const data = rmpFetchSync('POST', '/api/llm/reserve', { session_key: sessionKey });
+async function reserveLlmSlot(sessionKey) {
+  const data = await rmpFetch('POST', '/api/llm/reserve', { session_key: sessionKey });
   if (data.pin_session && data.profile_id && sessionKey) {
     pinSessionProfile(sessionKey, data.profile_id);
   }
   return data;
 }
 
-function releaseLlmSlot(sessionKey) {
+async function releaseLlmSlot(sessionKey) {
   try {
-    rmpFetchSync('POST', '/api/llm/release', { session_key: sessionKey });
+    await rmpFetch('POST', '/api/llm/release', { session_key: sessionKey });
   } catch (e) {
     log(`Release slot failed for ${sessionKey}: ${e.message}`);
   }
@@ -523,6 +530,28 @@ function installNativeSlackSuppressor() {
 function isSlackInboundSession(sessionKey) {
   const key = sessionKey || '';
   return isMainChatSession(key) || key.includes('slack:');
+}
+
+/** Cron → RMP task, after before_message_write has already blocked the write. */
+async function routeScheduledToRmp(payload) {
+  const { sessionKey } = payload;
+  try {
+    const activeData = await rmpFetch(
+      'GET',
+      `/sessions/${encodeURIComponent(sessionKey)}/active_task`
+    );
+    if (activeData.active_task?.id) {
+      log(`SKIP heartbeat/cron — active task ${activeData.active_task.id} on ${sessionKey}`);
+      return;
+    }
+  } catch (e) {
+    log(`Heartbeat active check error: ${e.message}`);
+  }
+  try {
+    await createRmpTaskFromInbound(payload);
+  } catch (e) {
+    log(`Task creation FAILED (fail-closed): ${e.message}`);
+  }
 }
 
 module.exports = {
@@ -606,6 +635,7 @@ module.exports = {
 
     // Claim Slack DMs before OpenClaw's native agent turn. Returning
     // { handled: true } stops the gateway from answering (and double-posting).
+    // Routing runs in the background: the claim must not wait on intake.
     api.on('inbound_claim', (event, ctx) => {
       try {
         if (isDevSuspended()) return;
@@ -615,8 +645,8 @@ module.exports = {
         if (channel !== 'slack' && !channel.includes('slack')) return;
         const sessionKey = pickSlackSessionKey(event, ctx);
         log(`inbound_claim slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
-        routeSlackDmToRmp(content, sessionKey);
         markSlackClaimed(sessionKey, content);
+        routeInBackground('inbound_claim', content, sessionKey);
         return { handled: true };
       } catch (e) {
         // Fail closed: still claim the turn so native OpenClaw cannot answer.
@@ -644,8 +674,8 @@ module.exports = {
         }
         // Safety net if inbound_claim did not run for this build/path.
         log(`before_dispatch claiming slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
-        routeSlackDmToRmp(content, sessionKey);
         markSlackClaimed(sessionKey, content);
+        routeInBackground('before_dispatch', content, sessionKey);
         return { handled: true };
       } catch (e) {
         log(`before_dispatch route error (still claiming; no native): ${e.message}`);
@@ -673,8 +703,8 @@ module.exports = {
           return { handled: true };
         }
         log(`message_received slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
-        routeSlackDmToRmp(content, sessionKey);
         markSlackClaimed(sessionKey, content);
+        routeInBackground('message_received', content, sessionKey);
         return { handled: true };
       } catch (e) {
         log(`message_received route error (still claiming; no native): ${e.message}`);
@@ -732,7 +762,10 @@ module.exports = {
             log(`BLOCKED Slack-session assistant msg (RMP owns delivery)`);
             return { block: true };
           }
-          const active = getActiveRmpUserTask(ctx?.sessionKey || 'agent:main:main');
+          // OpenClaw ignores a Promise from this hook: decide from the last known task.
+          const devSessionKey = ctx?.sessionKey || 'agent:main:main';
+          const active = activeUserTasks.get(devSessionKey);
+          void getActiveRmpUserTask(devSessionKey);
           if (active) {
             log(`BLOCKED main-session assistant msg during RMP task ${active.id}`);
             return { block: true };
@@ -768,44 +801,25 @@ module.exports = {
 
         const sessionKey = ctx?.sessionKey || 'agent:main:main';
 
-        if ((isHeartbeat || isCron) && !isSlackDM) {
-          try {
-            const activeData = rmpFetchSync(
-              'GET',
-              `/sessions/${encodeURIComponent(sessionKey)}/active_task`
-            );
-            if (activeData.active_task?.id) {
-              log(`SKIP heartbeat/cron — active task ${activeData.active_task.id} on ${sessionKey}`);
-              return { block: true };
-            }
-          } catch (e) {
-            log(`Heartbeat active check error: ${e.message}`);
-          }
-        }
-
         let intent = text;
         if (isCron) {
           intent = text.replace(/^\[cron:[^\]]*\]\s*/, '').trim();
         }
 
         if (isCron || isHeartbeat) {
-          try {
-            let idemKey;
-            if (isHeartbeat || (isCron && sessionKey.includes('heartbeat'))) {
-              idemKey = 'heartbeat-v1';
-            } else {
-              idemKey = null;
-            }
-            createRmpTaskFromInbound({
-              sessionKey,
-              intent: (intent || "").slice(0, 20000),
-              tags: isCron ? ['cron'] : isHeartbeat ? ['heartbeat'] : ['user-request'],
-              rawText: intent,
-              heartbeatKey: idemKey,
-            });
-          } catch (e) {
-            log(`Task creation FAILED (fail-closed): ${e.message}`);
+          let idemKey;
+          if (isHeartbeat || (isCron && sessionKey.includes('heartbeat'))) {
+            idemKey = 'heartbeat-v1';
+          } else {
+            idemKey = null;
           }
+          void routeScheduledToRmp({
+            sessionKey,
+            intent: (intent || "").slice(0, 20000),
+            tags: isCron ? ['cron'] : isHeartbeat ? ['heartbeat'] : ['user-request'],
+            rawText: intent,
+            heartbeatKey: idemKey,
+          });
           return { block: true };
         }
       } catch (e) {
@@ -814,7 +828,7 @@ module.exports = {
       }
     }, { priority: 100 });
 
-    api.on('message_sending', (event, ctx) => {
+    api.on('message_sending', async (event, ctx) => {
       const content = event?.content || '';
       if (!content.trim()) return { cancel: true };
 
@@ -826,7 +840,7 @@ module.exports = {
         return { cancel: true };
       }
 
-      const active = getActiveRmpUserTask(sessionKey);
+      const active = await getActiveRmpUserTask(sessionKey);
       if (active) {
         log(`SUPPRESSED native Slack delivery during RMP task ${active.id}`);
         return { cancel: true };
@@ -863,6 +877,10 @@ module.exports = {
       if (isRmpOwnedSlackSession(sessionKey) && !isDevSuspended()) {
         log(`SKIP LLM reserve on Slack/main session (RMP owns Slack path): ${sessionKey}`);
         return { outcome: 'pass' };
+      }
+      // Dev-mode native runs: refresh the task before_message_write checks without network.
+      if (isRmpOwnedSlackSession(sessionKey)) {
+        await getActiveRmpUserTask(sessionKey);
       }
       try {
         const data = await rmpFetch('POST', '/api/llm/reserve', { session_key: sessionKey });

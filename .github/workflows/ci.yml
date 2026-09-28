@@ -41,3 +41,11 @@ jobs:
 
       - name: Unit tests
         run: python -m pytest tests/ -q --ignore=tests/integration
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Plugin tests (node:test)
+        run: node --test tests/node/*.test.js

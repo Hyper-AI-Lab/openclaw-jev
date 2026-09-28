@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot OpenClaw upgrade for this RMP host.
-# backup → node check → npm i -g → doctor --fix → config-key guard →
+# backup → node check → npm i -g → plugins update → doctor --fix → config-key guard →
 # patch_openclaw.sh → verify → skills → optional restart.
 #
 # Never: openclaw onboard, openclaw update, doctor --force, hand-edit dist.
@@ -224,6 +224,10 @@ fi
   echo "node=${NODE_VER}"
   echo "npm=$(npm --version)"
   echo "openclaw_before=${BEFORE_OC}"
+  for pkg in "${OPENCLAW_HOME}"/npm/projects/*/node_modules/@openclaw/*/package.json; do
+    [[ -f "${pkg}" ]] || continue
+    node -p 'const p = require(process.argv[1]); `plugin_before=${p.name}@${p.version}`' "${pkg}"
+  done
   echo "stamp=${STAMP}"
 } > "${BACKUP_DIR}/VERSIONS.txt"
 echo "${BACKUP_DIR}" > /tmp/openclaw-upgrade-backup.path
@@ -257,6 +261,11 @@ if [[ "${SKIP_NPM}" != "1" ]]; then
 else
   log "SKIP_NPM=1 — leaving global package as $(openclaw --version 2>/dev/null | head -1)"
 fi
+
+# npm-installed plugins (Slack, Brave, ...) do not follow the core package; their
+# hook and debounce contracts must match it.
+log "openclaw plugins update --all (newest versions compatible with this core)"
+openclaw plugins update --all
 
 if [[ "${SKIP_DOCTOR}" != "1" ]]; then
   log "openclaw doctor --fix --non-interactive (no --force)"
@@ -296,4 +305,4 @@ fi
 log "Restarting RMP + gateway"
 bash "${RMP_ROOT}/ops/restart_rmp.sh"
 log "Done. Backup: ${BACKUP_DIR}"
-log "Rollback: reinstall the version in ${BACKUP_DIR}/VERSIONS.txt (openclaw_before), restore openclaw.json + plugins, bash patch_openclaw.sh, restart"
+log "Rollback: reinstall the version in ${BACKUP_DIR}/VERSIONS.txt (openclaw_before), openclaw plugins install each plugin_before spec, restore openclaw.json + plugins, bash patch_openclaw.sh, restart"

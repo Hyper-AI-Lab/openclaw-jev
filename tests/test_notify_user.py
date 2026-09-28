@@ -134,6 +134,33 @@ def test_plugin_fail_closed_sends_rmp_notice_not_native():
         assert "handled: true" in catch_slice
 
 
+def test_plugin_never_blocks_the_gateway_event_loop():
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    copies = [repo / "plugins/rmp_adapter/index.js"]
+    live = Path("/root/.openclaw/plugins/rmp_adapter/index.js")
+    try:
+        include_live = live.is_file()
+    except OSError:
+        include_live = False
+    if include_live:
+        copies.append(live)
+    for path in copies:
+        src = path.read_text()
+        # The gateway also serves intake's LLM leg; a sync curl froze it for ~70 s.
+        assert "child_process" not in src
+        assert "execFileSync" not in src
+        assert "AbortSignal.timeout" in src
+        # OpenClaw ignores a Promise returned from before_message_write.
+        assert "api.on('before_message_write', (event, ctx) =>" in src
+        for hook in ("inbound_claim", "before_dispatch", "message_received"):
+            start = src.find(f"api.on('{hook}'")
+            body = src[start : src.find("}, { priority: 120 });", start)]
+            assert "routeInBackground(" in body
+            assert "routeSlackDmToRmp(" not in body
+
+
 def test_intake_reservation_is_not_an_active_task():
     from app.task_registry.retriever import include_in_active_snapshot
 

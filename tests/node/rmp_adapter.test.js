@@ -1,0 +1,357 @@
+'use strict';
+
+const { test, mock, beforeEach, afterEach } = require('node:test');
+// The plugin talks to the live RMP API on this host. Background routes can outlive a
+// failed test, so the real fetch and real settings are never put back in this process.
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const PLUGIN = path.resolve(__dirname, '../../plugins/rmp_adapter/index.js');
+const LIVE_PLUGIN = '/root/.openclaw/plugins/rmp_adapter/index.js';
+const LOG_PATH = '/tmp/rmp_plugin_debug.log';
+const SETTINGS_PATH = '/root/.openclaw/rmp/settings.json';
+const SESSIONS_JSON = '/root/.openclaw/agents/main/sessions/sessions.json';
+const AGENT_SQLITE = '/root/.openclaw/agents/main/agent/openclaw-agent.sqlite';
+const SLACK_KEY = 'agent:main:slack:channel:dtest';
+
+const realReadFileSync = fs.readFileSync.bind(fs);
+const realAppendFileSync = fs.appendFileSync.bind(fs);
+const realWriteFileSync = fs.writeFileSync.bind(fs);
+
+let logs = [];
+let writes = [];
+let sessionsStore = null;
+
+function networkDisabled(url) {
+  return Promise.reject(new Error(`network disabled in tests: ${url}`));
+}
+globalThis.fetch = networkDisabled;
+
+mock.method(fs, 'readFileSync', (file, ...rest) => {
+  if (file === SETTINGS_PATH) {
+    return JSON.stringify({
+      api_key: 'test-key',
+      task_registry: { intake_llm_timeout_sec: 40, intake_vector_deadline_sec: 10 },
+    });
+  }
+  if (file === SESSIONS_JSON) {
+    if (!sessionsStore) {
+      const err = new Error(`ENOENT: no such file or directory, open '${file}'`);
+      err.code = 'ENOENT';
+      throw err;
+    }
+    return JSON.stringify(sessionsStore);
+  }
+  return realReadFileSync(file, ...rest);
+});
+mock.method(fs, 'appendFileSync', (file, data, ...rest) => {
+  if (file === LOG_PATH) {
+    logs.push(String(data));
+    return undefined;
+  }
+  return realAppendFileSync(file, data, ...rest);
+});
+mock.method(fs, 'writeFileSync', (file, data, ...rest) => {
+  if (String(file).startsWith('/root/') || String(file).startsWith('/tmp/rmp_ctx_')) {
+    writes.push(String(file));
+    return undefined;
+  }
+  return realWriteFileSync(file, data, ...rest);
+});
+
+function sha256(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+function json(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function timeoutError() {
+  return new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
+async function waitFor(pred, what) {
+  for (let i = 0; i < 2000; i += 1) {
+    if (pred()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+function sawLog(fragment) {
+  return logs.some((line) => line.includes(fragment));
+}
+
+/** Route table: [["POST /tasks", handler], [/^GET \/tasks\/by-idempotency\//, handler]]. */
+function installFetch(routes) {
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const key = `${init.method || 'GET'} ${new URL(url).pathname}`;
+    const call = { key, init, body: init.body ? JSON.parse(init.body) : undefined };
+    calls.push(call);
+    for (const [pattern, handler] of routes) {
+      if (pattern instanceof RegExp ? pattern.test(key) : pattern === key) {
+        const out = await handler(call);
+        return out instanceof Response ? out : json(out);
+      }
+    }
+    return json({ detail: `no route for ${key}` }, 404);
+  };
+  return calls;
+}
+
+function loadPlugin() {
+  delete require.cache[require.resolve(PLUGIN)];
+  const plugin = require(PLUGIN);
+  const hooks = {};
+  const tools = {};
+  plugin.register({
+    on: (name, handler) => { hooks[name] = handler; },
+    registerTool: (tool) => { tools[tool.name] = tool; },
+  });
+  return { hooks, tools };
+}
+
+function slackDm(content) {
+  return [
+    { content, metadata: { provider: 'slack' } },
+    { channelId: 'slack', sessionKey: SLACK_KEY },
+  ];
+}
+
+beforeEach(() => {
+  logs = [];
+  writes = [];
+  sessionsStore = { [SLACK_KEY]: {} };
+});
+
+afterEach(() => {
+  mock.timers.reset();
+  globalThis.fetch = networkDisabled;
+});
+
+test('message_received claims at once while POST /tasks is still in intake', async () => {
+  const post = deferred();
+  const calls = installFetch([['POST /tasks', () => post.promise]]);
+  const { hooks } = loadPlugin();
+
+  const claimed = hooks.message_received(...slackDm('hello aura'));
+  assert.deepEqual(claimed, { handled: true });
+  await waitFor(() => calls.length === 1, 'POST /tasks');
+
+  let loopRan = false;
+  setImmediate(() => { loopRan = true; });
+  await waitFor(() => loopRan, 'event loop turn during intake');
+
+  const [event, ctx] = slackDm('hello aura');
+  assert.deepEqual(hooks.before_dispatch({ ...event, channel: 'slack' }, ctx), { handled: true });
+
+  post.resolve({ task_id: 't1', status: 'created' });
+  await waitFor(() => sawLog('Created task t1'), 'task creation log');
+  assert.equal(calls.length, 1, 'before_dispatch must not POST the claimed DM again');
+  const [call] = calls;
+  assert.equal(call.body.session_key, SLACK_KEY);
+  assert.equal(call.body.raw_text, 'hello aura');
+  assert.equal(call.body.idempotency_key, sha256(`${SLACK_KEY}:hello aura`));
+  assert.equal(call.init.headers['X-RMP-API-Key'], 'test-key');
+  assert.ok(call.init.signal instanceof AbortSignal);
+});
+
+test('intake timeout recovers through an idempotent re-POST after an async sleep', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  let attempts = 0;
+  const calls = installFetch([
+    ['POST /tasks', () => {
+      attempts += 1;
+      if (attempts === 1) throw timeoutError();
+      return { task_id: 't2', status: 'created', deduplicated: true };
+    }],
+  ]);
+  const { hooks } = loadPlugin();
+
+  assert.deepEqual(hooks.message_received(...slackDm('long request')), { handled: true });
+  await waitFor(() => sawLog('Intake POST timed out'), 'timeout log');
+  assert.equal(attempts, 1, 're-POST waits for the 2 s sleep');
+  mock.timers.tick(2000);
+  await waitFor(() => sawLog('Recovered RMP ownership after timeout (task=t2)'), 'recovery');
+  assert.equal(calls.filter((c) => c.key === 'POST /api/notify-user').length, 0);
+});
+
+test('intake that never recovers sends the intake_unavailable notice', async () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  const calls = installFetch([
+    ['POST /tasks', () => { throw timeoutError(); }],
+    [/^GET \/tasks\/by-idempotency\//, () => json({ detail: 'not found' }, 404)],
+    ['POST /api/notify-user', () => ({ delivered: true })],
+  ]);
+  const { hooks } = loadPlugin();
+
+  assert.deepEqual(hooks.message_received(...slackDm('never lands')), { handled: true });
+  await waitFor(() => sawLog('Intake POST timed out'), 'timeout log');
+  for (const [step, waitMs] of [[1, 2000], [2, 3000], [3, 5000]]) {
+    mock.timers.tick(waitMs);
+    await waitFor(
+      () => calls.filter((c) => c.key.startsWith('GET /tasks/by-idempotency/')).length === step,
+      `idempotency lookup ${step}`,
+    );
+  }
+  await waitFor(() => sawLog('message_received route error (claimed; no native)'), 'route error');
+  const notices = calls.filter((c) => c.key === 'POST /api/notify-user');
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].body.reason, 'intake_unavailable');
+  assert.equal(notices[0].body.session_key, SLACK_KEY);
+  const idem = calls.find((c) => c.key.startsWith('GET /tasks/by-idempotency/'));
+  assert.ok(idem.key.endsWith(sha256(`${SLACK_KEY}:never lands`)));
+});
+
+test('a non-timeout intake failure notifies once without re-POSTing', async () => {
+  const calls = installFetch([
+    ['POST /tasks', () => json({ detail: 'boom' }, 500)],
+    ['POST /api/notify-user', () => ({ delivered: true })],
+  ]);
+  const { hooks } = loadPlugin();
+
+  assert.deepEqual(hooks.message_received(...slackDm('server error')), { handled: true });
+  await waitFor(() => sawLog('route error (claimed; no native): boom'), 'route error');
+  assert.equal(calls.filter((c) => c.key === 'POST /tasks').length, 1);
+  const notices = calls.filter((c) => c.key === 'POST /api/notify-user');
+  assert.deepEqual(notices.map((c) => c.body.reason), ['intake_unavailable']);
+});
+
+test('stop signals the active task, and an idle stop gets the stop_idle notice', async () => {
+  let calls = installFetch([
+    [/^GET \/sessions\/.+\/active_user_task$/, () => ({ active_task: { id: 'a1' } })],
+    ['POST /tasks/a1/signal', () => ({ ok: true })],
+  ]);
+  let { hooks } = loadPlugin();
+  assert.deepEqual(hooks.message_received(...slackDm('stop')), { handled: true });
+  await waitFor(() => sawLog('SIGNALED stop to task a1'), 'stop signal');
+  assert.deepEqual(calls.map((c) => c.key), [
+    `GET /sessions/${encodeURIComponent(SLACK_KEY)}/active_user_task`,
+    'POST /tasks/a1/signal',
+  ]);
+  assert.deepEqual(calls[1].body, { signal_type: 'user_input', message: 'stop' });
+
+  calls = installFetch([
+    [/^GET \/sessions\/.+\/active_user_task$/, () => ({ active_task: null })],
+    ['POST /api/notify-user', () => ({ delivered: true })],
+  ]);
+  ({ hooks } = loadPlugin());
+  assert.deepEqual(hooks.message_received(...slackDm('Stop.')), { handled: true });
+  await waitFor(() => sawLog('Stop with no active task; RMP ack'), 'stop_idle ack');
+  const notices = calls.filter((c) => c.key === 'POST /api/notify-user');
+  assert.deepEqual(notices.map((c) => c.body.reason), ['stop_idle']);
+});
+
+test('DMs on one session reach intake one at a time, in arrival order', async () => {
+  const first = deferred();
+  const calls = installFetch([
+    ['POST /tasks', (call) => (call.body.raw_text === 'first'
+      ? first.promise
+      : { task_id: 't-second', status: 'created' })],
+  ]);
+  const { hooks } = loadPlugin();
+
+  assert.deepEqual(hooks.message_received(...slackDm('first')), { handled: true });
+  assert.deepEqual(hooks.message_received(...slackDm('second')), { handled: true });
+  await waitFor(() => calls.length === 1, 'first POST');
+  for (let i = 0; i < 50; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 1, 'second DM waits for the first intake');
+
+  first.resolve({ task_id: 't-first', status: 'created' });
+  await waitFor(() => sawLog('Created task t-second'), 'second task');
+  assert.deepEqual(calls.map((c) => c.body.raw_text), ['first', 'second']);
+});
+
+test('before_message_write answers synchronously and routes cron in the background', async () => {
+  const activeCheck = deferred();
+  const calls = installFetch([
+    [/^GET \/sessions\/.+\/active_task$/, () => activeCheck.promise],
+    ['POST /tasks', () => ({ task_id: 'c1', status: 'created' })],
+  ]);
+  const { hooks } = loadPlugin();
+
+  const cron = hooks.before_message_write(
+    { message: { role: 'user', content: [{ type: 'text', text: '[cron:job-1] summarize inbox' }] } },
+    { sessionKey: 'agent:main:cron:job-1' },
+  );
+  assert.deepEqual(cron, { block: true }, 'a plain result, not a Promise, while the check is pending');
+  activeCheck.resolve({ active_task: null });
+  await waitFor(() => sawLog('Created task c1'), 'cron task');
+  assert.deepEqual(calls.map((c) => c.key), [
+    `GET /sessions/${encodeURIComponent('agent:main:cron:job-1')}/active_task`,
+    'POST /tasks',
+  ]);
+  assert.deepEqual(calls[1].body.tags, ['cron']);
+  assert.equal(calls[1].body.raw_text, 'summarize inbox');
+
+  const assistant = hooks.before_message_write(
+    { message: { role: 'assistant', content: [{ type: 'text', text: 'native reply' }] } },
+    { sessionKey: SLACK_KEY },
+  );
+  assert.deepEqual(assistant, { block: true });
+});
+
+test('message_sending cancels native Slack delivery', async () => {
+  const calls = installFetch([]);
+  const { hooks } = loadPlugin();
+  assert.deepEqual(await hooks.message_sending({ content: 'hi' }, { sessionKey: SLACK_KEY }), { cancel: true });
+  assert.equal(calls.length, 0);
+});
+
+test('a route that outlives its test cannot reach the live API', async () => {
+  const activeCheck = deferred();
+  installFetch([[/^GET \/sessions\/.+\/active_task$/, () => activeCheck.promise]]);
+  const { hooks } = loadPlugin();
+  hooks.before_message_write(
+    { message: { role: 'user', content: [{ type: 'text', text: '[cron:job-2] leak probe' }] } },
+    { sessionKey: 'agent:main:cron:job-2' },
+  );
+  globalThis.fetch = networkDisabled;
+  activeCheck.resolve({ active_task: null });
+  await waitFor(
+    () => sawLog('Task creation FAILED (fail-closed): network disabled in tests'),
+    'POST /tasks after the test ended',
+  );
+  assert.equal(JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')).api_key, 'test-key');
+});
+
+test('plugin never spawns processes, and the live copy matches the repo', () => {
+  const src = realReadFileSync(PLUGIN, 'utf8');
+  assert.doesNotMatch(src, /child_process|execFileSync|execSync|spawnSync/);
+  if (fs.existsSync(LIVE_PLUGIN)) {
+    assert.equal(realReadFileSync(LIVE_PLUGIN, 'utf8'), src);
+  }
+});
+
+test('session lookup reads the OpenClaw SQLite store in-process', {
+  skip: !fs.existsSync(AGENT_SQLITE) && 'no OpenClaw store on this host',
+}, async () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync(AGENT_SQLITE, { readOnly: true });
+  const keys = db.prepare("select session_key from session_nodes where session_key like '%slack:channel:%'")
+    .all()
+    .map((row) => String(row.session_key));
+  db.close();
+  const sortKey = (k) => `${k.toLowerCase().includes('slack:channel:d') ? 0 : 1}${k.toLowerCase()}`;
+  keys.sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : 0));
+
+  sessionsStore = null;
+  const calls = installFetch([['POST /tasks', () => ({ task_id: 's1', status: 'created' })]]);
+  const { hooks } = loadPlugin();
+  assert.deepEqual(hooks.before_dispatch({ channel: 'slack', content: 'no key on event' }, { channelId: 'slack' }), { handled: true });
+  await waitFor(() => sawLog('Created task s1'), 'task from store key');
+  assert.equal(calls[0].body.session_key, keys[0] || 'agent:main:main');
+});
