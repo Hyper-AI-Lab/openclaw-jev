@@ -235,6 +235,40 @@ async def test_api_fallback_without_jev_stays_degraded(hooks):
     assert result["llm_raw"]["jev"] == hooks["record"]
 
 
+def test_committed_intake_fixtures_validate():
+    from pathlib import Path
+    from ops import jev_eval
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "jev_intake_eval.jsonl"
+    cases, unlabeled = jev_eval.load_intake_cases([fixture], 250)
+    assert len(cases) >= 50 and unlabeled == 0
+
+
+async def test_intake_eval_flags_harmful_attach_and_fails_the_gate(monkeypatch):
+    from pathlib import Path
+    from ops import jev_eval
+    from app.decisions.jev import Evaluation
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "jev_intake_eval.jsonl"
+    cases = [c for c in jev_eval.load_intake_cases([fixture], 250)[0] if c["id"] in ("run-status-export", "ambig-two-exports")]
+    picks = {"run-status-export": {**STATUS_PING},
+        "ambig-two-exports": {**STATUS_PING, "running_action": "add_instructions", "finished_target": None}}
+
+    async def evaluate(state, questions, *, purpose, rubric, policy):
+        chosen = picks[purpose.removeprefix("eval.")]
+        return Evaluation("ok", result={"usage": {"input_tokens": 800, "output_tokens": 0},
+            "answers": {qid: answer(chosen[qid]) for qid in questions}}, latency_ms=300.0)
+    monkeypatch.setattr(jev_eval, "get_client", lambda: type("Fake", (), {"evaluate": staticmethod(evaluate)})())
+    monkeypatch.setattr(jev_eval, "close_jev_client", AsyncMock())
+    report = await jev_eval.run_intake(cases, Policy(cache_ttl_sec=0))
+    by_id = {r["id"]: r for r in report["records"]}
+    assert by_id["run-status-export"]["correct"] and not by_id["run-status-export"]["harmful"]
+    assert by_id["ambig-two-exports"]["harmful"] and "decision" in by_id["ambig-two-exports"]["errors"]
+    assert report["intake"]["accuracy_on_accepted"] == .5 and report["intake"]["harmful_errors"] == 1
+    assert report["intake"]["abstain_expected"] == 1 and report["intake"]["abstained_when_expected"] == 0
+    assert report["gate"]["passed"] is False
+
+
 async def test_promotion_review_sees_only_facts_that_pass_validation(monkeypatch):
     from app.memory import promotion
 
