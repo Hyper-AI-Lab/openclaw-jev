@@ -50,6 +50,7 @@ check_present 'RMP_OPENAI_FIRST_BYTE_20S' 'openai-first-byte-20s'
 check_present 'RMP_410_SKIP' '410-skip-model-not-found'
 check_present 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
 check_present 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'
+check_present 'RMP_SKIP_LOCAL_PLACEMENT_CLEANUP' 'skip-local-placement-cleanup'
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo ""

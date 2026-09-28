@@ -554,3 +554,66 @@ Each step appends one entry below. Earlier entries are never rewritten.
   - Not in scope, noted: `temporal_recover.sh` has no idle check; `_pick_key` ignores key
     pacing; `openclaw.json` still holds inline Brave, LangSearch and Jina API keys, against
     "secrets only in `/etc/openclaw/openclaw.env`".
+- **CI:** run 36438297631 on `f6c4f8f` passed: Unit tests, Set up Node, and Plugin tests
+  (node:test).
+
+## Extra step — Gateway startup freeze, investigation (2026-09-28, approved by Kirill)
+
+- **Method:** an idle gateway restart at 14:47:27Z. `kill -USR1` opened Node's inspector on
+  127.0.0.1:9229 as soon as the process started, and a CDP client recorded a V8 CPU profile
+  for 240 s (2 ms sampling). The inspector was closed afterwards. The freeze reproduced
+  inside the window: the gateway logged `process was frozen ~91726ms` at 14:51:13Z.
+- **Timeline:** from 14:49:32 to 14:51:11Z the main thread had zero idle samples, with
+  continuous JS at 23% GC. It is CPU-bound JS, not a blocking native call, and not the host.
+- **Culprit:** 99.7% of the samples sit under
+  `recoverPendingWorkspaceResults(deps, cleanupOrphans=true)`
+  (`server-worker-placement-startup-*.js`).
+  - The orphan cleanup loops over every `worker_session_placements` row and calls
+    `resolveWorkspacePath(placement)` on each.
+  - Each call runs `resolveGatewaySessionStoreTargetWithStore` without a store cache, which
+    lists and JSON-parses every session entry: `parseSqliteSessionEntryRecord` is 58.9%
+    self time, `iterateSqliteQuerySync` 25.3%.
+  - The call then throws, because no placement has a managed worktree.
+- **Why once per start, about a minute in:** `reconcile("startup")` skips the orphan cleanup
+  and sets `orphanCleanupPending`. The first periodic reconcile runs it once.
+- **Scale:** 510 placements, all `local` with no environment. 507 of them are RMP
+  `rmp_task_*`, `rmp_intake_*` and `rmp_verify_*` sessions, against about 500 session
+  entries, so roughly 255k entry parses per start. The cost grows quadratically with RMP
+  sessions, which RMP creates per task, intake and evaluation. On this host the loop never
+  does useful work: there are no worktrees and no worker environments.
+- **Status:** root cause found. The fix needs Kirill's decision, since it is either a dist
+  patch or a session-retention change.
+
+## Extra step — Gateway startup freeze, fix (2026-09-28, Kirill chose the dist patch)
+
+- **Change (`patch_openclaw.sh`, Patch 9, marker `RMP_SKIP_LOCAL_PLACEMENT_CLEANUP`):** in
+  the orphan-cleanup loop of `recoverPendingWorkspaceResults`, skip placements with
+  `state === "local"` and no `environmentId`.
+  - A placement that never left this host has no worker results to clean.
+  - Today every such `resolveWorkspacePath` call threw after its full session scan, so
+    skipping it changes nothing but the cost.
+  - The patch applies to exactly one needle, or prints `skip … (dist shape changed)`.
+  - `cleanedWorkspaceRoots` joins the candidate scan, and there are `require_marker` and
+    `check_present` checks. The cloud-worker bundle (`worker/worker.mjs`) does not contain
+    the loop.
+- **Pre-flight on a copy:** one line added, `node --check` passed. At script level a re-run
+  is a no-op, guarded by the marker.
+- **Applied:** `patch_openclaw.sh` patched 1 file and verify passed. A second run reported
+  `Already patched`.
+- **Live check:** an idle restart at 14:58:00Z logged `listening` after 11.3 s (15–31 s
+  before) and Slack connected 7 s later. For the next 4 minutes there was no
+  `process was frozen`, no `liveness heartbeat delayed` and no memory-pressure warning.
+  Every earlier start froze 70–100 s about a minute after `listening`.
+- **Unrelated intake failure found while verifying:** one LLM-path canary run at 15:02Z came
+  back degraded (confidence 0). Two re-runs passed in 13 s and 11 s. The transcripts show a
+  rare failure chain; Patch 9 does not touch intake:
+  1. gpt-5-nano answered the intake prompt with `NO_REPLY` (1 of 43 completed intake turns
+     in the store). OpenClaw prefixes hook messages with `[cron:<jobId> Hook]`, and the
+     model can read that as a scheduled run.
+  2. RMP rejects replies under 10 characters, so it waited out the 35 s poll before
+     falling back.
+  3. The gpt-oss-20b fallback streamed reasoning for 48 s on the intake-size prompt (first
+     byte in 0.56 s, answer at 15:04:17Z). That is past intake's budget.
+  - Follow-ups for Kirill to decide:
+    - treat an intake `NO_REPLY` as an immediate failure, so the fallback starts at once;
+    - give the NVIDIA fallback a low reasoning effort for intake and evaluator turns.

@@ -7,6 +7,7 @@
 #   - allowUnsafe passthrough for RMP JSON intake
 #   - LLM idle 5s (fail fast, rotate NVIDIA keys); OpenAI first byte 20s
 #   - HTTP 410 skip (model_not_found, not idle-timeout retry)
+#   - skip local placements in the cloud-worker orphan cleanup (startup freeze)
 # Model fallbacks (gpt-5-nano → gpt-oss-20b on NVIDIA) are INTENTIONAL — do not disable them.
 set -euo pipefail
 
@@ -27,7 +28,7 @@ fi
 mapfile -t CANDIDATES < <(
   if command -v rg >/dev/null 2>&1; then
     rg -l --glob '*.js' \
-      'hasHooks\("before_message_write"\)|filterBootstrapFilesForSession|runSubagentAnnounceFlow|async function deliverReplies|fallbackConfigured = false && hasConfiguredModelFallbacks|function normalizeAgentPayload|allowUnsafeExternalContent: value\.allowUnsafeExternalContent|DEFAULT_LLM_IDLE_TIMEOUT_MS|scanCanonicalSqliteSessionEntries|function parseSqliteSessionEntryRecord|status === 410' \
+      'hasHooks\("before_message_write"\)|filterBootstrapFilesForSession|runSubagentAnnounceFlow|async function deliverReplies|fallbackConfigured = false && hasConfiguredModelFallbacks|function normalizeAgentPayload|allowUnsafeExternalContent: value\.allowUnsafeExternalContent|DEFAULT_LLM_IDLE_TIMEOUT_MS|scanCanonicalSqliteSessionEntries|function parseSqliteSessionEntryRecord|status === 410|cleanedWorkspaceRoots' \
       "$DIST_DIR" 2>/dev/null || true
   else
     find "$DIST_DIR" -name '*.js'
@@ -357,6 +358,39 @@ PY
         fi
     fi
 
+    # Patch 9: the first reconcile after start runs the cloud-worker orphan cleanup over
+    # every placement. Each resolveWorkspacePath re-reads and parses the whole session
+    # store (uncached), then fails for placements without a worktree, so ~500 local
+    # placements froze the gateway for ~100 s per start. A placement that never left
+    # this host (local, no environment) has no worker results to clean.
+    if grep -q 'cleanedWorkspaceRoots' "$f" 2>/dev/null \
+       && ! grep -q 'RMP_SKIP_LOCAL_PLACEMENT_CLEANUP' "$f" 2>/dev/null; then
+        python3 - "$f" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+old = (
+    "\t\tfor (const placement of placements.list()) try {\n"
+    "\t\t\tconst root = await deps.resolveWorkspacePath(placement);\n"
+    "\t\t\tif (!cleanedWorkspaceRoots.has(root)) {"
+)
+new = (
+    "\t\tfor (const placement of placements.list()) try {\n"
+    "\t\t\tif (placement.state === \"local\" && !placement.environmentId) continue; /* RMP_SKIP_LOCAL_PLACEMENT_CLEANUP */\n"
+    "\t\t\tconst root = await deps.resolveWorkspacePath(placement);\n"
+    "\t\t\tif (!cleanedWorkspaceRoots.has(root)) {"
+)
+if text.count(old) != 1:
+    print("skip local-placement-cleanup (dist shape changed)")
+    raise SystemExit(0)
+path.write_text(text.replace(old, new, 1))
+print("patched-local-placement-cleanup")
+PY
+        if grep -q 'RMP_SKIP_LOCAL_PLACEMENT_CLEANUP' "$f" 2>/dev/null; then
+            applied="${applied} skip-local-placement-cleanup"
+        fi
+    fi
+
     if [ -n "$applied" ]; then
         echo "  Patched $(basename "$f"):$applied"
         PATCHED=$((PATCHED + 1))
@@ -395,6 +429,7 @@ require_marker 'RMP_OPENAI_FIRST_BYTE_20S' 'openai-first-byte-20s'
 require_marker 'RMP_410_SKIP' '410-skip-model-not-found'
 require_marker 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
 require_marker 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'
+require_marker 'RMP_SKIP_LOCAL_PLACEMENT_CLEANUP' 'skip-local-placement-cleanup'
 
 if [ "$PATCHED" -eq 0 ]; then
     echo "Already patched (idempotent re-run)."
