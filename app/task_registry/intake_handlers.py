@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Event, Observation, ProcessRun, Task, TaskRegistryEntry
 from app.metrics import inc as metrics_inc
+from app.orchestrator.process_brief import with_catchup
 from app.task_registry.intake_audit import record_intake_decision
 from app.task_registry.messages import add_task_message
 
@@ -263,9 +264,7 @@ async def handle_intake_outcome(
                     {
                         "task_id": target,
                         "catchup": catchup,
-                        "signal_text": (
-                            f"{catchup}\n\nUSER MESSAGE:\n{intent}" if catchup else intent
-                        ),
+                        "signal_text": with_catchup(catchup, intent),
                     }
                 )
             catchup = signals[0]["catchup"]

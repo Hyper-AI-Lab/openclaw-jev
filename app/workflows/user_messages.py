@@ -9,14 +9,18 @@ with workflow.unsafe.imports_passed_through():
     from app.activities.intake_activities import resubmit_user_messages
     from app.activities.openclaw_activities import send_to_openclaw
     from app.notification_policy import sanitize_user_facing_text
-    from app.orchestrator.process_brief import format_user_catchup
+    from app.orchestrator.process_brief import format_user_catchup, user_words
     from app.orchestrator.step_predicates import extract_agent_facts
     from app.task_registry.stop_command import is_whole_message_stop
 
 
 def _is_user_message(message: str) -> bool:
     text = str(message or "").strip()
-    return bool(text) and not text.startswith("[CANCEL]") and not is_whole_message_stop(text)
+    return (
+        bool(text)
+        and not text.startswith(("[CANCEL]", "[RECONCILER]"))
+        and not is_whole_message_stop(text)
+    )
 
 
 class AttachedMessages:
@@ -30,11 +34,11 @@ class AttachedMessages:
     _catchup_chunks: List[str]
 
     def _has_user_messages(self) -> bool:
-        return bool(self._catchup_chunks) or any(_is_user_message(m) for m in self.user_inputs)
+        return any(_is_user_message(m) for m in [*self._catchup_chunks, *self.user_inputs])
 
     def _take_user_messages(self) -> List[str]:
-        taken = [str(m).strip() for m in self._catchup_chunks if str(m).strip()]
-        taken += [str(m).strip() for m in self.user_inputs if _is_user_message(m)]
+        """Kirill's own words, without the brief intake put in front of them."""
+        taken = [user_words(str(m)) for m in [*self._catchup_chunks, *self.user_inputs] if _is_user_message(m)]
         self._catchup_chunks = []
         self.user_inputs = [m for m in self.user_inputs if not _is_user_message(m)]
         return taken

@@ -26,6 +26,20 @@ def compose_executor_memory(*parts: Optional[str]) -> str:
     return "\n\n".join(out)
 
 
+USER_MESSAGE_MARKER = "\n\nUSER MESSAGE:\n"
+
+
+def with_catchup(catchup: str, message: str) -> str:
+    """What intake signals a running task: the task's brief, then Kirill's message."""
+    return f"{catchup}{USER_MESSAGE_MARKER}{message}" if catchup else message
+
+
+def user_words(signalled: str) -> str:
+    """Kirill's message from a signal built by with_catchup."""
+    _, marker, message = signalled.partition(USER_MESSAGE_MARKER)
+    return (message if marker else signalled).strip()
+
+
 def format_user_catchup(messages: Iterable[str]) -> str:
     chunks = [m.strip() for m in messages if (m or "").strip()]
     if not chunks:
