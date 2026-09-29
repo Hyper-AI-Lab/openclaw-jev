@@ -210,3 +210,27 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - Node tests (15): identical texts with different Slack ids → two POSTs with id-based keys, and the second hook does not re-post the same id; attachment-only DM claimed with the file in text and payload; reply-to and thread ids forwarded; structured 502 logged readably, never `[object Object]`; the live plugin copy matches the repo.
 - Python tests: Slack context stored; ts → task through Kirill's messages or Aura's reply parts; a reply to a finished task makes it candidate F1 and Jev's `replied_to` names it; cron clarify → create_fresh while user clarify stays; cron jobs read from a state database; the intake cache separates identical texts replying to different messages; delivery records the Slack ts. Full suite 554 passed, 3 skipped; undefined-name check 0.
 - Live: migration applied (`slack_ts` present); API/worker reloaded 20:01; plugin copied (cmp identical), gateway healthy after 50 s, plugin registered; health canary `CANARY OK`; cron reader: 4 jobs from the state database, no read warnings since reload, snapshots written. Replies, threads and attachments from Kirill are part of the Step 12 acceptance DMs.
+
+---
+
+## Step 9 — Postgres and Qdrant back each other up (C3)
+
+**Date:** 2026-09-29 (20:06–20:26 CEST)
+
+**What changed:**
+
+- `app/memory/vector_sync.py` (new): transactional outbox (`vector_outbox`, committed with the row it indexes); a drain loop in the API (every 15 s, backoff per row up to 1 h) embeds with the configured embedder and upserts with point id = memory row id in Mem0's payload shape (`data`, `hash`, scope ids, `memory_type`, `provenance.memory_id`, `procedural_scope_id`), so retries overwrite and Mem0 search still reads the points; a daily reconciler diffs Postgres with both indexes (a row counts as indexed by its own id, its legacy `vector_ref` or a seeded point's `provenance.memory_id`), queues missing rows, deletes unreferenced points, and refuses to delete most of an index.
+- `MemoryRouter.write` commits the row and its outbox row together (no inline Mem0 write). Recall falls back to Postgres full-text search (`to_tsvector('simple')`, new GIN index) when the index or embedder does not answer; `VectorMemoryService.search` now returns None for "not answered" vs [] for "no hits". Compaction deletes points by row id and legacy ref.
+- Procedural recall is narrowed to its process type (`procedural_scope_id` filter; every procedural pool shared `agent_id="procedural"`, which is how canary procedures could reach user tasks).
+- Registry indexing goes through the same outbox (`index_terminal_task_async` enqueues); `index_terminal_task(require_vector=True)` raises on a failed vector write so the drain retries, and its embedding runs off the event loop. This removes the 10 s status-activity timeout seen in Step 3.
+- `app/memory/seed.py`: workspace chunks become memory rows (skipping stored ones) instead of vector-only points; the Postgres re-index is reconcile + drain. `ops/reconcile_vectors.py` runs the diff (dry run by default).
+- Schema (approved): `vector_outbox`, `ix_vector_outbox_pending`, `ix_memory_items_content_fts`, and the Step 8 `slack_ts` column in the startup migrations; created with `init_db()` before the code merged.
+
+**Correction to C3:** the audit's "432 rows never indexed" counted rows without `vector_ref`; most were linked by earlier seeded points (`provenance.memory_id`) and many were canary rows purged in Step 5. The dry run found the real drift: 9 rows missing, 57 orphan points (43 of them the vector-only workspace seed).
+
+**Rollout and verification:**
+
+- Tests: payloads Mem0 reads per scope; row + outbox committed together (working memory gets no outbox row); drain marks done, backs off a failure, deletes points of gone rows; reconcile queues missing rows, respects legacy and seeded links, deletes orphans in both indexes; the guard refuses an 80 % orphan delete; recall uses full text only when the index does not answer; procedural search carries the process-type filter; a failed registry vector write raises for retry. Full suite 562 passed, 3 skipped; undefined-name check 0.
+- Live: outbox table and indexes created (20:18); reload 20:19; workspace re-seeded as 45 rows, drained by the live loop in < 25 s (0 retries); reconcile applied: 9 queued and indexed, 57 orphans deleted; re-check: memory 2,583 rows = 2,583 points, registry 190 = 190, 0 missing / 0 orphans both. Full-text fallback: with the vector leg forced down, the same USER.md chunk comes back from Postgres. Legacy collections deleted (rmp_memories 2,190 pts, rmp_task_registry 2,531, mem0migrations 1; all 4096-dim); Mem0 recreated its own migrations collection at the current size. Health canary `CANARY OK`; memory canary `CANARY OK (memory_ok=1, prompt_ok=1)`; a new user task's memory read returns Postgres and vector items.
+
+**Noted, not changed:** `app/task_registry/hooks.py` `schedule_terminal_index` has no callers (pre-existing dead code).
