@@ -70,9 +70,9 @@ def test_conversational_no_longer_bypasses_quality_gate():
     assert "notify_slack_user" not in plan
     assert "return await self._judge_and_deliver(" in plan
     source = inspect.getsource(generic_task.GenericTaskWorkflow._judge_and_deliver)
-    assert "verify_response_quality" in source
+    assert "await self._judge(" in source
     assert "internal = is_internal_task(user_intent, task_type, tags)" in source
-    verify_pos = source.find("verify_response_quality")
+    verify_pos = source.find("await self._judge(")
     notify_complete = source.find("notify_slack_user", verify_pos)
     assert notify_complete != -1
     assert verify_pos < notify_complete

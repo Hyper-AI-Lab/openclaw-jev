@@ -782,20 +782,36 @@ async def check_intermediate_updates_enabled(payload: Dict[str, Any]) -> bool:
 
 @traced_activity("openclaw.verify_quality")
 async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
+    from app.artifacts.store import ArtifactStore
+    from app.openclaw_sessions import task_action_trace
     from app.orchestrator.process_evaluator import (
         build_evaluator_prompt,
+        format_action_trace,
+        format_artifacts,
         parse_evaluator_response,
         persist_evaluator_verdict,
     )
     from app.orchestrator.evaluator_tools import collect_situational_context
 
+    task_id = payload.get("task_id", "unknown")
     enriched = dict(payload)
     try:
         enriched["situational_tools"] = await collect_situational_context(payload)
     except Exception:
         enriched["situational_tools"] = "(situational tools unavailable)"
+    try:
+        enriched["tools_taken"] = format_action_trace(await asyncio.to_thread(task_action_trace, task_id))
+    except Exception as exc:
+        activity.logger.warning("Action trace unavailable for %s: %s", task_id, exc)
+        enriched["tools_taken"] = "(action trace unavailable)"
+    try:
+        enriched["artifacts"] = format_artifacts(
+            await ArtifactStore.list_for_process(payload.get("process_run_id") or "")
+        )
+    except Exception as exc:
+        activity.logger.warning("Artifact list unavailable for %s: %s", task_id, exc)
+        enriched["artifacts"] = "(artifact list unavailable)"
     verification_prompt = build_evaluator_prompt(enriched)
-    task_id = payload.get("task_id", "unknown")
     response = await _execute_on_internal_session(task_id, verification_prompt)
     result = parse_evaluator_response(response)
     await persist_evaluator_verdict(payload, result)

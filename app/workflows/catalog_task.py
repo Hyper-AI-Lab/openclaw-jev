@@ -4,7 +4,6 @@ from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from temporalio import workflow
-from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from app.activities.openclaw_activities import (
@@ -13,7 +12,6 @@ with workflow.unsafe.imports_passed_through():
         parse_agent_evaluation,
         send_to_openclaw,
         validate_openclaw_output,
-        verify_response_quality,
     )
     from app.task_registry.stop_command import is_whole_message_stop
     from app.activities.db_activities import (
@@ -55,11 +53,12 @@ with workflow.unsafe.imports_passed_through():
         ensure_brief_header,
         format_user_catchup,
     )
+    from app.workflows.judgment import EvaluatorRetry
     from app.workflows.user_messages import AttachedMessages
 
 
 @workflow.defn
-class CatalogTaskWorkflow(AttachedMessages):
+class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
     def __init__(self) -> None:
         self.user_inputs: List[str] = []
         self.process_run_id: str = ""
@@ -169,6 +168,22 @@ class CatalogTaskWorkflow(AttachedMessages):
             )
             workflow.continue_as_new(new_payload)
         return result
+
+    async def _judge_or_close(
+        self, verify_payload: Dict[str, Any], *, session_key: str, user_intent: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """The verdict, or the task's closing result when a stop arrived or the reviewer stayed down."""
+        task_id = verify_payload["task_id"]
+        task_type, tags = payload.get("task_type", ""), payload.get("tags") or []
+        quality = await self._judge(
+            verify_payload, session_key=session_key, user_intent=user_intent, task_type=task_type, tags=tags
+        )
+        if quality is not None:
+            return quality
+        stopped = await self._consume_stop(task_id, session_key)
+        if stopped:
+            return stopped
+        return await self._reviewer_unavailable(task_id, session_key, user_intent, task_type, tags)
 
     @workflow.run
     async def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -701,8 +716,7 @@ class CatalogTaskWorkflow(AttachedMessages):
                     evidence_ok = False
                     evidence_issues = evidence_issues + list(artifact_evidence["issues"])
 
-            quality = await workflow.execute_activity(
-                verify_response_quality,
+            quality = await self._judge_or_close(
                 {
                     "task_id": task_id,
                     "user_intent": user_intent,
@@ -711,10 +725,12 @@ class CatalogTaskWorkflow(AttachedMessages):
                     "attempt": 1,
                     "process_brief": self._initial_memory_block or "",
                 },
-                start_to_close_timeout=timedelta(minutes=5),
-                retry_policy=RetryPolicy(maximum_attempts=1),
-                heartbeat_timeout=timedelta(seconds=30),
+                session_key=session_key,
+                user_intent=user_intent,
+                payload=payload,
             )
+            if quality.get("status") in ("failed", "stopped_by_user"):
+                return quality
             gate = decide_completion_gate(
                 evidence_passed=evidence_ok,
                 evidence_issues=evidence_issues,
@@ -779,8 +795,7 @@ class CatalogTaskWorkflow(AttachedMessages):
                     evidence_issues = list(catalog_evidence["issues"]) + list(
                         base_evidence["issues"]
                     )
-                    quality = await workflow.execute_activity(
-                        verify_response_quality,
+                    quality = await self._judge_or_close(
                         {
                             "task_id": task_id,
                             "user_intent": user_intent,
@@ -789,9 +804,12 @@ class CatalogTaskWorkflow(AttachedMessages):
                             "attempt": judged,
                             "process_brief": self._initial_memory_block or "",
                         },
-                        start_to_close_timeout=timedelta(minutes=5),
-                        retry_policy=RetryPolicy(maximum_attempts=1),
+                        session_key=session_key,
+                        user_intent=user_intent,
+                        payload=payload,
                     )
+                    if quality.get("status") in ("failed", "stopped_by_user"):
+                        return quality
                     gate = decide_completion_gate(
                         evidence_passed=catalog_evidence["passed"]
                         and base_evidence["passed"],

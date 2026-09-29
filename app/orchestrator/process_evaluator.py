@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("rmp.process_evaluator")
 
@@ -101,6 +101,25 @@ def parse_evaluator_response(text: str) -> Dict[str, Any]:
     }
 
 
+def format_action_trace(trace: List[Dict[str, Any]]) -> str:
+    if not trace:
+        return "(no tool calls: the reply came from the conversation and memory only)"
+    lines = []
+    for index, call in enumerate(trace, 1):
+        ok = call.get("ok")
+        outcome = "ok" if ok else ("FAILED" if ok is False else "no result recorded")
+        lines.append(f"{index}. {call.get('tool')} {call.get('arguments')} -> {outcome}: {call.get('result')}")
+    return "\n".join(lines)
+
+
+def format_artifacts(artifacts: List[Dict[str, Any]]) -> str:
+    if not artifacts:
+        return "(none recorded)"
+    return "\n".join(
+        f"- {a.get('kind')}: {a.get('filename') or a.get('id')}" for a in artifacts[:20]
+    )
+
+
 def build_evaluator_prompt(payload: Dict[str, Any]) -> str:
     attempt = payload.get("attempt", 1)
     brief = (payload.get("process_brief") or payload.get("initial_memory_block") or "").strip()
@@ -130,6 +149,7 @@ SITUATIONAL TOOLS (local health/readiness/web only; privileged ops are denied):
 ATTEMPT: {attempt}
 
 Greetings/social chat: accept a short matching reply. Do not skip this judgment.
+Check every claim of work done in AURA OUTPUT (read, searched, checked, ran, sent, created, updated, fixed) against TOOLS/ACTIONS TAKEN and ARTIFACTS. A claim with no matching successful action is not done: verdict=rework and name the claim in command_to_aura. Answers that need only knowledge or the conversation need no tools.
 Insufficient work: verdict=rework with a concrete command_to_aura.
 Around attempt 10 you may verdict=strategy_change. Around attempt 20, verdict=escalate_user.
 

@@ -23,15 +23,19 @@ class AttachedMessages:
     """For task workflows whose `user_input` signal appends to `self.user_inputs`.
 
     Stop and cancel entries stay in `user_inputs` for the workflow's stop handling.
+    `_catchup_chunks` (messages parked for a next step that may never come) are taken too.
     """
 
     user_inputs: List[str]
+    _catchup_chunks: List[str]
 
     def _has_user_messages(self) -> bool:
-        return any(_is_user_message(m) for m in self.user_inputs)
+        return bool(self._catchup_chunks) or any(_is_user_message(m) for m in self.user_inputs)
 
     def _take_user_messages(self) -> List[str]:
-        taken = [str(m).strip() for m in self.user_inputs if _is_user_message(m)]
+        taken = [str(m).strip() for m in self._catchup_chunks if str(m).strip()]
+        taken += [str(m).strip() for m in self.user_inputs if _is_user_message(m)]
+        self._catchup_chunks = []
         self.user_inputs = [m for m in self.user_inputs if not _is_user_message(m)]
         return taken
 

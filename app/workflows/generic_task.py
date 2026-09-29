@@ -4,13 +4,11 @@ from typing import Any, Dict, List
 import re
 
 from temporalio import workflow
-from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from app.activities.openclaw_activities import (
         notify_slack_user,
         send_to_openclaw,
-        verify_response_quality,
     )
     from app.activities.plan_activities import generate_process_plan, save_process_plan
     from app.activities.db_activities import (
@@ -47,6 +45,7 @@ with workflow.unsafe.imports_passed_through():
         strip_system_acks,
     )
     from app.orchestrator.step_predicates import extract_agent_facts
+    from app.workflows.judgment import EvaluatorRetry
     from app.workflows.user_messages import AttachedMessages
 
 
@@ -69,7 +68,7 @@ def is_heartbeat_ack(text: str) -> bool:
 
 
 @workflow.defn
-class GenericTaskWorkflow(AttachedMessages):
+class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
     def __init__(self) -> None:
         self.user_inputs: List[str] = []
         self.process_run_id: str = ""
@@ -530,8 +529,7 @@ class GenericTaskWorkflow(AttachedMessages):
             evidence = check_evidence(user_intent, clean_result)
             quality = {"quality": "pass", "verdict": "accept"}
             if not internal:
-                quality = await workflow.execute_activity(
-                    verify_response_quality,
+                judged = await self._judge(
                     {
                         "task_id": task_id,
                         "user_intent": user_intent,
@@ -540,9 +538,20 @@ class GenericTaskWorkflow(AttachedMessages):
                         "attempt": attempt,
                         "process_brief": initial_memory_block or "",
                     },
-                    start_to_close_timeout=timedelta(minutes=5),
-                    retry_policy=RetryPolicy(maximum_attempts=1),
+                    session_key=session_key,
+                    user_intent=user_intent,
+                    task_type=task_type,
+                    tags=tags,
                 )
+                if judged is None:
+                    if self._stop_pending():
+                        return await self._finish_stop(task_id, session_key, user_intent, task_type, tags)
+                    result = await self._reviewer_unavailable(
+                        task_id, session_key, user_intent, task_type, tags
+                    )
+                    await self._resubmit_leftovers(task_id, session_key)
+                    return result
+                quality = judged
             gate = decide_completion_gate(
                 evidence_passed=evidence["passed"],
                 evidence_issues=evidence.get("issues", []),

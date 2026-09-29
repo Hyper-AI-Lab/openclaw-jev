@@ -77,6 +77,11 @@ class Recorder:
             if rec.signals_during_judging:
                 await _signal_own_workflow(rec.signals_during_judging.pop(0))
             verdict = rec.verdicts.pop(0) if rec.verdicts else "rework"
+            if verdict == "crash":
+                raise RuntimeError("evaluator model unavailable")
+            if verdict == "error":
+                return {"verdict": "rework", "quality": "fail", "issues": "evaluator error: malformed judge JSON",
+                        "command_to_aura": "Retry", "reason": "evaluator error", "parse_error": True}
             quality = "pass" if verdict == "accept" else "fail"
             return {"verdict": verdict, "quality": quality, "issues": "incomplete",
                     "command_to_aura": "fix it", "reason": verdict, "parse_error": False}
@@ -180,3 +185,23 @@ async def test_a_message_that_arrives_during_a_rework_is_folded_into_the_next_ju
     assert "include shoes too" in rec.prompts[1] and "Layers and a rain jacket." in rec.prompts[1]
     assert rec.judged == ["Pack layers and a light rain jacket.", "Layers, jacket and good shoes."]
     assert rec.slack == ["Layers, jacket and good shoes."]
+
+
+async def test_evaluator_failures_retry_the_evaluator_not_aura():
+    rec = Recorder(verdicts=["error", "crash", "error", "accept"], reworks=[])
+    result = await _run(rec)
+    assert result["status"] == "completed"
+    assert rec.prompts == []
+    held = [m for m in rec.slack if "reviewer is unavailable" in m]
+    assert len(held) == 1
+    assert rec.slack[-1] == "Pack layers and a light rain jacket."
+
+
+async def test_a_reviewer_that_never_recovers_closes_the_task_without_sending_the_draft():
+    rec = Recorder(verdicts=["error"] * 20, reworks=[])
+    result = await _run(rec)
+    assert result["status"] == "failed" and result["reason"] == "evaluator_unavailable"
+    assert rec.prompts == []
+    assert not any("Pack layers" in m for m in rec.slack)
+    assert "haven't sent an unchecked answer" in rec.slack[-1]
+    assert rec.failed == 1
