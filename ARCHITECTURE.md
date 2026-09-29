@@ -1,6 +1,6 @@
 # Aura System Architecture
 
-**Last updated:** 2026-09-05  
+**Last updated:** 2026-09-29  
 **Host:** Single Linux VPS (Europe/Berlin timezone on server; Kirill in JST)  
 **Status:** Production live (`development_mode: false`)
 
@@ -13,6 +13,7 @@ Related logs:
 - [`docs/history/DEVELOPMENT_PLAN.md`](docs/history/DEVELOPMENT_PLAN.md) — Phases 0–11 (historical)
 - [`docs/history/PRODUCTION_PLAN.md`](docs/history/PRODUCTION_PLAN.md) — Phases 12–20 (historical)
 - [`docs/CONTROL_PLANE_PROGRESS.md`](docs/CONTROL_PLANE_PROGRESS.md) — Analyst control-plane log (append-only)
+- [`docs/SYSTEM_AUDIT_PROGRESS.md`](docs/SYSTEM_AUDIT_PROGRESS.md) — Sep 29 2026 system audit and hardening log (append-only)
 - [`docs/runbooks/slack-sockets.md`](docs/runbooks/slack-sockets.md) — this-host Slack sockets only; never `apps.connections.open`
 
 ---
@@ -33,7 +34,9 @@ Aura is a **three-layer system** on one machine:
 
 **Primary LLM (chat):** OpenAI GPT-6 Luna (`openai/gpt-6-luna`) over the OpenAI Responses API on OpenClaw runtime (`agentRuntime.id: "openclaw"`), with NVIDIA-hosted GPT-OSS 20B (`nvidia/openai/gpt-oss-20b`) as the fallback after auth-key rotation. Chat Completions is not used: it rejects function tools with any reasoning effort on gpt-6-luna and has no `max`. **Intake** uses the same chain; subagent sessions, including the Process Evaluator, run on gpt-6-luna. Thinking: `max` for Aura's user-task runs (`send_to_openclaw` passes it per run), `medium` for everything else (`agents.defaults.thinkingDefault`: intake, evaluator, canaries). GLM-5.2, DeepSeek V4 Flash and MiniMax M3 are dropped (NVIDIA HTTP 410; MiniMax ended 2026-09-09). HTTP 410 is treated as skip, not a 5s idle retry.
 
-**Vector embeddings:** Advisory only. Live embedder is OpenAI `text-embedding-3-small` (1536-d) after NVIDIA NIM embeddings returned HTTP 410 EOL. `/health` `ready=true` only after a successful embed probe. Conversational continuity still uses Postgres `task_messages` + process memory and must not depend on embeddings.
+**Vector embeddings:** Advisory only. Live embedder is OpenAI `text-embedding-3-small` (1536-d) after NVIDIA NIM embeddings returned HTTP 410 EOL. `/health` `ready=true` only after a successful embed probe. Conversational continuity still uses Postgres `task_messages` + process memory and must not depend on embeddings. Postgres holds every memory; Qdrant is its index, kept in step by a transactional outbox and a daily reconcile, with Postgres full-text search as the fallback.
+
+**OpenAI storage:** off (`store: false`, patch `RMP_OPENAI_NO_STORE`). Reasoning carries between turns as encrypted content, so OpenAI keeps no prompts or replies.
 
 **Rate-limit policy:** On NVIDIA **rate limits**, RMP **waits, rotates keys, and tracks usage** (does not hop providers for 429s). Separate from that, OpenClaw keeps an ordered **model fallback chain** for unavailable/broken models. OpenAI key: `OPENAI_API_KEY` in `/etc/openclaw/openclaw.env` (SQLite profile `openai:default`). Three NVIDIA accounts (`nvidia:default`, `nvidia:key2`, `nvidia:key3`) with **balanced load** and a **max concurrent agent-run cap** (default 2). Never pin `nvidia:keyN` on an `openai/*` session.
 
@@ -118,8 +121,8 @@ Aura is a **three-layer system** on one machine:
 4. **Intake Analyst** (not Aura) classifies the message against hybrid-retrieved evidence into one of four relation classes, then applies a decision (`clarify` / attach / wait / rebuild / guided / fresh). See §5.0.0.
 5. If work proceeds, Temporal starts **GenericTaskWorkflow** or **CatalogTaskWorkflow** (catalog type is **intake-LLM only**).
 6. Aura executes in `agent:main:rmp_task_*` via **`send_to_openclaw`** (`deliver: false`).
-7. **Process Evaluator** (not Aura; session `rmp_verify_*`) must **accept** the result before Slack. Conversational replies are gated too. Canary/system stay on the short deterministic path.
-8. **`notify_slack_user`** → idempotent RMP `chat.postMessage`. Insufficient work is reworked (attempts 1–19) or escalated with a diagnosis (attempt 20).
+7. **Process Evaluator** (not Aura; session `rmp_verify_*`) must **accept** the result before Slack. Conversational replies are gated too. Canary/system stay on the short deterministic path. It sees Aura's action trace (tool calls and results from her transcript) and the run's artifacts. If the evaluator itself fails, the run waits for it on durable timers (1, 2, 4 … 60 min), sends a hold notice after two failures, and after the last one closes the task without sending the unchecked draft. Messages that arrive while Aura works, while she is judged or during rework are folded into the draft, which is judged again.
+8. **`notify_slack_user`** → idempotent RMP `chat.postMessage`, in ordered parts of at most 3,500 characters. Transient Slack errors retry; a permanent one is recorded (`slack.delivery_failed`) and alerted. Insufficient work is reworked (attempts 1–19, with one strategy change at 10) or escalated with a diagnosis (attempt 20). Messages that arrive after the reply go back to intake (`resubmit_user_messages`).
 
 ### 3.2 Cron (e.g. MoltMarket)
 
@@ -209,6 +212,7 @@ Run: `bash /root/.openclaw/rmp/ops/upgrade_openclaw.sh` (`make upgrade-openclaw`
 | GPT-6 thinking levels | `RMP_GPT6_THINKING_BACKPORT`: 2026.9.1's OpenAI thinking policy offers `max` only to `gpt-5.6*` and ignores declared efforts outside the codex runtime, so gpt-6-luna sessions clamped `max` to `high`. Backport of 2026.9.6's GPT-6 branch: levels come from `compat.supportedReasoningEfforts`. Skipped on releases that ship `OPENAI_GPT_6_MODEL_IDS` |
 | Session canonical scan | Skip in-flight `{}` placeholders with `entry_valid != 1`; do not fail-closed the whole store on parseable pending rows (2026.9 `entry_valid` triggers otherwise poison every `/hooks/agent`) |
 | Session timestamp drift | Ignore `session_nodes.updated_at` vs JSON `updatedAt` mismatch (often tens of ms); stock parser returns null and `/hooks/agent` throws `SESSION_CANONICAL_KEY_MIGRATION_REQUIRED` |
+| OpenAI no storage | `RMP_OPENAI_NO_STORE`: `storeMode: "disable"` and no server-side compaction for provider `openai`, so requests send `store: false` and replay `reasoning.encrypted_content` (stock sends `store: true` with no config switch) |
 | HTTP 410 skip | Classify 410 as `model_not_found` (next fallback), not timeout/idle retry |
 | Model fallbacks | **Left enabled** — gpt-6-luna → gpt-oss-20b (do not re-apply legacy no-fallback disable; do not restore GLM, DeepSeek or MiniMax) |
 
@@ -342,8 +346,10 @@ Primary path for Slack DMs, cron, and most automation.
    - **`build_process_memory_context`** — once at start; refreshed after each completed step (skipped vector for canaries via `skip_vector`).
    - For each plan step, up to **3 attempts** via **`GenericExecuteChildWorkflow`** child.
    - On step `blocked` → task `pending_user_input`; on exhausted failures → **`execute_compensation`**.
-3. **`decide_completion_gate`** — evidence check, then Process Evaluator (quality LLM) for user work. Quality LLM is skipped only for internal/canary/heartbeat (`is_internal_task`).
+3. **`decide_completion_gate`** — evidence check, then Process Evaluator (quality LLM) for user work. Quality LLM is skipped only for internal/canary/heartbeat (`is_internal_task`). `_judge_and_deliver` leaves only through an accept (then delivery) or an escalation; evaluator failures retry the evaluator (`EvaluatorRetry`, `app/workflows/judgment.py`), never Aura.
 4. **`notify_slack_user`** — final delivery unless internal/canary/heartbeat suppression applies.
+
+Messages signalled while the run works are taken at each turn and folded into the draft (`AttachedMessages`, `app/workflows/user_messages.py`); leftovers after delivery, stop or escalation are resubmitted to intake. A run the reconciler restarts after a crash carries `recovered_draft`, which is judged before anything is sent.
 
 Exception path: any uncaught workflow error triggers compensation + user-facing error message (formatted via `notification_policy`).
 
@@ -416,7 +422,7 @@ The orchestrator keeps **program logic** in charge; the LLM proposes actions and
 1. **`wait_for_dispatch_sync()`** — quota broker pacing (per-key interval, cooldown-aware key pick).
 2. **`reserve_profile(session_key)`** — atomic concurrency slot + balanced key assignment; pins `authProfileOverride` on session.
 3. **`POST /hooks/agent`** — dispatches prompt to isolated RMP session; `deliver: false` (RMP owns Slack); `allowUnsafeExternalContent: true` so OpenClaw does not EXTERNAL-wrap trusted RMP prompts (otherwise structured JSON intake returns `NO_REPLY`).
-4. **JSONL poll** — waits for terminal assistant message; scans up to 3 recent session files if session ID rotated.
+4. **JSONL poll** — waits for terminal assistant message; scans up to 3 recent session files if session ID rotated. Each dispatch starts with `[RMP_DISPATCH <nonce>]`, and only an assistant turn after that user turn counts, so a previous turn's reply or verdict is never taken for this one.
 5. **`release_profile()`** — always in `finally`.
 6. On 429: `record_rate_limit`, rotate, retry (up to 12× for chat).
 
@@ -430,10 +436,12 @@ The orchestrator keeps **program logic** in charge; the LLM proposes actions and
 
 | Component | File / unit | Behavior |
 |-----------|-------------|----------|
-| **Reconciler** | `app/reconciler.py` | Cron activity: stale tasks (>20m), stuck RUNNING workflows (>45m terminate + repair), orphan `*-plan-*` child cleanup; skips internal/canary Slack nudges |
+| **Reconciler** | `app/reconciler.py` | Every 60 s in the API: stale tasks (>20m), stuck RUNNING workflows (>45m terminate + repair), orphan `*-plan-*` child cleanup; skips internal/canary Slack nudges. A reply left by a dead run: if Temporal shows the workflow closed or missing, restart GenericTaskWorkflow with the draft to judge (a catalog run closes with a notice instead of repeating side effects). Closes process runs whose task already ended |
+| **Vector outbox** | `app/memory/vector_sync.py` (API loop) | Drains `vector_outbox` every 15 s; daily reconcile queues missing rows and unindexed finished user tasks, deletes unreferenced points |
 | **Workflow janitor** | `ops/workflow_janitor.py`, `rmp-janitor.timer` | Daily sweep of orphaned Temporal executions >24h |
 | **Canary timers** | `rmp-canary.timer`, `rmp-memory-canary.timer` | Hourly E2E + 6h memory/vector canary; results in logs + `data/last_memory_canary.json` |
-| **Readiness** | `GET /api/production/readiness` | Stuck workflow count, canary freshness, LLM orchestration snapshot |
+| **Canary sentinel** | `app/production/canary_sentinel.py`, `rmp-canary-sentinel.timer` | Every 30 min: canary health with remediation, then the invariant checks; pages Kirill by Slack DM on a failure (4 h cooldown per incident) |
+| **Readiness** | `GET /api/production/readiness` | Stuck workflow count, canary freshness, LLM orchestration snapshot, and the invariants (`app/production/invariants.py`): completions without an accept, attached messages neither answered nor resubmitted, Slack delivery failures, internal traces in shared memory, vector outbox and drift, orphan recoveries |
 
 This layer makes the single-VPS deployment **set-and-forget**: transient worker crashes, hung OpenClaw sessions, and orphaned children are repaired without operator intervention.
 
@@ -542,7 +550,7 @@ Tracks **requests + tokens** per key per day, by source:
 
 ### 6.1 Postgres (`rmp_db`)
 
-Core entities: `Task`, `ProcessRun`, `Step`, `Observation`, `Event`, `MemoryItem`, `Artifact`, `SideEffectReceipt`, `memory_links`.
+Core entities: `Task`, `ProcessRun`, `Step`, `Observation`, `Event`, `MemoryItem`, `Artifact`, `SideEffectReceipt`, `memory_links`, `task_messages`, `task_registry_entries`, `vector_outbox`. Postgres is the record of memory; Qdrant indexes it. `events` is indexed by `(event_type, occurred_at)` and `entity_id`.
 
 ### 6.2 Vector memory (Mem0 + Qdrant)
 
@@ -553,7 +561,7 @@ Core entities: `Task`, `ProcessRun`, `Step`, `Observation`, `Event`, `MemoryItem
 | Collection | `rmp_memories_openai_3small` |
 | Embedder | OpenAI `text-embedding-3-small` (1536-d). NVIDIA NIM embedders remain HTTP 410 EOL. See live `settings.json` `vector_memory.*` |
 | Config | `settings.json` → `vector_memory.*` |
-| Implementation | `app/memory/vector.py` (`embed_query_text`) |
+| Implementation | `app/memory/vector.py` (`embed_query_text`), `app/memory/vector_sync.py` (outbox, drain, reconcile) |
 
 **Why server mode:** Embedded Qdrant uses a single-process `.lock` file. With both `rmp-api` and `rmp-worker` using vector memory, only one process could hold the lock — the other reported `ready: false`. A shared Qdrant server lets both connect over HTTP.
 
@@ -576,23 +584,25 @@ Compose file: `docker-compose.qdrant.yml`. `rmp-api` and `rmp-worker` systemd un
 
 **Chat vs embed “compatibility”:** Chat models never see raw vectors. Embeddings only rank text chunks for retrieval. Conversational continuity must not depend on embeddings. NVIDIA NIM embedders probed 2026-09-05 return HTTP 410 EOL; live replacement is OpenAI `text-embedding-3-small`.
 
-**Semantic recall:** Memory lookup with `query=` merges Postgres rows and Qdrant vector hits (`MemoryRouter.read`).
+**Semantic recall:** Memory lookup with `query=` merges Postgres rows and Qdrant vector hits (`MemoryRouter.read`). When the index or the embedder does not answer, recall falls back to Postgres full-text search (`to_tsvector('simple')`, GIN index). Procedural recall is narrowed to its process type (`procedural_scope_id`).
 
-**Seeding:** `app/memory/seed.py` — chunks workspace markdown + re-indexes Postgres memories:
+**Writes and sync:** `MemoryRouter.write` commits the memory row and its `vector_outbox` row in one transaction. The API's drain (every 15 s, per-row backoff up to 1 h) embeds and upserts with point id = row id in Mem0's payload shape, so a retry overwrites instead of duplicating. Registry entries go through the same outbox. A daily reconcile (by hand: `ops/reconcile_vectors.py`, dry run by default) diffs Postgres with both indexes: it queues missing rows and finished user tasks without a registry entry, deletes points no row references, and refuses to delete most of an index.
+
+**Seeding:** `app/memory/seed.py` — workspace markdown chunks become memory rows (stored ones are skipped); the outbox indexes them:
 
 ```bash
 make -C /root/.openclaw/rmp seed-vector-memory
 ```
 
-Wipe Qdrant before changing embedder model or dimensions. Bulk seed is paced (~15–20 min for ~45 chunks) due to shared quota broker.
+Wipe Qdrant before changing embedder model or dimensions, then reconcile to re-queue every row.
 
-**Index (2026-06-04):** 45 vectors (31 workspace + 14 Postgres).
+**Index (2026-09-29):** memory 2,584 rows = 2,584 points; registry 201 entries = 201 points. The legacy 4096-d collections (`rmp_memories`, `rmp_task_registry`) are retired.
 
 **Future option:** Local embeddings (Ollama / sentence-transformers) — no API quota, ops tradeoff; not required for chat-model compatibility.
 
 ### 6.3 Memory promotion (`app/memory/promotion.py`)
 
-Episodic → semantic/procedural pipeline (partial vs original 4-stage vision).
+Episodic → semantic/procedural pipeline (partial vs original 4-stage vision). Canary, heartbeat and system runs are never promoted and never indexed in the registry (`app/memory/hygiene.py` defines their traces; `ops/purge_internal_memory.py` removes any). Procedural memory stores a procedure — task, steps, tools used, failed calls, result — not the reply.
 
 ### 6.4 Artifacts
 
@@ -625,13 +635,15 @@ Scanner catalog synced by RMP (`app/scanners/`) when `development_mode: false`.
 
 | Mechanism | Status |
 |-----------|--------|
-| Readiness API | ✅ ~93% at go-live |
+| Readiness API | ✅ includes the invariant checks; 30 pass, 1 warn, 0 fail at the Sep 29 2026 audit close |
+| Invariant monitors | ✅ `app/production/invariants.py`; the canary sentinel pages Kirill on a broken one |
 | Prometheus `/metrics` | ✅ |
 | Hourly canary | ✅ `:07` past each hour |
 | Daily backup | ✅ `ops/backup.sh` |
 | Runbooks | ✅ `docs/runbooks/` |
-| OTLP trace backend | ✅ Phoenix + OTel collector (`make observability`); `telemetry.otlp_endpoint` set |
+| OTLP trace backend | ⚠️ `make observability` brings up Phoenix + an OTel collector, but `telemetry.otlp_endpoint` is empty on this host, so traces stay in-process (readiness warns) |
 | Production Temporal | One official server on Postgres. Not a cluster and not Temporal Cloud. |
+| Ops Slack DM | ✅ `production.ops_slack` (on by default): canary failures and broken invariants DM Kirill, deduped per incident |
 | Alerting webhook | ⏳ Config present; disabled by default |
 
 ### Operator commands
@@ -643,8 +655,13 @@ make canary                 # manual E2E canary
 make readiness              # full readiness JSON
 make backup
 make sync-nvidia-keys       # env → SQLite authProfiles.store
-make seed-vector-memory     # re-index workspace + Postgres → Qdrant
+make seed-vector-memory     # workspace chunks → memory rows → outbox → Qdrant
+make restart-rmp            # restart API, worker, gateway; waits up to 60 s for health
 make rollback               # return to dev quiet mode (ops/rollback_dev.sh)
+
+venv/bin/python -m ops.reconcile_vectors [--apply]    # Postgres vs Qdrant diff (dry run by default)
+venv/bin/python -m app.production.canary_sentinel     # canaries + invariants now (pages on failure)
+venv/bin/python -m pytest tests/ -q                   # hermetic: always a private SQLite database
 
 python3 ops/llm_usage_report.py      # daily per-key usage by source
 python3 ops/nvidia_key_probe.py      # live NVIDIA smoke test on all keys
@@ -797,24 +814,30 @@ Prioritized for stability first, then capability.
     │   ├── llm_quota.json        # Per-key cooldowns, slots, in_flight
     │   ├── llm_usage.json        # Daily per-key usage by source
     │   ├── last_memory_canary.json
-    │   └── qdrant/               # Vector index
+    │   └── qdrant-server/        # Vector index (Qdrant server bind mount)
     ├── app/
-    │   ├── orchestrator/         # decision_engine, step_predicates, prompt_policy
-    │   ├── workflows/            # generic_task, catalog_task, child workflows
-    │   ├── reconciler.py         # Stale task + stuck workflow repair
+    │   ├── orchestrator/         # decision_engine, step_predicates, prompt_policy, process_evaluator
+    │   ├── workflows/            # generic_task, catalog_task, child workflows,
+    │   │                         # judgment (evaluator retry), user_messages (fold-in, resubmit)
+    │   ├── production/           # readiness, invariants, canary_sentinel, ops_notify
+    │   ├── reconciler.py         # Stale task + stuck workflow repair, orphan re-judging, run closing
     │   ├── llm/
     │   │   ├── quota_broker.py   # NVIDIA key gate, balanced rotation, slots
     │   │   └── usage_monitor.py  # Per-key daily usage ledger
     │   └── memory/
     │       ├── vector.py         # Mem0/Qdrant service
+    │       ├── vector_sync.py    # Outbox drain + Postgres/Qdrant reconcile
+    │       ├── hygiene.py        # What counts as an internal trace in shared memory
     │       ├── nvidia_embed.py   # NVIDIA embeddings + broker
     │       ├── mistral_embed.py  # Legacy adapter (unused in prod config)
-    │       └── seed.py           # Workspace + Postgres re-index
+    │       └── seed.py           # Workspace chunks → memory rows
     ├── ops/
     │   ├── sync_nvidia_keys.py   # Env → SQLite auth (NVIDIA + optional OpenAI)
     │   ├── nvidia_key_probe.py   # Live NVIDIA smoke test
     │   ├── llm_usage_report.py   # Usage summary CLI
     │   ├── workflow_janitor.py   # Orphan Temporal cleanup
+    │   ├── reconcile_vectors.py  # Postgres/Qdrant diff and repair
+    │   ├── purge_internal_memory.py  # Remove internal traces from shared memory
     │   ├── canary.sh, backup.sh, …
     └── tests/                    # pytest (orchestration, usage, workflows, …)
 

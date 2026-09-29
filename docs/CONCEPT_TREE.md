@@ -88,8 +88,8 @@ RMP chat.postMessage (idempotent)
 
 ### 3.3 Data stores
 
-- **Postgres `rmp_db`:** Task, ProcessRun, Step, Observation, Event, MemoryItem, Artifact, SideEffectReceipt, `task_messages`, intake decisions, registry entries.
-- **Qdrant:** advisory dense retrieval for memory/registry. Must not assign workflows. Health must not claim a dead embedder is ready.
+- **Postgres `rmp_db`:** Task, ProcessRun, Step, Observation, Event, MemoryItem, Artifact, SideEffectReceipt, `task_messages`, intake decisions, registry entries. The record of memory: a memory row and its `vector_outbox` row commit together.
+- **Qdrant:** advisory dense retrieval for memory/registry, an index of Postgres kept by the outbox drain and a daily reconcile. Recall falls back to Postgres full text when it does not answer. Must not assign workflows. Health must not claim a dead embedder is ready.
 - **OpenClaw JSONL:** executor transcripts for `rmp_*` sessions. Not the user-visible Slack log.
 - **Workspace files:** `USER.md` (human facts, including Japan/JST), `TOOLS.md` (Aura-visible ops). Main-session `MEMORY.md` is **not** the production recall path for RMP-owned DMs.
 
@@ -107,10 +107,14 @@ RMP chat.postMessage (idempotent)
 
 - Every user Slack DM: plugin claim → `POST /tasks` → intake → Temporal → evaluator → RMP `chat.postMessage`.
 - Every user message becomes a **task or a follow-up**. Never silently drop. `skip_*` still persist a decision and a short RMP ack.
+- A message that reaches running work is folded into that run's next judged reply, or goes back to intake if the reply already went out. A message related to several running tasks attaches to all of them.
 - OpenClaw executes only inside `rmp_task_*` / `rmp_verify_*` / `rmp_intake_*` with `deliver: false`.
 - Intake Analyst (not Aura) classifies relation: running / finished / memory / new. Uncertain → clarify.
 - Retrieval (FTS, vectors, metadata) is **evidence**. Vector scores and regex catalog hits must not auto-attach or auto-create catalogs.
-- After Aura acts, log it. Process Evaluator (not Aura) must **accept** before Slack, including greetings/chat, except the short deterministic canary/heartbeat/system path.
+- After Aura acts, log it. Process Evaluator (not Aura) must **accept** before Slack, including greetings/chat, except the short deterministic canary/heartbeat/system path. It judges what Aura did (her tool calls and their results), not only what she says. A draft recovered after a crash is judged by a restarted run; an evaluator outage waits for the evaluator and never sends the unchecked draft.
+- Canary, heartbeat and system runs never reach user or procedural memory or the task registry. Procedural memory holds procedures (steps, tools, failures), not replies.
+- Slack delivery cannot fail silently: a long reply goes out whole in ordered parts, transient errors retry, a permanent failure is recorded and alerted.
+- Invariants are monitored, not assumed: readiness shows them, and the canary sentinel pages Kirill when one breaks (a completion without an accept, a dropped attached message, a Slack failure, internal traces in shared memory, a stuck vector outbox).
 - Attempts: 1–9 rework; ~10 strategy change; 11–19 continue; ~20 stop and Slack a diagnosis.
 - Process-scoped memory is injected on execute. Across `create_fresh`, prior same-conversation Slack turns are injected (RECENT DIALOGUE). “This is new” labels a **new task row**, not a new person.
 - User-local clock is a **fact** (`USER LOCAL TIME` / Japan Standard Time). Server Europe/Berlin is not Kirill’s clock.
@@ -125,6 +129,7 @@ RMP chat.postMessage (idempotent)
 ### MUST NOT
 
 - Native OpenClaw Slack for user DMs, including “intake failed so let the gateway answer.”
+- Post a reply the evaluator has not accepted, including one recovered after a crash or held by an evaluator outage.
 - Plugin `process_type_hint` or keyword/`GENERIC_PROFILES`/web-regex **assignment** of catalogs or tool dumps.
 - Static incident patches: greeting-word locks, “don’t list crawlers,” other content bans for one failure.
 - Treat `execution_mode=conversational` as bypassing intake, evaluator, or RMP notify.
@@ -154,8 +159,8 @@ RMP chat.postMessage (idempotent)
 5. Outcomes: clarify (RMP question, no Aura yet); attach/wait/rebuild on **user** actives; create_guided / create_fresh; skip with ack.
 6. If work proceeds: Generic or Catalog Temporal workflow. Conversational → usually one deliver step (still RMP).
 7. Aura in `rmp_task_*`. Program-owned plan and code predicates advance steps.
-8. Process Evaluator in `rmp_verify_*` accepts or reworks.
-9. RMP `chat.postMessage`, idempotent. Assistant text stored on `task_messages`.
+8. Process Evaluator in `rmp_verify_*` accepts or reworks, judging Aura's action trace. Messages that arrived meanwhile are folded in and judged again.
+9. RMP `chat.postMessage`, idempotent, in ordered parts when long. Assistant text and its Slack `ts` stored on `task_messages`. Messages that arrive after it go back to intake.
 
 **Stop:** A **whole-message** stop/cancel/abort/halt may signal the active Temporal workflow (programmatic control). Incidental “stop” inside a normal sentence must still go through intake.
 
@@ -211,6 +216,7 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 | HTTP 410 | Skip to next model. |
 | 429 | Rotate NVIDIA keys; wait on true quota after rotation; do not hop providers for 429. |
 | OpenAI auth | Env `OPENAI_API_KEY` → SQLite `openai:default`. Never pin NVIDIA profiles on OpenAI sessions. |
+| OpenAI storage | `store: false` (`RMP_OPENAI_NO_STORE`): OpenAI keeps no prompts or replies. Reasoning carries between turns as `reasoning.encrypted_content`; server-side compaction is off (it needs stored responses). |
 | NVIDIA auth | `nvidia:default` → `key2` → `key3`, balanced. |
 | OmniRoute | Not in the live Slack path. |
 | Decision model | `jev-1.13.0` (TypeSafe), pinned. Typed intake and memory-promotion decisions only; never writes text. `TYPESAFE_API_KEY` in `/etc/openclaw/openclaw.env`. Modes in `settings.json` `jev`; `AURA_JEV_MODE=off` disables both. |
@@ -253,6 +259,8 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 | `nv-embed-v1` is the working embedder | Honest health: working replacement or not-ready | NVIDIA NIM deprecated (HTTP 410). |
 | Aura owns Slack because she is independent | Independence ≠ owning delivery | Feb constitution vs RMP era: Aura executes; RMP judges and delivers. |
 | Intake decides only through the LLM chain | Jev typed decision first; LLM chain below thresholds | Sep 28 2026: 11 of 14 DMs in 30 days fell to the zero-confidence fallback. |
+| An orphaned reply may go out as it is, so Kirill is not left waiting | A restarted run judges it first | Sep 29 2026 audit: 6 replies reached Slack unjudged on Sep 27–28 through the reconciler. |
+| OpenAI keeps responses (`store: true`, OpenClaw's default) | `store: false`; encrypted reasoning replay | Sep 29 2026: Kirill chose storage off if reasoning survives without it; verified live before and after the patch. |
 | gpt-5-nano primary at thinking `low`, Chat Completions | `openai/gpt-6-luna` over the Responses API; `max` for Aura's user tasks, `medium` elsewhere; OpenAI `max` calls get 120s first byte and 30s chunk gaps | Sep 29 2026 Kirill: "switch everything to gpt-6-luna with max effort", then chose max for task work and medium for intake, evaluator and canaries. Live probes: Chat Completions rejects tools with reasoning and has no `max`; max on an intake prompt took 36s vs 6s at medium with the same decision. |
 
 ---
@@ -265,6 +273,7 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 | [`ARCHITECTURE.md`](../ARCHITECTURE.md) | Runtime how (services, files, flows) |
 | [`CONTROL_PLANE_PROGRESS.md`](CONTROL_PLANE_PROGRESS.md) | Append-only control-plane execution log |
 | [`CONCEPT_TREE_PROGRESS.md`](CONCEPT_TREE_PROGRESS.md) | Append-only log for this constitution work |
+| [`SYSTEM_AUDIT_PROGRESS.md`](SYSTEM_AUDIT_PROGRESS.md) | Append-only log of the Sep 29 2026 system audit and hardening |
 | `/root/.cursor/rules/rmp-architecture.mdc` | Thin always-on coding binding |
 | `/root/.cursor/rules/openclaw-upgrade.mdc` | Upgrade/patch law |
 | `/root/.openclaw/workspace/TOOLS.md` | Aura executor notes (PROCESS BRIEF, tools). Not Cursor constitution. |

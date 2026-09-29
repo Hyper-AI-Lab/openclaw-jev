@@ -30,14 +30,14 @@ Aura (the **Reliability & Memory Plane**, RMP) is the sidecar that owns those gu
 
 | Capability | What Aura provides |
 | --- | --- |
-| Durable task intake | 3-layer funnel (fast path → vector gate → LLM classify) with `off` / `shadow` / `enforce` modes |
+| Durable task intake | Fast path → hybrid evidence (retrieval informs, never assigns) → Intake Analyst (Jev typed decision above thresholds, else the LLM) with `off` / `shadow` / `enforce` modes; a message related to several running tasks attaches to all of them |
 | Workflow control plane | Temporal `GenericTask` / `CatalogTask` workflows, child steps, reconciler + janitor |
-| Process memory | Process-scoped recall + promotion; Qdrant vectors (not-ready: NVIDIA embed HTTP 410) |
+| Process memory | Process-scoped recall + promotion; Postgres is the record, Qdrant (OpenAI `text-embedding-3-small`) its index via a transactional outbox, Postgres full text as the fallback |
 | Slack ownership | OpenClaw plugin routes DMs to RMP; RMP posts the final reply (no double-send / no native fallback) |
 | LLM orchestration | Balanced NVIDIA key rotation, concurrency caps, fast idle rotate (~5s), usage ledger |
 | Galaxy web stack | Brave + LangSearch search; Jina Reader; Crawl4AI / Scrapling / Crawlee / ScrapeGraphAI; OpenClaw `browser` + browser-use + Obscura CDP |
 | Web capability routing | Intake analyzer picks `search` / `fetch` / `crawl` / `extract` / `interact` and injects a tool brief |
-| Production gates | Readiness API, hourly canaries with **soft-fail deferral** (no worker restart while user tasks run), orphan-reply Slack recovery |
+| Production gates | Readiness API with invariant checks, hourly canaries with **soft-fail deferral** (no worker restart while user tasks run), a sentinel that DMs Kirill when an invariant breaks; a reply left by a dead run is judged by a restarted run |
 
 ## Architecture
 
@@ -72,11 +72,14 @@ flowchart TD
   Stack --> Obscura["Obscura_CDP_:9222"]
   Worker --> PG["PostgreSQL"]
   Worker --> Qdrant["Qdrant"]
-  Worker -->|"notify_slack_user"| Slack["Slack_DM_idempotent"]
+  Worker -->|"hooks/agent_rmp_verify"| Evaluator["Process_Evaluator"]
+  Evaluator -.->|"rework"| Worker
+  Evaluator -->|"accept_then_notify_slack_user"| Slack["Slack_DM_idempotent"]
   Canary["hourly_health_canary"] --> Sentinel["canary_sentinel"]
   Sentinel -->|"soft_timeout_+_active_users"| Defer["defer_worker_restart"]
   Sentinel -->|"hard_stale_or_code_sync"| Restart["restart_rmp_api_worker"]
-  Reconciler["reconciler"] -->|"orphan_OpenClaw_reply"| Slack
+  Sentinel -->|"broken_invariant"| Ops["ops_DM_to_Kirill"]
+  Reconciler["reconciler"] -->|"restart_dead_run_to_judge_its_draft"| Generic
 ```
 
 | Layer | Role |
@@ -159,7 +162,7 @@ curl -s http://127.0.0.1:8791/health   # web-stack backends (if enabled)
 - Obscura remote mode: `OBSCURA_CDP_URL=http://127.0.0.1:9222` (Hermes-compatible).  
 - After every `npm install -g openclaw`, run `ops/upgrade_openclaw.sh` (never hand-edit dist; never `openclaw onboard`).  
 - Model stack: `openai/gpt-6-luna` primary (OpenAI Responses API) → `nvidia/openai/gpt-oss-20b` (NVIDIA); intake uses the same chain; subagents and the Process Evaluator run on gpt-6-luna. No GLM, no DeepSeek, no MiniMax.  
-- Health canary **soft** failures (`timeout`/`failed`) defer worker restart while user tasks are active; reconciler can recover finished OpenClaw replies to Slack if delivery was interrupted.
+- Health canary **soft** failures (`timeout`/`failed`) defer worker restart while user tasks are active. If a run dies after Aura answered, the reconciler restarts it and the evaluator judges the draft before anything reaches Slack.
 
 ## Status
 
