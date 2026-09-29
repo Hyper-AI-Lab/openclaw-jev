@@ -35,7 +35,9 @@ USE_SQLITE_AUTH: Optional[bool] = None
 COOLDOWN_STEPS_SEC = (15, 30, 60, 120)
 DEFAULT_MIN_INTERVAL_SEC = 5.0
 DEFAULT_MAX_WAIT_SEC = 1800.0
-DEFAULT_MAX_CONCURRENT = 3
+DEFAULT_MAX_CONCURRENT = 4
+# Intake runs in its own lane, outside max_concurrent, so it never waits behind Aura's runs.
+INTAKE_LANE_SLOTS = 1
 CANARY_MAX_WAIT_SEC = 60.0
 RESERVE_WAIT_LOG_SEC = 2.0
 
@@ -337,8 +339,19 @@ def _profile_load_score(totals: Dict[str, int], in_flight: int = 0) -> float:
     return requests + (tokens / 5000.0) + (in_flight * 50.0)
 
 
+def _slot_kind(slot: Dict[str, Any]) -> str:
+    return str(slot.get("kind") or "") or classify_slot_kind(slot.get("session_key"))
+
+
 def _active_slot_count(state: Dict[str, Any]) -> int:
-    return len((state.get("global") or {}).get("active_slots") or {})
+    """Slots under max_concurrent (the intake lane has its own cap)."""
+    slots = (state.get("global") or {}).get("active_slots") or {}
+    return sum(1 for slot in slots.values() if _slot_kind(slot) != "intake")
+
+
+def _count_intake_slots(state: Dict[str, Any]) -> int:
+    slots = (state.get("global") or {}).get("active_slots") or {}
+    return sum(1 for slot in slots.values() if _slot_kind(slot) == "intake")
 
 
 def _existing_session_slot(
@@ -589,8 +602,8 @@ def classify_slot_kind(
     task_type: Optional[str] = None,
     kind: Optional[str] = None,
 ) -> str:
-    """Stamp user vs canary/heartbeat from tags/task_type, not UUID substring."""
-    if kind in ("user", "canary", "heartbeat"):
+    """Stamp user, intake or canary/heartbeat from tags/task_type and the session key, not UUID substring."""
+    if kind in ("user", "canary", "heartbeat", "intake"):
         return kind
     tag_set = {str(t).lower() for t in (tags or [])}
     tt = (task_type or "").lower()
@@ -603,6 +616,8 @@ def classify_slot_kind(
         return "heartbeat"
     if "canary" in sk:
         return "canary"
+    if "rmp_intake_" in sk:
+        return "intake"
     return "user"
 
 
@@ -620,12 +635,10 @@ def _count_kind_slots(state: Dict[str, Any]) -> tuple[int, int]:
     user_n = 0
     canary_n = 0
     for slot in ((state.get("global") or {}).get("active_slots") or {}).values():
-        k = str(slot.get("kind") or "") or classify_slot_kind(
-            slot.get("session_key")
-        )
+        k = _slot_kind(slot)
         if k in ("canary", "heartbeat"):
             canary_n += 1
-        else:
+        elif k != "intake":
             user_n += 1
     return user_n, canary_n
 
@@ -692,7 +705,11 @@ def _mutate_reserve(
         user_cap, canary_cap = _pool_caps(cfg.max_concurrent)
         total_cap = max(1, cfg.max_concurrent)
 
-        if kind in ("canary", "heartbeat"):
+        if kind == "intake":
+            intake_n = _count_intake_slots(state)
+            if intake_n >= INTAKE_LANE_SLOTS:
+                return _fail(f"intake lane busy ({intake_n}/{INTAKE_LANE_SLOTS})")
+        elif kind in ("canary", "heartbeat"):
             if canary_n >= canary_cap or _active_slot_count(state) >= total_cap:
                 return _fail(
                     f"canary slots full ({canary_n}/{canary_cap}, "
@@ -882,6 +899,8 @@ def get_orchestration_status(settings: Optional[Dict[str, Any]] = None) -> Dict[
         "active_slots": len(slots),
         "user_active": _count_kind_slots(state)[0],
         "canary_active": _count_kind_slots(state)[1],
+        "intake_slots": INTAKE_LANE_SLOTS,
+        "intake_active": _count_intake_slots(state),
         "rotation_mode": cfg.rotation_mode,
         "min_interval_sec": cfg.min_interval_sec,
         "sessions": {

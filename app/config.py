@@ -181,7 +181,7 @@ DEFAULT_LLM_QUOTA = {
     "provider": "nvidia",
     "min_interval_sec": 5.0,
     "max_wait_sec": 1800.0,
-    "max_concurrent": 3,
+    "max_concurrent": 4,
     "cooldown_steps_sec": [15, 30, 60, 120],
 }
 

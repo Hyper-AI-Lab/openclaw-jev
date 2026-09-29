@@ -150,6 +150,36 @@ def test_mutate_reserve_says_why_it_failed(broker_env, monkeypatch):
     assert why == ["every key is cooling down"]
 
 
+LANE = {"llm_quota": {"max_concurrent": 4, "min_interval_sec": 0, "max_wait_sec": 5}}
+
+
+def test_intake_sessions_run_in_their_own_lane():
+    assert qb.classify_slot_kind("agent:main:rmp_intake_ab12_c3d4") == "intake"
+    assert qb.classify_slot_kind("agent:main:rmp_task_t1") == "user"
+
+
+@pytest.mark.asyncio
+async def test_intake_never_waits_behind_aura_and_takes_none_of_her_slots(broker_env, monkeypatch):
+    import time
+
+    monkeypatch.setattr(qb, "reap_stale_llm_slots_sync", lambda **_: [])
+    monkeypatch.setattr(qb, "_patch_auth_last_good", lambda profile_id: None)
+    for n in range(3):
+        await qb.reserve_profile(session_key=f"agent:main:rmp_task_t{n}", settings=LANE)
+    with pytest.raises(TimeoutError, match=r"user slots full \(3/3, 3/4 total\)"):
+        await qb.reserve_profile(session_key="agent:main:rmp_task_t3", settings=LANE, deadline=time.time() + 0.5)
+
+    assert await qb.reserve_profile(session_key="agent:main:rmp_intake_a_1", settings=LANE)
+    with pytest.raises(TimeoutError, match=r"intake lane busy \(1/1\)"):
+        await qb.reserve_profile(session_key="agent:main:rmp_intake_b_2", settings=LANE, deadline=time.time() + 0.5)
+    status = qb.get_orchestration_status(LANE)
+    assert (status["user_slots"], status["canary_slots"], status["intake_slots"]) == (3, 1, 1)
+    assert (status["user_active"], status["intake_active"], status["active_slots"]) == (3, 1, 4)
+
+    await qb.release_profile(session_key="agent:main:rmp_intake_a_1")
+    assert await qb.reserve_profile(session_key="agent:main:rmp_intake_b_2", settings=LANE)
+
+
 class _Info:
     def __init__(self, started, timeout_sec):
         from datetime import timedelta
