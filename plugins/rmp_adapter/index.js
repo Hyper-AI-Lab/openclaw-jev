@@ -639,7 +639,7 @@ module.exports = {
         },
         required: ['process_run_id'],
       },
-      execute: async (params) => {
+      execute: async (_id, params) => {
         try {
           const q = params.query ? `?query=${encodeURIComponent(params.query)}` : '';
           const result = await rmpFetch(
@@ -654,7 +654,7 @@ module.exports = {
       },
     });
 
-    api.registerTool({
+    api.registerTool((context) => ({
       name: 'rmp_task_create',
       description: 'Create a durable task in the Reliability and Memory Plane.',
       parameters: {
@@ -666,7 +666,7 @@ module.exports = {
         },
         required: ['intent', 'task_type']
       },
-      execute: async (params, context) => {
+      execute: async (_id, params) => {
         try {
           const result = await rmpFetch('POST', '/tasks', {
             intent: params.intent,
@@ -680,7 +680,7 @@ module.exports = {
           return `Failed: ${err.message}`;
         }
       }
-    });
+    }), { name: 'rmp_task_create' });
 
     api.registerTool({
       name: 'rmp_task_status',
@@ -690,7 +690,7 @@ module.exports = {
         properties: { task_id: { type: 'string' } },
         required: ['task_id']
       },
-      execute: async (params) => {
+      execute: async (_id, params) => {
         try {
           const result = await rmpFetch('GET', `/tasks/${params.task_id}`);
           return `Task ${result.task_id}: ${result.status}`;
@@ -928,6 +928,24 @@ module.exports = {
       if (stripped !== content.trim()) {
         log('SANITIZED outbound Slack text (facts/metadata/interim stripped)');
         return { content: stripped };
+      }
+    }, { priority: 100 });
+
+    // A tool that waits for Kirill's answer cannot reach him from an RMP run (RMP owns every
+    // Slack message), so it would hold the run until its timeout.
+    api.on('before_tool_call', (event, ctx) => {
+      const sessionKey = ctx?.sessionKey || '';
+      if (!sessionKey.includes('rmp_task_') && !sessionKey.includes('rmp_verify_') && !sessionKey.includes('rmp_intake_')) {
+        return;
+      }
+      const tool = event?.toolName;
+      if (tool === 'ask_user' || (tool === 'secrets' && event?.params?.action === 'request')) {
+        log(`Blocked ${tool} in ${sessionKey}: Kirill cannot answer tool prompts in an RMP run`);
+        return {
+          block: true,
+          blockReason:
+            'Kirill cannot answer tool prompts during an RMP task. Put the question in your reply; RMP delivers it and brings his answer back as a follow-up.',
+        };
       }
     }, { priority: 100 });
 

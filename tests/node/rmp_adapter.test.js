@@ -119,7 +119,10 @@ function loadPlugin() {
   const tools = {};
   plugin.register({
     on: (name, handler) => { hooks[name] = handler; },
-    registerTool: (tool) => { tools[tool.name] = tool; },
+    registerTool: (tool) => {
+      const built = typeof tool === 'function' ? tool({ sessionKey: SLACK_KEY }) : tool;
+      tools[built.name] = built;
+    },
   });
   return { hooks, tools };
 }
@@ -427,4 +430,36 @@ test('the plugin log never carries the RMP key or an auth header value', async (
   const text = logs.join('');
   assert.ok(!text.includes('test-key') && !text.includes('abc.def'), text);
   assert.ok(text.includes('X-RMP-API-Key: ***') && text.includes('Bearer ***'));
+});
+
+test('plugin tools read their arguments the way OpenClaw passes them: execute(toolCallId, params)', async () => {
+  const calls = installFetch([
+    [/^GET \/memory\/process\/pr-1\/context$/, () => ({ context_block: 'Kirill prefers metric units.', count: 1 })],
+    ['POST /tasks', () => ({ task_id: 't-new', status: 'created' })],
+    ['GET /tasks/t-9', () => ({ task_id: 't-9', status: 'running' })],
+  ]);
+  const { tools } = loadPlugin();
+  assert.equal(
+    await tools.rmp_memory_recall.execute('call-1', { process_run_id: 'pr-1', query: 'units' }),
+    'PROCESS-SCOPED MEMORY (1 items):\nKirill prefers metric units.'
+  );
+  assert.equal(await tools.rmp_task_create.execute('call-2', { intent: 'Draft the memo', task_type: 'user' }), 'Task created: t-new');
+  assert.equal(await tools.rmp_task_status.execute('call-3', { task_id: 't-9' }), 'Task t-9: running');
+  assert.equal(calls[0].key, 'GET /memory/process/pr-1/context');
+  assert.equal(calls[1].body.intent, 'Draft the memo');
+  assert.equal(calls[1].body.session_key, SLACK_KEY);
+});
+
+test('an RMP run cannot wait on a tool prompt Kirill never sees', () => {
+  const { hooks } = loadPlugin();
+  const call = (toolName, params, sessionKey) => hooks.before_tool_call({ toolName, params }, { sessionKey });
+  for (const session of ['agent:main:rmp_task_t1', 'agent:main:rmp_verify_t1', 'agent:main:rmp_intake_abc']) {
+    const blocked = call('ask_user', { questions: [] }, session);
+    assert.equal(blocked.block, true);
+    assert.match(blocked.blockReason, /Put the question in your reply/);
+    assert.equal(call('secrets', { action: 'request', name: 'TEST_CODE_WORD' }, session).block, true);
+    assert.equal(call('secrets', { action: 'list' }, session), undefined);
+    assert.equal(call('web_fetch', { url: 'https://example.org' }, session), undefined);
+  }
+  assert.equal(call('ask_user', { questions: [] }, 'agent:main:main'), undefined);
 });
