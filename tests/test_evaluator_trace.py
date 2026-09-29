@@ -47,3 +47,26 @@ async def test_verify_sends_the_trace_and_artifacts_to_the_evaluator():
              "process_run_id": "pr1", "attempt": 1})
     assert result["verdict"] == "accept"
     assert "2. write" in seen["prompt"] and "- completion_output: plan.txt" in seen["prompt"]
+
+
+def test_a_reply_to_the_previous_turn_never_answers_this_dispatch():
+    import json
+
+    from app.activities.openclaw_activities import _poll_jsonl_for_response
+
+    def msg(role, text, ts, stop=None):
+        m = {"role": role, "content": [{"type": "text", "text": text}], "timestamp": ts}
+        if stop:
+            m["stopReason"] = stop
+        return json.dumps({"type": "message", "timestamp": ts, "message": m})
+
+    earlier = [msg("user", "[cron:a Hook] [RMP_DISPATCH first] judge draft 1", 1000),
+               msg("assistant", '{"verdict": "accept", "quality": "pass"}', 2000, "stop")]
+    marker = "[RMP_DISPATCH second]"
+    # The previous verdict is inside the 5 s window before this dispatch started.
+    text, _, _ = _poll_jsonl_for_response("", 0.0, earlier, marker)
+    assert text == ""
+    lines = earlier + [msg("user", f"[cron:b Hook] {marker} judge draft 2", 3000),
+                       msg("assistant", '{"verdict": "rework", "quality": "fail"}', 4000, "stop")]
+    text, reason, _ = _poll_jsonl_for_response("", 0.0, lines, marker)
+    assert '"rework"' in text and reason == "stop"

@@ -257,6 +257,7 @@ def _poll_session_ids_for_response(
     session_ids: List[str],
     start_time: float,
     require_terminal: bool,
+    marker: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Scan multiple session JSONL files for a terminal reply."""
     for sid in session_ids:
@@ -266,7 +267,7 @@ def _poll_session_ids_for_response(
             continue
         try:
             text_content, stop_reason, _ = _poll_jsonl_for_response(
-                jsonl_path, start_time, lines
+                jsonl_path, start_time, lines, marker
             )
             if (
                 text_content
@@ -291,15 +292,37 @@ def _extract_assistant_text(entry: dict) -> str:
     return full_text.strip()
 
 
+def _after_dispatched_turn(lines: list, marker: Optional[str]) -> Optional[list]:
+    """Lines after the user turn that carries this dispatch's marker; None until it is written.
+
+    Timestamps alone let a reply to the previous turn of the same session count as this one's.
+    """
+    if not marker:
+        return lines
+    for index in range(len(lines) - 1, -1, -1):
+        if marker not in lines[index]:
+            continue
+        try:
+            entry = json.loads(lines[index].strip())
+        except json.JSONDecodeError:
+            continue
+        if entry.get("message", {}).get("role") == "user":
+            return lines[index + 1:]
+    return None
+
+
 def _poll_jsonl_for_response(
-    jsonl_path: str, start_time: float, lines: list
+    jsonl_path: str, start_time: float, lines: list, marker: Optional[str] = None
 ) -> Tuple[str, str, Optional[str]]:
-    """Return the latest terminal assistant message after start_time."""
+    """Return the latest terminal assistant message after start_time (and after the marker's turn)."""
     best_text = ""
     best_reason = ""
     best_ts = 0.0
     latest_rate_error: Optional[str] = None
 
+    lines = _after_dispatched_turn(lines, marker)
+    if lines is None:
+        return best_text, best_reason, latest_rate_error
     for line in lines:
         try:
             entry = json.loads(line.strip())
@@ -433,6 +456,8 @@ async def _dispatch_openclaw_session(
         try:
             record_request(profile_id, "openclaw_hook")
             start_time = poll_start_time
+            marker = f"[RMP_DISPATCH {uuid.uuid4().hex[:12]}]"
+            hook_payload["message"] = f"{marker}\n{message}"
 
             # Snapshot before dispatch — new OpenClaw may create sessionId during POST.
             pre_session_id = get_session_entry(
@@ -538,6 +563,7 @@ async def _dispatch_openclaw_session(
                         fallback_ids,
                         start_time,
                         require_terminal,
+                        marker,
                     )
                     if fb_text:
                         record_success(profile_id)
@@ -560,7 +586,7 @@ async def _dispatch_openclaw_session(
                         if hard_fail:
                             raise OpenClawError(hard_fail)
                         text_content, stop_reason, rate_err = _poll_jsonl_for_response(
-                            jsonl_path, start_time, lines
+                            jsonl_path, start_time, lines, marker
                         )
                         if _jsonl_has_recent_activity(lines, start_time):
                             last_jsonl_activity = time.time()

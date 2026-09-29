@@ -123,7 +123,7 @@ def test_poll_session_ids_fallback_finds_reply(monkeypatch):
 
     sid = "abc-123"
 
-    def fake_poll(path, start_time, lines):
+    def fake_poll(path, start_time, lines, marker=None):
         return (
             'Summary here with enough length for terminal check. '
             '{"facts": {"step_complete": true}}',
