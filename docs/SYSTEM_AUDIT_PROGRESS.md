@@ -103,3 +103,27 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - The task registry intake searches holds 3,125 canary entries vs 140 user entries; intake cited "prior finished gateway/memory canary tasks" on Sep 28. Same contamination as C1, in a second store. Assigned to Step 5 (exclusion + approved purge).
 - Other workflow modules still import inside methods (sandbox warning for `app.notification_policy`). Assigned to Step 12 cleanup.
 - Delivery resolves any session without a Slack user to the owner's DM, so synthetic user-path tests would message Kirill; user-path live proof stays with the Step 12 acceptance DMs.
+
+---
+
+## Step 4 — Every attached message is addressed; several targets (B3, decision 1)
+
+**Date:** 2026-09-29 (18:40–19:02 CEST)
+
+**What changed:**
+
+- `app/workflows/user_messages.py` (new `AttachedMessages` mixin for both task workflows): take pending messages (stop and cancel entries stay for stop handling); fold them into Aura's current draft (`send_to_openclaw`, same session, max thinking for user tasks); after the run, wait for handlers and resubmit anything left.
+- `app/workflows/generic_task.py`: each judgment round first honours stop, then folds in pending messages; stop is also honoured right after the evaluator returns (no wasted rework or delivery after "stop"); an accepted draft that predates new messages is folded and judged again; the attempt counter now counts reworks only. Completion, escalation and stop all resubmit leftovers.
+- `app/workflows/catalog_task.py`: body moved to `_run`; `run` resubmits leftovers on every exit; fold-in before the first judgment and before each re-judge; leftovers also resubmitted before a durable leg continues as new. A message arriving during the catalog's final judgment is resubmitted as a follow-up rather than folded into that reply.
+- `app/activities/intake_activities.py` + `worker.py`: `resubmit_user_messages` posts leftovers to `POST /tasks` (deterministic idempotency key, full intake path).
+- Intake, several targets: `app/decisions/intake.py` asks Jev a yes/no `adds_to_Rn` question per running task when there are two or more; extra targets need the strict attach bar and only for `add_instructions`. `intake_prompt.py` documents `target_task_ids`. `apply_intake_policy` keeps only active, same-conversation (or durable) extra targets. The handler records the message, catch-up and `intake.attach` event on each target; `POST /tasks` signals each, acknowledges the delivered ones once ("Got it: adding “…” to the task(s) I'm working on (ids)"), and starts the message as new only if none were live.
+
+**Verification:**
+
+- Workflow tests (time-skipping server): a message sent while the evaluator runs is folded into the reply, and the revised reply is judged and sent; a message sent during a rework is folded in before the next judgment; a message sent after the reply (during the final status update) is resubmitted to intake; stop while judging stops with no rework.
+- Intake tests: per-task questions only with several running tasks; Jev attaches both tasks at 0.97 and only one when the second is at 0.8; status and restart stay single-target; the policy drops an inactive and a cross-conversation extra target; the handler records and signals each target; acknowledgements quote the message and name the tasks. The Jev eval harness test answers the new questions "no".
+- Full suite 528 passed, 3 skipped; node 11 passed; undefined-name check 0.
+- Live after reload (18:59:26): 0 running workflows at deploy; health canary `CANARY OK`; intake preview: Jev consulted (277 ms) and abstained below its execution-mode bar, the LLM decided — the intended cascade.
+- Multi-target and mid-task messages from Kirill are part of the Step 12 acceptance DMs.
+
+**Note:** parallel tool calls once raced on the same test file and dropped an appended test; it was re-added and runs (8 workflow tests).
