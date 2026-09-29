@@ -99,3 +99,28 @@ async def test_assemble_evidence_pack_fail_soft_on_fts_and_memory():
             )
     assert pack["memory_hits"]
     assert any(r.get("task_id") == "t1" for r in pack["ranked"])
+
+
+@pytest.mark.asyncio
+async def test_the_incoming_requests_own_reservation_is_not_evidence():
+    """The reservation row carries the new message as its goal; showing it made intake ask
+    Kirill whether he wanted a duplicate of his own request (Sep 30 acceptance DM)."""
+    from app.task_registry.hybrid_retriever import search_fts
+
+    statements = []
+
+    class _Rows:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class _Db:
+        async def execute(self, stmt, params):
+            statements.append(str(stmt))
+            return _Rows()
+
+    await search_fts("Remember this for later: my test code word", db=_Db())
+    [tasks_sql] = [s for s in statements if "FROM tasks," in s]
+    assert "coalesce(supplementary_context->>'intake_reserved', 'false') <> 'true'" in tasks_sql

@@ -99,6 +99,8 @@ async def search_fts(
         FROM tasks, plainto_tsquery('english', :q) AS q(query)
         WHERE to_tsvector('english', coalesce(goal,'')) @@ q.query
           AND status IN ('created','running','pending','pending_user_input','blocked','needs_replan')
+          -- An intake reservation is the incoming request itself, not existing work.
+          AND coalesce(supplementary_context->>'intake_reserved', 'false') <> 'true'
         ORDER BY rank DESC
         LIMIT :lim
         """
