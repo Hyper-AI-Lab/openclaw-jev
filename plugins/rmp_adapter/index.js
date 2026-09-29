@@ -2,12 +2,24 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const LOG = '/tmp/rmp_plugin_debug.log';
+const LOG = '/root/.openclaw/logs/rmp_adapter.log';
 const RMP_API = 'http://127.0.0.1:8000';
 const SETTINGS_PATH = '/root/.openclaw/rmp/settings.json';
 
+/** The log is never a place for the RMP key or any auth header value. */
+function redactSecrets(text) {
+  let out = String(text);
+  try {
+    const key = JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')).api_key;
+    if (key) out = out.split(key).join('***');
+  } catch (_) {}
+  return out.replace(/(X-RMP-API-Key:?\s*|Bearer\s+|x-access-token:)[^\s"'@]+/gi, '$1***');
+}
+
 function log(msg) {
-  try { fs.appendFileSync(LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch (_) {}
+  try {
+    fs.appendFileSync(LOG, `[${new Date().toISOString()}] ${redactSecrets(msg)}\n`, { mode: 0o600 });
+  } catch (_) {}
 }
 
 function loadSettings() {

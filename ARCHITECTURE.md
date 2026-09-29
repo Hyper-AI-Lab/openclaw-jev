@@ -653,7 +653,7 @@ systemctl status temporal rmp-api rmp-worker openclaw-gateway
 systemctl status rmp-memory-canary.timer rmp-janitor.timer rmp-canary.timer
 journalctl -u rmp-worker -f
 journalctl -u openclaw-gateway -f
-tail -f /tmp/rmp_plugin_debug.log
+tail -f /root/.openclaw/logs/rmp_adapter.log
 curl -s http://127.0.0.1:8000/memory/vector/status | jq
 curl -s -H "X-RMP-API-Key: $RMP_API_KEY" http://127.0.0.1:8000/api/llm/orchestration | jq
 curl -s -H "X-RMP-API-Key: $RMP_API_KEY" http://127.0.0.1:8000/api/llm/usage | jq

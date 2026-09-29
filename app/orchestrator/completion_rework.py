@@ -27,7 +27,8 @@ def next_loop_action(judged_attempt: int, policy: Optional[Dict[str, int]] = Non
     strategy_at = int(pol["strategy_change_attempt"])
     if judged_attempt >= escalate_at:
         return "escalate_user"
-    if judged_attempt >= strategy_at - 1:
+    # Attempt law: one change of approach (~10), then ordinary rework until ~20.
+    if judged_attempt == strategy_at - 1:
         return "strategy_change"
     return "rework"
 

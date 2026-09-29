@@ -10,7 +10,7 @@ const path = require('node:path');
 
 const PLUGIN = path.resolve(__dirname, '../../plugins/rmp_adapter/index.js');
 const LIVE_PLUGIN = '/root/.openclaw/plugins/rmp_adapter/index.js';
-const LOG_PATH = '/tmp/rmp_plugin_debug.log';
+const LOG_PATH = '/root/.openclaw/logs/rmp_adapter.log';
 const SETTINGS_PATH = '/root/.openclaw/rmp/settings.json';
 const SESSIONS_JSON = '/root/.openclaw/agents/main/sessions/sessions.json';
 const AGENT_SQLITE = '/root/.openclaw/agents/main/agent/openclaw-agent.sqlite';
@@ -416,4 +416,15 @@ test('a structured API error is logged readably, not as [object Object]', async 
   hooks.message_received(...slackDm('hey'));
   await waitFor(() => sawLog('route error (claimed; no native): HTTP 502: {"intake_action":"attach_active","error":"workflow not found"}'), 'readable error');
   assert.ok(!sawLog('[object Object]'));
+});
+
+test('the plugin log never carries the RMP key or an auth header value', async () => {
+  installFetch([['POST /tasks', () => json({ detail: 'X-RMP-API-Key: test-key rejected; Authorization: Bearer abc.def' }, 401)],
+    ['POST /api/notify-user', () => ({ delivered: true })]]);
+  const { hooks } = loadPlugin();
+  hooks.message_received(...slackDm('hi'));
+  await waitFor(() => sawLog('route error'), 'route error');
+  const text = logs.join('');
+  assert.ok(!text.includes('test-key') && !text.includes('abc.def'), text);
+  assert.ok(text.includes('X-RMP-API-Key: ***') && text.includes('Bearer ***'));
 });

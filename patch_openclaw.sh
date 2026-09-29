@@ -29,7 +29,7 @@ fi
 mapfile -t CANDIDATES < <(
   if command -v rg >/dev/null 2>&1; then
     rg -l --glob '*.js' \
-      'hasHooks\("before_message_write"\)|filterBootstrapFilesForSession|runSubagentAnnounceFlow|async function deliverReplies|fallbackConfigured = false && hasConfiguredModelFallbacks|function normalizeAgentPayload|allowUnsafeExternalContent: value\.allowUnsafeExternalContent|DEFAULT_LLM_IDLE_TIMEOUT_MS|scanCanonicalSqliteSessionEntries|function parseSqliteSessionEntryRecord|status === 410|cleanedWorkspaceRoots|function buildOpenAIThinkingProfile' \
+      'hasHooks\("before_message_write"\)|filterBootstrapFilesForSession|runSubagentAnnounceFlow|async function deliverReplies|fallbackConfigured = false && hasConfiguredModelFallbacks|function normalizeAgentPayload|allowUnsafeExternalContent: value\.allowUnsafeExternalContent|DEFAULT_LLM_IDLE_TIMEOUT_MS|scanCanonicalSqliteSessionEntries|function parseSqliteSessionEntryRecord|status === 410|cleanedWorkspaceRoots|function buildOpenAIThinkingProfile|function createOpenAIResponsesContextManagementWrapper' \
       "$DIST_DIR" 2>/dev/null || true
   else
     find "$DIST_DIR" -name '*.js'
@@ -367,6 +367,47 @@ PY
         fi
     fi
 
+    # Patch 6f: the OpenAI provider sent store:true on every Responses call, so OpenAI kept
+    # Aura's prompts and replies (Kirill, 2026-09-29: storage off). Reasoning still carries
+    # across turns: the transport requests reasoning.encrypted_content and replays it when
+    # store is false. Server-side compaction needs stored responses, so it goes too;
+    # OpenClaw's own compaction handles long sessions, as on Chat Completions before.
+    if grep -q 'function createOpenAIResponsesContextManagementWrapper' "$f" 2>/dev/null \
+       && ! grep -q 'RMP_OPENAI_NO_STORE' "$f" 2>/dev/null; then
+        python3 - "$f" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+if "RMP_OPENAI_NO_STORE" in text:
+    raise SystemExit(0)
+old = (
+    "\t\tconst policy = resolveOpenAIResponsesPayloadPolicy(model, {\n"
+    "\t\t\textraParams,\n"
+    "\t\t\tenablePromptCacheStripping: true,\n"
+    "\t\t\tenableServerCompaction: true,\n"
+    "\t\t\tstoreMode: \"provider-policy\"\n"
+    "\t\t});\n"
+)
+new = (
+    "\t\tconst rmpNoStore = String(model?.provider || \"\").toLowerCase() === \"openai\"; /* RMP_OPENAI_NO_STORE */\n"
+    "\t\tconst policy = resolveOpenAIResponsesPayloadPolicy(model, {\n"
+    "\t\t\textraParams,\n"
+    "\t\t\tenablePromptCacheStripping: true,\n"
+    "\t\t\tenableServerCompaction: !rmpNoStore,\n"
+    "\t\t\tstoreMode: rmpNoStore ? \"disable\" : \"provider-policy\"\n"
+    "\t\t});\n"
+)
+if text.count(old) != 1:
+    print("skip openai-no-store (dist shape changed)")
+    raise SystemExit(0)
+path.write_text(text.replace(old, new, 1))
+print("patched-openai-no-store")
+PY
+        if grep -q 'RMP_OPENAI_NO_STORE' "$f" 2>/dev/null; then
+            applied="${applied} openai-no-store"
+        fi
+    fi
+
     # Patch 7: 2026.9 session_nodes.entry_valid=0/-1 rows fail-closed the entire
     # store (every /hooks/agent). Keep placeholders skippable and allow parseable
     # pending rows through the canonical scan.
@@ -505,6 +546,7 @@ require_marker 'RMP_LLM_IDLE_5S' 'llm-idle-5s'
 require_marker 'RMP_OPENAI_FIRST_BYTE_20S' 'openai-first-byte-20s'
 require_marker 'RMP_OPENAI_MAX_EFFORT_120S' 'openai-max-effort-120s'
 require_marker 'RMP_GPT6_THINKING_BACKPORT|OPENAI_GPT_6_MODEL_IDS' 'gpt6-thinking-levels'
+require_marker 'RMP_OPENAI_NO_STORE' 'openai-no-store'
 require_marker 'RMP_410_SKIP' '410-skip-model-not-found'
 require_marker 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
 require_marker 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'

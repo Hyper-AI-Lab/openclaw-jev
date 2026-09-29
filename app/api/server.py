@@ -63,16 +63,18 @@ from app.config import (
     SETTINGS_PATH,
 )
 
-MODEL_CATALOG = {
-    "google": ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3.1-pro-preview"],
-    "openai": ["gpt-6-luna", "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o", "o3-mini"],
-    "anthropic": ["claude-3-5-haiku-latest", "claude-3-7-sonnet-latest"],
-    "mistral": ["mistral-large-latest", "mistral-large-2512", "mistral-medium-2505"],
-    "nvidia": [
-        "openai/gpt-oss-20b",
-        "nvidia/nemotron-3-nano-30b-a3b",
-    ],
-}
+def _live_model_catalog() -> Dict[str, List[str]]:
+    """The models the live chain can actually use, by provider."""
+    from app.llm.model_policy import FALLBACK_MODELS, PRIMARY_MODEL
+
+    catalog: Dict[str, List[str]] = {}
+    for ref in (PRIMARY_MODEL, *FALLBACK_MODELS):
+        provider, _, model = ref.partition("/")
+        catalog.setdefault(provider, []).append(model)
+    return catalog
+
+
+MODEL_CATALOG = _live_model_catalog()
 
 
 @asynccontextmanager
@@ -934,7 +936,7 @@ async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/tasks/{task_id}/cancel")
-async def cancel_task(task_id: str, db: AsyncSession = Depends(get_db)):
+async def cancel_task(task_id: str, reason: str = "api_cancel", db: AsyncSession = Depends(get_db)):
     """Terminate workflow and mark task stopped (dashboard / dev use)."""
     result = await db.execute(select(Task).where(Task.id == task_id))
     task = result.scalar_one_or_none()
@@ -950,7 +952,9 @@ async def cancel_task(task_id: str, db: AsyncSession = Depends(get_db)):
         await handle.terminate("Cancelled via API")
     except Exception as e:
         logger.warning("Terminate workflow %s: %s", task_id, e)
-    task.status = "stopped_by_user"
+    # stopped_by_user is only for Kirill's own "stop"; API cancels are cleanups and timeouts.
+    task.status = "cancelled"
+    task.supplementary_context = {**(task.supplementary_context or {}), "closed_reason": reason}
     task.next_check_at = None
     pr_result = await db.execute(
         select(ProcessRun)
@@ -969,7 +973,7 @@ async def cancel_task(task_id: str, db: AsyncSession = Depends(get_db)):
             entity_type="task",
             entity_id=task_id,
             event_type="task.cancelled",
-            event_payload={"source": "api"},
+            event_payload={"source": "api", "reason": reason},
         )
     )
     await db.commit()
@@ -1059,7 +1063,8 @@ async def suspend_all_running(db: AsyncSession = Depends(get_db)):
     )
     stopped = 0
     for task in result.scalars().all():
-        task.status = "stopped_by_user"
+        task.status = "cancelled"
+        task.supplementary_context = {**(task.supplementary_context or {}), "closed_reason": "dev_suspend"}
         stopped += 1
     await db.commit()
 
@@ -1333,9 +1338,13 @@ async def artifacts_download(artifact_id: str):
     )
 
 
+def _without_secrets(settings: Dict[str, Any]) -> Dict[str, Any]:
+    return {**settings, "api_key": "***" if settings.get("api_key") else ""}
+
+
 @app.get("/settings")
 async def get_settings():
-    return load_settings()
+    return _without_secrets(load_settings())
 
 
 @app.post("/settings")
@@ -1352,7 +1361,7 @@ async def update_settings(req: SettingsRequest):
                 stored[field] = value
 
     settings = update_stored_settings(_apply)
-    return {"status": "ok", "settings": settings}
+    return {"status": "ok", "settings": _without_secrets(settings)}
 
 
 # --- Dashboard (unchanged logic, condensed) ---

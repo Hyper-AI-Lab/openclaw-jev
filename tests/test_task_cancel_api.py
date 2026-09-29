@@ -13,6 +13,7 @@ async def test_cancel_indexes_the_task_after_commit():
         status = "running"
         correlation_id = "t-cancel"
         next_check_at = None
+        supplementary_context = {"source": "slack"}
 
     task = FakeTask()
     task_row = MagicMock()
@@ -32,9 +33,11 @@ async def test_cancel_indexes_the_task_after_commit():
 
     with patch.object(server, "connect_temporal", new_callable=AsyncMock, return_value=client), \
          patch("app.task_registry.hooks.index_terminal_task_async", index):
-        out = await server.cancel_task("t-cancel", db=db)
+        out = await server.cancel_task("t-cancel", reason="canary_timeout", db=db)
 
     assert out == {"status": "cancelled", "task_id": "t-cancel"}
-    assert task.status == "stopped_by_user"
+    # stopped_by_user is reserved for Kirill's own "stop"; an API cancel records why.
+    assert task.status == "cancelled"
+    assert task.supplementary_context == {"source": "slack", "closed_reason": "canary_timeout"}
     assert [c[0] for c in order.mock_calls] == ["commit", "index"]
     index.assert_awaited_once_with("t-cancel")

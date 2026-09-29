@@ -455,27 +455,30 @@ async def reconcile_once() -> dict:
                     WorkflowExecutionStatus.TERMINATED,
                     WorkflowExecutionStatus.CANCELED,
                 ):
+                    # A terminated run was ended by an operator, script or repair, not by Kirill's "stop".
                     terminal = (
-                        "stopped_by_user"
+                        "cancelled"
                         if desc.status == WorkflowExecutionStatus.TERMINATED
                         else "failed"
                     )
                     task.status = terminal
+                    if terminal == "cancelled":
+                        task.supplementary_context = {
+                            **(task.supplementary_context or {}),
+                            "closed_reason": "workflow_terminated",
+                        }
                     task.next_check_at = None
                     pr = await db.execute(
                         select(ProcessRun).where(ProcessRun.task_id == task.id)
                     )
-                    proc_state = (
-                        "stopped_by_user"
-                        if terminal == "stopped_by_user"
-                        else "failed_terminal"
-                    )
+                    proc_state = "canceled" if terminal == "cancelled" else "failed_terminal"
                     for run in pr.scalars().all():
                         if run.current_state not in (
                             "completed",
                             "failed_terminal",
                             "stopped_by_user",
                             "compensated",
+                            "canceled",
                         ):
                             run.current_state = proc_state
                             run.ended_at = now

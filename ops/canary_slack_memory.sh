@@ -135,7 +135,7 @@ if [[ "$STATUS" != "completed" ]]; then
   echo "CANARY FAIL: task status=${STATUS}"
   if [[ -n "${TASK_ID}" ]]; then
     curl -sf -X POST -H "X-RMP-API-Key: ${API_KEY}" \
-      "http://127.0.0.1:8000/tasks/${TASK_ID}/cancel" >/dev/null 2>&1 || true
+      "http://127.0.0.1:8000/tasks/${TASK_ID}/cancel?reason=canary_timeout" >/dev/null 2>&1 || true
   fi
   RESULT_FILE="${RMP_ROOT}/data/last_memory_canary.json"
   mkdir -p "$(dirname "${RESULT_FILE}")"

@@ -20,15 +20,15 @@ def test_next_loop_action_1_to_8_rework():
         assert next_loop_action(n, policy) == "rework"
 
 
-def test_next_loop_action_9_through_19_strategy():
+def test_next_loop_action_changes_strategy_once_then_reworks():
     policy = {
         "max_attempts": 20,
         "strategy_change_attempt": 10,
         "escalate_user_attempt": 20,
     }
     assert next_loop_action(9, policy) == "strategy_change"
-    assert next_loop_action(10, policy) == "strategy_change"
-    assert next_loop_action(19, policy) == "strategy_change"
+    for n in range(10, 20):
+        assert next_loop_action(n, policy) == "rework"
 
 
 def test_next_loop_action_20_escalates():

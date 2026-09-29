@@ -122,7 +122,7 @@ echo "CANARY TIMEOUT"
 # Cancel the stuck canary task so it cannot pin LLM slots / starve user work.
 if [[ -n "${TASK_ID}" ]]; then
   curl -sf -X POST -H "X-RMP-API-Key: ${API_KEY}" \
-    "http://127.0.0.1:8000/tasks/${TASK_ID}/cancel" >/dev/null 2>&1 || true
+    "http://127.0.0.1:8000/tasks/${TASK_ID}/cancel?reason=canary_timeout" >/dev/null 2>&1 || true
 fi
 run_sentinel
 exit 1
