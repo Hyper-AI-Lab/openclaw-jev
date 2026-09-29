@@ -190,7 +190,7 @@ def get_intake_models() -> list[str]:
 
 
 def get_primary_agent_model() -> str:
-    """OpenClaw agents.defaults.model.primary — gpt-5-nano with NVIDIA fallbacks."""
+    """OpenClaw agents.defaults.model.primary — the policy primary with NVIDIA fallbacks."""
     cfg = _read_json(OPENCLAW_CONFIG_PATH, {})
     model = (cfg.get("agents") or {}).get("defaults", {}).get("model") or {}
     if isinstance(model, dict):

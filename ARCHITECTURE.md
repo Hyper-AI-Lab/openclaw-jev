@@ -27,11 +27,11 @@ Aura is a **three-layer system** on one machine:
 | **OpenClaw** | `/root/.openclaw` | Agent runtime: Slack gateway, LLM, workspace, cron, plugins |
 | **RMP** (Reliability & Memory Plane) | `/root/.openclaw/rmp` | Sidecar API + Temporal workflows + Postgres ledger + vector memory + LLM orchestration |
 
-**How the layers combine:** OpenClaw is the **runtime** (Slack socket, gpt-5-nano + NVIDIA gpt-oss-20b fallback, tools, JSONL sessions, cron). RMP wraps it as a **sidecar control plane**: the `rmp_adapter` plugin intercepts inbound messages, creates durable tasks, and blocks the main/Slack session so work runs in isolated `rmp_task_*` sessions under Temporal. Safe Harbor supplies legacy scanners and watchdog scripts; RMP can invoke or sync them when not in development mode.
+**How the layers combine:** OpenClaw is the **runtime** (Slack socket, gpt-6-luna + NVIDIA gpt-oss-20b fallback, tools, JSONL sessions, cron). RMP wraps it as a **sidecar control plane**: the `rmp_adapter` plugin intercepts inbound messages, creates durable tasks, and blocks the main/Slack session so work runs in isolated `rmp_task_*` sessions under Temporal. Safe Harbor supplies legacy scanners and watchdog scripts; RMP can invoke or sync them when not in development mode.
 
 **Design intent:** User-facing work (Slack DMs, cron) is **routed through RMP** so every turn becomes a durable Temporal workflow with steps, observations, evidence checks, and idempotent Slack delivery. OpenClaw remains the **execution engine** (tools, LLM, JSONL sessions); RMP is the **control plane** — it owns plans, step predicates, process memory, completion gates, reconciliation, and **LLM key orchestration** (balanced rotation, concurrency caps, usage accounting).
 
-**Primary LLM (chat):** OpenAI gpt-5-nano (`openai/gpt-5-nano`) on OpenClaw runtime (`agentRuntime.id: "openclaw"`), with NVIDIA-hosted GPT-OSS 20B (`nvidia/openai/gpt-oss-20b`) as the fallback after auth-key rotation. **Intake** uses the same chain; subagent sessions, including the Process Evaluator, run on gpt-5-nano. GLM-5.2, DeepSeek V4 Flash and MiniMax M3 are dropped (NVIDIA HTTP 410; MiniMax ended 2026-09-09). HTTP 410 is treated as skip, not a 5s idle retry.
+**Primary LLM (chat):** OpenAI GPT-6 Luna (`openai/gpt-6-luna`) over the OpenAI Responses API on OpenClaw runtime (`agentRuntime.id: "openclaw"`), with NVIDIA-hosted GPT-OSS 20B (`nvidia/openai/gpt-oss-20b`) as the fallback after auth-key rotation. Chat Completions is not used: it rejects function tools with any reasoning effort on gpt-6-luna and has no `max`. **Intake** uses the same chain; subagent sessions, including the Process Evaluator, run on gpt-6-luna. Thinking: `max` for Aura's user-task runs (`send_to_openclaw` passes it per run), `medium` for everything else (`agents.defaults.thinkingDefault`: intake, evaluator, canaries). GLM-5.2, DeepSeek V4 Flash and MiniMax M3 are dropped (NVIDIA HTTP 410; MiniMax ended 2026-09-09). HTTP 410 is treated as skip, not a 5s idle retry.
 
 **Vector embeddings:** Advisory only. Live embedder is OpenAI `text-embedding-3-small` (1536-d) after NVIDIA NIM embeddings returned HTTP 410 EOL. `/health` `ready=true` only after a successful embed probe. Conversational continuity still uses Postgres `task_messages` + process memory and must not depend on embeddings.
 
@@ -59,7 +59,7 @@ Aura is a **three-layer system** on one machine:
                 │ (sync block → RMP)            │
                 ▼                               ▼
 ┌───────────────────────────┐     ┌───────────────────────────────────────────┐
-│  RMP API (:8000)          │     │  OpenClaw Agent (gpt-5-nano / NVIDIA fb)  │
+│  RMP API (:8000)          │     │  OpenClaw Agent (gpt-6-luna / NVIDIA fb)  │
 │  FastAPI                  │     │  • Tools, skills, workspace files           │
 │  POST /tasks              │────▶│  • Per-task session: agent:main:rmp_task_*│
 │  signals, memory, export  │     │  • JSONL poll for completion              │
@@ -143,10 +143,10 @@ Success/failure is logged internally; **no Slack notification** to Kirill (canar
 | Config | `/root/.openclaw/openclaw.json` |
 | Workspace | `/root/.openclaw/workspace` (`USER.md`, `MEMORY.md`, `memory/*.md`, `HEARTBEAT.md`) |
 | Agent sessions | SQLite `/root/.openclaw/agents/main/agent/openclaw-agent.sqlite` (`session_nodes`, `session_windows`, `transcript_events`); legacy JSONL under `agents/main/sessions/` |
-| Primary model | `openai/gpt-5-nano` (`agentRuntime.id: "openclaw"`); fallback `nvidia/openai/gpt-oss-20b`; intake same chain; subagents gpt-5-nano |
-| Model fallbacks | gpt-5-nano → gpt-oss-20b on NVIDIA (no GLM, no DeepSeek, no MiniMax). HTTP 410 = skip to next model |
+| Primary model | `openai/gpt-6-luna` (`api: openai-responses`, `agentRuntime.id: "openclaw"`); fallback `nvidia/openai/gpt-oss-20b`; intake same chain; subagents gpt-6-luna; thinking `max` for user-task runs, `medium` default |
+| Model fallbacks | gpt-6-luna → gpt-oss-20b on NVIDIA (no GLM, no DeepSeek, no MiniMax). HTTP 410 = skip to next model |
 | Concurrency | OpenClaw `maxConcurrent: 2`; RMP `max_concurrent: 3`, `min_interval_sec: 5` |
-| LLM keys | `/etc/openclaw/openclaw.env`: `OPENAI_API_KEY` (gpt-5-nano), `NVIDIA_API_KEY`, `NVIDIA_API_KEY_2`, optional `_3` |
+| LLM keys | `/etc/openclaw/openclaw.env`: `OPENAI_API_KEY` (gpt-6-luna), `NVIDIA_API_KEY`, `NVIDIA_API_KEY_2`, optional `_3` |
 | Auth profiles | Shared SQLite `authProfiles.store` in `state/openclaw.sqlite` (2026.9+); synced from env via `ops/sync_nvidia_keys.py`. Do not recreate leftover `auth-profiles.json` (triggers AUTH_PROFILE_MIGRATION_REQUIRED). |
 | Auth rotation order | `auth.order.openai`: `openai:default`. `auth.order.nvidia`: `nvidia:default` → `nvidia:key2` → `nvidia:key3`. Never pin `nvidia:keyN` on `openai/*` sessions.
 | Plugin | `/root/.openclaw/plugins/rmp_adapter/index.js` |
@@ -204,11 +204,12 @@ Run: `bash /root/.openclaw/rmp/ops/upgrade_openclaw.sh` (`make upgrade-openclaw`
 | Slack suppress | `deliverReplies` calls `__RMP_SUPPRESS_NATIVE_SLACK` so RMP owns delivery |
 | allowUnsafe passthrough | OpenClaw 2026.7 dropped `allowUnsafeExternalContent` from HTTP `/hooks/agent` normalize; RMP needs it (or auto-enable for `rmp_*` keys) to avoid EXTERNAL wrap → `NO_REPLY` on JSON intake |
 | LLM idle 5s | `DEFAULT_LLM_IDLE_TIMEOUT_MS` 120s → 5s so idle silence fails fast and NVIDIA keys rotate |
-| OpenAI first byte 20s | `RMP_OPENAI_FIRST_BYTE_20S`: for `provider === "openai"` stream creation, the first chunk and the provider first-event guard wait up to 20s (gpt-5-nano's first byte is ~4s median, often over 5s on intake prompts). Gaps between chunks and every other provider keep 5s |
+| OpenAI first byte 20s | `RMP_OPENAI_FIRST_BYTE_20S`: for `provider === "openai"` stream creation, the first chunk and the provider first-event guard wait up to 20s (gpt-5-nano's first byte was ~4s median, often over 5s on intake prompts). Gaps between chunks and every other provider keep 5s |
+| OpenAI max effort 120s / 30s | `RMP_OPENAI_MAX_EFFORT_120S`: OpenAI calls with `options.reasoning === "max"` wait up to 120s for the first byte (wrapper and provider first-event guard) and 30s between chunks. gpt-6-luna at max sent nothing for 69s on one probe and paused 5s mid-stream on another. Every other call keeps the rows above |
 | Session canonical scan | Skip in-flight `{}` placeholders with `entry_valid != 1`; do not fail-closed the whole store on parseable pending rows (2026.9 `entry_valid` triggers otherwise poison every `/hooks/agent`) |
 | Session timestamp drift | Ignore `session_nodes.updated_at` vs JSON `updatedAt` mismatch (often tens of ms); stock parser returns null and `/hooks/agent` throws `SESSION_CANONICAL_KEY_MIGRATION_REQUIRED` |
 | HTTP 410 skip | Classify 410 as `model_not_found` (next fallback), not timeout/idle retry |
-| Model fallbacks | **Left enabled** — gpt-5-nano → gpt-oss-20b (do not re-apply legacy no-fallback disable; do not restore GLM, DeepSeek or MiniMax) |
+| Model fallbacks | **Left enabled** — gpt-6-luna → gpt-oss-20b (do not re-apply legacy no-fallback disable; do not restore GLM, DeepSeek or MiniMax) |
 
 Upgrade checklist: `ops/upgrade_openclaw.sh` (backup → Node ≥ 22.22.3 → `npm install -g openclaw@latest` → `openclaw plugins update --all` (newest plugin versions compatible with the core) → `OPENCLAW_SERVICE_REPAIR_POLICY=external openclaw doctor --fix --non-interactive` → restore RMP config keys / `TOOLS.md` → `ops/settle_openclaw_sessions.py` (never drop `session_nodes` entry_valid triggers) → `patch_openclaw.sh` → verify → skills → restart if no user tasks → `make production-check`). Do not run `openclaw update` (it re-runs doctor/restart on its own).
 
@@ -227,7 +228,7 @@ Two **non-Aura** RMP agents own judgment. Retrieval is **evidence only** — nev
 | Role | Session | Job |
 |------|---------|-----|
 | **Intake Analyst** | `agent:main:rmp_intake_*` | Classify each user message against running work, finished work, global memory, or “this is new.” If unsure, **clarify** via RMP Slack. |
-| **Process Evaluator** | `agent:main:rmp_verify_*` | Aura never reaches Slack first. Dual gate: deterministic evidence, then semantic judge. Walks gpt-5-nano → `nvidia/openai/gpt-oss-20b` with an explicit model, own session per model, within its activity deadline. Fail closed on parse/tool errors. |
+| **Process Evaluator** | `agent:main:rmp_verify_*` | Aura never reaches Slack first. Dual gate: deterministic evidence, then semantic judge. Walks gpt-6-luna (thinking `medium`) → `nvidia/openai/gpt-oss-20b` with an explicit model, own session per model, within its activity deadline. Fail closed on parse/tool errors. |
 | **Aura** | `agent:main:rmp_task_*` | Execution engine only (tools, code, search, replies). |
 
 **Four relation classes (intake):**
@@ -725,7 +726,7 @@ cat /root/.openclaw/rmp/data/llm_usage.json   # daily usage ledger
 - Evidence-based completion + idempotency + reconciler  
 - Seven workflow catalog templates  
 - Vector memory infrastructure + graph API  
-- **RMP keys module** — `app/llm/model_policy.py` + SQLite auth sync; gpt-5-nano primary and subagent model, NVIDIA gpt-oss-20b fallback  
+- **RMP keys module** — `app/llm/model_policy.py` + SQLite auth sync; gpt-6-luna primary and subagent model, NVIDIA gpt-oss-20b fallback  
 - **Multi-key NVIDIA rotation** + RMP quota broker (chat + embeddings) + balanced load + usage ledger  
 - Backups, canary, readiness, go-live/rollback  
 - Slack noise suppression (canary/heartbeat/ack stripping)  
@@ -833,7 +834,7 @@ Prioritized for stability first, then capability.
 | Slack bot/app tokens | `openclaw.json` | Slack gateway |
 | Postgres | `DATABASE_URL` in `/etc/rmp/rmp.env` | RMP ledger |
 | Mistral API key | `/etc/openclaw/openclaw.env` (optional) | **Legacy** — not used by current RMP config |
-| **OpenAI API key** | `/etc/openclaw/openclaw.env` `OPENAI_API_KEY` → SQLite `openai:default` | gpt-5-nano primary. Never git, Slack, or `openclaw.json`. Do not set `models.providers.openai.apiKey` to `${OPENAI_API_KEY}` — that marks the provider cold if the gateway process env is stale. Missing key: readiness **warn** `openai_key_missing`; OpenClaw falls back to gpt-oss-20b. |
+| **OpenAI API key** | `/etc/openclaw/openclaw.env` `OPENAI_API_KEY` → SQLite `openai:default` | gpt-6-luna primary. Never git, Slack, or `openclaw.json`. Do not set `models.providers.openai.apiKey` to `${OPENAI_API_KEY}` — that marks the provider cold if the gateway process env is stale. Missing key: readiness **warn** `openai_key_missing`; OpenClaw falls back to gpt-oss-20b. |
 
 Do not commit secrets to git.
 

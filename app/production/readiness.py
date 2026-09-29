@@ -574,19 +574,19 @@ async def check_stuck_workflows(max_count: int = 3) -> CheckResult:
 
 
 def check_openai_key() -> CheckResult:
-    """Warn when OPENAI_API_KEY is unset — primary stays gpt-5-nano; NVIDIA fallbacks still work."""
-    from app.llm.model_policy import openai_key_present
+    """Warn when OPENAI_API_KEY is unset — the OpenAI primary is unwired; NVIDIA fallbacks still work."""
+    from app.llm.model_policy import PRIMARY_MODEL, openai_key_present
 
     if openai_key_present():
         return CheckResult(
             "openai_key",
             "pass",
-            "OPENAI_API_KEY present (gpt-5-nano primary wired)",
+            f"OPENAI_API_KEY present ({PRIMARY_MODEL} primary wired)",
         )
     return CheckResult(
         "openai_key",
         "warn",
-        "openai_key_missing — primary openai/gpt-5-nano unwired until OPENAI_API_KEY is set in /etc/openclaw/openclaw.env",
+        f"openai_key_missing — primary {PRIMARY_MODEL} unwired until OPENAI_API_KEY is set in /etc/openclaw/openclaw.env",
     )
 
 

@@ -86,7 +86,7 @@ flowchart TD
 | **Plugin (`plugins/rmp_adapter`)** | Intercepts Slack → creates RMP tasks; suppresses native double-posts (fail closed) |
 | **Web (`plugins/aura_web`, `plugins/langsearch`, `web-stack/`)** | Multi-backend search/fetch/crawl/extract/browser tools + localhost FastAPI backends |
 
-**Binding rules:** every Slack DM goes through RMP; primary chat model is `openai/gpt-5-nano` (`nvidia/openai/gpt-oss-20b` fallback); LLM idle silence fails fast (~5s) and rotates keys. No GLM, no DeepSeek, no MiniMax.
+**Binding rules:** every Slack DM goes through RMP; primary chat model is `openai/gpt-6-luna` (`nvidia/openai/gpt-oss-20b` fallback), thinking `max` for Aura's user tasks and `medium` elsewhere; LLM idle silence fails fast (~5s) and rotates keys. No GLM, no DeepSeek, no MiniMax.
 
 Deep dive: [`ARCHITECTURE.md`](ARCHITECTURE.md) · Runbooks: [`docs/runbooks/`](docs/runbooks/)
 
@@ -158,7 +158,7 @@ curl -s http://127.0.0.1:8791/health   # web-stack backends (if enabled)
 - LangSearch / Jina keys live in OpenClaw `plugins.entries.*` (not this repo).  
 - Obscura remote mode: `OBSCURA_CDP_URL=http://127.0.0.1:9222` (Hermes-compatible).  
 - After every `npm install -g openclaw`, run `ops/upgrade_openclaw.sh` (never hand-edit dist; never `openclaw onboard`).  
-- Model stack: `openai/gpt-5-nano` primary → `nvidia/openai/gpt-oss-20b` (NVIDIA); intake uses the same chain; subagents and the Process Evaluator run on gpt-5-nano. No GLM, no DeepSeek, no MiniMax.  
+- Model stack: `openai/gpt-6-luna` primary (OpenAI Responses API) → `nvidia/openai/gpt-oss-20b` (NVIDIA); intake uses the same chain; subagents and the Process Evaluator run on gpt-6-luna. No GLM, no DeepSeek, no MiniMax.  
 - Health canary **soft** failures (`timeout`/`failed`) defer worker restart while user tasks are active; reconciler can recover finished OpenClaw replies to Slack if delivery was interrupted.
 
 ## Status

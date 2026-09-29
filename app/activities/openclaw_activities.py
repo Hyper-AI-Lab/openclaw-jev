@@ -375,6 +375,7 @@ async def _dispatch_openclaw_session(
     tags: Optional[List[str]] = None,
     task_type: Optional[str] = None,
     deadline: Optional[float] = None,
+    thinking: Optional[str] = None,
 ) -> str:
     """Gate on LLM quota, dispatch to OpenClaw, poll JSONL; retry on rate limits.
 
@@ -400,6 +401,8 @@ async def _dispatch_openclaw_session(
     }
     if model:
         hook_payload["model"] = model
+    if thinking:
+        hook_payload["thinking"] = thinking
 
     async def _maybe_touch_liveness() -> None:
         nonlocal last_liveness_touch
@@ -493,7 +496,7 @@ async def _dispatch_openclaw_session(
             if not session_id:
                 raise OpenClawError("Could not find session ID for internal execution.")
 
-            # Pin NVIDIA profile only for nvidia/* models (never openai/gpt-5-nano).
+            # Pin NVIDIA profile only for nvidia/* models (never openai/*).
             from app.llm.model_policy import should_pin_nvidia_profile
 
             if should_pin_nvidia_profile(model, profile_id):
@@ -620,6 +623,8 @@ async def _dispatch_openclaw_session(
 @traced_activity("openclaw.dispatch")
 async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
     from app.config import get_primary_agent_model
+    from app.llm.model_policy import TASK_THINKING, THINKING_DEFAULT
+    from app.notification_policy import is_internal_task
 
     task_id = payload.get("task_id", "unknown")
     internal_session_key = f"agent:main:rmp_task_{task_id}"
@@ -628,6 +633,7 @@ async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
     model = payload.get("model") or get_primary_agent_model()
     tags = payload.get("tags") or []
     task_type = payload.get("task_type") or ""
+    internal = is_internal_task("", task_type, tags)
 
     text_content = await _dispatch_openclaw_session(
         internal_session_key,
@@ -638,6 +644,7 @@ async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
         model=model,
         tags=tags,
         task_type=task_type,
+        thinking=THINKING_DEFAULT if internal else TASK_THINKING,
     )
     return {"result": {"payloads": [{"text": text_content}]}}
 
@@ -796,7 +803,7 @@ async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _execute_on_internal_session(task_id: str, message: str) -> str:
-    """Process Evaluator turn: gpt-5-nano, then the NVIDIA fallback, each with an explicit model."""
+    """Process Evaluator turn: the primary, then the NVIDIA fallback, each with an explicit model."""
     from app.llm.model_policy import FALLBACK_MODELS, SUBAGENT_MODEL, drop_unwired_openai
     from app.orchestrator.process_evaluator import parse_evaluator_response
 

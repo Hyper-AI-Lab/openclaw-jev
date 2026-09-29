@@ -1,7 +1,7 @@
 # Aura / RMP concept tree (source of truth)
 
 **Status:** Binding constitution for this host.  
-**Last updated:** 2026-09-28  
+**Last updated:** 2026-09-29  
 **How to use:** This document is *why* and *what must remain true*. [`ARCHITECTURE.md`](../ARCHITECTURE.md) is *how it is built*. Cursor rules are *must not violate while coding*. Aura-facing [`TOOLS.md`](/root/.openclaw/workspace/TOOLS.md) is executor notes, not this constitution.
 
 If a later chat, plan, or nested rule disagrees with this file, this file wins after applying the conflict law in §2.
@@ -36,7 +36,7 @@ Apply in order:
 1. **Kirill’s latest explicit instruction** wins. Encode his *meaning*, not later jargon. Examples of latest-wins:
    - No direct OpenClaw Slack; every DM through the analyst; Aura never posts first.
    - No static components for narrow cases; workflows are situational.
-   - Primary chat model is `openai/gpt-5-nano` (this **supersedes** June 2026 “I won’t add OpenAI” and August MiniMax-as-primary).
+   - Primary chat model is `openai/gpt-6-luna`: thinking `max` for Aura's user-task work, `medium` elsewhere (Sep 29 2026; this **supersedes** gpt-5-nano, June 2026 “I won’t add OpenAI” and August MiniMax-as-primary).
    - `conversational` as a **one-step RMP plan** is allowed. A short **native or ungated** reply is not.
 2. Founding pillars in `request.txt` and `request_2` still bind unless (1) replaced them.
 3. This file and the thin always-on Cursor rule [`/root/.cursor/rules/rmp-architecture.mdc`](/root/.cursor/rules/rmp-architecture.mdc) are the live coding invariants.
@@ -114,8 +114,8 @@ RMP chat.postMessage (idempotent)
 - Attempts: 1–9 rework; ~10 strategy change; 11–19 continue; ~20 stop and Slack a diagnosis.
 - Process-scoped memory is injected on execute. Across `create_fresh`, prior same-conversation Slack turns are injected (RECENT DIALOGUE). “This is new” labels a **new task row**, not a new person.
 - User-local clock is a **fact** (`USER LOCAL TIME` / Japan Standard Time). Server Europe/Berlin is not Kirill’s clock.
-- Primary model: `openai/gpt-5-nano`. Fallback: `nvidia/openai/gpt-oss-20b` (NVIDIA-hosted; MiniMax M3 ended 2026-09-09). Subagent sessions, including the Process Evaluator, run on `openai/gpt-5-nano`. Intake: when `jev.intake_mode` is `enforce`, the pinned decision model `jev-1.13.0` answers typed intake questions first and counts only above program thresholds; otherwise the same chain decides. `apply_intake_policy` stays the authority either way.
-- LLM idle ~5s then rotate keys/models. OpenAI alone gets 20s for the first byte; gaps between chunks stay 5s for every provider. HTTP 410 is skip (next model), not an idle retry.
+- Primary model: `openai/gpt-6-luna` over the OpenAI Responses API. Fallback: `nvidia/openai/gpt-oss-20b` (NVIDIA-hosted; MiniMax M3 ended 2026-09-09). Subagent sessions, including the Process Evaluator, run on `openai/gpt-6-luna`. Thinking: `max` for Aura's user-task runs; `medium` for intake, the Process Evaluator, canaries and anything else. Intake: when `jev.intake_mode` is `enforce`, the pinned decision model `jev-1.13.0` answers typed intake questions first and counts only above program thresholds; otherwise the same chain decides. `apply_intake_policy` stays the authority either way.
+- LLM idle ~5s then rotate keys/models. OpenAI alone gets 20s for the first byte; gaps between chunks stay 5s for every provider. The one exception is OpenAI calls at thinking `max`: 120s for the first byte and 30s between chunks (Kirill, Sep 29 2026; measured, not “to be safe”). HTTP 410 is skip (next model), not an idle retry.
 - OpenAI key only in `/etc/openclaw/openclaw.env` → SQLite `openai:default`. Never `openclaw.json` interpolations, git, or Slack. Never pin `nvidia:keyN` on an `openai/*` session.
 - After `npm install -g openclaw`, run `ops/upgrade_openclaw.sh`. Never `openclaw onboard`, never `doctor --force`, never hand-edit dist.
 - Canaries are health checks: green → silent; failure → fix if possible else alert Kirill. They are not user work (`wait_active` / `attach_active` must ignore them). `CANARY_OK` must not appear in user Slack.
@@ -203,10 +203,11 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 
 | Item | Live law |
 |------|----------|
-| Primary | `openai/gpt-5-nano` (`agentRuntime.id: openclaw`) |
+| Primary | `openai/gpt-6-luna` (`api: openai-responses`, `agentRuntime.id: openclaw`). Chat Completions rejects function tools with any reasoning effort on this model and has no `max`. |
 | Fallbacks | `nvidia/openai/gpt-oss-20b`: NVIDIA auth with key rotation, despite the `openai/` model id. No GLM, DeepSeek or MiniMax (all HTTP 410). No Gemini unless configured. |
-| Subagents / Process Evaluator | `openai/gpt-5-nano` (`agents.defaults.subagents.model`). |
-| Idle | ~5s then rotate. Do not restore 120s. First byte: OpenAI 20s (`RMP_OPENAI_FIRST_BYTE_20S`, stream creation, first chunk and the provider's first-event guard), since gpt-5-nano needs about 4s median and up to 5s; NVIDIA 5s, where key rotation exists. Gaps between chunks: 5s for all. |
+| Subagents / Process Evaluator | `openai/gpt-6-luna` (`agents.defaults.subagents.model`). |
+| Thinking | `max` for Aura's user-task runs (RMP passes it per run); `medium` default (`agents.defaults.thinkingDefault`) for intake, the Process Evaluator, canaries and the rest. |
+| Idle | ~5s then rotate. Do not restore 120s globally. First byte: OpenAI 20s (`RMP_OPENAI_FIRST_BYTE_20S`, stream creation, first chunk and the provider's first-event guard); NVIDIA 5s, where key rotation exists. Gaps between chunks: 5s for all. Exception: OpenAI calls at thinking `max` get 120s for the first byte and 30s between chunks (`RMP_OPENAI_MAX_EFFORT_120S`); gpt-6-luna at max sent nothing for 69s on one probe. |
 | HTTP 410 | Skip to next model. |
 | 429 | Rotate NVIDIA keys; wait on true quota after rotation; do not hop providers for 429. |
 | OpenAI auth | Env `OPENAI_API_KEY` → SQLite `openai:default`. Never pin NVIDIA profiles on OpenAI sessions. |
@@ -252,6 +253,7 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 | `nv-embed-v1` is the working embedder | Honest health: working replacement or not-ready | NVIDIA NIM deprecated (HTTP 410). |
 | Aura owns Slack because she is independent | Independence ≠ owning delivery | Feb constitution vs RMP era: Aura executes; RMP judges and delivers. |
 | Intake decides only through the LLM chain | Jev typed decision first; LLM chain below thresholds | Sep 28 2026: 11 of 14 DMs in 30 days fell to the zero-confidence fallback. |
+| gpt-5-nano primary at thinking `low`, Chat Completions | `openai/gpt-6-luna` over the Responses API; `max` for Aura's user tasks, `medium` elsewhere; OpenAI `max` calls get 120s first byte and 30s chunk gaps | Sep 29 2026 Kirill: "switch everything to gpt-6-luna with max effort", then chose max for task work and medium for intake, evaluator and canaries. Live probes: Chat Completions rejects tools with reasoning and has no `max`; max on an intake prompt took 36s vs 6s at medium with the same decision. |
 
 ---
 

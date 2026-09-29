@@ -251,6 +251,37 @@ async def test_evaluator_returns_the_last_error_when_every_model_fails(monkeypat
     assert len(calls) == 2
 
 
+@pytest.mark.asyncio
+async def test_user_task_runs_think_at_max_and_internal_runs_at_the_default(monkeypatch):
+    from app.activities import openclaw_activities as oa
+    from app.llm.model_policy import TASK_THINKING, THINKING_DEFAULT
+
+    seen = []
+
+    async def dispatch(session_key, message, **kwargs):
+        seen.append(kwargs.get("thinking"))
+        return "done"
+
+    monkeypatch.setattr(oa, "_dispatch_openclaw_session", dispatch)
+    await oa.send_to_openclaw({"task_id": "u1", "message": "summarize my notes"})
+    await oa.send_to_openclaw(
+        {"task_id": "c1", "message": "RMP CANARY", "tags": ["canary", "system"], "task_type": "canary"}
+    )
+    assert seen == [TASK_THINKING, THINKING_DEFAULT]
+
+
+def test_rework_dispatch_carries_task_type_and_tags():
+    import inspect
+
+    from app.workflows import generic_task
+
+    src = inspect.getsource(generic_task.GenericTaskWorkflow._plan_driven_loop)
+    rework = src[src.find('"message": rework_prompt'):]
+    rework = rework[: rework.find("}")]
+    assert '"task_type": task_type' in rework
+    assert '"tags": tags' in rework
+
+
 def test_no_deadline_outside_an_activity():
     from app.activities import openclaw_activities as oa
 

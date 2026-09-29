@@ -5,22 +5,24 @@ from app.llm import model_policy as mp
 
 
 def test_policy_shape():
-    assert mp.PRIMARY_MODEL == "openai/gpt-5-nano"
+    assert mp.PRIMARY_MODEL == "openai/gpt-6-luna"
     assert mp.FALLBACK_MODELS == ("nvidia/openai/gpt-oss-20b",)
     assert mp.SUBAGENT_MODEL == mp.PRIMARY_MODEL
     assert mp.GLM_MODEL not in mp.allowed_models()
     assert "deepseek" not in json.dumps(mp.allowed_models())
     assert "minimax" not in json.dumps(mp.allowed_models())
+    assert "gpt-5-nano" not in json.dumps(mp.allowed_models())
     assert mp.intake_model_chain() == [
-        "openai/gpt-5-nano",
+        "openai/gpt-6-luna",
         "nvidia/openai/gpt-oss-20b",
     ]
+    assert (mp.THINKING_DEFAULT, mp.TASK_THINKING) == ("medium", "max")
 
 
 def test_should_pin_nvidia_only_for_nvidia_models():
     # gpt-oss-20b is NVIDIA-hosted: NVIDIA key rotation applies despite the "openai/" id.
     assert mp.should_pin_nvidia_profile("nvidia/openai/gpt-oss-20b", "nvidia:key2")
-    assert not mp.should_pin_nvidia_profile("openai/gpt-5-nano", "nvidia:key2")
+    assert not mp.should_pin_nvidia_profile("openai/gpt-6-luna", "nvidia:key2")
     assert not mp.should_pin_nvidia_profile(None, "nvidia:key2")
     assert not mp.should_pin_nvidia_profile("nvidia/openai/gpt-oss-20b", "openai:default")
 
@@ -55,6 +57,7 @@ def test_apply_openclaw_policy_writes_combo_and_drops_retired_models(tmp_path):
                         "models": {
                             "nvidia/z-ai/glm-5.2": {"alias": "GLM"},
                             "nvidia/deepseek-ai/deepseek-v4-flash-0731": {"alias": "DeepSeek"},
+                            "openai/gpt-5-nano": {"alias": "GPT-5 nano"},
                         },
                         "modelPolicy": {"allow": ["nvidia/z-ai/glm-5.2"]},
                         "heartbeat": {"every": "30m", "target": "none", "session": "heartbeat"},
@@ -66,13 +69,17 @@ def test_apply_openclaw_policy_writes_combo_and_drops_retired_models(tmp_path):
                 },
                 "models": {
                     "providers": {
+                        "openai": {
+                            "api": "openai-completions",
+                            "models": [{"id": "gpt-5-nano", "api": "openai-completions"}],
+                        },
                         "nvidia": {
                             "models": [
                                 {"id": "minimaxai/minimax-m3"},
                                 {"id": "z-ai/glm-5.2"},
                                 {"id": "deepseek-ai/deepseek-v4-flash-0731"},
                             ]
-                        }
+                        },
                     }
                 },
                 "plugins": {"allow": ["rmp_adapter", "nvidia"]},
@@ -88,12 +95,13 @@ def test_apply_openclaw_policy_writes_combo_and_drops_retired_models(tmp_path):
     assert "nvidia/z-ai/glm-5.2" not in json.dumps(cfg)
     assert "deepseek" not in json.dumps(cfg)
     assert cfg["agents"]["defaults"]["subagents"] == {"maxConcurrent": 2, "model": mp.PRIMARY_MODEL}
-    runtime = cfg["agents"]["defaults"]["models"]["openai/gpt-5-nano"]["agentRuntime"]
+    runtime = cfg["agents"]["defaults"]["models"]["openai/gpt-6-luna"]["agentRuntime"]
     assert runtime == {"id": "openclaw"}
-    assert cfg["agents"]["defaults"]["models"]["openai/gpt-5-nano"]["params"] == {
-        "thinking": "low"
+    assert cfg["agents"]["defaults"]["models"]["openai/gpt-6-luna"]["params"] == {
+        "thinking": "medium"
     }
-    assert cfg["agents"]["defaults"]["thinkingDefault"] == "low"
+    assert cfg["agents"]["defaults"]["thinkingDefault"] == "medium"
+    assert "gpt-5-nano" not in json.dumps(cfg)
     assert cfg["agents"]["defaults"]["heartbeat"] == {
         "every": "0m",
         "target": "none",
@@ -102,10 +110,14 @@ def test_apply_openclaw_policy_writes_combo_and_drops_retired_models(tmp_path):
     assert "agents.defaults.heartbeat.every" in result["changed"]
     openai = cfg["models"]["providers"]["openai"]
     assert openai["baseUrl"] == "https://api.openai.com/v1"
-    assert openai["api"] == "openai-completions"
+    assert openai["api"] == "openai-responses"
     assert "apiKey" not in openai
-    ids = [m["id"] for m in openai["models"]]
-    assert "gpt-5-nano" in ids
+    assert [m["id"] for m in openai["models"]] == ["gpt-6-luna"]
+    luna = openai["models"][0]
+    assert luna["api"] == "openai-responses"
+    assert luna["thinkingLevelMap"]["max"] == "max"
+    assert "max" in luna["compat"]["supportedReasoningEfforts"]
+    assert luna["contextWindow"] == 272000
     nvidia_ids = [m["id"] for m in cfg["models"]["providers"]["nvidia"]["models"]]
     assert "z-ai/glm-5.2" not in nvidia_ids
     assert "minimax" not in json.dumps(cfg)

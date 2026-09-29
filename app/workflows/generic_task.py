@@ -569,6 +569,8 @@ class GenericTaskWorkflow:
                     "message": rework_prompt,
                     "task_id": task_id,
                     "session_key": session_key,
+                    "task_type": task_type,
+                    "tags": tags,
                 },
                 start_to_close_timeout=timedelta(minutes=45),
             )

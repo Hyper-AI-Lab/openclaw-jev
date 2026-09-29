@@ -63,7 +63,7 @@ from app.config import (
 
 MODEL_CATALOG = {
     "google": ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3.1-pro-preview"],
-    "openai": ["gpt-5-nano", "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o", "o3-mini"],
+    "openai": ["gpt-6-luna", "gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o", "o3-mini"],
     "anthropic": ["claude-3-5-haiku-latest", "claude-3-7-sonnet-latest"],
     "mistral": ["mistral-large-latest", "mistral-large-2512", "mistral-medium-2505"],
     "nvidia": [

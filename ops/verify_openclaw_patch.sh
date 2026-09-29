@@ -47,6 +47,7 @@ check_present '__RMP_SUPPRESS_NATIVE_SLACK' 'slack-rmp-suppress patch'
 check_present 'RMP_ALLOW_UNSAFE_EXTERNAL|RMP_FORCE_ALLOW_UNSAFE' 'allowUnsafeExternalContent RMP passthrough'
 check_present 'RMP_LLM_IDLE_5S' 'llm-idle-5s'
 check_present 'RMP_OPENAI_FIRST_BYTE_20S' 'openai-first-byte-20s'
+check_present 'RMP_OPENAI_MAX_EFFORT_120S' 'openai-max-effort-120s'
 check_present 'RMP_410_SKIP' '410-skip-model-not-found'
 check_present 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
 check_present 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'
@@ -76,8 +77,8 @@ SUB=$(python3 -c "import json; c=json.load(open('/root/.openclaw/openclaw.json')
 echo "OK: agent primary=${PRIMARY}"
 echo "OK: agent fallbacks=${FALLBACKS}"
 echo "OK: subagents model=${SUB}"
-if [[ "${PRIMARY}" != "openai/gpt-5-nano" ]]; then
-  echo "FAIL: agent primary must be openai/gpt-5-nano (got ${PRIMARY})"
+if [[ "${PRIMARY}" != "openai/gpt-6-luna" ]]; then
+  echo "FAIL: agent primary must be openai/gpt-6-luna (got ${PRIMARY})"
   FAIL=1
 fi
 if [[ "${FALLBACKS}" == *"glm"* ]]; then

@@ -168,7 +168,7 @@ if changed:
 else:
     print("RMP-critical config keys intact")
 PY
-  log "Apply RMP model policy (openai/gpt-5-nano + NVIDIA fallbacks, no GLM)"
+  log "Apply RMP model policy (openai/gpt-6-luna + NVIDIA fallbacks, no GLM)"
   "${RMP_ROOT}/venv/bin/python" - <<'PY'
 import json, sys
 sys.path.insert(0, "/root/.openclaw/rmp")

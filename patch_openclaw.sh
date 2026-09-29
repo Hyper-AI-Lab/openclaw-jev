@@ -5,10 +5,11 @@
 #   - suppress native announce/Slack for RMP-owned sessions
 #   - minimal bootstrap for RMP internal sessions (task/verify/intake)
 #   - allowUnsafe passthrough for RMP JSON intake
-#   - LLM idle 5s (fail fast, rotate NVIDIA keys); OpenAI first byte 20s
+#   - LLM idle 5s (fail fast, rotate NVIDIA keys); OpenAI first byte 20s;
+#     max-effort OpenAI calls 120s first byte and 30s between chunks
 #   - HTTP 410 skip (model_not_found, not idle-timeout retry)
 #   - skip local placements in the cloud-worker orphan cleanup (startup freeze)
-# Model fallbacks (gpt-5-nano → gpt-oss-20b on NVIDIA) are INTENTIONAL — do not disable them.
+# Model fallbacks (gpt-6-luna → gpt-oss-20b on NVIDIA) are INTENTIONAL — do not disable them.
 set -euo pipefail
 
 DIST_DIR="/usr/lib/node_modules/openclaw/dist"
@@ -290,6 +291,52 @@ PY
         fi
     fi
 
+    # Patch 6d: OpenAI calls at thinking=max get 120s for the first byte and 30s
+    # between chunks. gpt-6-luna at max sent nothing for 69s on one probe and paused
+    # 5s mid-stream on another. Every other call keeps Patch 6c's rule.
+    if grep -q 'RMP_OPENAI_FIRST_BYTE_20S' "$f" 2>/dev/null \
+       && ! grep -q 'RMP_OPENAI_MAX_EFFORT_120S' "$f" 2>/dev/null; then
+        python3 - "$f" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+if "RMP_OPENAI_MAX_EFFORT_120S" in text:
+    raise SystemExit(0)
+edits = [
+    (
+        "const RMP_OPENAI_FIRST_BYTE_MS = 2e4; /* RMP_OPENAI_FIRST_BYTE_20S */",
+        "const RMP_OPENAI_FIRST_BYTE_MS = 2e4; /* RMP_OPENAI_FIRST_BYTE_20S */\n"
+        "const RMP_OPENAI_MAX_FIRST_BYTE_MS = 12e4, RMP_OPENAI_MAX_GAP_MS = 3e4; /* RMP_OPENAI_MAX_EFFORT_120S */",
+    ),
+    (
+        "\t\tconst firstByteMs = model?.provider === \"openai\" ? Math.max(timeoutMs, RMP_OPENAI_FIRST_BYTE_MS) : timeoutMs;\n",
+        "\t\tconst rmpMaxEffort = model?.provider === \"openai\" && options?.reasoning === \"max\";\n"
+        "\t\tconst firstByteMs = rmpMaxEffort ? Math.max(timeoutMs, RMP_OPENAI_MAX_FIRST_BYTE_MS) : model?.provider === \"openai\" ? Math.max(timeoutMs, RMP_OPENAI_FIRST_BYTE_MS) : timeoutMs;\n"
+        "\t\tconst gapMs = rmpMaxEffort ? Math.max(timeoutMs, RMP_OPENAI_MAX_GAP_MS) : timeoutMs;\n",
+    ),
+    (
+        "\t\t\t\t\tconst armMs = isFirstStreamArm ? firstByteMs : timeoutMs;\n",
+        "\t\t\t\t\tconst armMs = isFirstStreamArm ? firstByteMs : gapMs;\n",
+    ),
+    (
+        "\t\t\t\tfirstEventTimeoutMs: optionsWithFirstEvent?.firstEventTimeoutMs ?? firstEventTimeoutMs,\n",
+        "\t\t\t\tfirstEventTimeoutMs: optionsWithFirstEvent?.firstEventTimeoutMs ?? (model?.provider === \"openai\" && options?.reasoning === \"max\" ? Math.max(firstEventTimeoutMs, RMP_OPENAI_MAX_FIRST_BYTE_MS) : firstEventTimeoutMs),\n",
+    ),
+]
+missing = [old[:60] for old, _ in edits if text.count(old) != 1]
+if missing:
+    print("skip openai-max-effort (dist shape changed): " + "; ".join(missing))
+    raise SystemExit(0)
+for old, new in edits:
+    text = text.replace(old, new, 1)
+path.write_text(text)
+print("patched-openai-max-effort")
+PY
+        if grep -q 'RMP_OPENAI_MAX_EFFORT_120S' "$f" 2>/dev/null; then
+            applied="${applied} openai-max-effort-120s"
+        fi
+    fi
+
     # Patch 7: 2026.9 session_nodes.entry_valid=0/-1 rows fail-closed the entire
     # store (every /hooks/agent). Keep placeholders skippable and allow parseable
     # pending rows through the canonical scan.
@@ -405,7 +452,7 @@ done
 
 echo ""
 echo "Done. Patched/restored $PATCHED files."
-echo "Note: model fallbacks left ENABLED (gpt-5-nano → gpt-oss-20b on NVIDIA)."
+echo "Note: model fallbacks left ENABLED (gpt-6-luna → gpt-oss-20b on NVIDIA)."
 
 require_marker() {
     local pattern="$1"
@@ -426,6 +473,7 @@ require_marker 'RMP_ALLOW_UNSAFE_EXTERNAL' 'allow-unsafe-passthrough'
 require_marker 'RMP_FORCE_ALLOW_UNSAFE' 'allow-unsafe-rmp-force'
 require_marker 'RMP_LLM_IDLE_5S' 'llm-idle-5s'
 require_marker 'RMP_OPENAI_FIRST_BYTE_20S' 'openai-first-byte-20s'
+require_marker 'RMP_OPENAI_MAX_EFFORT_120S' 'openai-max-effort-120s'
 require_marker 'RMP_410_SKIP' '410-skip-model-not-found'
 require_marker 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
 require_marker 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'

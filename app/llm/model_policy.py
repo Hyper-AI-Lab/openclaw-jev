@@ -9,15 +9,20 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-PRIMARY_MODEL = "openai/gpt-5-nano"
+PRIMARY_MODEL = "openai/gpt-6-luna"
 # NVIDIA-hosted, so it uses NVIDIA auth and key rotation despite the "openai/" model id.
 FALLBACK_MODELS = ("nvidia/openai/gpt-oss-20b",)
 # Hook-created sessions without a model (the Process Evaluator) run on the subagent model.
 SUBAGENT_MODEL = PRIMARY_MODEL
 GLM_MODEL = "nvidia/z-ai/glm-5.2"
 # NVIDIA ended MiniMax M3 on 2026-09-09 and DeepSeek V4 Flash on 2026-09-21 (HTTP 410).
-RETIRED_MODEL_MARKERS = ("glm", "deepseek", "minimax")
-OPENAI_MODEL_ID = "gpt-5-nano"
+# OpenAI shuts gpt-5-nano down on 2026-12-11.
+RETIRED_MODEL_MARKERS = ("glm", "deepseek", "minimax", "gpt-5-nano")
+OPENAI_MODEL_ID = "gpt-6-luna"
+# Intake, the Process Evaluator and canaries run at the default; Aura's user-task
+# runs pass TASK_THINKING per run.
+THINKING_DEFAULT = "medium"
+TASK_THINKING = "max"
 OPENAI_PROVIDER_BASE_URL = "https://api.openai.com/v1"
 OPENAI_AUTH_PROFILE = "openai:default"
 OPENCLAW_AGENT_RUNTIME = {"id": "openclaw"}
@@ -26,18 +31,26 @@ HEARTBEAT_EVERY = "0m"
 
 _OPENAI_MODEL_ROW = {
     "id": OPENAI_MODEL_ID,
-    "name": "GPT-5 nano",
+    "name": "GPT-6 Luna",
     "reasoning": True,
     "input": ["text"],
     "cost": {
-        "input": 0.05,
-        "output": 0.4,
-        "cacheRead": 0.005,
-        "cacheWrite": 0,
+        "input": 0.1,
+        "output": 0.5,
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125,
     },
-    "contextWindow": 400000,
+    # The model takes 1.05M, but prompts over 272k tokens bill at the long-context
+    # rate; compaction must run before that.
+    "contextWindow": 272000,
     "maxTokens": 128000,
-    "api": "openai-completions",
+    # Chat Completions rejects function tools with any reasoning effort and has no "max".
+    "api": "openai-responses",
+    # OpenClaw 2026.9.1 predates GPT-6: without these it clamps max to high.
+    "thinkingLevelMap": {"xhigh": "xhigh", "max": "max"},
+    "compat": {
+        "supportedReasoningEfforts": ["none", "low", "medium", "high", "xhigh", "max"]
+    },
 }
 
 _NVIDIA_FALLBACK_ROW = {
@@ -53,10 +66,9 @@ _NVIDIA_FALLBACK_ROW = {
 
 _MODEL_ALIASES = {
     PRIMARY_MODEL: {
-        "alias": "GPT-5 nano (OpenAI primary)",
+        "alias": "GPT-6 Luna (OpenAI primary)",
         "agentRuntime": dict(OPENCLAW_AGENT_RUNTIME),
-        # thinking=medium first-token often exceeds the 5s idle patch.
-        "params": {"thinking": "low"},
+        "params": {"thinking": THINKING_DEFAULT},
     },
     FALLBACK_MODELS[0]: {"alias": "GPT-OSS 20B (NVIDIA fallback)"},
 }
@@ -76,7 +88,7 @@ def model_uses_nvidia_auth(model: Optional[str] = None) -> bool:
 
 
 def should_pin_nvidia_profile(model: Optional[str], profile_id: str) -> bool:
-    """Pin nvidia:keyN only onto nvidia/* sessions — never onto openai/gpt-5-nano."""
+    """Pin nvidia:keyN only onto nvidia/* sessions — never onto openai/*."""
     if not str(profile_id or "").startswith("nvidia:"):
         return False
     return model_uses_nvidia_auth(model)
@@ -119,6 +131,21 @@ def _ensure_openai_model_row(openai_cfg: Dict[str, Any]) -> bool:
     return _ensure_model_row(openai_cfg, _OPENAI_MODEL_ROW)
 
 
+def _drop_retired_rows(provider_cfg: Dict[str, Any]) -> bool:
+    rows = provider_cfg.get("models") or []
+    if not isinstance(rows, list):
+        return False
+    kept = [
+        row
+        for row in rows
+        if not (isinstance(row, dict) and _is_retired_ref(str(row.get("id") or "")))
+    ]
+    if len(kept) == len(rows):
+        return False
+    provider_cfg["models"] = kept
+    return True
+
+
 def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Write OpenClaw primary, fallbacks, allowlist, openai row, auth.order, and heartbeat.
 
@@ -142,8 +169,8 @@ def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
     if model.get("fallbacks") != want_fb:
         model["fallbacks"] = want_fb
         changed.append("agents.defaults.model.fallbacks")
-    if defaults.get("thinkingDefault") != "low":
-        defaults["thinkingDefault"] = "low"
+    if defaults.get("thinkingDefault") != THINKING_DEFAULT:
+        defaults["thinkingDefault"] = THINKING_DEFAULT
         changed.append("agents.defaults.thinkingDefault")
 
     aliases = defaults.setdefault("models", {})
@@ -179,31 +206,23 @@ def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
     if openai.get("baseUrl") != OPENAI_PROVIDER_BASE_URL:
         openai["baseUrl"] = OPENAI_PROVIDER_BASE_URL
         changed.append("models.providers.openai.baseUrl")
-    if openai.get("api") != "openai-completions":
-        openai["api"] = "openai-completions"
+    if openai.get("api") != _OPENAI_MODEL_ROW["api"]:
+        openai["api"] = _OPENAI_MODEL_ROW["api"]
         changed.append("models.providers.openai.api")
     # Agent auth is SQLite openai:default. ${OPENAI_API_KEY} on the provider
     # marks the whole plugin cold if systemd has not reloaded EnvironmentFile.
     if "apiKey" in openai:
         openai.pop("apiKey", None)
         changed.append("models.providers.openai.drop-apiKey-interp")
+    if _drop_retired_rows(openai):
+        changed.append("models.providers.openai.drop-retired")
     if _ensure_openai_model_row(openai):
         changed.append("models.providers.openai.models")
 
     nvidia = providers.get("nvidia")
     if isinstance(nvidia, dict):
-        nmodels = nvidia.get("models") or []
-        if isinstance(nmodels, list):
-            filtered = [
-                row
-                for row in nmodels
-                if not (
-                    isinstance(row, dict) and _is_retired_ref(str(row.get("id") or ""))
-                )
-            ]
-            if len(filtered) != len(nmodels):
-                nvidia["models"] = filtered
-                changed.append("models.providers.nvidia.drop-retired")
+        if _drop_retired_rows(nvidia):
+            changed.append("models.providers.nvidia.drop-retired")
         if _ensure_model_row(nvidia, _NVIDIA_FALLBACK_ROW):
             changed.append("models.providers.nvidia.models:fallback")
 
