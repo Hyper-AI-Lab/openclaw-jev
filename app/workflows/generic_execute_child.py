@@ -17,8 +17,9 @@ with workflow.unsafe.imports_passed_through():
         send_to_openclaw,
         validate_openclaw_output,
     )
+    from app.notification_policy import sanitize_user_facing_text
     from app.orchestrator.prompt_policy import build_generic_execute_prompt
-    from app.orchestrator.step_predicates import decide_status_from_predicates
+    from app.orchestrator.step_predicates import decide_status_from_predicates, extract_agent_facts
 
 
 @workflow.defn
@@ -140,9 +141,6 @@ class GenericExecuteChildWorkflow:
                 attempt,
                 max_attempts,
             )
-            from app.notification_policy import sanitize_user_facing_text
-            from app.orchestrator.step_predicates import extract_agent_facts
-
             display_text = sanitize_user_facing_text(
                 extract_agent_facts(text_content).get("body") or text_content
             )

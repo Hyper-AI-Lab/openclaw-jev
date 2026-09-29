@@ -44,8 +44,9 @@ with workflow.unsafe.imports_passed_through():
         next_loop_action,
     )
     from app.orchestrator.decision_engine import decide_completion_gate
-    from app.workflows.catalog import get_template
-    from app.notification_policy import format_workflow_error, is_silent_system_ack
+    from app.orchestrator.step_predicates import extract_agent_facts
+    from app.workflows.catalog import get_template, normalize_catalog_type
+    from app.notification_policy import format_workflow_error, is_silent_system_ack, sanitize_user_facing_text
     from app.workflows.catalog_step_child import CatalogStepChildWorkflow
     from app.workflows.generic_task import is_heartbeat_ack, is_heartbeat_request, strip_json_eval
     from app.orchestrator.process_brief import (
@@ -208,8 +209,6 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
         self._initial_memory_block = (payload.get("initial_memory_block") or "").strip()
         # Trust the process_type already assigned at intake/start — do not
         # re-match intent keywords (that would reintroduce hard routing).
-        from app.workflows.catalog import get_template, normalize_catalog_type
-
         process_type = normalize_catalog_type(str(process_type_raw), "") or str(process_type_raw)
         if not get_template(process_type):
             raise ValueError(
@@ -775,9 +774,6 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                         clean_result = rework_resp["result"]["payloads"][0]["text"]
                     except Exception:
                         clean_result = str(rework_resp)
-                    from app.notification_policy import sanitize_user_facing_text
-                    from app.orchestrator.step_predicates import extract_agent_facts
-
                     clean_result = sanitize_user_facing_text(
                         extract_agent_facts(clean_result).get("body") or clean_result
                     )

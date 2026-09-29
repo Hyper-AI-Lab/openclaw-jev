@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 import re
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from app.activities.openclaw_activities import (
@@ -21,6 +22,7 @@ with workflow.unsafe.imports_passed_through():
         record_event,
         update_process_state,
         update_task_status,
+        write_episodic_observation,
     )
     from app.evidence import check_evidence
     from app.orchestrator.process_brief import (
@@ -210,6 +212,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     initial_memory_block=payload.get("initial_memory_block"),
                     rework_max_attempts=attempt_policy["max_attempts"],
                     attempt_policy=attempt_policy,
+                    write_episodic=payload.get("execution_mode") == "conversational",
                 )
             else:
                 result = await self._plan_driven_loop(
@@ -491,6 +494,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
             initial_memory_block=initial_memory_block,
             rework_max_attempts=rework_max_attempts,
             attempt_policy=attempt_policy,
+            write_episodic=is_conversational,
         )
 
     async def _judge_and_deliver(
@@ -505,6 +509,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
         initial_memory_block: str | None = None,
         rework_max_attempts: int = 20,
         attempt_policy: Dict[str, int] | None = None,
+        write_episodic: bool = False,
     ) -> Dict[str, Any]:
         """Judge, rework, deliver. Leaves only by acceptance or by escalation."""
         policy = attempt_policy or {
@@ -626,6 +631,18 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 },
                 start_to_close_timeout=timedelta(seconds=30),
             )
+            if write_episodic:
+                # Conversational steps defer their episodic write to here, after Slack.
+                await workflow.execute_activity(
+                    write_episodic_observation,
+                    {
+                        "process_run_id": self.process_run_id,
+                        "task_id": task_id,
+                        "text": clean_result[:4000],
+                    },
+                    start_to_close_timeout=timedelta(seconds=90),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
         await workflow.execute_activity(
             update_process_state,
             {
