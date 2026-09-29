@@ -66,14 +66,14 @@ def _safe_activity_heartbeat() -> None:
 
 
 def _is_rmp_terminal_response(text: str) -> bool:
-    """Reject whitespace-only, stub, or missing-eval replies from RMP agent sessions."""
+    """Reject empty and interim replies from RMP agent sessions; a short final reply is the answer."""
     cleaned = (text or "").strip()
     first_line = cleaned.split("\n")[0].strip() if cleaned else ""
     if first_line in {"HEARTBEAT_OK", "CANARY_OK"} or first_line.startswith(
         ("HEARTBEAT_OK", "CANARY_OK")
     ):
         return True
-    if len(cleaned) < 10:
+    if not cleaned:
         return False
     lower = cleaned.lower()
     if any(p in lower for p in _INTERIM_RMP_PHRASES) and '"task_status"' not in cleaned:

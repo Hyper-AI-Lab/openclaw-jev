@@ -5,6 +5,9 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+# OpenClaw's token for a turn that sends nothing.
+SILENT_REPLY = "NO_REPLY"
+
 
 def extract_agent_facts(text: str) -> Dict[str, Any]:
     """Parse structured facts JSON from agent output; fall back to legacy task_status."""
@@ -106,7 +109,8 @@ def evaluate_step_predicate(
     if "CANARY_OK" in upper_body or "RMP CANARY" in (user_intent or "").upper():
         return {"passed": True, "suggested_status": "completed", "issues": []}
 
-    if len(body.strip()) < 20:
+    deliver = pid in ("deliver", "generic_deliver")
+    if not deliver and len(body.strip()) < 20:
         issues.append("Response too short for step completion")
 
     if pid == "file_read":
@@ -130,9 +134,10 @@ def evaluate_step_predicate(
         if facts.get("step_complete") is False:
             issues.append("catalog_dispatch: step_complete=false in facts")
 
-    elif pid == "deliver" or pid == "generic_deliver":
-        if len(body) < 30:
-            issues.append("deliver: no substantive answer")
+    elif deliver:
+        # Whether a reply is enough is the Process Evaluator's call; "Pong!" is an answer.
+        if upper_body in ("", SILENT_REPLY):
+            issues.append("deliver: no answer")
 
     passed = len(issues) == 0
     suggested = "completed" if passed else "pending"

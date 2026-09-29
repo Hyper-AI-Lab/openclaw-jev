@@ -378,6 +378,15 @@ async def test_a_message_that_arrives_while_the_reply_posts_starts_over_in_kiril
     assert h.slack == [reply, f"Got it: adding \u201c{late}\u201d to the task I'm working on ({tid[:8]}).", answer]
 
 
+async def test_a_one_word_answer_reaches_slack_on_the_first_attempt(h):
+    h.intake, h.drafts = [{"decision": "create_fresh"}], ["Pong!"]
+
+    tid = (await h.send("ping", "1790000010.000100"))["task_id"]
+
+    assert (await h.finish(tid))["final_result"] == "Pong!"
+    assert h.slack == ["Pong!"] and len(h.prompts) == 1
+
+
 async def test_a_conversational_reply_is_kept_in_process_memory_after_it_reaches_slack(h):
     reply = "Doing well, thanks. The Osaka plan is ready whenever you want it."
     h.intake, h.drafts = [{"decision": "create_fresh"}], [reply]

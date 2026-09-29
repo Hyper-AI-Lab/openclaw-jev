@@ -169,10 +169,12 @@ def test_poll_accepts_facts_terminal():
     assert _is_rmp_terminal_response(text)
 
 
-def test_terminal_accepts_short_greeting_and_canary_ok():
+def test_a_finished_turn_counts_however_short_it_is():
     assert _is_rmp_terminal_response("Yes, I'm here.") is True
     assert _is_rmp_terminal_response("CANARY_OK") is True
-    assert _is_rmp_terminal_response("OK") is False
+    assert _is_rmp_terminal_response("OK") is True
+    assert _is_rmp_terminal_response("NO_REPLY") is True
+    assert _is_rmp_terminal_response("   ") is False
     assert _is_rmp_terminal_response("Let me check") is False
 
 

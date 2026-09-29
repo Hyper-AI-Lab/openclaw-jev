@@ -51,6 +51,19 @@ def test_decide_status_complete_on_predicate():
     assert decision["status"] == "completed"
 
 
+def test_a_short_answer_completes_a_deliver_step():
+    """Whether it is enough is the Process Evaluator's call (Sep 30: a 'ping' failed on length)."""
+    reply = 'Pong! I\u2019m here.\n\n```json\n{"facts": {"step_complete": true, "stopped": false}}\n```'
+    decision = decide_status_from_predicates("deliver", "ping", reply, validation_ok=True, attempt=1, max_attempts=3)
+    assert decision["action"] == "complete"
+
+
+@pytest.mark.parametrize("reply", ["", "NO_REPLY", '```json\n{"facts": {"step_complete": true}}\n```'])
+def test_a_turn_with_nothing_to_send_is_not_a_delivered_answer(reply):
+    pred = evaluate_step_predicate("generic_deliver", user_intent="ping", agent_text=reply, facts={"step_complete": True})
+    assert pred["passed"] is False and pred["issues"] == ["deliver: no answer"]
+
+
 def test_plan_json_schema_roundtrip():
     plan = {
         "steps": [
