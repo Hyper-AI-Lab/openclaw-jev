@@ -65,10 +65,13 @@ def test_missing_quality_without_skip_retries():
 
 
 def test_conversational_no_longer_bypasses_quality_gate():
-    source = inspect.getsource(generic_task.GenericTaskWorkflow._plan_driven_loop)
-    assert "if is_conversational and clean_result.strip():" not in source
+    plan = inspect.getsource(generic_task.GenericTaskWorkflow._plan_driven_loop)
+    assert "if is_conversational and clean_result.strip():" not in plan
+    assert "notify_slack_user" not in plan
+    assert "return await self._judge_and_deliver(" in plan
+    source = inspect.getsource(generic_task.GenericTaskWorkflow._judge_and_deliver)
     assert "verify_response_quality" in source
-    assert "skip_quality = is_internal_task(user_intent, task_type, tags)" in source
+    assert "internal = is_internal_task(user_intent, task_type, tags)" in source
     verify_pos = source.find("verify_response_quality")
     notify_complete = source.find("notify_slack_user", verify_pos)
     assert notify_complete != -1

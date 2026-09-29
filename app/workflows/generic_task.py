@@ -43,8 +43,10 @@ with workflow.unsafe.imports_passed_through():
         format_workflow_error,
         is_internal_task,
         is_silent_system_ack,
+        sanitize_user_facing_text,
         strip_system_acks,
     )
+    from app.orchestrator.step_predicates import extract_agent_facts
 
 
 def strip_json_eval(text: str) -> str:
@@ -188,25 +190,41 @@ class GenericTaskWorkflow:
             start_to_close_timeout=timedelta(seconds=10),
         )
 
+        attempt_policy = {
+            "max_attempts": int(payload.get("rework_max_attempts") or 20),
+            "strategy_change_attempt": int(payload.get("strategy_change_attempt") or 10),
+            "escalate_user_attempt": int(payload.get("escalate_user_attempt") or 20),
+        }
+        # A recovered reply is judged like any draft; it is never posted as is.
+        recovered_draft = (payload.get("recovered_draft") or "").strip()
         try:
-            result = await self._plan_driven_loop(
-                task_id,
-                session_key,
-                user_intent,
-                correlation_id,
-                payload.get("task_type", "generic"),
-                payload.get("tags") or [],
-                generic_profile,
-                initial_memory_block=payload.get("initial_memory_block"),
-                rework_max_attempts=int(payload.get("rework_max_attempts") or 20),
-                user_time_block=user_time_block,
-                execution_mode=execution_mode,
-                attempt_policy={
-                    "max_attempts": int(payload.get("rework_max_attempts") or 20),
-                    "strategy_change_attempt": int(payload.get("strategy_change_attempt") or 10),
-                    "escalate_user_attempt": int(payload.get("escalate_user_attempt") or 20),
-                },
-            )
+            if recovered_draft:
+                result = await self._judge_and_deliver(
+                    task_id,
+                    session_key,
+                    user_intent,
+                    payload.get("task_type", "generic"),
+                    payload.get("tags") or [],
+                    recovered_draft,
+                    initial_memory_block=payload.get("initial_memory_block"),
+                    rework_max_attempts=attempt_policy["max_attempts"],
+                    attempt_policy=attempt_policy,
+                )
+            else:
+                result = await self._plan_driven_loop(
+                    task_id,
+                    session_key,
+                    user_intent,
+                    correlation_id,
+                    payload.get("task_type", "generic"),
+                    payload.get("tags") or [],
+                    generic_profile,
+                    initial_memory_block=payload.get("initial_memory_block"),
+                    rework_max_attempts=attempt_policy["max_attempts"],
+                    user_time_block=user_time_block,
+                    execution_mode=execution_mode,
+                    attempt_policy=attempt_policy,
+                )
         except Exception as e:
             await workflow.execute_activity(
                 execute_compensation,
@@ -258,21 +276,17 @@ class GenericTaskWorkflow:
                     payload.get("tags") or [],
                     generic_profile,
                     initial_memory_block=payload.get("initial_memory_block"),
-                    rework_max_attempts=int(payload.get("rework_max_attempts") or 20),
+                    rework_max_attempts=attempt_policy["max_attempts"],
                     user_time_block=user_time_block,
                     execution_mode=execution_mode,
-                    attempt_policy={
-                        "max_attempts": int(payload.get("rework_max_attempts") or 20),
-                        "strategy_change_attempt": int(payload.get("strategy_change_attempt") or 10),
-                        "escalate_user_attempt": int(payload.get("escalate_user_attempt") or 20),
-                    },
+                    attempt_policy=attempt_policy,
                 )
             except Exception as e:
                 err_text = format_workflow_error(e)
                 return {"status": "compensated", "task_id": task_id, "reason": err_text}
 
         if isinstance(result, dict) and result.get("status") in ("compensated", "failed"):
-            if not is_internal_task(
+            if not result.get("user_notified") and not is_internal_task(
                 user_intent,
                 payload.get("task_type", "generic"),
                 payload.get("tags") or [],
@@ -460,15 +474,38 @@ class GenericTaskWorkflow:
                         continue
                     break
 
-        from app.notification_policy import sanitize_user_facing_text
-        from app.orchestrator.step_predicates import extract_agent_facts
-
         raw_result = final_text or step_context
         extracted = extract_agent_facts(raw_result)
         clean_result = sanitize_user_facing_text(
             extracted.get("body") or raw_result
         )
 
+        return await self._judge_and_deliver(
+            task_id,
+            session_key,
+            user_intent,
+            task_type,
+            tags,
+            clean_result,
+            initial_memory_block=initial_memory_block,
+            rework_max_attempts=rework_max_attempts,
+            attempt_policy=attempt_policy,
+        )
+
+    async def _judge_and_deliver(
+        self,
+        task_id: str,
+        session_key: str,
+        user_intent: str,
+        task_type: str,
+        tags: List[str],
+        clean_result: str,
+        *,
+        initial_memory_block: str | None = None,
+        rework_max_attempts: int = 20,
+        attempt_policy: Dict[str, int] | None = None,
+    ) -> Dict[str, Any]:
+        """Judge, rework, deliver. Leaves only by acceptance or by escalation."""
         policy = attempt_policy or {
             "max_attempts": int(rework_max_attempts or 20),
             "strategy_change_attempt": 10,
@@ -478,11 +515,13 @@ class GenericTaskWorkflow:
             max_rework = 0
         else:
             max_rework = int(policy["max_attempts"])
-        for rework_attempt in range(1, max_rework + 1):
+        internal = is_internal_task(user_intent, task_type, tags)
+        attempt = 0
+        while True:
+            attempt += 1
             evidence = check_evidence(user_intent, clean_result)
-            skip_quality = is_internal_task(user_intent, task_type, tags)
             quality = {"quality": "pass", "verdict": "accept"}
-            if not skip_quality:
+            if not internal:
                 quality = await workflow.execute_activity(
                     verify_response_quality,
                     {
@@ -490,7 +529,7 @@ class GenericTaskWorkflow:
                         "user_intent": user_intent,
                         "agent_response": clean_result[:4000],
                         "process_run_id": self.process_run_id,
-                        "attempt": rework_attempt,
+                        "attempt": attempt,
                         "process_brief": initial_memory_block or "",
                     },
                     start_to_close_timeout=timedelta(minutes=5),
@@ -501,54 +540,23 @@ class GenericTaskWorkflow:
                 evidence_issues=evidence.get("issues", []),
                 quality_passed=quality.get("quality") != "fail",
                 quality_issues=quality.get("issues", ""),
-                skip_quality_llm=skip_quality,
+                skip_quality_llm=internal,
             )
             if gate["action"] == "complete":
                 break
-            action = next_loop_action(rework_attempt, policy)
-            if action == "escalate_user":
-                diag = build_escalation_message(
+            action = next_loop_action(attempt, policy)
+            if action == "escalate_user" or attempt >= max_rework:
+                return await self._escalate(
+                    task_id,
+                    session_key,
                     user_intent,
+                    task_type,
+                    tags,
                     clean_result,
                     evidence_issues=evidence.get("issues"),
                     quality_issues=quality.get("issues", ""),
-                    attempts=rework_attempt,
+                    attempt=attempt,
                 )
-                await workflow.execute_activity(
-                    finalize_task_failure,
-                    {
-                        "task_id": task_id,
-                        "process_run_id": self.process_run_id,
-                        "task_status": "failed",
-                        "process_state": "failed_terminal",
-                    },
-                    start_to_close_timeout=timedelta(seconds=10),
-                )
-                if not is_internal_task(user_intent, task_type, tags):
-                    await workflow.execute_activity(
-                        notify_slack_user,
-                        {
-                            "session_key": session_key,
-                            "task_id": task_id,
-                            "intent": user_intent,
-                            "task_type": task_type,
-                            "tags": tags,
-                            "message": diag[:3000],
-                        },
-                        start_to_close_timeout=timedelta(seconds=30),
-                    )
-                await workflow.execute_activity(
-                    record_event,
-                    {
-                        "correlation_id": task_id,
-                        "entity_type": "task",
-                        "entity_id": task_id,
-                        "event_type": "evaluator.escalate",
-                        "event_payload": {"attempt": rework_attempt},
-                    },
-                    start_to_close_timeout=timedelta(seconds=10),
-                )
-                return {"status": "failed", "task_id": task_id, "reason": "escalated"}
             prompt_fn = (
                 build_strategy_change_prompt
                 if action == "strategy_change"
@@ -560,7 +568,7 @@ class GenericTaskWorkflow:
                 evidence_issues=evidence.get("issues"),
                 quality_issues=quality.get("issues", ""),
                 command_to_aura=quality.get("command_to_aura", ""),
-                attempt=rework_attempt + 1,
+                attempt=attempt + 1,
                 max_attempts=max_rework,
             )
             rework_resp = await workflow.execute_activity(
@@ -583,7 +591,7 @@ class GenericTaskWorkflow:
                 extracted.get("body") or clean_result
             )
 
-        if not is_internal_task(user_intent, task_type, tags):
+        if not internal:
             await workflow.execute_activity(
                 notify_slack_user,
                 {
@@ -621,4 +629,66 @@ class GenericTaskWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
         )
         return {"status": "completed", "task_id": task_id, "final_result": clean_result}
+
+    async def _escalate(
+        self,
+        task_id: str,
+        session_key: str,
+        user_intent: str,
+        task_type: str,
+        tags: List[str],
+        clean_result: str,
+        *,
+        evidence_issues: List[str] | None,
+        quality_issues: str,
+        attempt: int,
+    ) -> Dict[str, Any]:
+        diag = build_escalation_message(
+            user_intent,
+            clean_result,
+            evidence_issues=evidence_issues,
+            quality_issues=quality_issues,
+            attempts=attempt,
+        )
+        await workflow.execute_activity(
+            finalize_task_failure,
+            {
+                "task_id": task_id,
+                "process_run_id": self.process_run_id,
+                "task_status": "failed",
+                "process_state": "failed_terminal",
+            },
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+        notified = not is_internal_task(user_intent, task_type, tags)
+        if notified:
+            await workflow.execute_activity(
+                notify_slack_user,
+                {
+                    "session_key": session_key,
+                    "task_id": task_id,
+                    "intent": user_intent,
+                    "task_type": task_type,
+                    "tags": tags,
+                    "message": diag[:3000],
+                },
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+        await workflow.execute_activity(
+            record_event,
+            {
+                "correlation_id": task_id,
+                "entity_type": "task",
+                "entity_id": task_id,
+                "event_type": "evaluator.escalate",
+                "event_payload": {"attempt": attempt},
+            },
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+        return {
+            "status": "failed",
+            "task_id": task_id,
+            "reason": "escalated",
+            "user_notified": notified,
+        }
 

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import select
 from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.service import RPCError, RPCStatusCode
 
 from app.db.database import AsyncSessionLocal
 from app.db.models import Event, ProcessRun, Task
@@ -48,90 +49,143 @@ async def _notify_repair(task: Task, message: str) -> None:
         logger.warning("Reconciler Slack notify failed for %s: %s", task.id, exc)
 
 
+ORPHAN_EVENTS = (
+    "reconciler.orphaned_reply_delivered",
+    "reconciler.orphan_reply_rejudged",
+    "reconciler.orphan_run_failed",
+)
+
+
+async def _started_payload(client: Client, handle) -> dict | None:
+    history = await handle.fetch_history()
+    for event in history.events[:1]:
+        payloads = event.workflow_execution_started_event_attributes.input.payloads
+        if payloads:
+            args = await client.data_converter.decode(payloads)
+            if args and isinstance(args[0], dict):
+                return args[0]
+    return None
+
+
+def _rebuilt_payload(task: Task) -> dict:
+    from app.orchestrator.completion_rework import get_attempt_policy
+
+    policy = get_attempt_policy()
+    return {
+        "task_id": task.id,
+        "intent": task.goal or "",
+        "session_key": task.openclaw_session_key,
+        "correlation_id": task.correlation_id or task.id,
+        "task_type": task.task_type or "user",
+        "tags": [],
+        "task_kind": task.task_kind or "one_shot",
+        "rework_max_attempts": policy["max_attempts"],
+        "strategy_change_attempt": policy["strategy_change_attempt"],
+        "escalate_user_attempt": policy["escalate_user_attempt"],
+    }
+
+
 async def _recover_orphaned_session_reply(
     client: Client,
     db,
     task: Task,
     now: datetime,
     stats: dict,
-) -> bool:
-    """If OpenClaw finished but workflow/Slack did not, deliver and complete."""
+) -> str | None:
+    """A dead run whose Aura turn finished restarts from that reply for the evaluator.
+
+    Returns "restarted", "failed" (closed with a notice), or None (nothing to do).
+    """
     if _task_is_internal(task):
-        return False
+        return None
     if task.status not in ("running", "created"):
-        return False
+        return None
     if not task.updated_at:
-        return False
+        return None
     age = now - task.updated_at
     if age < timedelta(seconds=ORPHAN_REPLY_MIN_AGE_SEC):
-        return False
+        return None
     if age > timedelta(minutes=ORPHAN_REPLY_MAX_AGE_MINUTES):
-        return False
+        return None
 
-    # Skip if we already recovered once.
     prior = await db.execute(
-        select(Event).where(
-            Event.entity_id == task.id,
-            Event.event_type == "reconciler.orphaned_reply_delivered",
-        )
+        select(Event).where(Event.entity_id == task.id, Event.event_type.in_(ORPHAN_EVENTS))
     )
     if prior.scalars().first():
-        return False
+        return None
+
+    wf_id = f"workflow-{task.id}"
+    handle = client.get_workflow_handle(wf_id)
+    try:
+        desc = await handle.describe()
+    except RPCError as exc:
+        if exc.status != RPCStatusCode.NOT_FOUND:
+            return None
+        desc = None
+    if desc is not None and desc.status == WorkflowExecutionStatus.RUNNING:
+        return None
 
     from app.orchestrator.session_recovery import (
         extract_user_facing_reply,
         read_completed_rmp_session_reply,
     )
+    from app.workflows.catalog import CATALOG, CATALOG_ALIASES
 
     raw = read_completed_rmp_session_reply(task.id)
     if not raw:
-        return False
+        return None
     clean = extract_user_facing_reply(raw)
     if not clean or len(clean) < 40:
-        return False
+        return None
 
-    await notify_slack_user_safe(task, clean)
-    task.status = "completed"
-    task.next_check_at = None
+    catalog = (desc is not None and desc.workflow_type != "GenericTaskWorkflow") or (
+        task.task_type in CATALOG or task.task_type in CATALOG_ALIASES
+    )
+    if catalog:
+        # Replaying a catalog run could repeat its side effects; close it honestly.
+        from app.activities.db_activities import finalize_task_failure
 
-    wf_id = f"workflow-{task.id}"
-    await _terminate_workflow(client, wf_id, "Orphan reply recovered — OpenClaw done, Slack delivered")
-    orphans = await _cleanup_orphan_plan_children(client, task.id)
-    stats["orphans_terminated"] = stats.get("orphans_terminated", 0) + orphans
+        await finalize_task_failure(
+            {"task_id": task.id, "task_status": "failed", "process_state": "failed_terminal"}
+        )
+        task.status = "failed"
+        task.next_check_at = None
+        await _notify_repair(
+            task,
+            f"Task {task.id[:8]} was interrupted before its result could be checked, "
+            "so I did not send it. Please ask again.",
+        )
+        event_type, outcome = "reconciler.orphan_run_failed", "failed"
+    else:
+        payload = (await _started_payload(client, handle) if desc is not None else None) or (
+            _rebuilt_payload(task)
+        )
+        try:
+            await client.start_workflow(
+                "GenericTaskWorkflow",
+                {**payload, "recovered_draft": clean},
+                id=wf_id,
+                task_queue="openclaw-tasks",
+            )
+        except Exception as exc:
+            logger.warning("Orphan re-judge start failed for %s: %s", task.id[:8], exc)
+            return None
+        event_type, outcome = "reconciler.orphan_reply_rejudged", "restarted"
+
     stats["orphaned_replies"] = stats.get("orphaned_replies", 0) + 1
     db.add(
         Event(
             correlation_id=task.correlation_id or task.id,
             entity_type="task",
             entity_id=task.id,
-            event_type="reconciler.orphaned_reply_delivered",
-            event_payload={"chars": len(clean), "terminated_children": orphans},
+            event_type=event_type,
+            event_payload={"chars": len(clean)},
         )
     )
     stats["events"] += 1
-    metrics_inc("reconciler_orphaned_reply_delivered")
-    logger.info("Recovered orphaned reply for task %s (%d chars)", task.id[:8], len(clean))
-    return True
-
-
-async def notify_slack_user_safe(task: Task, message: str) -> None:
-    if not task.openclaw_session_key:
-        return
-    try:
-        from app.activities.openclaw_activities import notify_slack_user
-
-        await notify_slack_user(
-            {
-                "session_key": task.openclaw_session_key,
-                "task_id": task.id,
-                "message": message,
-                "intent": task.goal or "",
-                "task_type": task.task_type or "",
-                "tags": ["reconciler-recover"],
-            }
-        )
-    except Exception as exc:
-        logger.warning("Orphan reply Slack notify failed for %s: %s", task.id, exc)
+    metrics_inc(event_type.replace(".", "_"))
+    logger.info("Orphaned reply for task %s: %s (%d chars)", task.id[:8], outcome, len(clean))
+    return outcome
 
 
 async def _get_temporal() -> Client:
@@ -332,7 +386,7 @@ async def reconcile_once() -> dict:
             select(Task).where(Task.status.in_(["running", "created"]))
         )
         for task in orphan_candidates.scalars().all():
-            if await _recover_orphaned_session_reply(client, db, task, now, stats):
+            if await _recover_orphaned_session_reply(client, db, task, now, stats) == "failed":
                 terminal_task_ids.append(task.id)
 
         stuck_result = await db.execute(

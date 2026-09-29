@@ -5,7 +5,7 @@ from app.workflows import generic_execute_child, generic_task
 
 
 def test_quality_gate_runs_before_slack_on_generic_complete():
-    source = inspect.getsource(generic_task.GenericTaskWorkflow._plan_driven_loop)
+    source = inspect.getsource(generic_task.GenericTaskWorkflow._judge_and_deliver)
     assert "verify_response_quality" in source
     assert "notify_slack_user" in source
     assert source.find("verify_response_quality") < source.rfind("notify_slack_user")

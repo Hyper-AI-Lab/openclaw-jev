@@ -820,6 +820,7 @@ async def _execute_on_internal_session(task_id: str, message: str) -> str:
                 message,
                 poll_timeout_sec=180,
                 require_terminal=False,
+                task_id=task_id,
                 model=model,
                 deadline=deadline,
             )

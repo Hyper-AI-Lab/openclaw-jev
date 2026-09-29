@@ -63,7 +63,9 @@ def test_escalation_message_is_user_facing_diagnosis():
 
 
 def test_generic_canary_skips_rework_loop():
-    src = inspect.getsource(GenericTaskWorkflow._plan_driven_loop)
+    src = inspect.getsource(GenericTaskWorkflow._judge_and_deliver) + inspect.getsource(
+        GenericTaskWorkflow._escalate
+    )
     assert 'task_type == "canary"' in src
     assert "max_rework = 0" in src
     assert "next_loop_action" in src

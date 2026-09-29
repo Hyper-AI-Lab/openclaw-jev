@@ -275,7 +275,7 @@ def test_rework_dispatch_carries_task_type_and_tags():
 
     from app.workflows import generic_task
 
-    src = inspect.getsource(generic_task.GenericTaskWorkflow._plan_driven_loop)
+    src = inspect.getsource(generic_task.GenericTaskWorkflow._judge_and_deliver)
     rework = src[src.find('"message": rework_prompt'):]
     rework = rework[: rework.find("}")]
     assert '"task_type": task_type' in rework

@@ -176,8 +176,8 @@ async def test_reconciler_indexes_the_tasks_it_completes_after_commit():
     stale_done = FakeTask("stale-done", "created", 25)
 
     async def recover(client, db, task, now_, stats):
-        task.status = "completed"
-        return True
+        task.status = "failed"
+        return "failed"
 
     order = MagicMock()
     db = AsyncMock()
