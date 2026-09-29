@@ -113,7 +113,8 @@ RMP chat.postMessage (idempotent)
 - Retrieval (FTS, vectors, metadata) is **evidence**. Vector scores and regex catalog hits must not auto-attach or auto-create catalogs.
 - After Aura acts, log it. Process Evaluator (not Aura) must **accept** before Slack, including greetings/chat, except the short deterministic canary/heartbeat/system path. It judges what Aura did (her tool calls and their results), not only what she says. A draft recovered after a crash is judged by a restarted run; an evaluator outage waits for the evaluator and never sends the unchecked draft.
 - Canary, heartbeat and system runs never reach user or procedural memory or the task registry. Procedural memory holds procedures (steps, tools, failures), not replies.
-- Slack delivery cannot fail silently: a long reply goes out whole in ordered parts, transient errors retry, a permanent failure is recorded and alerted.
+- Slack delivery cannot fail silently: a long reply goes out whole in ordered parts, transient errors retry, a permanent failure is recorded and alerted, and the task ends `failed` (`slack_delivery_failed`) so its status matches what Kirill received.
+- RMP owns every question to Kirill: inside RMP runs Aura cannot use tools that wait for his answer (`ask_user`, `secrets` request); she asks in her reply.
 - Invariants are monitored, not assumed: readiness shows them, and the canary sentinel pages Kirill when one breaks (a completion without an accept, a dropped attached message, a Slack failure, internal traces in shared memory, a stuck vector outbox).
 - Attempts: 1–9 rework; ~10 strategy change; 11–19 continue; ~20 stop and Slack a diagnosis.
 - Process-scoped memory is injected on execute. Across `create_fresh`, prior same-conversation Slack turns are injected (RECENT DIALOGUE). “This is new” labels a **new task row**, not a new person.
@@ -130,6 +131,7 @@ RMP chat.postMessage (idempotent)
 
 - Native OpenClaw Slack for user DMs, including “intake failed so let the gateway answer.”
 - Post a reply the evaluator has not accepted, including one recovered after a crash or held by an evaluator outage.
+- Judge in code whether a reply is enough by its length (step predicates, reply polling). That is the Process Evaluator's call; code rejects only an empty or `NO_REPLY` turn.
 - Plugin `process_type_hint` or keyword/`GENERIC_PROFILES`/web-regex **assignment** of catalogs or tool dumps.
 - Static incident patches: greeting-word locks, “don’t list crawlers,” other content bans for one failure.
 - Treat `execution_mode=conversational` as bypassing intake, evaluator, or RMP notify.

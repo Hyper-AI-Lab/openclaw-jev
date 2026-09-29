@@ -38,7 +38,7 @@ Aura is a **three-layer system** on one machine:
 
 **OpenAI storage:** off (`store: false`, patch `RMP_OPENAI_NO_STORE`). Reasoning carries between turns as encrypted content, so OpenAI keeps no prompts or replies.
 
-**Rate-limit policy:** On NVIDIA **rate limits**, RMP **waits, rotates keys, and tracks usage** (does not hop providers for 429s). Separate from that, OpenClaw keeps an ordered **model fallback chain** for unavailable/broken models. OpenAI key: `OPENAI_API_KEY` in `/etc/openclaw/openclaw.env` (SQLite profile `openai:default`). Three NVIDIA accounts (`nvidia:default`, `nvidia:key2`, `nvidia:key3`) with **balanced load** and a **max concurrent agent-run cap** (default 2). Never pin `nvidia:keyN` on an `openai/*` session.
+**Rate-limit policy:** On NVIDIA **rate limits**, RMP **waits, rotates keys, and tracks usage** (does not hop providers for 429s). Separate from that, OpenClaw keeps an ordered **model fallback chain** for unavailable/broken models. OpenAI key: `OPENAI_API_KEY` in `/etc/openclaw/openclaw.env` (SQLite profile `openai:default`). Three NVIDIA accounts (`nvidia:default`, `nvidia:key2`, `nvidia:key3`) with **balanced load** and a **max concurrent agent-run cap** of 4 (3 user slots + 1 canary), plus a 1-slot intake lane outside the cap so intake never waits behind Aura's long runs. Never pin `nvidia:keyN` on an `openai/*` session.
 
 ---
 
@@ -118,11 +118,11 @@ Aura is a **three-layer system** on one machine:
 1. Kirill sends a DM → OpenClaw Slack provider receives it (session key `agent:main:slack:channel:…`).
 2. **`rmp_adapter`** claims the turn (`inbound_claim` / `message_received`) and `POST /tasks` with the **full Slack text** (not a truncated intent). **No native OpenClaw Slack fallback** — fail closed (claim + suppress) if intake/API is down.
 3. **`before_message_write`**: blocks Slack DM persistence / native assistant turns while RMP owns delivery (`{ block: true }`).
-4. **Intake Analyst** (not Aura) classifies the message against hybrid-retrieved evidence into one of four relation classes, then applies a decision (`clarify` / attach / wait / rebuild / guided / fresh). See §5.0.0.
+4. **Intake Analyst** (not Aura) classifies the message against hybrid-retrieved evidence into one of four relation classes, then applies a decision (`clarify` / attach / wait / rebuild / guided / fresh). See §5.0.0. The request's own reservation row (`intake_reserved`) is never evidence; when intake handles the message elsewhere, it closes as `cancelled` with `closed_reason: intake_placeholder` and stays out of the task registry.
 5. If work proceeds, Temporal starts **GenericTaskWorkflow** or **CatalogTaskWorkflow** (catalog type is **intake-LLM only**).
 6. Aura executes in `agent:main:rmp_task_*` via **`send_to_openclaw`** (`deliver: false`).
 7. **Process Evaluator** (not Aura; session `rmp_verify_*`) must **accept** the result before Slack. Conversational replies are gated too. Canary/system stay on the short deterministic path. It sees Aura's action trace (tool calls and results from her transcript) and the run's artifacts. If the evaluator itself fails, the run waits for it on durable timers (1, 2, 4 … 60 min), sends a hold notice after two failures, and after the last one closes the task without sending the unchecked draft. Messages that arrive while Aura works, while she is judged or during rework are folded into the draft, which is judged again.
-8. **`notify_slack_user`** → idempotent RMP `chat.postMessage`, in ordered parts of at most 3,500 characters. Transient Slack errors retry; a permanent one is recorded (`slack.delivery_failed`) and alerted. Insufficient work is reworked (attempts 1–19, with one strategy change at 10) or escalated with a diagnosis (attempt 20). Messages that arrive after the reply go back to intake (`resubmit_user_messages`).
+8. **`notify_slack_user`** → idempotent RMP `chat.postMessage`, in ordered parts of at most 3,500 characters. Transient Slack errors retry; a permanent one is recorded (`slack.delivery_failed`) and alerted, and the task ends `failed` with `closed_reason: slack_delivery_failed` (Kirill, Sep 30 2026), with no further notice Slack would refuse too. Insufficient work is reworked (attempts 1–19, with one strategy change at 10) or escalated with a diagnosis (attempt 20). Messages that arrive after the reply go back to intake (`resubmit_user_messages`).
 
 ### 3.2 Cron (e.g. MoltMarket)
 
@@ -171,13 +171,14 @@ OpenClaw also has built-in profile cooldown/rotation on 429; RMP’s quota broke
 | `before_agent_run` | **`POST /api/llm/reserve`** — balanced key + concurrency slot for gateway sessions (not `rmp_task_*`, `rmp_verify_*`, `rmp_intake_*`, Slack/main, heartbeat) |
 | `agent_end` | **`POST /api/llm/release`** — free slot for same session exclusions |
 | `llm_output` | **`POST /api/llm/record-gateway`** — token/request accounting for gateway LLM turns |
+| `before_tool_call` | In `rmp_task_*` / `rmp_verify_*` / `rmp_intake_*` sessions, blocks `ask_user` and `secrets` `request`: they ask Kirill through a channel RMP suppresses, so the run would sleep until their 15-minute timeout. Aura is told to ask in her reply |
 | Assistant ack block | Pure system acks not written to `agent:main:main` transcript |
 
 The plugin never blocks the gateway's event loop: every RMP call is async `fetch` with `AbortSignal.timeout`, and the session-key lookup reads the OpenClaw store in-process (`node:sqlite`). The same gateway serves intake's LLM leg while `POST /tasks` waits on it; a synchronous call froze it for the whole intake (~70 s).
 
 On task create the plugin also **prefetches** process memory (`GET /memory/process/{id}/context`) and passes `initial_memory_block` into the workflow payload.
 
-Tools exposed to the agent: `rmp_task_create`, `rmp_task_status`, `rmp_memory_recall` (optional; normal path is automatic routing).
+Tools exposed to the agent: `rmp_task_create`, `rmp_task_status`, `rmp_memory_recall` (optional; normal path is automatic routing). OpenClaw 2026.9 calls plugin tools as `execute(toolCallId, params, signal)`; `rmp_task_create` is a tool factory so it gets the session from the factory context. `tests/node/*.test.js` call every plugin tool that way.
 
 ### 4.0.1 Galaxy web capability stack
 
@@ -413,7 +414,7 @@ The orchestrator keeps **program logic** in charge; the LLM proposes actions and
 | **Decision engine** | `decision_engine.py` | `decide_step_outcome()` — maps predicate result + attempt budget to `completed`/`pending`/`failed`/`blocked`; `decide_completion_gate()` — evidence + quality LLM (user work always evaluated) |
 | **Prompt policy** | `prompt_policy.py` | Forbids workspace `memory_search` during RMP steps. Regex `GENERIC_PROFILES` exist as leftover tables; `resolve_generic_profile` returns `None` so they do not assign tool budgets on user DMs |
 
-**Predicate examples:** `generic_deliver`, read/summarize/recall-specific gates, catalog-specific gates. Legacy `task_status` JSON in agent output is still parsed as fallback but **predicates are authoritative**.
+**Predicate examples:** `generic_deliver`, read/summarize/recall-specific gates, catalog-specific gates. Legacy `task_status` JSON in agent output is still parsed as fallback but **predicates are authoritative**. A deliver step passes any real answer however short ("Pong!"); whether it is enough is the Process Evaluator's call. Only an empty or `NO_REPLY` turn fails it.
 
 ### 5.5 OpenClaw execution path (`openclaw_activities.py`)
 
@@ -422,7 +423,7 @@ The orchestrator keeps **program logic** in charge; the LLM proposes actions and
 1. **`wait_for_dispatch_sync()`** — quota broker pacing (per-key interval, cooldown-aware key pick).
 2. **`reserve_profile(session_key)`** — atomic concurrency slot + balanced key assignment; pins `authProfileOverride` on session.
 3. **`POST /hooks/agent`** — dispatches prompt to isolated RMP session; `deliver: false` (RMP owns Slack); `allowUnsafeExternalContent: true` so OpenClaw does not EXTERNAL-wrap trusted RMP prompts (otherwise structured JSON intake returns `NO_REPLY`).
-4. **JSONL poll** — waits for terminal assistant message; scans up to 3 recent session files if session ID rotated. Each dispatch starts with `[RMP_DISPATCH <nonce>]`, and only an assistant turn after that user turn counts, so a previous turn's reply or verdict is never taken for this one.
+4. **JSONL poll** — waits for terminal assistant message; scans up to 3 recent session files if session ID rotated. Each dispatch starts with `[RMP_DISPATCH <nonce>]`, and only an assistant turn after that user turn counts, so a previous turn's reply or verdict is never taken for this one. Any non-empty finished turn is the reply, however short.
 5. **`release_profile()`** — always in `finally`.
 6. On 429: `record_rate_limit`, rotate, retry (up to 12× for chat).
 
@@ -503,7 +504,7 @@ All RMP-issued NVIDIA calls (worker dispatch, embeddings, quality review) and ga
 | **Keys** | `NVIDIA_API_KEY` → `nvidia:default`, `NVIDIA_API_KEY_2` → `nvidia:key2`, `NVIDIA_API_KEY_3` → `nvidia:key3` |
 | **Rotation mode** | `balanced` — pick key with lowest daily load score: `requests + tokens/5000 + in_flight×50` |
 | **Per-key pacing** | `min_interval_sec: 5` (live settings); no global gap across all keys beyond broker pacing |
-| **Concurrency** | `max_concurrent: 3` — `reserve_profile()` / `release_profile()` track `active_slots`, `session_slots`, per-key `in_flight` |
+| **Concurrency** | `max_concurrent: 4` (3 user + 1 canary) — `reserve_profile()` / `release_profile()` track `active_slots`, `session_slots`, per-key `in_flight`. `rmp_intake_*` sessions reserve from a 1-slot intake lane outside `max_concurrent` (`INTAKE_LANE_SLOTS`) |
 | **Waits** | The broker lock covers one attempt, never a sleep, so releases are never blocked by a waiting reserve. Callers pass a `deadline` (intake and the evaluator: their activity budget). Waits over 2 s are logged with their reason (slots full, key cooling down, key pacing) |
 | **On 429** | Escalating cooldown per key (15s → 30s → 60s → 120s); rotate; retry up to 6× (embed) or 12× (chat) |
 | **Session pinning** | `assign_openclaw_session_profile()` sets `authProfileOverride` on the SQLite auth store (do not recreate leftover `auth-profiles.json`) |
@@ -518,7 +519,7 @@ All RMP-issued NVIDIA calls (worker dispatch, embeddings, quality review) and ga
   "max_wait_sec": 1800.0,
   "cooldown_steps_sec": [15, 30, 60, 120],
   "rotation_mode": "balanced",
-  "max_concurrent": 3
+  "max_concurrent": 4
 }
 ```
 

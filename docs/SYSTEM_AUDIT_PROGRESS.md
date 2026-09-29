@@ -290,3 +290,35 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 **Purge (approved by Kirill 21:45 CEST, after the 05:15 dump was confirmed to hold the rows):** deleted 3,805,651 `reconciler.process_check` rows (21 s), then `VACUUM (FULL, ANALYZE) events` (3.6 s lock). Every other event type kept its count; events 1,354 MB → 9 MB, database 1,391 MB → 46 MB; services healthy, no errors.
 
 **Noted, not changed:** ops alerts use task id `ops:<incident>`, which has no `tasks` row, so their ledger write (delivery event and assistant message) fails its foreign key and is skipped with a warning; delivery and dedupe use the receipt, which is written (89 ops receipts, 0 ledger rows; pre-existing).
+
+---
+
+## Step 12 — End-to-end proof and close (T1)
+
+**Date:** 2026-09-29 21:40 – 2026-09-30 00:55 CEST (Kirill's acceptance DMs 05:08–07:35 JST)
+
+**What changed:**
+
+- `tests/test_whole_path.py` (new; built by a Grok 4.7 subagent, reviewed and extended here): `POST /tasks` in process → intake (`IntakeWorkflow`, `handle_intake_outcome`) → `GenericTaskWorkflow` and its child on a time-skipping Temporal server, with every worker activity real except Aura's dispatch and the intake analyst; the evaluator runs its real prompt, parser and verdict records with only its model turn scripted; Slack splitting, idempotency and the ledger run for real against a fake Slack; the network is sealed (any other connection fails the test). Ten scenarios: rework then accept; a follow-up folded into the one judged reply; the same DM twice; stop; a long answer in ordered parts; a permanent Slack refusal; a message arriving while the reply posts (resubmitted in Kirill's words); a reconciler nudge; a one-word answer; conversational process memory. The invariants run on the resulting database.
+- Docs (`CONCEPT_TREE.md`, `ARCHITECTURE.md`, `README.md`, `docs/README.md`) match the system; new runbook `docs/runbooks/invariant-alerts.md`.
+
+**Found and fixed** (each with a test that failed first):
+
+- From the harness: leftovers were resubmitted, and fold-ins quoted, with intake's PROCESS BRIEF in front of Kirill's words (`with_catchup` / `user_words`); the reconciler's `[RECONCILER]` signals were taken as his messages; conversational replies left no episodic process memory (the post-Slack write was dropped on Sep 9); method-level imports in workflow code made the sandbox warn.
+- From the first acceptance run (9 DMs sent within 4 minutes): eight of nine `aura_web` tools and all three `rmp_adapter` tools read their arguments as `execute(params)` while OpenClaw 2026.9 calls `execute(toolCallId, params)` (LangSearch "Missing parameter query", Jina fetching `undefined`, `rmp_memory_recall` broken), so Aura invented Bitcoin prices and the evaluator rejected them; `ask_user` / `secrets request` froze the PELICAN-47 run for its 15-minute timeout (now blocked in RMP sessions by `before_tool_call`); intake, Aura and the evaluator shared 2 slots, so an intake waited 63 s and fell back (intake now has its own lane; cap 4 = 3 user + 1 canary). The five running test tasks were cancelled (`acceptance_reset`) before the deploy.
+- From the second run: intake's full-text leg listed the request's own reservation, so PELICAN-47 got a clarify and the next message answered it (reservations excluded); a ping's "Pong! I'm here." failed a 20/30-character deliver rule, and the `NO_REPLY` after identical retries fell under the poller's 10-character rule, so the run waited out two 10-minute timeouts (length no longer judges an answer; empty or `NO_REPLY` fails fast); cancelled reservations were indexed as finished tasks by the Step 11 reconcile (closed as `intake_placeholder` and skipped).
+- Kirill's decisions: a reply Slack refuses for good ends the task `failed` with `closed_reason: slack_delivery_failed` and no further notice (`notify_slack_user` returns delivered / suppressed / refused; its result hint is `Union[bool, str]` because older histories hold booleans and a `str` hint fails to decode them on replay, proven with a test); delete the 8 placeholder registry entries and their vectors (backup `data/backups/purge-placeholder-registry-20260929T222135Z.json`) and the one procedure the hijacked task wrote ("Remember this… PELICAN-47" = "find the Bitcoin price"; backup `purge-hijacked-procedure-20260929T224856Z.json`). The 11 historical placeholders got the `intake_placeholder` marker (additive update).
+
+**Acceptance (Kirill's DMs, checked in the database and transcripts):**
+
+- Tool-using request with a follow-up while it runs: one reply covering USD and EUR from a real Coinbase lookup, after the evaluator rejected five drafts that were not backed by a successful fetch.
+- The same short text twice: two tasks, both answered on the first attempt ("Pong!", 5 characters, ~20 s each).
+- A file-only DM: the analyst read the screenshot and asked what to do with it.
+- A thread reply to an older Aura message: related to the Bitcoin task through its reply-to id and answered in context ("It was Coinbase"), in the main DM.
+- "stop" during a task: one confirmation, no essay.
+- A long answer: a 27,854-character guide in 9 ordered parts; the evaluator made Aura remove every raw citation marker first (none reached Slack).
+- A fact told earlier and asked later: PELICAN-47 acknowledged, then recalled; it lives in the task registry (Postgres + Qdrant) and the dialogue.
+
+**Verification:** full suite 595 passed, 3 skipped (the three need `bs4`, not installed); node 20/20; whole-path harness 10/10 three runs in a row, judgment harness 11/11; CI green through `e621fde`. Live: readiness 30 pass, 1 warn (OTLP endpoint not configured, by design), 0 fail; all six invariants pass; memory 2,602 rows = 2,602 points, registry 214 = 214; no active user task at any deploy, and no open Temporal workflow when the Slack result type changed.
+
+**Known limits, not changed:** semantic promotion takes candidates only from Aura's reply with deterministic patterns, so facts Kirill states are recalled through the registry and the dialogue, not semantic memory (an LLM or Jev extraction step would be new design); max-effort reworks are slow when the evaluator demands verified sources (the Kubernetes guide took 23 minutes); replies to thread messages go to the main DM; a retried plan step gets the same prompt without the rejection reason; ops alerts' ledger rows fail their foreign key (the receipt, which delivery uses, is written).
