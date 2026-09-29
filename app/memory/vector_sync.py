@@ -3,7 +3,8 @@
 Every indexable memory row and every registry entry gets a `vector_outbox` row in the
 transaction that writes it. The drainer embeds and upserts with point id = row id, so a
 retry overwrites instead of duplicating. The reconciler diffs Postgres with both indexes:
-missing rows are queued, points no row references are deleted.
+missing rows and finished user tasks without a registry entry are queued, points no row
+references are deleted.
 """
 from __future__ import annotations
 
@@ -18,8 +19,10 @@ from sqlalchemy import select
 
 from app.config import get_task_registry_config, get_vector_memory_config, is_vector_memory_enabled
 from app.db.database import AsyncSessionLocal
-from app.db.models import MemoryItem, TaskRegistryEntry, VectorOutbox
+from app.db.models import MemoryItem, Task, TaskRegistryEntry, VectorOutbox
 from app.memory.vector import INDEXABLE_TYPES, embed_query_text, scope_to_mem0_ids
+from app.notification_policy import is_internal_task
+from app.orchestrator.decision_engine import TERMINAL_STATUSES
 
 logger = logging.getLogger("rmp.vector_sync")
 
@@ -29,6 +32,8 @@ RECONCILE_INTERVAL_SEC = 24 * 3600
 MAX_BACKOFF_SEC = 3600
 # Refuse a reconcile that would delete most of an index: a failed Postgres read looks the same.
 MAX_ORPHAN_SHARE = 0.5
+# A task that just ended is indexed by its own run first.
+UNINDEXED_SETTLE_MINUTES = 10
 
 
 def _client():
@@ -193,6 +198,16 @@ async def reconcile(apply: bool = True) -> Dict[str, Any]:
             )
         ).all()
         entries = {tid for (tid,) in (await db.execute(select(TaskRegistryEntry.task_id))).all()}
+        now = datetime.utcnow()
+        ended = (
+            await db.execute(
+                select(Task.id, Task.goal, Task.task_type).where(
+                    Task.status.in_(TERMINAL_STATUSES),
+                    Task.created_at >= now - timedelta(days=int(get_task_registry_config().get("backfill_days", 90))),
+                    Task.updated_at < now - timedelta(minutes=UNINDEXED_SETTLE_MINUTES),
+                )
+            )
+        ).all()
         pending = {
             (kind, ref)
             for kind, ref in (
@@ -220,6 +235,13 @@ async def reconcile(apply: bool = True) -> Dict[str, Any]:
     reg_points = {pid for pid, _ in await asyncio.to_thread(_scroll, registry_collection(), None)}
     reg_missing = [tid for tid in entries if tid not in reg_points and ("registry", tid) not in pending]
     reg_orphans = _guarded(sorted(reg_points - entries), len(reg_points), registry_collection())
+    # A task can end on a path that never queues its registry entry.
+    unindexed = [
+        t.id for t in ended
+        if t.id not in entries
+        and ("registry", t.id) not in pending
+        and not is_internal_task(t.goal or "", t.task_type or "", [])
+    ]
 
     stats = {
         "memory_rows": len(active),
@@ -230,12 +252,13 @@ async def reconcile(apply: bool = True) -> Dict[str, Any]:
         "registry_points": len(reg_points),
         "registry_missing": len(reg_missing),
         "registry_orphans": len(reg_orphans),
+        "registry_unindexed": len(unindexed),
         "applied": apply,
     }
     if apply:
         async with AsyncSessionLocal() as db:
             db.add_all([VectorOutbox(kind="memory", ref_id=rid) for rid in missing])
-            db.add_all([VectorOutbox(kind="registry", ref_id=tid) for tid in reg_missing])
+            db.add_all([VectorOutbox(kind="registry", ref_id=tid) for tid in reg_missing + unindexed])
             await db.commit()
         await asyncio.to_thread(delete_memory_points, orphans)
         await asyncio.to_thread(_delete_points, registry_collection(), reg_orphans)

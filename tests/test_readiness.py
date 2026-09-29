@@ -144,3 +144,30 @@ def test_settings_integrity_fails_when_jev_is_missing_invalid_or_keys_differ(tmp
     monkeypatch.setenv("RMP_API_KEY", "b" * 64)
     r = check_settings_integrity()
     assert r.status == "fail" and "disagree" in r.message
+
+
+def test_registry_freshness_counts_finished_user_tasks_only(tmp_path, monkeypatch):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from app.db.models import Base, Task, TaskRegistryEntry
+    from app.production.readiness import check_task_registry_index_fresh
+
+    url = f"sqlite:///{tmp_path / 'registry.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine, tables=[Task.__table__, TaskRegistryEntry.__table__])
+    canary = "RMP CANARY: Reply with exactly CANARY_OK on its own line. No tools."
+    with Session(engine) as db:
+        db.add_all([Task(id=f"c{i}", goal=canary, task_type="canary", status="completed") for i in range(50)])
+        db.add_all([Task(id=f"u{i}", goal="Compare visa rules", status="completed") for i in range(10)])
+        db.add_all([TaskRegistryEntry(id=f"r{i}", task_id=f"u{i}") for i in range(9)])
+        db.commit()
+    monkeypatch.setattr("app.db.database.DATABASE_URL", url)
+    r = check_task_registry_index_fresh()
+    assert r.status == "pass" and r.details == {"indexed": 9, "terminal": 10}
+
+    with Session(engine) as db:
+        db.query(TaskRegistryEntry).filter(TaskRegistryEntry.task_id.in_(["u5", "u6", "u7", "u8"])).delete()
+        db.commit()
+    r = check_task_registry_index_fresh()
+    assert r.status == "warn" and "5/10 finished user tasks" in r.message

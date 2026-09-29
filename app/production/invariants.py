@@ -185,7 +185,14 @@ async def check_vector_sync() -> CheckResult:
             details,
         )
     unsynced = sum(
-        drift[k] for k in ("memory_missing", "memory_orphans", "registry_missing", "registry_orphans")
+        drift[k]
+        for k in (
+            "memory_missing",
+            "memory_orphans",
+            "registry_missing",
+            "registry_orphans",
+            "registry_unindexed",
+        )
     )
     if unsynced:
         return CheckResult(

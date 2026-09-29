@@ -14,7 +14,8 @@ from app.production import canary_sentinel, invariants
 from app.production.readiness import CheckResult
 
 CANARY_GOAL = "RMP CANARY: Reply with exactly CANARY_OK on its own line. No tools."
-NO_DRIFT = {"memory_missing": 0, "memory_orphans": 0, "registry_missing": 0, "registry_orphans": 0}
+NO_DRIFT = {"memory_missing": 0, "memory_orphans": 0, "registry_missing": 0, "registry_orphans": 0,
+            "registry_unindexed": 0}
 
 
 def ago(**delta):
@@ -122,6 +123,7 @@ async def _vector_check(drift=NO_DRIFT):
 async def test_vectors_warn_on_drift_and_fail_when_the_outbox_stops(session):
     assert (await _vector_check()).status == "pass"
     assert (await _vector_check({**NO_DRIFT, "memory_missing": 2})).status == "warn"
+    assert (await _vector_check({**NO_DRIFT, "registry_unindexed": 3})).status == "warn"
 
     await seed(session, VectorOutbox(kind="memory", ref_id="m1", next_attempt_at=ago(minutes=20)))
     result = await _vector_check()

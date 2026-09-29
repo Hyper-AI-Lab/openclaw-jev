@@ -684,14 +684,15 @@ def check_task_registry_vector() -> CheckResult:
 
 
 def check_task_registry_index_fresh() -> CheckResult:
-    """Warn if terminal tasks significantly outnumber indexed registry entries."""
+    """Warn if many finished user tasks have no registry entry (internal runs are never indexed)."""
     from datetime import datetime, timedelta
 
-    from sqlalchemy import create_engine, func, select, text
+    from sqlalchemy import create_engine, select
 
     from app.config import get_task_registry_config
     from app.db.database import DATABASE_URL
     from app.db.models import Task, TaskRegistryEntry
+    from app.notification_policy import is_internal_task
     from app.task_registry.indexer import TERMINAL_STATUSES
 
     cfg = get_task_registry_config()
@@ -701,41 +702,37 @@ def check_task_registry_index_fresh() -> CheckResult:
     cutoff = datetime.utcnow() - timedelta(days=days)
     sync_url = DATABASE_URL.replace("+asyncpg", "+psycopg2")
     engine = create_engine(sync_url)
-    terminal_statuses = list(TERMINAL_STATUSES)
     try:
         with engine.connect() as conn:
-            terminal = conn.execute(
-                text(
-                    "SELECT count(*) FROM tasks WHERE status = ANY(:st) AND created_at >= :cutoff"
-                ),
-                {"st": terminal_statuses, "cutoff": cutoff},
-            ).scalar()
-            indexed = conn.execute(
-                text("SELECT count(*) FROM task_registry_entries")
-            ).scalar()
+            ended = conn.execute(
+                select(Task.id, Task.goal, Task.task_type).where(
+                    Task.status.in_(list(TERMINAL_STATUSES)), Task.created_at >= cutoff
+                )
+            ).all()
+            indexed = set(conn.execute(select(TaskRegistryEntry.task_id)).scalars())
     except Exception as exc:
         return CheckResult(
             "task_registry_index",
             "warn",
             f"Registry index check failed: {exc}",
         )
-    terminal_n = int(terminal or 0)
-    indexed_n = int(indexed or 0)
-    if terminal_n == 0:
+    user = [t.id for t in ended if not is_internal_task(t.goal or "", t.task_type or "", [])]
+    if not user:
         return CheckResult("task_registry_index", "pass", "No terminal tasks to index")
-    ratio = indexed_n / terminal_n if terminal_n else 1.0
-    if ratio >= 0.85:
+    indexed_n = sum(1 for tid in user if tid in indexed)
+    details = {"indexed": indexed_n, "terminal": len(user)}
+    if indexed_n >= 0.85 * len(user):
         return CheckResult(
             "task_registry_index",
             "pass",
-            f"Registry index fresh ({indexed_n}/{terminal_n})",
-            {"indexed": indexed_n, "terminal": terminal_n},
+            f"Registry index fresh ({indexed_n}/{len(user)} finished user tasks)",
+            details,
         )
     return CheckResult(
         "task_registry_index",
         "warn",
-        f"Registry index stale ({indexed_n}/{terminal_n} terminal tasks indexed)",
-        {"indexed": indexed_n, "terminal": terminal_n},
+        f"Registry index stale ({indexed_n}/{len(user)} finished user tasks indexed)",
+        details,
     )
 
 

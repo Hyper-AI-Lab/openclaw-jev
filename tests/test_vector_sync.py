@@ -83,13 +83,19 @@ async def test_the_drain_indexes_retries_with_backoff_and_deletes_gone_rows():
     assert deletes == [["r-gone", None]]
 
 
-async def test_reconcile_backfills_missing_rows_deletes_orphans_and_respects_legacy_links():
+async def test_reconcile_backfills_missing_rows_and_tasks_deletes_orphans_and_respects_legacy_links():
     legacy_ref = "22222222-2222-4222-8222-222222222222"
     rows = [(ROW, {}), ("r-legacy", {"vector_ref": legacy_ref}), ("r-seeded", {}), ("r-missing", {})]
     points = [(ROW, {"memory_id": ROW}), (legacy_ref, {}), ("p-seeded", {"memory_id": "r-seeded"}), ("p-orphan", {})]
+    ended = [
+        SimpleNamespace(id="t-indexed", goal="Compare visa rules", task_type="user"),
+        SimpleNamespace(id="t-ended", goal="summarize inbox", task_type="cron"),
+        SimpleNamespace(id="c1", goal="RMP CANARY: Reply with exactly CANARY_OK on its own line.", task_type="canary"),
+        SimpleNamespace(id="t-queued", goal="Draft the memo", task_type="user"),
+    ]
     db = MagicMock()
     results = []
-    for value in (rows, [("t-indexed",), ("t-missing",)], []):
+    for value in (rows, [("t-indexed",), ("t-missing",)], ended, [("registry", "t-queued")]):
         r = MagicMock()
         r.all.return_value = value
         results.append(r)
@@ -102,8 +108,10 @@ async def test_reconcile_backfills_missing_rows_deletes_orphans_and_respects_leg
          patch.object(vector_sync, "delete_memory_points", side_effect=lambda ids: deleted.append(("memory", list(ids)))), \
          patch.object(vector_sync, "_delete_points", side_effect=lambda coll, ids: deleted.append(("registry", list(ids)))):
         stats = await vector_sync.reconcile(apply=True)
-    assert stats["memory_missing"] == 1 and stats["memory_orphans"] == 1
-    assert [(o.kind, o.ref_id) for o in added] == [("memory", "r-missing"), ("registry", "t-missing")]
+    assert stats["memory_missing"] == 1 and stats["memory_orphans"] == 1 and stats["registry_unindexed"] == 1
+    assert [(o.kind, o.ref_id) for o in added] == [
+        ("memory", "r-missing"), ("registry", "t-missing"), ("registry", "t-ended"),
+    ]
     assert deleted == [("memory", ["p-orphan"]), ("registry", ["t-orphan"])]
 
 
