@@ -259,3 +259,34 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - Patch 6f offline: applies once (3-line diff), idempotent, patched module parses.
 - Live: `settings_integrity` pass; retired key refused, current key 200, no key 401; `/settings` shows `***`; new plugin log 0600 with no key; two max-effort turns in one session with store off (tool call, then a follow-up that needs turn 1): both correct, and OpenAI returns 404 for both response ids (not stored); health canary `CANARY OK`; intake latency canary PASS.
 - Daily backups under `data/backups/*/settings.json` and `/root/.openclaw/settings.json.bak-luna-20260929-170939` still contain the retired key, which no longer grants access; backups were left intact.
+
+---
+
+## Step 11 — Invariant monitors (M1)
+
+**Date:** 2026-09-29 (20:50–21:40 CEST)
+
+**What changed:**
+
+- `app/production/invariants.py` (new), read from stored facts over a rolling 24 h: `judged_deliveries` (a completed user task has an `evaluator.accept`), `attached_messages` (an attach on a task that ended is followed by an accept, an escalation or `task.messages_resubmitted`, unless Kirill or an operator stopped it; 2 min settle), `slack_delivery` (`slack.delivery_failed`), `memory_hygiene` (rows from internal tasks, rows quoting canary tokens — `CANARY_OK`, `RMP CANARY`, `RMP MEMORY CANARY`, the canary's fictional name — and registry entries of internal tasks), `vector_sync` (outbox rows overdue > 15 min or failing ≥ 5 times: fail; index drift: warn) and `orphan_recoveries` (warn). A check that cannot run reports warn instead of breaking readiness.
+- Readiness includes them; the canary sentinel (every 30 min) pages Kirill by Slack DM on any `fail`, 4 h cooldown per incident set; warnings show in readiness only.
+- `resubmit_user_messages` records `task.messages_resubmitted` on the source task (the attach check needs the link). `app/memory/hygiene.py` holds the one definition of internal traces, used by the check and `ops/purge_internal_memory.py`.
+- Events indexed by `(event_type, occurred_at)` and `entity_id` (built concurrently, 31 s; also in the startup migrations). The table had only `id` and `correlation_id`, so every per-task event lookup scanned 3.8M rows.
+
+**Found while building the monitors, fixed:**
+
+- 194 process runs stayed `running`/`blocked` after their tasks had failed (174), completed (13), been cancelled (4) or stopped (3), back to June: runs close only when a workflow reaches its own end. The reconciler logged `reconciler.process_check` for each every 5 min — 3,804,875 rows, 1.1 GB of the 1.15 GB database, read by nothing. The reconciler now closes any open run whose task ended (one `reconciler.process_run_closed` event each), treats `superseded` as terminal, and no longer logs the per-tick check.
+- 11 finished user tasks (cancelled, stopped, or ended on paths that never queue an entry) had no registry entry, so intake could not find them. The vector reconcile now queues finished user tasks without an entry and reports them as drift. The readiness freshness check counted internal runs, which are never indexed (190/3050); it now compares finished user tasks with their entries.
+- `/api/dashboard-data` (no auth) returned `settings.json` whole, including the RMP key (API bound to 127.0.0.1); it now masks it like `/settings`.
+- `ops/restart_rmp.sh` checked health once, 3 s after restarting; the API needs about 5 s, so every restart reported failure. It now waits up to 60 s.
+
+**Incident during verification (mine):** to run the checks against live data I sourced `/etc/rmp/rmp.env` in a persistent shell; `tests/conftest.py` only defaulted `DATABASE_URL`, so three later pytest runs (19:14–19:23 UTC) used the live database. Impact checked: 0 rows created or updated in tasks, events, memory, messages, outbox, registry, receipts and intake decisions since 19:10 UTC; the only delete in the tests targets a private SQLite file; Postgres and both indexes still agreed afterwards. Settings, OpenClaw home and data paths stayed temporary (the env file sets only the key and the URL). Fixed: tests always get a private SQLite file — proven with an exported decoy URL and with a CI-style run (`RMP_SETTINGS_PATH` set, which skips the hermetic block and fell back to the app's default URL, the live database on this host). The suite was re-run hermetically.
+
+**Verification:**
+
+- Tests: each invariant fails on a seeded SQLite state and passes once it is right (unaccepted completion; dropped, answered, stopped, live and just-ended attaches; day-old vs recent delivery failure; orphan warn; memory rows from a canary, a quoted canary token, a registry entry of a canary, and a clean row that says "canary"; overdue and failing outbox rows, drift and unindexed tasks); a crashing check reports warn; the sentinel pages once per cooldown, names the failing check with task-id prefixes and leaves warnings out; runs of ended tasks close with their task's outcome while live and superseded runs stay; reconcile queues an unindexed cron task but not an indexed task, a canary or a queued one; freshness 9/10 passes and 5/10 warns with 50 canaries present. Full suite 576 passed, 3 skipped (hermetic); node 16.
+- Live: first reconciler pass closed the 194 runs (19:05:56 UTC); no `process_check` rows since 19:05:21. Reconcile queued the 11 unindexed tasks and the drain indexed them (0 retries): registry 190 → 201, 110/110 finished user tasks. All six invariants pass; memory 2,584 rows = 2,584 points. Readiness 30 pass, 1 warn (telemetry: no OTLP endpoint, by design), 0 fail. Sentinel run through its systemd unit: exit 0, no issues, no page. The six unaccepted user completions in the last 7 days were all delivered on Sep 27–28 by the pre-Step-3 orphan path; the monitor would have failed on each.
+
+**Waiting on Kirill:** whether to delete the 3.8M `reconciler.process_check` rows (not covered by the approved purge, which was the plugin log).
+
+**Noted, not changed:** ops alerts use task id `ops:<incident>`, which has no `tasks` row, so their ledger write (delivery event and assistant message) fails its foreign key and is skipped with a warning; delivery and dedupe use the receipt, which is written (89 ops receipts, 0 ledger rows; pre-existing).
