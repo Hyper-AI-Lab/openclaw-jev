@@ -76,6 +76,9 @@ CREATE INDEX IF NOT EXISTS ix_task_registry_recurrence ON task_registry_entries 
 
 ALTER TABLE process_runs ADD COLUMN IF NOT EXISTS parent_process_run_id VARCHAR;
 CREATE INDEX IF NOT EXISTS ix_process_runs_parent_process_run_id ON process_runs (parent_process_run_id);
+
+ALTER TABLE task_messages ADD COLUMN IF NOT EXISTS slack_ts VARCHAR;
+CREATE INDEX IF NOT EXISTS ix_task_messages_slack_ts ON task_messages (slack_ts);
 SQL
 
 echo "Task registry schema migration complete."

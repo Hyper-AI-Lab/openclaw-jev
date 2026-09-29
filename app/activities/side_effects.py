@@ -2,7 +2,7 @@
 import asyncio
 import hashlib
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from sqlalchemy import select
@@ -82,8 +82,10 @@ async def _record_receipt(
         await db.commit()
 
 
-async def _post_part(client: httpx.AsyncClient, bot_token: str, user_id: str, text: str) -> Optional[str]:
-    """None when Slack accepted the part; a permanent Slack error code otherwise.
+async def _post_part(
+    client: httpx.AsyncClient, bot_token: str, user_id: str, text: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """(None, message ts) when Slack accepted the part; (permanent Slack error code, None) otherwise.
 
     Transient failures are retried here a few times, then raised as SlackTransientError.
     """
@@ -110,10 +112,10 @@ async def _post_part(client: httpx.AsyncClient, bot_token: str, user_id: str, te
                 except ValueError:
                     data = {"ok": False, "error": f"http {resp.status_code} non-json"}
                 if data.get("ok"):
-                    return None
+                    return None, data.get("ts")
                 error = str(data.get("error") or "unknown_error")
                 if error not in TRANSIENT_SLACK_ERRORS:
-                    return error
+                    return error, None
                 reason = error
         if attempt + 1 < INLINE_ATTEMPTS:
             await asyncio.sleep(delay)
@@ -166,20 +168,26 @@ async def send_slack_message_idempotent(
         return True
 
     parts = split_for_slack(message)
+    first_ts: Optional[str] = None
     async with httpx.AsyncClient() as client:
         for index, part in enumerate(parts, 1):
             part_key = slack_idempotency_key(task_id, f"{index}/{len(parts)}\n{part}")
             if len(parts) > 1 and await _already_sent(part_key):
                 continue
-            error = await _post_part(client, bot_token, user_id, part)
+            error, ts = await _post_part(client, bot_token, user_id, part)
             if error:
                 await _record_delivery_failure(task_id, user_id, error, index, len(parts))
                 return False
+            first_ts = first_ts or ts
             if len(parts) > 1:
-                await _record_receipt(part_key, "slack.part", {"task_id": task_id, "part": index})
+                await _record_receipt(
+                    part_key, "slack.part", {"task_id": task_id, "part": index, "ts": ts}
+                )
 
     await _record_receipt(
-        idem_key, "slack", {"task_id": task_id, "user_id": user_id, "parts": len(parts)}
+        idem_key,
+        "slack",
+        {"task_id": task_id, "user_id": user_id, "parts": len(parts), "ts": first_ts},
     )
     try:
         from app.db.models import Event, TaskMessage
@@ -202,6 +210,7 @@ async def send_slack_message_idempotent(
                     role="assistant",
                     content=message,
                     source="slack",
+                    slack_ts=first_ts,
                 )
             )
             await db.commit()

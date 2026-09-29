@@ -138,6 +138,10 @@ class TaskRequest(BaseModel):
     idempotency_key: Optional[str] = None
     process_type_hint: Optional[str] = None
     task_kind_hint: Optional[str] = None
+    slack_message_id: Optional[str] = None
+    thread_id: Optional[str] = None
+    reply_to: Optional[Dict[str, Any]] = None
+    attachments: Optional[List[Dict[str, Any]]] = None
 
 
 class SignalRequest(BaseModel):
@@ -267,6 +271,15 @@ async def _cancel_intake_reservation(task: Task, db: AsyncSession) -> None:
     await db.commit()
 
 
+def _slack_context(request: TaskRequest) -> Dict[str, Any]:
+    return {
+        "message_id": request.slack_message_id,
+        "thread_id": request.thread_id,
+        "reply_to_id": (request.reply_to or {}).get("id"),
+        "attachments": request.attachments or [],
+    }
+
+
 def _make_idempotency_key(request: TaskRequest) -> str:
     if request.idempotency_key:
         return request.idempotency_key
@@ -373,6 +386,7 @@ async def preview_task_intake(
             "recurrence_key": recurrence_key,
             "task_type": preview_task_type,
             "bypass_jev": bypass_jev,
+            "reply_to": request.reply_to,
         }
     )
     return {"preview": True, "intake": result}
@@ -511,6 +525,7 @@ async def create_task(
                 "process_type_hint": request.process_type_hint,
                 "recurrence_key": recurrence_key,
                 "task_type": task_type,
+                "reply_to": request.reply_to,
             }
         )
         intake_catalog_type = intake_result.get("catalog_type")
@@ -653,12 +668,14 @@ async def create_task(
         role="user" if task_type == "user" else task_type,
         source=msg_source,
         db=db,
+        slack_ts=request.slack_message_id,
     )
     if msg_id:
         task.supplementary_context = {
             "latest_message_id": msg_id,
             "source": msg_source,
             "session_key": request.session_key,
+            **({"slack": _slack_context(request)} if request.slack_message_id or request.attachments else {}),
         }
     await db.commit()
     metrics_inc("task_created")

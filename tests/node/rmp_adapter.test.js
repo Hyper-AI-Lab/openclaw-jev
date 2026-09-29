@@ -224,7 +224,7 @@ test('a non-timeout intake failure notifies once without re-POSTing', async () =
   const { hooks } = loadPlugin();
 
   assert.deepEqual(hooks.message_received(...slackDm('server error')), { handled: true });
-  await waitFor(() => sawLog('route error (claimed; no native): boom'), 'route error');
+  await waitFor(() => sawLog('route error (claimed; no native): HTTP 500: boom'), 'route error');
   assert.equal(calls.filter((c) => c.key === 'POST /tasks').length, 1);
   const notices = calls.filter((c) => c.key === 'POST /api/notify-user');
   assert.deepEqual(notices.map((c) => c.body.reason), ['intake_unavailable']);
@@ -354,4 +354,66 @@ test('session lookup reads the OpenClaw SQLite store in-process', {
   assert.deepEqual(hooks.before_dispatch({ channel: 'slack', content: 'no key on event' }, { channelId: 'slack' }), { handled: true });
   await waitFor(() => sawLog('Created task s1'), 'task from store key');
   assert.equal(calls[0].body.session_key, keys[0] || 'agent:main:main');
+});
+
+test('identical texts with different Slack ids are two messages; one id seen twice is one', async () => {
+  const calls = installFetch([['POST /tasks', (call) => ({ task_id: `t-${call.body.slack_message_id}`, status: 'created' })]]);
+  const { hooks } = loadPlugin();
+  const dm = (messageId) => [{ content: 'ok', messageId, metadata: { provider: 'slack' } }, { channelId: 'slack', sessionKey: SLACK_KEY }];
+
+  assert.deepEqual(hooks.message_received(...dm('1790000000.000100')), { handled: true });
+  assert.deepEqual(hooks.message_received(...dm('1790000060.000200')), { handled: true });
+  const [again, ctx] = dm('1790000060.000200');
+  assert.deepEqual(hooks.before_dispatch({ ...again, channel: 'slack' }, ctx), { handled: true });
+  await waitFor(() => calls.length === 2, 'two POST /tasks');
+  await waitFor(() => sawLog('Created task t-1790000060.000200'), 'second task');
+  assert.equal(calls.length, 2, 'the second hook must not re-post the same Slack message');
+  assert.deepEqual(calls.map((c) => c.body.idempotency_key), [
+    sha256(`${SLACK_KEY}:msg:1790000000.000100`),
+    sha256(`${SLACK_KEY}:msg:1790000060.000200`),
+  ]);
+});
+
+test('an attachment-only DM is claimed and reaches intake with its file', async () => {
+  const calls = installFetch([['POST /tasks', () => ({ task_id: 't-file', status: 'created' })]]);
+  const { hooks } = loadPlugin();
+  const event = {
+    content: '',
+    messageId: '1790000100.000300',
+    media: [{ path: '/root/.openclaw/media/inbound/report.pdf', contentType: 'application/pdf' }],
+    metadata: { provider: 'slack' },
+  };
+  assert.deepEqual(hooks.message_received(event, { channelId: 'slack', sessionKey: SLACK_KEY }), { handled: true });
+  await waitFor(() => calls.length === 1, 'POST /tasks');
+  const { body } = calls[0];
+  assert.match(body.raw_text, /^Kirill sent an attachment\.\n\n\[Attachments\]\n- report\.pdf \(application\/pdf\): \/root\/\.openclaw\/media\/inbound\/report\.pdf$/);
+  assert.deepEqual(body.attachments, [{ path: '/root/.openclaw/media/inbound/report.pdf', type: 'application/pdf', name: 'report.pdf' }]);
+});
+
+test('reply-to and thread ids travel with the message', async () => {
+  const calls = installFetch([['POST /tasks', () => ({ task_id: 't-reply', status: 'created' })]]);
+  const { hooks } = loadPlugin();
+  const event = {
+    content: 'yes, go ahead with that one',
+    messageId: '1790000200.000400',
+    threadId: '1790000150.000350',
+    replyToId: '1790000150.000350',
+    replyToBody: 'Shall I book the 10:05 train?',
+    metadata: { provider: 'slack' },
+  };
+  hooks.message_received(event, { channelId: 'slack', sessionKey: SLACK_KEY });
+  await waitFor(() => calls.length === 1, 'POST /tasks');
+  assert.equal(calls[0].body.thread_id, '1790000150.000350');
+  assert.deepEqual(calls[0].body.reply_to, { id: '1790000150.000350', body: 'Shall I book the 10:05 train?', sender: '' });
+});
+
+test('a structured API error is logged readably, not as [object Object]', async () => {
+  installFetch([
+    ['POST /tasks', () => json({ detail: { intake_action: 'attach_active', error: 'workflow not found' } }, 502)],
+    ['POST /api/notify-user', () => ({ delivered: true })],
+  ]);
+  const { hooks } = loadPlugin();
+  hooks.message_received(...slackDm('hey'));
+  await waitFor(() => sawLog('route error (claimed; no native): HTTP 502: {"intake_action":"attach_active","error":"workflow not found"}'), 'readable error');
+  assert.ok(!sawLog('[object Object]'));
 });

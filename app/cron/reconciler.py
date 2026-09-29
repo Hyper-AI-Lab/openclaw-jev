@@ -17,9 +17,31 @@ from app.metrics import inc as metrics_inc
 logger = logging.getLogger("rmp.cron_reconciler")
 
 OPENCLAW_CRON_PATH = os.path.join(OPENCLAW_HOME, "cron", "jobs.json")
+# OpenClaw 2026.9 keeps cron jobs in its state database; jobs.json is the older store.
+OPENCLAW_STATE_DB = os.path.join(OPENCLAW_HOME, "state", "openclaw.sqlite")
 
 
 def load_openclaw_cron_jobs() -> List[dict]:
+    if os.path.exists(OPENCLAW_STATE_DB):
+        import sqlite3
+
+        try:
+            con = sqlite3.connect(f"file:{OPENCLAW_STATE_DB}?mode=ro", uri=True, timeout=5)
+            try:
+                rows = con.execute(
+                    "SELECT job_json, state_json FROM cron_jobs ORDER BY sort_order"
+                ).fetchall()
+            finally:
+                con.close()
+            jobs = []
+            for job_json, state_json in rows:
+                job = json.loads(job_json)
+                job["state"] = json.loads(state_json) if state_json else {}
+                jobs.append(job)
+            return jobs
+        except Exception as e:
+            logger.warning("Could not read OpenClaw cron jobs from %s: %s", OPENCLAW_STATE_DB, e)
+            return []
     try:
         with open(OPENCLAW_CRON_PATH) as f:
             data = json.load(f)

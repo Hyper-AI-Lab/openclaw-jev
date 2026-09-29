@@ -38,6 +38,7 @@ def build_intake_prompt(context: Dict[str, Any]) -> str:
         "fts_hits": context.get("fts_hits"),
         "advisory_hits": context.get("advisory_hits"),
         "supplementary_messages": context.get("supplementary_messages"),
+        "reply_to": context.get("reply_to"),
         "soft_catalog_candidates": soft_hits,
         "available_catalog_types": catalog_ids,
     }
@@ -71,6 +72,7 @@ RULES:
 - catalog_hint: YOU assign (or null). Valid ids are in available_catalog_types.
   Never set tool_self_upgrade for awareness ("are you aware", "now you can").
 - web_intent: search|fetch|crawl|adaptive_extract|schema_extract|interact|none. interact only for real click/login/screenshot.
+- reply_to, when present, is the earlier message this one directly replies to (quoted) and the task it belongs to: strong evidence for relation_class and the target.
 - Never invent task IDs; use only IDs from context.
 
 Respond with ONLY a single JSON object matching this schema (no markdown fences, no prose before or after):

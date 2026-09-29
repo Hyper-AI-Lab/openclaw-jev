@@ -102,7 +102,8 @@ async function rmpFetch(method, urlPath, body, opts) {
   let data = null;
   try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
   if (res.status >= 400) {
-    throw new Error(data.detail || data.raw || `HTTP ${res.status}`);
+    const detail = typeof data.detail === 'string' ? data.detail : data.detail ? JSON.stringify(data.detail) : data.raw;
+    throw new Error(`HTTP ${res.status}${detail ? `: ${String(detail).slice(0, 500)}` : ''}`);
   }
   return data;
 }
@@ -114,6 +115,46 @@ function extractText(msg) {
     if (part?.type === 'text' && part.text) text += part.text;
   }
   return text;
+}
+
+/** The Slack message as RMP needs it: text, identity, what it replies to, attachments. */
+function inboundFromEvent(event) {
+  const media = Array.isArray(event?.media) ? event.media : [];
+  const attachments = media
+    .map((m) => {
+      const where = String(m?.path || m?.url || '');
+      return {
+        path: where,
+        type: String(m?.contentType || m?.kind || ''),
+        name: String(m?.fileName || m?.name || path.basename(where) || 'attachment'),
+      };
+    })
+    .filter((a) => a.path);
+  const replyToId = String(event?.replyToId || event?.threadId || '');
+  return {
+    content: String(event?.content || event?.body || '').trim(),
+    messageId: String(event?.messageId || '') || null,
+    threadId: String(event?.threadId || '') || null,
+    replyTo: replyToId
+      ? { id: replyToId, body: String(event?.replyToBody || '').slice(0, 2000), sender: String(event?.replyToSender || '') }
+      : null,
+    attachments,
+  };
+}
+
+/** Message text with the attachments Aura can open. */
+function textWithAttachments(inbound) {
+  if (!inbound.attachments.length) return inbound.content;
+  const lines = inbound.attachments.map((a) => `- ${a.name}${a.type ? ` (${a.type})` : ''}: ${a.path}`);
+  return `${inbound.content || 'Kirill sent an attachment.'}\n\n[Attachments]\n${lines.join('\n')}`;
+}
+
+function describeError(e) {
+  if (e instanceof Error) return `${e.message}${e.stack ? ` | ${e.stack.split('\n').slice(1, 3).join(' ').trim()}` : ''}`;
+  if (e && typeof e === 'object') {
+    try { return JSON.stringify(e).slice(0, 500); } catch (_) { return Object.prototype.toString.call(e); }
+  }
+  return String(e);
 }
 
 function isStopCommand(intent) {
@@ -260,15 +301,19 @@ function clearMainSessionSendPolicy() {
   }
 }
 
-function inboundIdempotencyKey(sessionKey, rawText, intent, heartbeatKey) {
+/** One key per Slack message: its id when Slack gave one, else its text. */
+function inboundIdempotencyKey(sessionKey, rawText, intent, heartbeatKey, messageId) {
   if (heartbeatKey) {
     return crypto.createHash('sha256').update(`${sessionKey}:${heartbeatKey}`).digest('hex');
+  }
+  if (messageId) {
+    return crypto.createHash('sha256').update(`${sessionKey}:msg:${messageId}`).digest('hex');
   }
   return crypto.createHash('sha256').update(`${sessionKey}:${rawText || intent}`).digest('hex');
 }
 
-async function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeatKey }) {
-  const idemKey = inboundIdempotencyKey(sessionKey, rawText, intent, heartbeatKey);
+async function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, heartbeatKey, inbound }) {
+  const idemKey = inboundIdempotencyKey(sessionKey, rawText, intent, heartbeatKey, inbound?.messageId);
   const data = await rmpFetch('POST', '/tasks', {
     intent: (rawText || intent || "").slice(0, 20000),
     tags: tags || ['user-request'],
@@ -277,6 +322,10 @@ async function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, hea
     raw_text: rawText || intent,
     // No process_type_hint: intake LLM + memory/registry decide routing.
     idempotency_key: idemKey,
+    slack_message_id: inbound?.messageId || null,
+    thread_id: inbound?.threadId || null,
+    reply_to: inbound?.replyTo || null,
+    attachments: inbound?.attachments?.length ? inbound.attachments : null,
   });
   if (data.skipped) {
     log(`INTAKE skipped: ${data.intake_action || 'skip'} — ${data.reason || ''}`);
@@ -316,15 +365,15 @@ async function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, hea
   return data;
 }
 
-async function routeSlackDmToRmp(content, sessionKey) {
+async function routeSlackDmToRmp(inbound, sessionKey) {
   if (isDevSuspended()) {
     log('DEV MODE: Slack DM absorbed (no task, no delivery)');
     return true;
   }
-  const intent = (content || '').trim();
+  const intent = textWithAttachments(inbound).trim();
   if (!intent) return true;
 
-  if (isStopCommand(intent)) {
+  if (!inbound.attachments.length && isStopCommand(intent)) {
     try {
       const activeData = await rmpFetch('GET', `/sessions/${encodeURIComponent(sessionKey)}/active_user_task`);
       if (activeData.active_task?.id) {
@@ -339,7 +388,7 @@ async function routeSlackDmToRmp(content, sessionKey) {
         log(`Stop with no active task; RMP notice was not delivered on ${sessionKey}`);
       }
     } catch (e) {
-      log(`Signal error: ${e.message}`);
+      log(`Signal error: ${describeError(e)}`);
       await notifyRmpUser(sessionKey, 'intake_unavailable', intent);
       throw e;
     }
@@ -351,6 +400,7 @@ async function routeSlackDmToRmp(content, sessionKey) {
     intent,
     tags: ['user-request'],
     rawText: intent,
+    inbound,
   };
   try {
     await createRmpTaskFromInbound(payload);
@@ -360,7 +410,7 @@ async function routeSlackDmToRmp(content, sessionKey) {
     // Server may still create the task; recover via idempotent re-POST. Never
     // hand the turn back to native OpenClaw.
     if (isLikelyTimeoutError(e)) {
-      log(`Intake POST timed out; recovering via idempotent re-POST: ${e.message}`);
+      log(`Intake POST timed out; recovering via idempotent re-POST: ${describeError(e)}`);
       for (const waitMs of [2000, 3000, 5000]) {
         await sleep(waitMs);
         try {
@@ -368,10 +418,10 @@ async function routeSlackDmToRmp(content, sessionKey) {
           log(`Recovered RMP ownership after timeout (task=${data?.task_id || '?'})`);
           return true;
         } catch (e2) {
-          log(`Recovery attempt failed: ${e2.message}`);
+          log(`Recovery attempt failed: ${describeError(e2)}`);
         }
         try {
-          const idemKey = inboundIdempotencyKey(sessionKey, intent, intent);
+          const idemKey = inboundIdempotencyKey(sessionKey, intent, intent, null, inbound.messageId);
           const found = await rmpFetch('GET', `/tasks/by-idempotency/${encodeURIComponent(idemKey)}`);
           if (found && found.task_id) {
             log(`Recovered RMP ownership via idempotency ${found.task_id}`);
@@ -387,20 +437,25 @@ async function routeSlackDmToRmp(content, sessionKey) {
 
 /** One route at a time per session, in arrival order, so a stop sees the task it stops. */
 const routeChains = new Map();
-function routeInBackground(hookName, content, sessionKey) {
+function routeInBackground(hookName, inbound, sessionKey) {
   const next = (routeChains.get(sessionKey) || Promise.resolve())
-    .then(() => routeSlackDmToRmp(content, sessionKey))
-    .catch((e) => log(`${hookName} route error (claimed; no native): ${e.message}`));
+    .then(() => routeSlackDmToRmp(inbound, sessionKey))
+    .catch((e) => log(`${hookName} route error (claimed; no native): ${describeError(e)}`));
   routeChains.set(sessionKey, next);
   next.then(() => {
     if (routeChains.get(sessionKey) === next) routeChains.delete(sessionKey);
   });
 }
 
-/** Recent Slack DMs claimed by inbound_claim — avoid a second POST from the same event. */
+/** Recent Slack DMs claimed by one hook — avoid a second POST from the same event.
+ * Keyed by Slack message id, so two quick identical texts are still two messages. */
 const claimedSlackKeys = new Map();
-function markSlackClaimed(sessionKey, content) {
-  const fp = crypto.createHash('sha256').update(content || '').digest('hex');
+function claimFingerprint(inbound) {
+  if (inbound.messageId) return `id:${inbound.messageId}`;
+  return crypto.createHash('sha256').update(textWithAttachments(inbound)).digest('hex');
+}
+function markSlackClaimed(sessionKey, inbound) {
+  const fp = claimFingerprint(inbound);
   const now = Date.now();
   const aliases = new Set([sessionKey, 'agent:main:main']);
   const discovered = findSlackSessionKeyFromStore();
@@ -416,8 +471,8 @@ function markSlackClaimed(sessionKey, content) {
   }
   return `${sessionKey}::${fp}`;
 }
-function wasSlackClaimed(sessionKey, content) {
-  const fp = crypto.createHash('sha256').update(content || '').digest('hex');
+function wasSlackClaimed(sessionKey, inbound) {
+  const fp = claimFingerprint(inbound);
   const aliases = new Set([sessionKey, 'agent:main:main']);
   const discovered = findSlackSessionKeyFromStore();
   if (discovered) aliases.add(discovered);
@@ -636,25 +691,29 @@ module.exports = {
     // Claim Slack DMs before OpenClaw's native agent turn. Returning
     // { handled: true } stops the gateway from answering (and double-posting).
     // Routing runs in the background: the claim must not wait on intake.
+    // A message with neither text nor attachments carries nothing to route.
+    const hasSubstance = (inbound) => Boolean(inbound.content || inbound.attachments.length);
+    const preview = (inbound) =>
+      `${inbound.content.slice(0, 80)}${inbound.attachments.length ? ` [+${inbound.attachments.length} attachment(s)]` : ''}`;
+
     api.on('inbound_claim', (event, ctx) => {
       try {
         if (isDevSuspended()) return;
         const channel = String(event?.channel || ctx?.channelId || '').toLowerCase();
-        const content = String(event?.content || event?.body || '').trim();
-        if (!content) return;
+        const inbound = inboundFromEvent(event);
+        if (!hasSubstance(inbound)) return;
         if (channel !== 'slack' && !channel.includes('slack')) return;
         const sessionKey = pickSlackSessionKey(event, ctx);
-        log(`inbound_claim slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
-        markSlackClaimed(sessionKey, content);
-        routeInBackground('inbound_claim', content, sessionKey);
+        log(`inbound_claim slack DM on ${sessionKey}: ${preview(inbound)}`);
+        markSlackClaimed(sessionKey, inbound);
+        routeInBackground('inbound_claim', inbound, sessionKey);
         return { handled: true };
       } catch (e) {
         // Fail closed: still claim the turn so native OpenClaw cannot answer.
-        log(`inbound_claim route error (still claiming; no native): ${e.message}`);
+        log(`inbound_claim route error (still claiming; no native): ${describeError(e)}`);
         try {
-          const sessionKey = pickSlackSessionKey(event, ctx);
-          const content = String(event?.content || event?.body || '').trim();
-          if (content) markSlackClaimed(sessionKey, content);
+          const inbound = inboundFromEvent(event);
+          if (hasSubstance(inbound)) markSlackClaimed(pickSlackSessionKey(event, ctx), inbound);
         } catch (_) {}
         return { handled: true };
       }
@@ -664,25 +723,24 @@ module.exports = {
       try {
         if (isDevSuspended()) return;
         const channel = String(event?.channel || ctx?.channelId || '').toLowerCase();
-        const content = String(event?.content || event?.body || '').trim();
-        if (!content) return;
+        const inbound = inboundFromEvent(event);
+        if (!hasSubstance(inbound)) return;
         if (channel !== 'slack' && !channel.includes('slack')) return;
         const sessionKey = pickSlackSessionKey(event, ctx);
-        if (wasSlackClaimed(sessionKey, content)) {
-          log(`before_dispatch: already claimed by inbound_claim on ${sessionKey}`);
+        if (wasSlackClaimed(sessionKey, inbound)) {
+          log(`before_dispatch: already claimed on ${sessionKey}`);
           return { handled: true };
         }
         // Safety net if inbound_claim did not run for this build/path.
-        log(`before_dispatch claiming slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
-        markSlackClaimed(sessionKey, content);
-        routeInBackground('before_dispatch', content, sessionKey);
+        log(`before_dispatch claiming slack DM on ${sessionKey}: ${preview(inbound)}`);
+        markSlackClaimed(sessionKey, inbound);
+        routeInBackground('before_dispatch', inbound, sessionKey);
         return { handled: true };
       } catch (e) {
-        log(`before_dispatch route error (still claiming; no native): ${e.message}`);
+        log(`before_dispatch route error (still claiming; no native): ${describeError(e)}`);
         try {
-          const sessionKey = pickSlackSessionKey(event, ctx);
-          const content = String(event?.content || event?.body || '').trim();
-          if (content) markSlackClaimed(sessionKey, content);
+          const inbound = inboundFromEvent(event);
+          if (hasSubstance(inbound)) markSlackClaimed(pickSlackSessionKey(event, ctx), inbound);
         } catch (_) {}
         return { handled: true };
       }
@@ -693,25 +751,24 @@ module.exports = {
       try {
         const meta = event?.metadata || {};
         const provider = String(meta.provider || meta.surface || meta.originatingChannel || ctx?.channelId || '').toLowerCase();
-        const content = (event?.content || '').trim();
-        if (!content) return;
+        const inbound = inboundFromEvent(event);
+        if (!hasSubstance(inbound)) return;
         const isSlack = provider === 'slack' || provider.includes('slack');
         if (!isSlack) return;
         const sessionKey = pickSlackSessionKey(event, ctx);
-        if (wasSlackClaimed(sessionKey, content)) {
+        if (wasSlackClaimed(sessionKey, inbound)) {
           log(`message_received skip (already claimed) on ${sessionKey}`);
           return { handled: true };
         }
-        log(`message_received slack DM on ${sessionKey}: ${content.slice(0, 80)}`);
-        markSlackClaimed(sessionKey, content);
-        routeInBackground('message_received', content, sessionKey);
+        log(`message_received slack DM on ${sessionKey}: ${preview(inbound)}`);
+        markSlackClaimed(sessionKey, inbound);
+        routeInBackground('message_received', inbound, sessionKey);
         return { handled: true };
       } catch (e) {
-        log(`message_received route error (still claiming; no native): ${e.message}`);
+        log(`message_received route error (still claiming; no native): ${describeError(e)}`);
         try {
-          const sessionKey = pickSlackSessionKey(event, ctx);
-          const content = (event?.content || '').trim();
-          if (content) markSlackClaimed(sessionKey, content);
+          const inbound = inboundFromEvent(event);
+          if (hasSubstance(inbound)) markSlackClaimed(pickSlackSessionKey(event, ctx), inbound);
         } catch (_) {}
         return { handled: true };
       }

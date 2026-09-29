@@ -99,11 +99,13 @@ async def _build_intake_context(payload: Dict[str, Any]) -> tuple[Dict[str, Any]
         session_key=session_key,
         recurrence_key=recurrence_key,
         tags=tags,
+        reply_to=payload.get("reply_to"),
     )
     _safe_activity_heartbeat()
     context["task_type"] = payload.get("task_type") or ""
+    reply_id = (payload.get("reply_to") or {}).get("id") or ""
     fp = hashlib.sha256(
-        f"{session_key}:{recurrence_key}:{intent[:500]}".encode()
+        f"{session_key}:{recurrence_key}:{reply_id}:{intent[:500]}".encode()
     ).hexdigest()
     return context, recurrence_key, fp
 

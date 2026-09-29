@@ -192,6 +192,7 @@ class TaskMessage(Base):
     role = Column(String, default="user")  # user | system | cron | api
     content = Column(Text, nullable=False)
     source = Column(String, default="api")  # slack | cron | api | signal
+    slack_ts = Column(String, index=True)  # Slack message ts, for replies and threads
     created_at = Column(DateTime, default=datetime.utcnow)
 
     task = relationship("Task", back_populates="messages")

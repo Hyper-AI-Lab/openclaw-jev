@@ -242,7 +242,8 @@ async def handle_intake_outcome(
             for target in targets:
                 catchup = await build_catchup_block(target, db)
                 await add_task_message(
-                    target, intent, role="user", source="slack", db=db
+                    target, intent, role="user", source="slack", db=db,
+                    slack_ts=getattr(request, "slack_message_id", None),
                 )
                 metrics_inc("intake_attached")
                 db.add(
@@ -338,7 +339,10 @@ async def handle_intake_outcome(
                 event_payload={"decision_id": decision_id, "question": question[:500]},
             )
         )
-        await add_task_message(task_id, intent, role="user", source="slack", db=db)
+        await add_task_message(
+            task_id, intent, role="user", source="slack", db=db,
+            slack_ts=getattr(request, "slack_message_id", None),
+        )
         await _intake_notify_slack(
             session_key=session_key,
             task_id=task_id,
@@ -388,7 +392,10 @@ async def handle_intake_outcome(
                 event_payload={"decision_id": decision_id, "kind": effective},
             )
         )
-        await add_task_message(ack_id, intent, role="user", source="slack", db=db)
+        await add_task_message(
+            ack_id, intent, role="user", source="slack", db=db,
+            slack_ts=getattr(request, "slack_message_id", None),
+        )
         await _intake_notify_slack(
             session_key=session_key,
             task_id=ack_id,

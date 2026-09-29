@@ -240,6 +240,17 @@ def apply_intake_policy(
             decision = "clarify"
             overrides.append("low_confidence_clarify")
 
+    # No one can answer a clarify question on a scheduled run.
+    non_interactive = (
+        str(context.get("task_type") or "") == "cron"
+        or "cron" in tag_set
+        or session_key.startswith("agent:main:cron:")
+    )
+    if non_interactive and decision == "clarify":
+        decision = "create_fresh"
+        target_task_id = None
+        overrides.append("non_interactive_no_clarify")
+
     catalog_hint = llm_result.get("catalog_hint")
     catalog_type = None
     raw_hint = (str(catalog_hint).strip() if catalog_hint is not None else "") or ""

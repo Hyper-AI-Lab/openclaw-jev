@@ -113,12 +113,18 @@ def build_intake_request(
         "finished_tasks": finished_state,
         "memory": [_text(m.get("snippet"), 300) for m in (context.get("memory_hits") or [])[:MAX_MEMORY]],
     }
+    replied = context.get("reply_to") or {}
+    if replied.get("quoted") or replied.get("task_id"):
+        by_task = {task_id: alias for alias, task_id in aliases.items()}
+        state["replied_to"] = {"text": _text(replied.get("quoted"), 300),
+                               "task": by_task.get(str(replied.get("task_id") or ""))}
     from app.workflows.catalog import CATALOG
 
     questions = {
         "relation": choice(
             "How does state.message relate to Kirill's work with Aura? Use state.recent_dialogue, "
-            "state.running_tasks, state.finished_tasks and state.memory as evidence.",
+            "state.running_tasks, state.finished_tasks and state.memory as evidence. When present, "
+            "state.replied_to is the earlier message it directly replies to and the listed task it belongs to.",
             {"running": "It continues, answers, asks about or changes a task in state.running_tasks.",
              "finished": "It follows up on a task in state.finished_tasks, such as a correction, a repeat or a question about its result.",
              "memory": "It depends on Kirill's remembered facts or preferences in state.memory, not on a listed task.",

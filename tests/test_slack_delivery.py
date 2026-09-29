@@ -63,10 +63,12 @@ async def _send(slack, message="Hello", alert=None):
 
 
 async def test_a_transient_failure_is_retried_until_slack_accepts(ledger):
-    slack = FakeSlack([(503, {"ok": False}, {}), (200, {"ok": False, "error": "internal_error"}, {}), (200, {"ok": True}, {})])
+    slack = FakeSlack([(503, {"ok": False}, {}), (200, {"ok": False, "error": "internal_error"}, {}),
+                       (200, {"ok": True, "ts": "1790.0042"}, {})])
     assert await _send(slack) is True
     assert len(slack.posted) == 3
     assert [type(o).__name__ for o in ledger[1]] == ["Event", "TaskMessage"]
+    assert ledger[1][1].slack_ts == "1790.0042"
 
 
 async def test_a_lasting_outage_raises_so_the_activity_retries_later(ledger):

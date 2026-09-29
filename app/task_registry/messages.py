@@ -23,6 +23,7 @@ async def add_task_message(
     role: str = "user",
     source: str = "api",
     db: Optional[AsyncSession] = None,
+    slack_ts: Optional[str] = None,
 ) -> str:
     text = (content or "").strip()
     if not text:
@@ -34,6 +35,7 @@ async def add_task_message(
         role=role,
         content=text[:8000],
         source=source,
+        slack_ts=slack_ts or None,
     )
 
     async def _commit(session: AsyncSession) -> None:
@@ -156,3 +158,32 @@ async def recent_session_dialogue_block(
         return await _query(db)
     async with AsyncSessionLocal() as session:
         return await _query(session)
+
+
+async def task_for_slack_message(ts: str) -> Optional[Dict[str, Any]]:
+    """The task a Slack message belongs to: one of Kirill's messages or a part of Aura's reply."""
+    from app.db.models import SideEffectReceipt
+
+    if not ts:
+        return None
+    async with AsyncSessionLocal() as session:
+        task_id = (
+            await session.execute(
+                select(TaskMessage.task_id).where(TaskMessage.slack_ts == ts).limit(1)
+            )
+        ).scalar_one_or_none()
+        if not task_id:
+            receipt = (
+                await session.execute(
+                    select(SideEffectReceipt.metadata_ref)
+                    .where(SideEffectReceipt.metadata_ref["ts"].as_string() == ts)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            task_id = (receipt or {}).get("task_id")
+        if not task_id:
+            return None
+        task = await session.get(Task, task_id)
+    if task is None:
+        return None
+    return {"task_id": task.id, "status": task.status, "goal": (task.goal or "")[:300]}
