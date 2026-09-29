@@ -145,6 +145,11 @@ def build_intake_request(
             {"add_instructions": "Adds details, answers Aura's question, or changes what the task should do.",
              "asks_status": "Only asks about progress or waits for the result, with no new instructions.",
              "wants_restart": "Says the task is stuck, broken or wrong and should start over."})
+        if len(running) > 1:
+            for alias, criterion in running_criteria.items():
+                questions[f"adds_to_{alias}"] = choice(
+                    f"Does state.message add details to, answer, or change running task {alias}?",
+                    {"yes": f"It does. {criterion}", "no": "It does not concern this task."})
     if finished:
         questions["finished_target"] = choice(
             "Which finished task does state.message follow up on?",
@@ -162,7 +167,7 @@ def compose_intake_result(answers: dict, aliases: dict, policy: Policy) -> dict 
     kind, strict = relation["choice"], policy.intake_attach_min_confidence
     if not relation["choice_is_max"]:
         return None
-    target, similar = None, []
+    target, similar, targets = None, [], []
     if kind == "running":
         tgt, act = answers.get("running_target"), answers.get("running_action")
         if not (_passes(relation, strict) and _passes(tgt, strict) and _passes(act, strict)) or tgt["choice"] == "none":
@@ -171,6 +176,16 @@ def compose_intake_result(answers: dict, aliases: dict, policy: Policy) -> dict 
         decision, similar = RUNNING_ACTIONS[act["choice"]], [target]
         support = [relation["confidence"], tgt["confidence"], act["confidence"]]
         rationale = f"Intake (Jev): this message is about running task {target[:8]}."
+        if decision == "attach_active":
+            targets += [
+                aliases[qid.removeprefix("adds_to_")]
+                for qid, answer in answers.items()
+                if qid.startswith("adds_to_") and answer["choice"] == "yes" and _passes(answer, strict)
+                and aliases[qid.removeprefix("adds_to_")] != target
+            ]
+            if targets:
+                rationale = f"Intake (Jev): this message adds to running tasks {', '.join(t[:8] for t in [target, *targets])}."
+            targets = [target, *targets]
     else:
         # Not about a running task once little probability is left on running or unclear;
         # a rival workflow next to running work needs the stricter bar.
@@ -203,6 +218,7 @@ def compose_intake_result(answers: dict, aliases: dict, policy: Policy) -> dict 
         "rationale": rationale,
         "similar_task_ids": similar,
         "target_task_id": target,
+        "target_task_ids": targets or ([target] if target else []),
         "catalog_hint": catalog_hint,
         "web_intent": web["choice"] if _passes(web, policy.intake_min_confidence) else None,
         "guidance_notes": "",
@@ -233,7 +249,7 @@ async def _review(context: dict, policy: Policy) -> tuple[dict | None, dict]:
         "reason": ev.reason, "latency_ms": ev.latency_ms, "request_hash": ev.request_hash,
         "accepted": proposal is not None,
         "proposal": {k: proposal[k] for k in ("decision", "relation_class", "execution_mode", "confidence",
-            "target_task_id", "similar_task_ids", "catalog_hint", "web_intent")} if proposal else None,
+            "target_task_id", "target_task_ids", "similar_task_ids", "catalog_hint", "web_intent")} if proposal else None,
         "answers": {qid: {"choice": a["choice"], "confidence": round(a["confidence"], 3)} for qid, a in answers.items()},
     }
     logger.info("jev intake %s", json.dumps(record, sort_keys=True))

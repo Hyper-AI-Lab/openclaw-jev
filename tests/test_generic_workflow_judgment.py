@@ -12,13 +12,24 @@ from app.workflows.generic_task import GenericTaskWorkflow
 QUEUE = "judgment-tests"
 
 
+async def _signal_own_workflow(message: str) -> None:
+    handle = activity.client().get_workflow_handle(activity.info().workflow_id)
+    await handle.signal("user_input", message)
+
+
 class Recorder:
-    def __init__(self, verdicts: List[str], reworks: List[str]):
+    def __init__(self, verdicts: List[str], reworks: List[str], signals_during_judging=(), signal_on_completed=None,
+                 signals_during_rework=()):
         self.verdicts = list(verdicts)
         self.reworks = list(reworks)
         self.slack: List[str] = []
         self.judged: List[str] = []
+        self.prompts: List[str] = []
+        self.resubmitted: List[List[str]] = []
         self.failed = 0
+        self.signals_during_judging = list(signals_during_judging)
+        self.signal_on_completed = signal_on_completed
+        self.signals_during_rework = list(signals_during_rework)
 
     def activities(self):
         rec = self
@@ -33,7 +44,15 @@ class Recorder:
 
         @activity.defn(name="update_task_status")
         async def update_task_status(payload: Dict[str, Any]) -> None:
+            if payload.get("status") == "completed" and rec.signal_on_completed:
+                await _signal_own_workflow(rec.signal_on_completed)
+                rec.signal_on_completed = None
             return None
+
+        @activity.defn(name="resubmit_user_messages")
+        async def resubmit_user_messages(payload: Dict[str, Any]) -> int:
+            rec.resubmitted.append(list(payload["messages"]))
+            return len(payload["messages"])
 
         @activity.defn(name="update_process_state")
         async def update_process_state(payload: Dict[str, Any]) -> None:
@@ -55,6 +74,8 @@ class Recorder:
         @activity.defn(name="verify_response_quality")
         async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
             rec.judged.append(payload["agent_response"])
+            if rec.signals_during_judging:
+                await _signal_own_workflow(rec.signals_during_judging.pop(0))
             verdict = rec.verdicts.pop(0) if rec.verdicts else "rework"
             quality = "pass" if verdict == "accept" else "fail"
             return {"verdict": verdict, "quality": quality, "issues": "incomplete",
@@ -62,6 +83,9 @@ class Recorder:
 
         @activity.defn(name="send_to_openclaw")
         async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
+            rec.prompts.append(payload["message"])
+            if rec.signals_during_rework:
+                await _signal_own_workflow(rec.signals_during_rework.pop(0))
             text = rec.reworks.pop(0) if rec.reworks else "Another attempt at the answer."
             return {"result": {"payloads": [{"text": text}]}}
 
@@ -72,7 +96,7 @@ class Recorder:
 
         return [ensure_process_run, record_event, update_task_status, update_process_state,
                 promote_completion_memory, finalize_task_failure, execute_compensation,
-                verify_response_quality, send_to_openclaw, notify_slack_user]
+                verify_response_quality, send_to_openclaw, notify_slack_user, resubmit_user_messages]
 
 
 async def _run(recorder: Recorder, **overrides) -> Dict[str, Any]:
@@ -119,3 +143,40 @@ async def test_escalation_sends_exactly_one_message():
     result = await _run(rec, rework_max_attempts=3, strategy_change_attempt=2, escalate_user_attempt=3)
     assert result["status"] == "failed" and result["user_notified"] is True
     assert len(rec.slack) == 1
+
+
+async def test_a_message_that_arrives_while_judging_is_folded_in_before_delivery():
+    rec = Recorder(verdicts=["accept", "accept"], reworks=["Layers, a rain jacket and an umbrella."],
+                   signals_during_judging=["also, will I need an umbrella?"])
+    result = await _run(rec)
+    assert result["status"] == "completed"
+    assert "also, will I need an umbrella?" in rec.prompts[0]
+    assert "Pack layers and a light rain jacket." in rec.prompts[0]
+    assert rec.judged == ["Pack layers and a light rain jacket.", "Layers, a rain jacket and an umbrella."]
+    assert rec.slack == ["Layers, a rain jacket and an umbrella."]
+    assert rec.resubmitted == []
+
+
+async def test_a_message_that_arrives_after_the_reply_goes_back_to_intake():
+    rec = Recorder(verdicts=["accept"], reworks=[], signal_on_completed="and book the hotel, please")
+    result = await _run(rec)
+    assert result["status"] == "completed"
+    assert rec.slack == ["Pack layers and a light rain jacket."]
+    assert rec.resubmitted == [["and book the hotel, please"]]
+
+
+async def test_a_stop_while_judging_stops_the_task():
+    rec = Recorder(verdicts=["rework"], reworks=[], signals_during_judging=["stop"])
+    result = await _run(rec)
+    assert result["status"] == "stopped_by_user"
+    assert rec.prompts == [] and rec.slack == ["Task t1 stopped as requested."]
+
+
+async def test_a_message_that_arrives_during_a_rework_is_folded_into_the_next_judged_reply():
+    rec = Recorder(verdicts=["rework", "accept"], reworks=["Layers and a rain jacket.", "Layers, jacket and good shoes."],
+                   signals_during_rework=["include shoes too"])
+    result = await _run(rec)
+    assert result["status"] == "completed"
+    assert "include shoes too" in rec.prompts[1] and "Layers and a rain jacket." in rec.prompts[1]
+    assert rec.judged == ["Pack layers and a light rain jacket.", "Layers, jacket and good shoes."]
+    assert rec.slack == ["Layers, jacket and good shoes."]

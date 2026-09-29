@@ -55,10 +55,11 @@ with workflow.unsafe.imports_passed_through():
         ensure_brief_header,
         format_user_catchup,
     )
+    from app.workflows.user_messages import AttachedMessages
 
 
 @workflow.defn
-class CatalogTaskWorkflow:
+class CatalogTaskWorkflow(AttachedMessages):
     def __init__(self) -> None:
         self.user_inputs: List[str] = []
         self.process_run_id: str = ""
@@ -163,11 +164,21 @@ class CatalogTaskWorkflow:
                 "process_run_id": self.process_run_id,
                 "_durable_leg": True,
             }
+            await self._resubmit_leftovers(
+                payload.get("task_id", "unknown"), payload.get("session_key", "agent:main:main")
+            )
             workflow.continue_as_new(new_payload)
         return result
 
     @workflow.run
     async def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        result = await self._run(payload)
+        await self._resubmit_leftovers(
+            payload.get("task_id", "unknown"), payload.get("session_key", "agent:main:main")
+        )
+        return result
+
+    async def _run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         task_id = payload.get("task_id", "unknown")
         user_intent = payload.get("intent", "")
         session_key = payload.get("session_key", "agent:main:main")
@@ -650,6 +661,12 @@ class CatalogTaskWorkflow:
                     return {"status": "failed", "task_id": task_id, "step": step.name}
 
             clean_result = accumulated_output.strip() or "Workflow steps completed."
+            added = self._take_user_messages()
+            if added:
+                clean_result = await self._fold_in(
+                    task_id, session_key, payload.get("task_type", ""),
+                    payload.get("tags") or [], clean_result, added,
+                )
             catalog_evidence = check_catalog_completion(
                 template.process_type, user_intent, clean_result
             )
@@ -748,6 +765,12 @@ class CatalogTaskWorkflow:
                     clean_result = sanitize_user_facing_text(
                         extract_agent_facts(clean_result).get("body") or clean_result
                     )
+                    added = self._take_user_messages()
+                    if added:
+                        clean_result = await self._fold_in(
+                            task_id, session_key, payload.get("task_type", ""),
+                            payload.get("tags") or [], clean_result, added,
+                        )
                     judged += 1
                     catalog_evidence = check_catalog_completion(
                         template.process_type, user_intent, clean_result

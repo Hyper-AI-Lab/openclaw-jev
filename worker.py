@@ -31,7 +31,10 @@ from app.activities.openclaw_activities import (
     validate_openclaw_output,
     verify_response_quality,
 )
-from app.activities.intake_activities import classify_task_intake_activity
+from app.activities.intake_activities import (
+    classify_task_intake_activity,
+    resubmit_user_messages,
+)
 from app.activities.plan_activities import generate_process_plan, save_process_plan
 from app.telemetry import init_telemetry
 from app.temporal_control import connect_temporal_with_retry
@@ -92,6 +95,7 @@ async def main():
             generate_process_plan,
             save_process_plan,
             classify_task_intake_activity,
+            resubmit_user_messages,
         ],
     )
     try:

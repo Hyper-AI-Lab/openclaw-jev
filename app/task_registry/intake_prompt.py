@@ -14,6 +14,7 @@ INTAKE_JSON_SCHEMA = {
     "catalog_hint": "optional catalog process_type or null",
     "guidance_notes": "optional string for create_guided or the clarify question to ask the user",
     "target_task_id": "optional task id for attach/wait/rebuild/spawn",
+    "target_task_ids": ["attach_active only: every running task id this message adds to or changes (usually one)"],
     "web_intent": "optional none|search|fetch|crawl|adaptive_extract|schema_extract|interact — soft hint for web tool routing",
 }
 
@@ -53,7 +54,7 @@ FOUR RELATION CLASSES (set relation_class):
 
 DECISIONS:
 - clarify: you are uncertain which class applies. Put the question in guidance_notes. Do NOT start Aura execution.
-- attach_active: continue the running task (target_task_id required).
+- attach_active: continue the running task (target_task_id required). If the message adds to or changes several running tasks, list all of them in target_task_ids.
 - wait_active: tell the user work is in flight; do not start a rival workflow.
 - rebuild_stale: the active workflow looks stuck/dead; supersede it and restart with this message.
 - create_guided: new workflow with citations of finished work and/or memory.

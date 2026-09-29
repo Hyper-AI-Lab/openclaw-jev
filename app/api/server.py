@@ -572,24 +572,36 @@ async def create_task(
                 tid = outcome.get("task_id")
                 await _cancel_intake_reservation(task, db)
                 if tid and outcome.get("signal_required"):
-                    try:
-                        client = await connect_temporal()
-                        handle = client.get_workflow_handle(f"workflow-{tid}")
-                        await handle.signal(
-                            "user_input",
-                            outcome.get("signal_text") or intent,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Intake attach found no live workflow for %s (%s); starting this message instead",
-                            tid,
-                            exc,
-                        )
-                        task.status = "created"
-                        guided_memory = outcome.get("_guided_memory_block") or ""
-                    else:
+                    from app.task_registry.intake_handlers import acknowledge_attach
+
+                    signals = outcome.get("signals") or [
+                        {"task_id": tid, "signal_text": outcome.get("signal_text") or intent}
+                    ]
+                    delivered = []
+                    for sig in signals:
+                        try:
+                            client = await connect_temporal()
+                            handle = client.get_workflow_handle(f"workflow-{sig['task_id']}")
+                            await handle.signal("user_input", sig["signal_text"] or intent)
+                            delivered.append(sig["task_id"])
+                        except Exception as exc:
+                            logger.warning(
+                                "Intake attach found no live workflow for %s (%s)",
+                                sig["task_id"],
+                                exc,
+                            )
+                    if delivered:
                         await db.commit()
-                        return outcome
+                        await acknowledge_attach(
+                            session_key=request.session_key,
+                            task_ids=delivered,
+                            intent=intent,
+                            tags=request.tags or [],
+                        )
+                        return {**outcome, "attached_task_ids": delivered}
+                    logger.warning("No live workflow for %s; starting this message instead", tid)
+                    task.status = "created"
+                    guided_memory = outcome.get("_guided_memory_block") or ""
                 else:
                     await db.commit()
                     return outcome

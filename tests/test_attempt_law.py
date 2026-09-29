@@ -74,7 +74,7 @@ def test_generic_canary_skips_rework_loop():
 
 
 def test_catalog_honors_strategy_and_escalate():
-    src = inspect.getsource(CatalogTaskWorkflow.run)
+    src = inspect.getsource(CatalogTaskWorkflow._run)
     assert "next_loop_action" in src
     assert "build_strategy_change_prompt" in src
     assert "build_escalation_message" in src

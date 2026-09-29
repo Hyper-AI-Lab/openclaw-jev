@@ -86,7 +86,7 @@ def test_conversational_still_defers_mid_step_memory():
 def test_catalog_evidence_failure_enters_rework_not_instant_fail():
     from app.workflows.catalog_task import CatalogTaskWorkflow
 
-    src = inspect.getsource(CatalogTaskWorkflow.run)
+    src = inspect.getsource(CatalogTaskWorkflow._run)
     assert "Completion evidence missing" not in src
     assert "Artifact evidence failed" not in src
     ev_idx = src.find("catalog_evidence = check_catalog_completion")

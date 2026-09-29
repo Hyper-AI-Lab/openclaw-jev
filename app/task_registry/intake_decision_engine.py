@@ -274,6 +274,24 @@ def apply_intake_policy(
 
     relation_class = _relation_class_for(decision, llm_result)
 
+    target_task_ids: List[str] = [target_task_id] if target_task_id else []
+    if decision == "attach_active" and target_task_id:
+        by_id = {t.get("task_id"): t for t in active}
+        for tid in llm_result.get("target_task_ids") or []:
+            extra = by_id.get(tid)
+            if extra is None or tid in target_task_ids:
+                continue
+            extra_session = extra.get("session_key") or ""
+            if (
+                extra_session
+                and session_key
+                and not session_keys_equivalent(session_key, extra_session)
+                and (extra.get("task_kind") or "one_shot") != "durable"
+            ):
+                overrides.append("cross_session_extra_target_dropped")
+                continue
+            target_task_ids.append(tid)
+
     result = {
         "decision": decision,
         "effective_decision": effective if enforced else "create_fresh",
@@ -281,6 +299,7 @@ def apply_intake_policy(
         "rationale": llm_result.get("rationale") or "",
         "similar_task_ids": similar_ids,
         "target_task_id": target_task_id,
+        "target_task_ids": target_task_ids,
         "catalog_type": catalog_type,
         "guidance_notes": llm_result.get("guidance_notes") or "",
         "policy_overrides": overrides,

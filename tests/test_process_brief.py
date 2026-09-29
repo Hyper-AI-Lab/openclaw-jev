@@ -48,7 +48,7 @@ def test_catalog_workflow_reads_initial_memory_block():
 
     from app.workflows.catalog_task import CatalogTaskWorkflow
 
-    src = inspect.getsource(CatalogTaskWorkflow.run)
+    src = inspect.getsource(CatalogTaskWorkflow._run)
     assert "initial_memory_block" in src
     assert "compose_executor_memory" in src
 

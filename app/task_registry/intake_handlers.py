@@ -22,6 +22,23 @@ TERMINAL = frozenset(
 _SILENT_TAGS = frozenset({"canary", "system", "heartbeat", "intake-smoke"})
 
 
+async def acknowledge_attach(
+    *, session_key: str, task_ids: list, intent: str, tags: Optional[list] = None
+) -> None:
+    """RMP note that a message joined running work. Quotes the message so each note is distinct."""
+    snippet = " ".join((intent or "").split())
+    snippet = snippet if len(snippet) <= 60 else snippet[:57] + "..."
+    shorts = ", ".join(t[:8] for t in task_ids)
+    where = f"the task I'm working on ({shorts})" if len(task_ids) == 1 else f"the tasks I'm working on ({shorts})"
+    await _intake_notify_slack(
+        session_key=session_key,
+        task_id=task_ids[0],
+        message=f"Got it: adding \u201c{snippet}\u201d to {where}.",
+        intent=intent,
+        tags=tags,
+    )
+
+
 async def _intake_notify_slack(
     *,
     session_key: str,
@@ -209,10 +226,7 @@ async def handle_intake_outcome(
     if effective == "attach_active":
         tid = decision.get("target_task_id")
         if tid:
-            catchup = await build_catchup_block(tid, db)
-            await add_task_message(
-                tid, intent, role="user", source="slack", db=db
-            )
+            targets = [tid] + [t for t in decision.get("target_task_ids") or [] if t != tid]
             result = await db.execute(select(Task).where(Task.id == tid))
             existing = result.scalar_one_or_none()
             raw_ctx = (
@@ -222,19 +236,38 @@ async def handle_intake_outcome(
             )
             ctx = dict(raw_ctx) if isinstance(raw_ctx, dict) else {}
             intake_clarify = bool(ctx.get("intake_clarify"))
-            metrics_inc("intake_attached")
-            db.add(
-                Event(
-                    correlation_id=tid,
-                    entity_type="task",
-                    entity_id=tid,
-                    event_type="intake.attach",
-                    event_payload={
-                        "decision_id": decision_id,
-                        "resume_clarify": intake_clarify,
-                    },
+            if intake_clarify:
+                targets = [tid]
+            signals = []
+            for target in targets:
+                catchup = await build_catchup_block(target, db)
+                await add_task_message(
+                    target, intent, role="user", source="slack", db=db
                 )
-            )
+                metrics_inc("intake_attached")
+                db.add(
+                    Event(
+                        correlation_id=target,
+                        entity_type="task",
+                        entity_id=target,
+                        event_type="intake.attach",
+                        event_payload={
+                            "decision_id": decision_id,
+                            "resume_clarify": intake_clarify,
+                            "targets": targets,
+                        },
+                    )
+                )
+                signals.append(
+                    {
+                        "task_id": target,
+                        "catchup": catchup,
+                        "signal_text": (
+                            f"{catchup}\n\nUSER MESSAGE:\n{intent}" if catchup else intent
+                        ),
+                    }
+                )
+            catchup = signals[0]["catchup"]
             if existing and intake_clarify:
                 existing.status = "created"
                 ctx["intake_clarify"] = False
@@ -255,17 +288,16 @@ async def handle_intake_outcome(
                     "task_type": (existing.task_type if existing else None) or "user",
                     "signal_required": False,
                 }
-            signal_text = (
-                f"{catchup}\n\nUSER MESSAGE:\n{intent}" if catchup else intent
-            )
             return {
                 "task_id": tid,
+                "target_task_ids": targets,
                 "status": "running",
                 "intake_action": "attach_active",
                 "intake_decision_id": decision_id,
                 "deduplicated": True,
                 "signal_required": True,
-                "signal_text": signal_text,
+                "signal_text": signals[0]["signal_text"],
+                "signals": [{"task_id": s["task_id"], "signal_text": s["signal_text"]} for s in signals],
                 "_guided_memory_block": catchup,
             }
 

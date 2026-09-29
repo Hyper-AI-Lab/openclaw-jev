@@ -47,6 +47,7 @@ with workflow.unsafe.imports_passed_through():
         strip_system_acks,
     )
     from app.orchestrator.step_predicates import extract_agent_facts
+    from app.workflows.user_messages import AttachedMessages
 
 
 def strip_json_eval(text: str) -> str:
@@ -68,7 +69,7 @@ def is_heartbeat_ack(text: str) -> bool:
 
 
 @workflow.defn
-class GenericTaskWorkflow:
+class GenericTaskWorkflow(AttachedMessages):
     def __init__(self) -> None:
         self.user_inputs: List[str] = []
         self.process_run_id: str = ""
@@ -146,6 +147,7 @@ class GenericTaskWorkflow:
             },
             start_to_close_timeout=timedelta(seconds=30),
         )
+        await self._resubmit_leftovers(task_id, session_key)
         return {"status": "stopped_by_user", "task_id": task_id}
 
     @workflow.run
@@ -516,9 +518,15 @@ class GenericTaskWorkflow:
         else:
             max_rework = int(policy["max_attempts"])
         internal = is_internal_task(user_intent, task_type, tags)
-        attempt = 0
+        attempt = 1
         while True:
-            attempt += 1
+            if self._stop_pending():
+                return await self._finish_stop(task_id, session_key, user_intent, task_type, tags)
+            added = self._take_user_messages()
+            if added:
+                clean_result = await self._fold_in(
+                    task_id, session_key, task_type, tags, clean_result, added
+                )
             evidence = check_evidence(user_intent, clean_result)
             quality = {"quality": "pass", "verdict": "accept"}
             if not internal:
@@ -542,7 +550,11 @@ class GenericTaskWorkflow:
                 quality_issues=quality.get("issues", ""),
                 skip_quality_llm=internal,
             )
+            if self._stop_pending():
+                return await self._finish_stop(task_id, session_key, user_intent, task_type, tags)
             if gate["action"] == "complete":
+                if self._has_user_messages():
+                    continue  # the accepted reply predates them: fold in and judge again
                 break
             action = next_loop_action(attempt, policy)
             if action == "escalate_user" or attempt >= max_rework:
@@ -590,6 +602,7 @@ class GenericTaskWorkflow:
             clean_result = sanitize_user_facing_text(
                 extracted.get("body") or clean_result
             )
+            attempt += 1
 
         if not internal:
             await workflow.execute_activity(
@@ -628,6 +641,7 @@ class GenericTaskWorkflow:
             },
             start_to_close_timeout=timedelta(seconds=30),
         )
+        await self._resubmit_leftovers(task_id, session_key)
         return {"status": "completed", "task_id": task_id, "final_result": clean_result}
 
     async def _escalate(
@@ -685,6 +699,7 @@ class GenericTaskWorkflow:
             },
             start_to_close_timeout=timedelta(seconds=10),
         )
+        await self._resubmit_leftovers(task_id, session_key)
         return {
             "status": "failed",
             "task_id": task_id,

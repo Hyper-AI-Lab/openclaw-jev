@@ -309,7 +309,7 @@ async def test_intake_eval_flags_harmful_attach_and_fails_the_gate(monkeypatch):
     async def evaluate(state, questions, *, purpose, rubric, policy):
         chosen = picks[purpose.removeprefix("eval.")]
         return Evaluation("ok", result={"usage": {"input_tokens": 800, "output_tokens": 0},
-            "answers": {qid: answer(chosen[qid]) for qid in questions}}, latency_ms=300.0)
+            "answers": {qid: answer(chosen.get(qid, "no")) for qid in questions}}, latency_ms=300.0)
     monkeypatch.setattr(jev_eval, "get_client", lambda: type("Fake", (), {"evaluate": staticmethod(evaluate)})())
     monkeypatch.setattr(jev_eval, "close_jev_client", AsyncMock())
     monkeypatch.setattr(jev_eval, "MIN_REQUEST_SPACING_SEC", 0)

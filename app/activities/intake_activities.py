@@ -210,3 +210,32 @@ async def classify_task_intake(payload: Dict[str, Any]) -> Dict[str, Any]:
 @activity.defn(name="classify_task_intake")
 async def classify_task_intake_activity(payload: Dict[str, Any]) -> Dict[str, Any]:
     return await classify_task_intake(payload)
+
+
+@activity.defn(name="resubmit_user_messages")
+async def resubmit_user_messages(payload: Dict[str, Any]) -> int:
+    """Messages that reached a run after its reply went out start over at intake."""
+    import httpx
+
+    from app.config import get_api_key
+
+    task_id = payload["task_id"]
+    sent = 0
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        for index, text in enumerate(payload.get("messages") or []):
+            key = hashlib.sha256(f"resubmit:{task_id}:{index}:{text}".encode()).hexdigest()
+            resp = await client.post(
+                "http://127.0.0.1:8000/tasks",
+                headers={"X-RMP-API-Key": get_api_key()},
+                json={
+                    "intent": text,
+                    "raw_text": text,
+                    "session_key": payload["session_key"],
+                    "tags": ["user-request"],
+                    "user_id": "slack_user",
+                    "idempotency_key": key,
+                },
+            )
+            resp.raise_for_status()
+            sent += 1
+    return sent
