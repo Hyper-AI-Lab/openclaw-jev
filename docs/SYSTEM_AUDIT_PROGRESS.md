@@ -55,3 +55,25 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - Healthy: every DM claimed; Sep 27 self-attach fixed same day; Jev-era decisions sensible; related-task context; suppressed deliveries all canaries; no Slack API errors; catalog gate sound; canaries 24/24 per day since Sep 16.
 
 **Kirill's decisions (2026-09-29):** plan approved, execute Steps 2–12 in order; attach a message to every running task it clearly relates to; turn OpenAI response storage off if OpenClaw can carry reasoning without it (verify first); approved: rotate the RMP API key and purge the old plugin log, delete canary-derived memory rows and vectors, add DB tables/columns, retire the three legacy Qdrant collections after verification, restore the `jev` section.
+
+---
+
+## Step 2 — Settings integrity (D1)
+
+**Date:** 2026-09-29 (18:15–18:20 CEST)
+
+**Root cause, reproduced:** the old `load_settings()` rewrote `settings.json` on every call from every process, with truncate-then-write; `_read_json` turned a half-written file into `{}` and the defaults were written back. Running the old code with 4 readers and 2 writers on a temp file lost the `jev` section in 1,193–1,198 of 1,200 reads (3 runs), and the final file had no `jev` each time. That is how Jev intake (enforce) and promotion (shadow) were switched off on 2026-09-29 between 15:36 and 17:09 CEST. Local test runs also wrote the live file (no `conftest.py`), which is likely what raced with the services.
+
+**What changed:**
+
+- `app/config.py`: `load_settings()` is read-only (defaults merge in memory). `update_settings(mutate)` is the one writer: `flock` on `settings.json.lock`, temp file, `fsync`, `os.replace`, file mode kept; `mutate` edits only stored keys, so defaults are never baked in. A corrupt file raises `SettingsCorruptError` instead of reading as empty. The API key is created once under the lock when missing; `RMP_API_KEY` from the environment is used but no longer copied into the file. `save_settings` and `_write_json` removed (no callers left).
+- `app/api/server.py`: `POST /settings` and `POST /dev/suspend-all` write through `update_settings`.
+- `tests/conftest.py`: tests get temp `OPENCLAW_HOME`, `RMP_DATA_DIR` and `RMP_SETTINGS_PATH` before `app` is imported, as CI sets them.
+- `app/production/readiness.py`: `settings_integrity` fails when the file is corrupt, the `jev` section is missing or invalid, or the stored API key differs from `RMP_API_KEY` (plugin and API would disagree).
+- Live: `jev` restored from backup `20260929T031503Z` through `update_settings` (intake `enforce`, promotion `shadow`, thresholds 0.85/0.92/0.95/0.95).
+
+**Verification:**
+
+- New tests: reads leave bytes and mtime unchanged; unknown keys kept, defaults not stored; corrupt file raises; env key not written; API key created once across 6 processes; 4 writers × 40 updates with 4 readers × 300 reads: no lost key, every counter exact, no temp files left. Readiness: pass, missing, invalid, corrupt and key-mismatch cases.
+- Full suite hermetic: 509 passed, 3 skipped.
+- Live after reload (18:16): `settings.json` untouched for 75 s while services ran; `get_policy()` = enforce/shadow; `settings_integrity` pass; intake previews answered by Jev (`decision_source: jev`, 254 ms).
