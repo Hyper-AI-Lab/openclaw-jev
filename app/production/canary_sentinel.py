@@ -613,6 +613,45 @@ async def handle_canary_failure(
 
 
 async def run_sentinel(*, trigger: str = "scheduled") -> Dict[str, Any]:
+    result = await _run_canaries(trigger)
+    result["invariants"] = await _check_invariants(trigger)
+    return result
+
+
+async def _check_invariants(trigger: str) -> Dict[str, Any]:
+    from app.production.invariants import run_invariant_checks
+
+    broken = [c for c in await run_invariant_checks() if c.status == "fail"]
+    out: Dict[str, Any] = {
+        "broken": [{"name": c.name, "message": c.message, "details": c.details} for c in broken],
+        "alerted": False,
+    }
+    if not broken:
+        return out
+    incident_key = "invariant:" + ":".join(sorted(c.name for c in broken))
+    if _alert_cooldown_active(incident_key):
+        out["alert_suppressed"] = "cooldown"
+        return out
+    lines = ["⚠️ RMP invariant broken", f"Trigger: {trigger}"]
+    for check in broken:
+        ids = check.details.get("task_ids") or check.details.get("memory_ids") or []
+        suffix = f" ({', '.join(i[:8] for i in ids[:5])})" if ids else ""
+        lines.append(f"• {check.name}: {check.message}{suffix}")
+    message = "\n".join(lines)
+    alerted = await notify_ops_slack(message, incident_id=incident_key)
+    await send_alert(
+        "invariant.broken",
+        message.replace("\n", " ")[:500],
+        severity="error",
+        context={"broken": out["broken"], "trigger": trigger},
+    )
+    if alerted:
+        _record_alert(incident_key)
+    out["alerted"] = alerted
+    return out
+
+
+async def _run_canaries(trigger: str) -> Dict[str, Any]:
     issues = evaluate_canaries()
     result: Dict[str, Any] = {
         "trigger": trigger,
@@ -700,7 +739,7 @@ async def _main_async(args: List[str]) -> int:
         trigger = args[args.index("--trigger") + 1]
     result = await run_sentinel(trigger=trigger)
     print(json.dumps(result, indent=2))
-    return 0 if not result.get("issues") else 1
+    return 0 if not result.get("issues") and not result["invariants"]["broken"] else 1
 
 
 def main() -> None:

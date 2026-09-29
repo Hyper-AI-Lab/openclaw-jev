@@ -220,6 +220,8 @@ async def resubmit_user_messages(payload: Dict[str, Any]) -> int:
     import httpx
 
     from app.config import get_api_key
+    from app.db.database import AsyncSessionLocal
+    from app.db.models import Event
 
     task_id = payload["task_id"]
     sent = 0
@@ -240,4 +242,16 @@ async def resubmit_user_messages(payload: Dict[str, Any]) -> int:
             )
             resp.raise_for_status()
             sent += 1
+    if sent:
+        async with AsyncSessionLocal() as db:
+            db.add(
+                Event(
+                    correlation_id=task_id,
+                    entity_type="task",
+                    entity_id=task_id,
+                    event_type="task.messages_resubmitted",
+                    event_payload={"count": sent},
+                )
+            )
+            await db.commit()
     return sent

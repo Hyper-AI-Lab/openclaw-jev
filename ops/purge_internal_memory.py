@@ -14,36 +14,17 @@ import json
 import os
 from datetime import datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 
 from app.config import RMP_DATA_DIR, get_task_registry_config
 from app.db.database import AsyncSessionLocal
-from app.db.models import MemoryItem, Task, TaskRegistryEntry
+from app.db.models import MemoryItem, TaskRegistryEntry
+from app.memory.hygiene import internal_traces
 from app.notification_policy import is_internal_task
-
-INTERNAL_PROCEDURAL_SCOPES = ("canary", "heartbeat", "system")
 
 
 def _row(obj) -> dict:
     return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
-
-
-async def _collect():
-    async with AsyncSessionLocal() as db:
-        tasks = (await db.execute(select(Task.id, Task.goal, Task.task_type))).all()
-        internal = {t.id for t in tasks if is_internal_task(t.goal or "", t.task_type or "", [])}
-        shared = (
-            await db.execute(select(MemoryItem).where(MemoryItem.scope_type.in_(("user", "procedural"))))
-        ).scalars().all()
-        items = [
-            m for m in shared
-            if (m.provenance_ref or {}).get("task_id") in internal
-            or (m.scope_type == "procedural" and m.scope_id in INTERNAL_PROCEDURAL_SCOPES)
-        ]
-        entries = (
-            await db.execute(select(TaskRegistryEntry).where(TaskRegistryEntry.task_id.in_(internal)))
-        ).scalars().all()
-    return internal, items, entries
 
 
 def _internal_memory_point(payload: dict, internal: set) -> bool:
@@ -118,7 +99,7 @@ def _delete_vectors(items, entries) -> tuple[int, int]:
 
 
 async def main(apply: bool) -> None:
-    internal, items, entries = await _collect()
+    internal, items, entries = await internal_traces()
     by_scope: dict = {}
     for m in items:
         key = f"{m.scope_type}/{m.memory_type}"

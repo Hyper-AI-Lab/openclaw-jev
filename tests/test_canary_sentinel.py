@@ -196,6 +196,7 @@ async def test_run_sentinel_alerts_on_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(canary_sentinel, "ALERT_STATE_PATH", tmp_path / "alerts.json")
     monkeypatch.setattr(canary_sentinel, "evaluate_runtime_code_sync", lambda: None)
     monkeypatch.setattr(canary_sentinel, "evaluate_llm_usage", lambda: None)
+    monkeypatch.setattr("app.production.invariants.run_invariant_checks", AsyncMock(return_value=[]))
     canary_sentinel.write_health_canary_result(status="failed", task_id="x", error="boom")
 
     with patch.object(canary_sentinel, "attempt_remediation", return_value=[]):
@@ -226,6 +227,7 @@ async def test_run_sentinel_recovery_rerun_clears_timeout_without_alert(tmp_path
     monkeypatch.setattr(canary_sentinel, "ALERT_STATE_PATH", tmp_path / "alerts.json")
     monkeypatch.setattr(canary_sentinel, "evaluate_runtime_code_sync", lambda: None)
     monkeypatch.setattr(canary_sentinel, "evaluate_llm_usage", lambda: None)
+    monkeypatch.setattr("app.production.invariants.run_invariant_checks", AsyncMock(return_value=[]))
     canary_sentinel.write_health_canary_result(status="timeout", task_id="stuck", error="poll timeout")
     mem_path.write_text(
         json.dumps(

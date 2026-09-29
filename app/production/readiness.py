@@ -798,6 +798,8 @@ def check_runtime_code_sync() -> CheckResult:
 
 
 async def run_all_checks() -> Dict[str, Any]:
+    from app.production.invariants import run_invariant_checks
+
     sync_checks = [
         check_development_mode(),
         check_api_key(),
@@ -827,7 +829,7 @@ async def run_all_checks() -> Dict[str, Any]:
         check_openclaw_gateway(),
         check_stuck_workflows(),
     )
-    results: List[CheckResult] = sync_checks + list(async_checks)
+    results: List[CheckResult] = sync_checks + list(async_checks) + await run_invariant_checks()
 
     counts = {"pass": 0, "warn": 0, "fail": 0}
     for r in results:
