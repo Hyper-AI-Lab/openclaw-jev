@@ -234,3 +234,28 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - Live: outbox table and indexes created (20:18); reload 20:19; workspace re-seeded as 45 rows, drained by the live loop in < 25 s (0 retries); reconcile applied: 9 queued and indexed, 57 orphans deleted; re-check: memory 2,583 rows = 2,583 points, registry 190 = 190, 0 missing / 0 orphans both. Full-text fallback: with the vector leg forced down, the same USER.md chunk comes back from Postgres. Legacy collections deleted (rmp_memories 2,190 pts, rmp_task_registry 2,531, mem0migrations 1; all 4096-dim); Mem0 recreated its own migrations collection at the current size. Health canary `CANARY OK`; memory canary `CANARY OK (memory_ok=1, prompt_ok=1)`; a new user task's memory read returns Postgres and vector items.
 
 **Noted, not changed:** `app/task_registry/hooks.py` `schedule_terminal_index` has no callers (pre-existing dead code).
+
+---
+
+## Step 10 — Security and hygiene (A7, A4, A5, A11, B8, decision 2)
+
+**Date:** 2026-09-29 (20:26–20:46 CEST)
+
+**What changed:**
+
+- RMP API key rotated (approved): `/etc/rmp/rmp.env` (atomic replace, mode 600) and `settings.json` (`update_settings`) together, then rmp-api, rmp-worker and the gateway restarted at once. Fingerprints: retired `1d580d7e` → current `b395b111`.
+- Plugin log: `/root/.openclaw/logs/rmp_adapter.log` (dir 700, file created 0600); every line redacts the current RMP key and `X-RMP-API-Key` / `Bearer` / `x-access-token` values. The old world-readable `/tmp/rmp_plugin_debug.log` (500 KB, 14 lines with the retired key) was deleted.
+- `GET /settings` and `POST /settings` return `api_key: "***"` (the dashboard never read it back).
+- Unauthenticated requests get 401 with the detail: the auth middleware raised `HTTPException`, which middleware turns into a 500 with a traceback (found while verifying the rotation; pre-existing).
+- Statuses: `POST /tasks/{id}/cancel` sets `cancelled` with `closed_reason` (query `reason`, default `api_cancel`; canary scripts send `canary_timeout`); dev suspend-all → `cancelled`/`dev_suspend`; the reconciler maps a terminated run to `cancelled`/`workflow_terminated` (process state `canceled`). `stopped_by_user` stays for Kirill's own stop. The Sep 28 clarify tasks and the 117 canaries got `stopped_by_user` from exactly this endpoint.
+- Attempt law: `next_loop_action` changes strategy once (after attempt 9, so attempt 10 is the new approach), then ordinary rework to 19, escalation at 20; the test that encoded "strategy change on every attempt ≥ 9" now asserts the doctrine.
+- Model catalog built from `PRIMARY_MODEL` + `FALLBACK_MODELS` (`openai: gpt-6-luna`, `nvidia: openai/gpt-oss-20b`).
+- Stray `app/activities/openclaw_activities.py.bak` (untracked) removed.
+- Patch 6f `RMP_OPENAI_NO_STORE` (decision 2, verified first): OpenClaw's OpenAI wrapper used `storeMode: "provider-policy"` → `store: true` on every call, with no config switch (`compat.supportsStore: false` only strips the field and OpenAI then stores by default). The transport already requests `reasoning.encrypted_content` and replays it when store is false, so the patch sets `storeMode: "disable"` for provider `openai` and turns off server-side compaction (it needs stored responses); OpenClaw's own compaction handles long sessions, as on Chat Completions until this morning. Dist file backed up to `/root/.openclaw/backups/dist/proxy-DdZecu4V.js.pre-6f`.
+
+**Verification:**
+
+- Tests: log redaction (node); 401 for missing and wrong keys; cancel records `cancelled` + reason; attempt law 1–8 rework, 9 strategy change, 10–19 rework, 20 escalate. Full suite 563 passed, 3 skipped; node 16 (live-copy check passes after deploy).
+- Patch 6f offline: applies once (3-line diff), idempotent, patched module parses.
+- Live: `settings_integrity` pass; retired key refused, current key 200, no key 401; `/settings` shows `***`; new plugin log 0600 with no key; two max-effort turns in one session with store off (tool call, then a follow-up that needs turn 1): both correct, and OpenAI returns 404 for both response ids (not stored); health canary `CANARY OK`; intake latency canary PASS.
+- Daily backups under `data/backups/*/settings.json` and `/root/.openclaw/settings.json.bak-luna-20260929-170939` still contain the retired key, which no longer grants access; backups were left intact.
