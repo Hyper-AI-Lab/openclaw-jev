@@ -62,7 +62,7 @@ module.exports = {
         },
         required: ['query'],
       },
-      execute: async (params) => textResult(await langsearchSearch(params.query, params.count)),
+      execute: async (_id, params) => textResult(await langsearchSearch(params.query, params.count)),
     });
 
     api.registerTool({
@@ -76,7 +76,7 @@ module.exports = {
         },
         required: ['url'],
       },
-      execute: async (params) => textResult(await jinaReader(params.url)),
+      execute: async (_id, params) => textResult(await jinaReader(params.url)),
     });
 
     api.registerTool({
@@ -92,7 +92,7 @@ module.exports = {
         },
         required: ['url'],
       },
-      execute: async (params) =>
+      execute: async (_id, params) =>
         textResult(
           await backendsPost('/v1/crawl4ai', {
             url: params.url,
@@ -114,7 +114,7 @@ module.exports = {
         },
         required: ['url'],
       },
-      execute: async (params) =>
+      execute: async (_id, params) =>
         textResult(await backendsPost('/v1/scrapling', { url: params.url, css: params.css || null })),
     });
 
@@ -131,7 +131,7 @@ module.exports = {
           job_id: { type: 'string', description: 'If set, poll existing job status' },
         },
       },
-      execute: async (params) => {
+      execute: async (_id, params) => {
         if (params.job_id) {
           return textResult(await backendsGet(`/v1/crawlee/${encodeURIComponent(params.job_id)}`));
         }
@@ -159,7 +159,7 @@ module.exports = {
         },
         required: ['url', 'prompt'],
       },
-      execute: async (params) => {
+      execute: async (_id, params) => {
         let schema = null;
         if (params.schema_json) {
           try {
@@ -190,7 +190,7 @@ module.exports = {
         },
         required: ['task'],
       },
-      execute: async (params) =>
+      execute: async (_id, params) =>
         textResult(
           await backendsPost(
             '/v1/browser-use',
@@ -215,7 +215,7 @@ module.exports = {
         },
         required: ['url'],
       },
-      execute: async (params) =>
+      execute: async (_id, params) =>
         textResult(
           await backendsPost('/v1/obscura', {
             url: params.url,
