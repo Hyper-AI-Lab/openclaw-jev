@@ -46,35 +46,51 @@ async def _collect():
     return internal, items, entries
 
 
-def _sweep_shared_canary_vectors(apply: bool) -> int:
-    """User/procedural points whose text is canary output, including ones no row references."""
+def _internal_memory_point(payload: dict, internal: set) -> bool:
+    if payload.get("scope_type") not in ("user", "procedural"):
+        return False
+    text = str(payload.get("data") or "")
+    source = (payload.get("provenance") or {}).get("task_id")
+    return source in internal or "CANARY" in text.upper() or "Cushy Gloom" in text
+
+
+def _internal_registry_point(payload: dict, internal: set) -> bool:
+    return payload.get("task_id") in internal or is_internal_task(
+        str(payload.get("intent_snippet") or ""), str(payload.get("process_type") or ""), []
+    )
+
+
+def _sweep_shared_internal_vectors(internal: set, apply: bool) -> dict:
+    """Internal points in the shared indexes, including ones no row references."""
     from qdrant_client.http import models as rest
 
     from app.config import get_vector_memory_config
     from app.task_registry.vector_store import _get_qdrant_client
 
     client = _get_qdrant_client()
-    collection = get_vector_memory_config().get("collection_name")
-    doomed, offset = [], None
-    while True:
-        points, offset = client.scroll(collection, limit=512, offset=offset, with_payload=True, with_vectors=False)
-        for point in points:
-            payload = point.payload or {}
-            text = str(payload.get("data") or "")
-            if payload.get("scope_type") in ("user", "procedural") and (
-                "CANARY" in text.upper() or "Cushy Gloom" in text
-            ):
-                doomed.append(point.id)
-        if offset is None:
-            break
-    if apply:
-        for start in range(0, len(doomed), 256):
-            client.delete(
-                collection_name=collection,
-                points_selector=rest.PointIdsList(points=doomed[start:start + 256]),
-                wait=True,
+    targets = {
+        get_vector_memory_config().get("collection_name"): _internal_memory_point,
+        get_task_registry_config().get("collection_name", "rmp_task_registry"): _internal_registry_point,
+    }
+    counts = {}
+    for collection, is_internal_point in targets.items():
+        doomed, offset = [], None
+        while True:
+            points, offset = client.scroll(
+                collection, limit=512, offset=offset, with_payload=True, with_vectors=False
             )
-    return len(doomed)
+            doomed += [p.id for p in points if is_internal_point(p.payload or {}, internal)]
+            if offset is None:
+                break
+        if apply:
+            for start in range(0, len(doomed), 256):
+                client.delete(
+                    collection_name=collection,
+                    points_selector=rest.PointIdsList(points=doomed[start:start + 256]),
+                    wait=True,
+                )
+        counts[collection] = len(doomed)
+    return counts
 
 
 def _delete_vectors(items, entries) -> tuple[int, int]:
@@ -110,8 +126,8 @@ async def main(apply: bool) -> None:
     print(f"internal tasks: {len(internal)}")
     print(f"memory rows to delete: {len(items)} {by_scope}")
     print(f"registry entries to delete: {len(entries)}")
-    swept = await asyncio.to_thread(_sweep_shared_canary_vectors, apply)
-    print(f"shared canary vectors {'deleted' if apply else 'to delete'}: {swept}")
+    swept = await asyncio.to_thread(_sweep_shared_internal_vectors, internal, apply)
+    print(f"shared internal vectors {'deleted' if apply else 'to delete'}: {swept}")
     if not apply:
         print("dry run: nothing deleted (use --apply)")
         return
