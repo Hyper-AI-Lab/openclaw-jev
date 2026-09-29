@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -329,7 +329,11 @@ async def auth_middleware(request: Request, call_next):
         or request.url.path.startswith("/artifacts/")
     ):
         return await call_next(request)
-    _verify_api_key(request)
+    try:
+        _verify_api_key(request)
+    except HTTPException as exc:
+        # Raised inside middleware, an HTTPException becomes a 500; answer it here.
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     return await call_next(request)
 
 
