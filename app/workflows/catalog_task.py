@@ -720,7 +720,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 {
                     "task_id": task_id,
                     "user_intent": user_intent,
-                    "agent_response": clean_result[:4000],
+                    "agent_response": clean_result,
                     "process_run_id": self.process_run_id,
                     "attempt": 1,
                     "process_brief": self._initial_memory_block or "",
@@ -799,7 +799,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                         {
                             "task_id": task_id,
                             "user_intent": user_intent,
-                            "agent_response": clean_result[:4000],
+                            "agent_response": clean_result,
                             "process_run_id": self.process_run_id,
                             "attempt": judged,
                             "process_brief": self._initial_memory_block or "",
@@ -909,7 +909,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     task_kind,
                 )
 
-            summary = clean_result[:3000]
+            summary = clean_result
             await workflow.execute_activity(
                 notify_slack_user,
                 {

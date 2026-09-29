@@ -5,7 +5,7 @@ import logging
 from typing import Optional
 
 from app.activities.openclaw_activities import _get_slack_user_id
-from app.activities.side_effects import send_slack_message_idempotent
+from app.activities.side_effects import SlackTransientError, send_slack_message_idempotent
 from app.config import get_slack_bot_token, load_settings
 
 logger = logging.getLogger("rmp.ops_notify")
@@ -38,9 +38,13 @@ async def notify_ops_slack(message: str, *, incident_id: str) -> bool:
     if not text:
         return False
 
-    return await send_slack_message_idempotent(
-        task_id=f"ops:{incident_id}",
-        user_id=user_id,
-        message=text,
-        bot_token=bot_token,
-    )
+    try:
+        return await send_slack_message_idempotent(
+            task_id=f"ops:{incident_id}",
+            user_id=user_id,
+            message=text,
+            bot_token=bot_token,
+        )
+    except SlackTransientError as exc:
+        logger.warning("Ops Slack not delivered yet (%s): %s", incident_id, exc)
+        return False

@@ -10,7 +10,7 @@ import logging
 from typing import Any, Dict
 
 from app.activities.openclaw_activities import _get_slack_user_id
-from app.activities.side_effects import send_slack_message_idempotent
+from app.activities.side_effects import SlackTransientError, send_slack_message_idempotent
 from app.config import get_slack_bot_token, should_suspend_slack
 from app.notification_policy import should_deliver_slack
 
@@ -57,12 +57,16 @@ async def deliver_user_notice(
         return {"ok": True, "delivered": False, "reason": "missing_slack_config"}
 
     task_id = notice_task_id(session_key or "unknown", reason, idempotency_key)
-    delivered = await send_slack_message_idempotent(
-        task_id=task_id,
-        user_id=user_id,
-        message=message,
-        bot_token=bot_token,
-    )
+    try:
+        delivered = await send_slack_message_idempotent(
+            task_id=task_id,
+            user_id=user_id,
+            message=message,
+            bot_token=bot_token,
+        )
+    except SlackTransientError as exc:
+        logger.warning("User notice not delivered yet (%s): %s", reason, exc)
+        delivered = False
     return {
         "ok": True,
         "delivered": bool(delivered),

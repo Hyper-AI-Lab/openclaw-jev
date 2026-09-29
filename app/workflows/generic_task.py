@@ -533,7 +533,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     {
                         "task_id": task_id,
                         "user_intent": user_intent,
-                        "agent_response": clean_result[:4000],
+                        "agent_response": clean_result,
                         "process_run_id": self.process_run_id,
                         "attempt": attempt,
                         "process_brief": initial_memory_block or "",
@@ -622,7 +622,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     "intent": user_intent,
                     "task_type": task_type,
                     "tags": tags,
-                    "message": clean_result[:3000],
+                    "message": clean_result,
                 },
                 start_to_close_timeout=timedelta(seconds=30),
             )
