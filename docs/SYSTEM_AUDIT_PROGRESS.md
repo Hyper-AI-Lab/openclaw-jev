@@ -148,3 +148,23 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 
 - Tests: no procedure for a reply without steps or tools; procedure text names steps, tools and failures; canary promotion writes nothing; user promotion stores facts and the procedure, not the reply, and pins only under Jev enforce; internal tasks are not indexed; the trace pairs calls with results, redacts a bearer token and honours `since_ms`. Full suite 536 passed, 3 skipped.
 - Live: memory for a brand-new user task (3 queries): 0 canary items. Registry evidence for 3 queries: 0 internal rows (remaining canary mentions are Kirill's own messages about health checks and one old `[cron:SupersedeCanary]` test seed that the classifier counts as cron work). Health canary `CANARY OK`; memory canary `CANARY OK (memory_ok=1, prompt_ok=1)`; after both, no new user or procedural rows and no registry entries.
+
+---
+
+## Step 6 — The evaluator judges the work (B9, B5)
+
+**Date:** 2026-09-29 (19:22–19:38 CEST)
+
+**What changed:**
+
+- `app/activities/openclaw_activities.py` `verify_response_quality`: adds Aura's tool trace (`task_action_trace`, redacted) and the process artifacts to the evaluator payload. `app/orchestrator/process_evaluator.py`: `format_action_trace` / `format_artifacts`; the prompt now requires each claim of work (read, searched, checked, ran, sent, created, updated, fixed) to match a successful action, and says knowledge-only answers need no tools.
+- `app/workflows/judgment.py` (new `EvaluatorRetry` mixin, used by both task workflows): when the evaluator produces no verdict (bad JSON, model error, crashed activity) it is retried on durable timers (1, 2, 4, 8, 15, 30, 60 min, about two hours) instead of reworking Aura; after the second failure Kirill is told once that the reply is held for review; a stop interrupts the wait; if the reviewer never recovers the task is closed (`evaluator.unavailable`) with a message that no unchecked answer was sent. `catalog_task.py` uses it at both judgment sites (`_judge_or_close`).
+- `app/workflows/user_messages.py`: taking pending messages also takes `_catchup_chunks` (the catalog parks messages there for a next step that may never come), so they are folded in or resubmitted.
+- **Found during live verification and fixed in this step:** the reply poll accepted the latest terminal assistant message newer than dispatch time minus 5 s, so a second dispatch to the same session within 5 s of a reply returned the earlier reply. Live, the evaluator judged an invented claim "rework" but the activity returned the previous turn's "accept". Every dispatch attempt now leads its message with a unique `[RMP_DISPATCH <nonce>]` marker and both poll paths accept only replies after the user turn carrying it.
+
+**Verification:**
+
+- Workflow tests: evaluator error, crash and error, then accept → no Aura rework, one held notice, reply delivered after acceptance; reviewer never recovers → task closed as `evaluator_unavailable`, draft never sent, one failure finalization.
+- Unit tests: trace and artifact formatting; the prompt carries the trace and the claim rule; `verify_response_quality` sends trace and artifacts to the evaluator; a reply to the previous turn inside the 5 s window is ignored and the new turn's verdict is returned.
+- Full suite 542 passed, 3 skipped; node 11 passed; undefined-name check 0.
+- Live on gpt-6-luna (medium) with a real trace (`read USER.md`): honest answer → accept ("The successful USER.md read confirms…"); same answer plus "I also emailed him the result and updated his calendar" → rework ("Remove the unsupported email and calendar claims"). Health canary `CANARY OK`; intake LLM path 8 s (target 45 s).
