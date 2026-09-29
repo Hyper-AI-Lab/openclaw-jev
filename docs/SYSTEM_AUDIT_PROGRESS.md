@@ -127,3 +127,24 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - Multi-target and mid-task messages from Kirill are part of the Step 12 acceptance DMs.
 
 **Note:** parallel tool calls once raced on the same test file and dropped an appended test; it was re-added and runs (8 workflow tests).
+
+---
+
+## Step 5 — Memory hygiene (C1, C2, C4 + registry contamination)
+
+**Date:** 2026-09-29 (19:02–19:22 CEST)
+
+**What changed:**
+
+- `app/memory/promotion.py`: `promote_completion_memory` looks up the task and process run (best effort; a lookup failure no longer fails promotion) and skips canary, system and heartbeat work entirely. Procedural memory is a procedure summary — task, plan steps, tools Aura used (with failed-call count), short result — written only when tools or more than one step ran; replies stay episodic. Facts are pinned only when Jev promotion runs in `enforce` and accepted them; confidence ≥ 85 alone no longer pins.
+- `app/openclaw_sessions.py`: `task_action_trace(task_id, since_ms=None)` pairs Aura's tool calls with their results from the transcript, clipped and redacted (also used by Step 6).
+- `app/task_registry/indexer.py`: internal tasks are not indexed into the registry intake searches.
+- `ops/purge_internal_memory.py` (run as `python -m ops.purge_internal_memory [--apply]`): dry run by default; `--apply` writes a JSON backup, deletes user/procedural rows whose source task is internal, registry entries of internal tasks and their vectors, then sweeps both shared Qdrant indexes for internal points no row references. Idempotent.
+- `tests/conftest.py`: `DATABASE_URL` points at an empty temp SQLite, so no test can reach the live Postgres.
+
+**Purge (approved), 2026-09-29 17:12 UTC:** backup `data/backups/purge-internal-memory-20260929T171211Z.json`. Verified first: all 49 user facts came from canaries (28 memory, 21 health); the 90 non-canary-typed registry entries were heartbeat prompts, mislabelled canaries and intake smoke tests. Deleted 664 memory rows (615 procedural, 49 user) and 3,215 registry entries; vectors: 98 memory + 3,031 registry by reference, then 563 memory and 184 registry points swept by content (their references were stale or missing). Legacy 4096-dim collections keep their canary points until Step 9 retires them.
+
+**Verification:**
+
+- Tests: no procedure for a reply without steps or tools; procedure text names steps, tools and failures; canary promotion writes nothing; user promotion stores facts and the procedure, not the reply, and pins only under Jev enforce; internal tasks are not indexed; the trace pairs calls with results, redacts a bearer token and honours `since_ms`. Full suite 536 passed, 3 skipped.
+- Live: memory for a brand-new user task (3 queries): 0 canary items. Registry evidence for 3 queries: 0 internal rows (remaining canary mentions are Kirill's own messages about health checks and one old `[cron:SupersedeCanary]` test seed that the classifier counts as cron work). Health canary `CANARY OK`; memory canary `CANARY OK (memory_ok=1, prompt_ok=1)`; after both, no new user or procedural rows and no registry entries.
