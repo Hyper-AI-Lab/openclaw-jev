@@ -168,3 +168,22 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - Unit tests: trace and artifact formatting; the prompt carries the trace and the claim rule; `verify_response_quality` sends trace and artifacts to the evaluator; a reply to the previous turn inside the 5 s window is ignored and the new turn's verdict is returned.
 - Full suite 542 passed, 3 skipped; node 11 passed; undefined-name check 0.
 - Live on gpt-6-luna (medium) with a real trace (`read USER.md`): honest answer → accept ("The successful USER.md read confirms…"); same answer plus "I also emailed him the result and updated his calendar" → rework ("Remove the unsupported email and calendar claims"). Health canary `CANARY OK`; intake LLM path 8 s (target 45 s).
+
+---
+
+## Step 7 — Delivery that cannot silently fail (B6, B7)
+
+**Date:** 2026-09-29 (19:38–19:47 CEST)
+
+**What changed:**
+
+- `app/activities/side_effects.py`: `send_slack_message_idempotent` classifies failures. Network errors, HTTP 5xx and 429 (honouring `Retry-After`, capped at 30 s) and Slack's `ratelimited`/`internal_error`/`fatal_error`/`service_unavailable`/`request_timeout` are retried inline three times and then raised as `SlackTransientError`, so the Temporal activity keeps retrying until Slack is back. Any other Slack error is permanent: recorded as a `slack.delivery_failed` event (error, part) and sent to `send_alert` (the ops webhook, never Slack itself), and the call returns False.
+- Long replies: `split_for_slack` makes ordered parts of at most 3,500 characters cut at a paragraph, then line, sentence or word break; each part has its own receipt, so a retry after a partial failure sends only the missing parts; the ledger (`slack.delivered` event + `task_messages`) stores the full reply once. A ledger write failure is now a warning, since RECENT DIALOGUE reads it.
+- Workflows: final replies and evaluator inputs are no longer cut to 3,000 / 4,000 characters (generic and catalog); memory-content caps and the bounded escalation text stay.
+- Non-activity callers (`POST /api/notify-user` for plugin notices, the ops notifier) treat a transient failure as "not delivered yet" instead of raising; intake acknowledgements and reconciler notices were already guarded.
+
+**Verification:**
+
+- Tests with a mocked Slack API: splitting keeps all text and breaks at paragraphs; 503 → internal_error → ok delivers with one ledger entry; three 503s raise `SlackTransientError` with no ledger entry; 429 with `Retry-After: 7` waits 7 s; `channel_not_found` is not retried, is recorded and alerted; a 9,000-character reply goes out as 3 ordered parts, and after a failure on part 2 the retry sends only parts 2–3, with one full-text ledger row.
+- Full suite 548 passed, 3 skipped; undefined-name check 0.
+- Live after reload (19:45): Slack `auth.test` ok; health canary `CANARY OK`. A long user-visible reply is part of the Step 12 acceptance DMs.
