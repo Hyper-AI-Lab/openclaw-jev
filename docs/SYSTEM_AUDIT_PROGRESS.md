@@ -77,3 +77,29 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - New tests: reads leave bytes and mtime unchanged; unknown keys kept, defaults not stored; corrupt file raises; env key not written; API key created once across 6 processes; 4 writers × 40 updates with 4 readers × 300 reads: no lost key, every counter exact, no temp files left. Readiness: pass, missing, invalid, corrupt and key-mismatch cases.
 - Full suite hermetic: 509 passed, 3 skipped.
 - Live after reload (18:16): `settings.json` untouched for 75 s while services ran; `get_policy()` = enforce/shadow; `settings_integrity` pass; intake previews answered by Jev (`decision_source: jev`, 254 ms).
+
+---
+
+## Step 3 — Nothing unjudged reaches Slack (B1, B4)
+
+**Date:** 2026-09-29 (18:20–18:40 CEST)
+
+**What changed:**
+
+- `app/reconciler.py`: orphan recovery acts only when Temporal reports the run closed or missing (an unreachable Temporal means "decide next pass"). A generic task restarts `GenericTaskWorkflow` under the same id from the run's original input (read from its history: tags, brief with RECENT DIALOGUE, attempt policy), plus `recovered_draft`; without history the input is rebuilt from the task row. A catalog run is closed as failed with a notice, since replaying it could repeat side effects. The reconciler no longer posts to Slack or terminates the run; events `reconciler.orphan_reply_rejudged` / `reconciler.orphan_run_failed`. `notify_slack_user_safe` removed (no callers).
+- `app/workflows/generic_task.py`: judgment moved from `_plan_driven_loop` into `_judge_and_deliver`, which leaves only by acceptance or `_escalate`; a rework limit below the escalation attempt now escalates after judging the last attempt instead of sending an unjudged rework. Canaries still get no rework, but a failed evidence check now fails them instead of passing silently. `run()` accepts `recovered_draft` and judges it; escalation marks `user_notified`, so `run()` no longer adds a second "couldn't complete" message. The attempt policy is built once. Workflow imports moved to module level (the sandbox warned about in-method imports).
+- `app/activities/openclaw_activities.py`: evaluator calls pass `task_id`, so task liveness is refreshed while the evaluator runs.
+
+**Verification:**
+
+- First real workflow tests (Temporal time-skipping server, stubbed activities): a recovered draft is judged before delivery; a rejected draft is reworked and only the accepted rework is sent; limit 2 with escalation at 20 judges two attempts, never produces the third draft and sends only the diagnosis; escalation sends exactly one message. They pass with warnings as errors.
+- Reconciler tests: running run untouched; dead generic run restarted from its input with the draft; missing run restarted from the task row; dead catalog run closed with a notice, not replayed; prior recovery or unreachable Temporal does nothing.
+- Source tests updated to the new method names (same assertions). Full suite 518 passed, 3 skipped; node 11 passed. Undefined-name check on edited functions: 0.
+- Live: 0 running workflows at deploy; reload 18:35:45; health canary `CANARY OK` through `_judge_and_deliver`.
+
+**Observed during verification (assigned to later steps, not fixed here):**
+
+- `update_task_status` runs registry indexing (embedding + Qdrant upsert) inside a 10 s activity; the canary's first attempt timed out after committing and was retried. Assigned to Step 9 (index through the outbox).
+- The task registry intake searches holds 3,125 canary entries vs 140 user entries; intake cited "prior finished gateway/memory canary tasks" on Sep 28. Same contamination as C1, in a second store. Assigned to Step 5 (exclusion + approved purge).
+- Other workflow modules still import inside methods (sandbox warning for `app.notification_policy`). Assigned to Step 12 cleanup.
+- Delivery resolves any session without a Slack user to the owner's DM, so synthetic user-path tests would message Kirill; user-path live proof stays with the Step 12 acceptance DMs.
