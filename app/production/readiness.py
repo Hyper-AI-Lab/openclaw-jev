@@ -224,6 +224,40 @@ def check_api_key() -> CheckResult:
     return CheckResult("api_key", "pass", "API key configured")
 
 
+def check_settings_integrity() -> CheckResult:
+    """settings.json parses, keeps its jev section, and the plugin's key matches the services'."""
+    from app.config import SettingsCorruptError, _read_settings_file
+    from app.decisions.jev import Policy
+
+    try:
+        stored = _read_settings_file()
+    except SettingsCorruptError as exc:
+        return CheckResult("settings_integrity", "fail", str(exc))
+    jev = stored.get("jev")
+    if not isinstance(jev, dict):
+        return CheckResult(
+            "settings_integrity", "fail", "jev section missing: Jev intake and promotion are off"
+        )
+    try:
+        policy = Policy(**jev)
+    except (TypeError, ValueError) as exc:
+        return CheckResult("settings_integrity", "fail", f"jev section invalid: {exc}")
+    env_key = os.environ.get("RMP_API_KEY", "").strip()
+    if env_key and stored.get("api_key") != env_key:
+        return CheckResult(
+            "settings_integrity",
+            "fail",
+            "settings.json api_key differs from RMP_API_KEY: the plugin and the API disagree",
+        )
+    modes = {"intake_mode": policy.intake_mode, "promotion_mode": policy.promotion_mode}
+    return CheckResult(
+        "settings_integrity",
+        "pass",
+        f"jev intake={policy.intake_mode} promotion={policy.promotion_mode}",
+        {"jev": modes},
+    )
+
+
 def get_last_backup_info() -> Dict[str, Any]:
     """Latest backup directory metadata for dashboards."""
     if not os.path.isdir(BACKUP_ROOT):
@@ -767,6 +801,7 @@ async def run_all_checks() -> Dict[str, Any]:
     sync_checks = [
         check_development_mode(),
         check_api_key(),
+        check_settings_integrity(),
         check_slack_configured(),
         check_slack_sockets(),
         check_backup_recency(),

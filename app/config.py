@@ -1,9 +1,13 @@
 """Central RMP configuration loaded from openclaw.json and settings.json."""
+import fcntl
 import json
 import os
 import secrets
+import tempfile
+import time
+from contextlib import contextmanager
 from functools import lru_cache
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 
 from app.llm.model_policy import FALLBACK_MODELS, PRIMARY_MODEL
 
@@ -83,12 +87,55 @@ def _read_json(path: str, default: Any = None) -> Any:
         return default
 
 
-def _write_json(path: str, data: Any) -> None:
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+class SettingsCorruptError(RuntimeError):
+    """settings.json exists but is not a JSON object. Never read as empty settings."""
+
+
+def _read_settings_file() -> dict:
+    for attempt in range(5):
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except ValueError:
+            # Only a writer that bypasses update_settings can expose a half-written file.
+            time.sleep(0.02 * (attempt + 1))
+            continue
+        if isinstance(data, dict):
+            return data
+        break
+    raise SettingsCorruptError(f"{SETTINGS_PATH} is not a valid JSON object")
+
+
+@contextmanager
+def _settings_write_lock() -> Iterator[None]:
+    os.makedirs(os.path.dirname(SETTINGS_PATH) or ".", exist_ok=True)
+    with open(f"{SETTINGS_PATH}.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _write_settings_file(data: dict) -> None:
+    """Readers see the old or the new file, never a partial one."""
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(SETTINGS_PATH) or ".", prefix=".settings.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(SETTINGS_PATH):
+            os.chmod(tmp, os.stat(SETTINGS_PATH).st_mode & 0o777)
+        os.replace(tmp, SETTINGS_PATH)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 DEFAULT_VECTOR_MEMORY = {
@@ -229,13 +276,23 @@ def get_api_key() -> str:
     return load_settings().get("api_key", "")
 
 
+def _ensure_api_key() -> str:
+    with _settings_write_lock():
+        raw = _read_settings_file()
+        if not raw.get("api_key"):
+            raw["api_key"] = secrets.token_hex(32)
+            _write_settings_file(raw)
+        return raw["api_key"]
+
+
 def load_settings() -> dict:
-    settings = _read_json(SETTINGS_PATH, {})
+    """File settings merged with defaults. Reading never rewrites the file."""
+    settings = _read_settings_file()
     env_key = os.environ.get("RMP_API_KEY", "").strip()
     if env_key:
         settings["api_key"] = env_key
     elif not settings.get("api_key"):
-        settings["api_key"] = secrets.token_hex(32)
+        settings["api_key"] = _ensure_api_key()
     settings.setdefault("intermediate_updates", True)
     settings.setdefault("development_mode", False)
     settings.setdefault("suspend_slack_notifications", False)
@@ -259,8 +316,20 @@ def load_settings() -> dict:
     settings["llm_quota"] = {**DEFAULT_LLM_QUOTA, **llm_q}
     tr = settings.get("task_registry") or {}
     settings["task_registry"] = {**DEFAULT_TASK_REGISTRY, **tr}
-    _write_json(SETTINGS_PATH, settings)
     return settings
+
+
+def update_settings(mutate: Callable[[dict], None]) -> dict:
+    """The only settings writer: locked read-modify-write of the file's own keys.
+
+    ``mutate`` edits the stored settings in place (defaults are not merged in).
+    Returns the merged view after the write.
+    """
+    with _settings_write_lock():
+        raw = _read_settings_file()
+        mutate(raw)
+        _write_settings_file(raw)
+    return load_settings()
 
 
 def is_development_mode() -> bool:
@@ -282,10 +351,6 @@ def should_send_intermediate_updates() -> bool:
     if s.get("development_mode"):
         return False
     return bool(s.get("intermediate_updates", False))
-
-
-def save_settings(settings: dict) -> None:
-    _write_json(SETTINGS_PATH, settings)
 
 
 def get_vector_memory_config() -> dict:

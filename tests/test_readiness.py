@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -110,3 +111,36 @@ def test_safe_harbor_warns_when_auto_on_and_missing(monkeypatch, tmp_path):
     r = check_safe_harbor_peripheral()
     assert r.status == "warn"
     assert "missing" in r.message
+
+
+def _stored_settings(tmp_path, monkeypatch, content):
+    import app.config as config
+
+    path = tmp_path / "settings.json"
+    path.write_text(content if isinstance(content, str) else json.dumps(content))
+    monkeypatch.setattr(config, "SETTINGS_PATH", str(path))
+
+
+def test_settings_integrity_passes_with_a_valid_jev_section(tmp_path, monkeypatch):
+    from app.production.readiness import check_settings_integrity
+
+    _stored_settings(tmp_path, monkeypatch, {"api_key": "k" * 64, "jev": {"intake_mode": "enforce", "promotion_mode": "shadow"}})
+    monkeypatch.setenv("RMP_API_KEY", "k" * 64)
+    r = check_settings_integrity()
+    assert r.status == "pass" and r.details["jev"] == {"intake_mode": "enforce", "promotion_mode": "shadow"}
+
+
+def test_settings_integrity_fails_when_jev_is_missing_invalid_or_keys_differ(tmp_path, monkeypatch):
+    from app.production.readiness import check_settings_integrity
+
+    monkeypatch.delenv("RMP_API_KEY", raising=False)
+    _stored_settings(tmp_path, monkeypatch, {"api_key": "k" * 64})
+    assert "jev section missing" in check_settings_integrity().message
+    _stored_settings(tmp_path, monkeypatch, {"api_key": "k" * 64, "jev": {"intake_mode": "always"}})
+    assert "jev section invalid" in check_settings_integrity().message
+    _stored_settings(tmp_path, monkeypatch, '{"api_key": ')
+    assert check_settings_integrity().status == "fail"
+    _stored_settings(tmp_path, monkeypatch, {"api_key": "a" * 64, "jev": {}})
+    monkeypatch.setenv("RMP_API_KEY", "b" * 64)
+    r = check_settings_integrity()
+    assert r.status == "fail" and "disagree" in r.message

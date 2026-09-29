@@ -22,7 +22,7 @@ from app.config import (
     get_task_registry_intake_mode,
     is_task_registry_enabled,
     load_settings,
-    save_settings,
+    update_settings as update_stored_settings,
     is_development_mode,
     should_suspend_interception,
 )
@@ -1024,12 +1024,14 @@ async def suspend_all_running(db: AsyncSession = Depends(get_db)):
         stopped += 1
     await db.commit()
 
-    settings = load_settings()
-    settings["development_mode"] = True
-    settings["suspend_slack_notifications"] = True
-    settings["suspend_task_interception"] = True
-    settings["intermediate_updates"] = False
-    save_settings(settings)
+    update_stored_settings(
+        lambda stored: stored.update(
+            development_mode=True,
+            suspend_slack_notifications=True,
+            suspend_task_interception=True,
+            intermediate_updates=False,
+        )
+    )
 
     return {"terminated_workflows": terminated, "stopped_tasks": stopped, "development_mode": True}
 
@@ -1299,16 +1301,18 @@ async def get_settings():
 
 @app.post("/settings")
 async def update_settings(req: SettingsRequest):
-    settings = load_settings()
-    if req.intermediate_updates is not None:
-        settings["intermediate_updates"] = req.intermediate_updates
-    if req.development_mode is not None:
-        settings["development_mode"] = req.development_mode
-    if req.suspend_slack_notifications is not None:
-        settings["suspend_slack_notifications"] = req.suspend_slack_notifications
-    if req.suspend_task_interception is not None:
-        settings["suspend_task_interception"] = req.suspend_task_interception
-    save_settings(settings)
+    def _apply(stored: dict) -> None:
+        for field in (
+            "intermediate_updates",
+            "development_mode",
+            "suspend_slack_notifications",
+            "suspend_task_interception",
+        ):
+            value = getattr(req, field)
+            if value is not None:
+                stored[field] = value
+
+    settings = update_stored_settings(_apply)
     return {"status": "ok", "settings": settings}
 
 
