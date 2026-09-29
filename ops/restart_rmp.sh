@@ -4,7 +4,10 @@ set -euo pipefail
 
 systemctl daemon-reload
 systemctl restart rmp-api rmp-worker openclaw-gateway
-sleep 3
+for _ in $(seq 60); do
+  curl -sf http://127.0.0.1:8000/health >/dev/null && break
+  sleep 1
+done
 curl -sf http://127.0.0.1:8000/health | python3 -c "import json,sys; d=json.load(sys.stdin); assert d.get('status')=='ok', d"
 # Confirm boot stamps exist (written by process startup)
 python3 - <<'PY'
