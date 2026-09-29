@@ -27,6 +27,11 @@ async def index_terminal_task(task_id: str) -> Optional[str]:
     if summary.get("terminal_status") not in TERMINAL_STATUSES:
         logger.debug("Skip registry index for non-terminal task %s", task_id)
         return None
+    from app.notification_policy import is_internal_task
+
+    if is_internal_task(summary.get("intent_snippet") or "", summary.get("process_type") or "", []):
+        logger.debug("Skip registry index for internal task %s", task_id)
+        return None
     point_id = upsert_task_vector(task_id, summary)
     entry_id = await upsert_registry_entry(task_id, vector_point_id=point_id)
     logger.info("Indexed task %s into registry (entry=%s)", task_id[:8], entry_id)

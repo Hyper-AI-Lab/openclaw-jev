@@ -210,3 +210,51 @@ def read_transcript_lines(session_id: str) -> List[str]:
     except Exception:
         return []
     return [row[0] for row in rows if row and row[0]]
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def task_action_trace(
+    task_id: str, *, since_ms: Optional[int] = None, limit: int = 40
+) -> List[Dict[str, Any]]:
+    """Aura's tool calls in the task's rmp_task session, oldest first, secrets redacted.
+
+    Each item: tool, arguments, ok (None while no result was recorded), result.
+    """
+    from app.memory.policy import redact_secrets
+
+    entry = get_session_entry(f"agent:main:rmp_task_{task_id}")
+    calls: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for line in read_transcript_lines(entry.get("sessionId") or ""):
+        try:
+            msg = (json.loads(line) or {}).get("message") or {}
+        except (ValueError, AttributeError):
+            continue
+        if since_ms and isinstance(msg.get("timestamp"), (int, float)) and msg["timestamp"] < since_ms:
+            continue
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
+            for part in msg["content"]:
+                if isinstance(part, dict) and part.get("type") == "toolCall":
+                    call_id = str(part.get("id") or len(order))
+                    args = json.dumps(part.get("arguments") or {}, ensure_ascii=False)
+                    calls[call_id] = {
+                        "tool": str(part.get("name") or ""),
+                        "arguments": redact_secrets(_clip(args, 300)),
+                        "ok": None,
+                        "result": "",
+                    }
+                    order.append(call_id)
+        elif msg.get("role") == "toolResult" and str(msg.get("toolCallId")) in calls:
+            content = msg.get("content")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(p.get("text") or "") for p in content if isinstance(p, dict)
+                )
+            call = calls[str(msg["toolCallId"])]
+            call["ok"] = not msg.get("isError")
+            call["result"] = redact_secrets(_clip(content, 300))
+    return [calls[c] for c in order][-limit:]

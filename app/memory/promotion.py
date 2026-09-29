@@ -1,8 +1,11 @@
 """Memory promotion pipeline: extract → validate → promote (report §6.1)."""
 from __future__ import annotations
 
+import logging
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("rmp.memory.promotion")
 
 MIN_PROMOTION_CONFIDENCE = 70
 
@@ -78,6 +81,28 @@ def extract_semantic_facts(content: str, process_type: str = "") -> List[Dict[st
     return unique[:8]
 
 
+def build_procedure_summary(
+    goal: str,
+    steps: List[Dict[str, Any]],
+    trace: List[Dict[str, Any]],
+    outcome: str,
+) -> Optional[str]:
+    """What was done, reusable on similar work. None when no steps or tools ran."""
+    step_names = [str(s.get("name")) for s in steps or [] if isinstance(s, dict) and s.get("name")]
+    tools = list(dict.fromkeys(t["tool"] for t in trace if t.get("tool")))
+    if not tools and len(step_names) <= 1:
+        return None
+    failed = sum(1 for t in trace if t.get("ok") is False)
+    lines = [f"Task: {' '.join((goal or '').split())[:300]}"]
+    if step_names:
+        lines.append("Steps: " + "; ".join(step_names))
+    if tools:
+        suffix = f" ({failed} call(s) failed)" if failed else ""
+        lines.append("Tools used: " + ", ".join(tools) + suffix)
+    lines.append(f"Result: {' '.join((outcome or '').split())[:300]}")
+    return "\n".join(lines)
+
+
 def validate_fact(fact: Dict[str, Any]) -> Tuple[bool, str]:
     """Stage C: confidence and provenance quality gate."""
     conf = int(fact.get("confidence", 0))
@@ -99,12 +124,17 @@ async def promote_completion_memory(
     episodic_content: str,
     user_scope_id: str = "default",
 ) -> Dict[str, Any]:
-    """Stage D+E: promote validated facts to semantic/procedural/pinned pools."""
+    """Stage D+E: validated facts to the user pools; the executed procedure to procedural.
+
+    Canary, system and heartbeat work never becomes shared memory.
+    """
     from app.memory.router import MemoryRouter
     from sqlalchemy import select
 
     from app.db.database import AsyncSessionLocal
-    from app.db.models import MemoryItem
+    from app.db.models import MemoryItem, ProcessRun, Task
+    from app.notification_policy import is_internal_task
+    from app.openclaw_sessions import task_action_trace
 
     stats = {
         "extracted": 0,
@@ -113,6 +143,16 @@ async def promote_completion_memory(
         "promoted_pinned": 0,
         "rejected": 0,
     }
+    task = run = None
+    try:
+        async with AsyncSessionLocal() as db:
+            task = await db.get(Task, task_id) if task_id else None
+            run = await db.get(ProcessRun, process_run_id) if process_run_id else None
+    except Exception as exc:
+        logger.warning("Promotion lookup failed for task %s: %s", task_id, exc)
+    goal = (task.goal if task else "") or ""
+    if is_internal_task(goal, (task.task_type if task else "") or process_type or "", []):
+        return {**stats, "skipped": "internal_task"}
 
     async def _exists(scope_type: str, scope_id: str, content_prefix: str) -> bool:
         async with AsyncSessionLocal() as db:
@@ -167,7 +207,8 @@ async def promote_completion_memory(
                 confidence=int(fact["confidence"]),
             )
             stats["promoted_semantic"] += 1
-            if int(fact.get("confidence", 0)) >= 85:
+            # Pinned facts ride along on every task, so only Jev-accepted ones (enforce).
+            if review["mode"] == "enforce":
                 await MemoryRouter.write(
                     scope_type="user",
                     scope_id=user_scope_id,
@@ -185,13 +226,15 @@ async def promote_completion_memory(
         except ValueError:
             stats["rejected"] += 1
 
-    if process_type and len(episodic_content.strip()) >= 50:
+    steps = (run.plan_json or {}).get("steps") if run and isinstance(run.plan_json, dict) else []
+    procedure = build_procedure_summary(goal, steps, task_action_trace(task_id), episodic_content)
+    if process_type and procedure:
         try:
             await MemoryRouter.write(
                 scope_type="procedural",
                 scope_id=process_type,
                 memory_type="procedural",
-                content=episodic_content[:2000],
+                content=procedure,
                 provenance={
                     "task_id": task_id,
                     "promoted_from": "completion_pipeline",
