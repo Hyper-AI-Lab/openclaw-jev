@@ -335,18 +335,22 @@ class VectorMemoryService:
         query: str,
         limit: int = 5,
         memory_type: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Hits for the scope; None when the index or embedder is unavailable (not the same as no hits)."""
         if not self.config.get("enabled", True):
             return []
         if not query or not query.strip():
             return []
         if not self._ensure_client():
-            return []
+            return None
 
         ids = scope_to_mem0_ids(scope_type, scope_id)
         filters: Dict[str, Any] = {}
         if memory_type:
             filters["memory_type"] = memory_type
+        if ids.get("scope_id"):
+            # Every procedural pool shares agent_id "procedural"; the process type narrows it.
+            filters["procedural_scope_id"] = ids["scope_id"]
 
         try:
             kwargs = {k: v for k, v in ids.items() if k in ("user_id", "agent_id", "run_id")}
@@ -371,7 +375,7 @@ class VectorMemoryService:
             ]
         except Exception as e:
             logger.warning("Vector memory search failed: %s", e)
-            return []
+            return None
 
     def delete(self, memory_id: str) -> bool:
         if not memory_id or not self._ensure_client():

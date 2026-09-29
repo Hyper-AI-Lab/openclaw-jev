@@ -18,7 +18,7 @@ async def test_vector_search_timeout_fail_soft():
 
     with patch("app.memory.router.asyncio.to_thread", side_effect=slow_search):
         hits = await _vector_search_bounded(svc, "process", "run-1", "query", 5, None)
-    assert hits == []
+    assert hits is None  # "not answered": recall falls back to Postgres full-text
 
 
 @pytest.mark.asyncio

@@ -99,6 +99,10 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS ix_tasks_goal_fts ON tasks USING gin (to_tsvector('english', coalesce(goal, '')))",
     "CREATE INDEX IF NOT EXISTS ix_task_registry_fts ON task_registry_entries USING gin (to_tsvector('english', coalesce(intent_snippet,'') || ' ' || coalesce(outcome_summary,'')))",
     "CREATE INDEX IF NOT EXISTS ix_task_messages_fts ON task_messages USING gin (to_tsvector('english', coalesce(content, '')))",
+    "ALTER TABLE task_messages ADD COLUMN IF NOT EXISTS slack_ts VARCHAR",
+    "CREATE INDEX IF NOT EXISTS ix_task_messages_slack_ts ON task_messages (slack_ts)",
+    "CREATE INDEX IF NOT EXISTS ix_memory_items_content_fts ON memory_items USING gin (to_tsvector('simple', coalesce(content, '')))",
+    "CREATE INDEX IF NOT EXISTS ix_vector_outbox_pending ON vector_outbox (next_attempt_at) WHERE done_at IS NULL",
 ]
 
 

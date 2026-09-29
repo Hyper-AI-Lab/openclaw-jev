@@ -55,6 +55,8 @@ _scanner_stop: Optional[asyncio.Event] = None
 _scanner_task: Optional[asyncio.Task] = None
 _cron_stop: Optional[asyncio.Event] = None
 _cron_task: Optional[asyncio.Task] = None
+_vector_stop: Optional[asyncio.Event] = None
+_vector_task: Optional[asyncio.Task] = None
 
 from app.config import (
     OPENCLAW_CONFIG_PATH,
@@ -76,7 +78,7 @@ MODEL_CATALOG = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _reconciler_stop, _reconciler_task, _scanner_stop, _scanner_task
-    global _cron_stop, _cron_task
+    global _cron_stop, _cron_task, _vector_stop, _vector_task
     await init_db()
     load_settings()
     init_telemetry("rmp-api")
@@ -93,7 +95,11 @@ async def lifespan(app: FastAPI):
     _scanner_task = asyncio.create_task(scanner_monitor_loop(_scanner_stop))
     _cron_stop = asyncio.Event()
     _cron_task = asyncio.create_task(cron_reconciler_loop(_cron_stop))
-    logger.info("RMP API started with reconciler, scanner monitor, cron reconciler")
+    from app.memory.vector_sync import vector_outbox_loop
+
+    _vector_stop = asyncio.Event()
+    _vector_task = asyncio.create_task(vector_outbox_loop(_vector_stop))
+    logger.info("RMP API started with reconciler, scanner monitor, cron reconciler, vector outbox")
     yield
     if _reconciler_stop:
         _reconciler_stop.set()
@@ -107,6 +113,10 @@ async def lifespan(app: FastAPI):
         _cron_stop.set()
     if _cron_task:
         await _cron_task
+    if _vector_stop:
+        _vector_stop.set()
+    if _vector_task:
+        await _vector_task
     from app.decisions.jev import close_jev_client
 
     await close_jev_client()

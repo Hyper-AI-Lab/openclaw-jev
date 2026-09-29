@@ -1,10 +1,11 @@
 """Index terminal tasks into Postgres registry + Qdrant."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
-from app.config import get_task_registry_config
+from app.config import get_task_registry_config, is_vector_memory_enabled
 from app.task_registry.summary import upsert_registry_entry
 from app.task_registry.vector_store import upsert_task_vector
 
@@ -15,7 +16,8 @@ TERMINAL_STATUSES = frozenset(
 )
 
 
-async def index_terminal_task(task_id: str) -> Optional[str]:
+async def index_terminal_task(task_id: str, *, require_vector: bool = False) -> Optional[str]:
+    """Registry entry + vector for a finished task. require_vector raises when the vector write failed."""
     cfg = get_task_registry_config()
     if not cfg.get("enabled", True):
         return None
@@ -32,7 +34,9 @@ async def index_terminal_task(task_id: str) -> Optional[str]:
     if is_internal_task(summary.get("intent_snippet") or "", summary.get("process_type") or "", []):
         logger.debug("Skip registry index for internal task %s", task_id)
         return None
-    point_id = upsert_task_vector(task_id, summary)
+    point_id = await asyncio.to_thread(upsert_task_vector, task_id, summary)
+    if require_vector and point_id is None and is_vector_memory_enabled():
+        raise RuntimeError(f"registry vector write failed for {task_id}")
     entry_id = await upsert_registry_entry(task_id, vector_point_id=point_id)
     logger.info("Indexed task %s into registry (entry=%s)", task_id[:8], entry_id)
     return entry_id

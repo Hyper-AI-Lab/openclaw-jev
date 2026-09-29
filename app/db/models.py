@@ -182,6 +182,21 @@ class Event(Base):
     occurred_at = Column(DateTime, default=datetime.utcnow)
 
 
+class VectorOutbox(Base):
+    """Qdrant index work, committed in the same transaction as the Postgres row it indexes."""
+
+    __tablename__ = "vector_outbox"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    kind = Column(String, nullable=False)  # memory | registry
+    ref_id = Column(String, nullable=False, index=True)  # memory_items.id | tasks.id
+    attempts = Column(Integer, default=0)
+    last_error = Column(Text)
+    next_attempt_at = Column(DateTime, default=datetime.utcnow, index=True)
+    done_at = Column(DateTime, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class TaskMessage(Base):
     """Supplementary user/cron text linked to a task (not the primary RAG corpus)."""
 

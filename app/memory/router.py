@@ -1,16 +1,17 @@
 """Process-scoped memory routing per the RMP architecture plan."""
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.config import get_vector_memory_config, is_vector_memory_enabled
 from app.db.database import AsyncSessionLocal
-from app.db.models import MemoryItem
+from app.db.models import MemoryItem, VectorOutbox
 from app.memory.policy import apply_write_policy, redact_secrets
-from app.memory.vector import get_vector_service
+from app.memory.vector import INDEXABLE_TYPES, get_vector_service
 
 logger = logging.getLogger("rmp.memory")
 
@@ -26,7 +27,8 @@ async def _vector_search_bounded(
     query: str,
     limit: int,
     memory_type: Optional[str],
-) -> List[Dict[str, Any]]:
+) -> Optional[List[Dict[str, Any]]]:
+    """Vector hits; None when the index or embedder did not answer."""
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(
@@ -46,7 +48,7 @@ async def _vector_search_bounded(
             scope_type,
             scope_id,
         )
-        return []
+        return None
     except Exception as exc:
         logger.warning(
             "Vector search failed for %s/%s: %s",
@@ -54,7 +56,48 @@ async def _vector_search_bounded(
             scope_id,
             exc,
         )
+        return None
+
+
+_FTS_WORD = re.compile(r"[^\W_]{3,}", re.UNICODE)
+
+
+async def _fts_search(
+    scope_type: str,
+    scope_id: str,
+    query: str,
+    limit: int,
+    memory_type: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Keyword recall from Postgres for when the vector index or embedder is down."""
+    words = list(dict.fromkeys(w.lower() for w in _FTS_WORD.findall(query or "")))[:12]
+    if not words:
         return []
+    async with AsyncSessionLocal() as db:
+        if db.get_bind().dialect.name != "postgresql":
+            return []
+        tsquery = func.to_tsquery("simple", " | ".join(words))
+        document = func.to_tsvector("simple", func.coalesce(MemoryItem.content, ""))
+        q = select(MemoryItem).where(
+            MemoryItem.scope_type == scope_type,
+            MemoryItem.scope_id == scope_id,
+            MemoryItem.valid_to.is_(None),
+            document.op("@@")(tsquery),
+        )
+        if memory_type:
+            q = q.where(MemoryItem.memory_type == memory_type)
+        q = q.order_by(func.ts_rank(document, tsquery).desc()).limit(limit)
+        rows = (await db.execute(q)).scalars().all()
+    return [
+        {
+            "id": m.id,
+            "memory_type": m.memory_type,
+            "content": redact_secrets(m.content or ""),
+            "confidence": m.confidence,
+            "source": "postgres_fts",
+        }
+        for m in rows
+    ]
 
 
 class MemoryRouter:
@@ -84,7 +127,6 @@ class MemoryRouter:
             raise ValueError(f"Memory write rejected: {reason}")
 
         mem_id = str(uuid.uuid4())
-        vector_ref = None
         async with AsyncSessionLocal() as db:
             db.add(
                 MemoryItem(
@@ -98,31 +140,9 @@ class MemoryRouter:
                     valid_from=datetime.utcnow(),
                 )
             )
+            if is_vector_memory_enabled() and memory_type in INDEXABLE_TYPES:
+                db.add(VectorOutbox(kind="memory", ref_id=mem_id))
             await db.commit()
-
-        if is_vector_memory_enabled() and memory_type in ("semantic", "episodic", "procedural"):
-            svc = get_vector_service()
-            vector_ref = await asyncio.to_thread(
-                svc.add,
-                scope_type,
-                scope_id,
-                redacted,
-                memory_type,
-                provenance,
-            )
-            if vector_ref and provenance is not None:
-                provenance = {**provenance, "vector_ref": vector_ref}
-            elif vector_ref:
-                provenance = {"vector_ref": vector_ref}
-
-        if vector_ref and provenance:
-            async with AsyncSessionLocal() as db:
-                result = await db.execute(select(MemoryItem).where(MemoryItem.id == mem_id))
-                row = result.scalar_one_or_none()
-                if row:
-                    row.provenance_ref = provenance
-                    await db.commit()
-
         return mem_id
 
     @staticmethod
@@ -154,21 +174,20 @@ class MemoryRouter:
                 for m in result.scalars().all()
             ]
 
-        if query and is_vector_memory_enabled() and not skip_vector:
+        if query and not skip_vector:
             try:
-                svc = get_vector_service()
                 vm_cfg = get_vector_memory_config()
                 vector_limit = int(vm_cfg.get("semantic_recall_limit", 5))
-                vector_hits = await _vector_search_bounded(
-                    svc,
-                    scope_type,
-                    scope_id,
-                    query,
-                    vector_limit,
-                    memory_type
-                    if memory_type in ("semantic", "episodic", "procedural")
-                    else None,
-                )
+                indexed_type = memory_type if memory_type in INDEXABLE_TYPES else None
+                vector_hits = None
+                if is_vector_memory_enabled():
+                    vector_hits = await _vector_search_bounded(
+                        get_vector_service(), scope_type, scope_id, query, vector_limit, indexed_type
+                    )
+                if vector_hits is None:
+                    vector_hits = await _fts_search(
+                        scope_type, scope_id, query, vector_limit, indexed_type
+                    )
                 seen = {item["content"][:200] for item in pg_items}
                 merged = list(pg_items)
                 for hit in vector_hits:
@@ -196,12 +215,14 @@ class MemoryRouter:
         limit: int = 5,
         memory_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        if not is_vector_memory_enabled():
-            return []
-        svc = get_vector_service()
-        return await _vector_search_bounded(
-            svc, scope_type, scope_id, query, limit, memory_type
-        )
+        hits = None
+        if is_vector_memory_enabled():
+            hits = await _vector_search_bounded(
+                get_vector_service(), scope_type, scope_id, query, limit, memory_type
+            )
+        if hits is None:
+            hits = await _fts_search(scope_type, scope_id, query, limit, memory_type)
+        return hits
 
     @staticmethod
     async def read_ordered(
@@ -309,13 +330,16 @@ class MemoryRouter:
             )
             items = result.scalars().all()
             count = 0
-            if is_vector_memory_enabled():
-                svc = get_vector_service()
-                for item in items:
-                    vref = (item.provenance_ref or {}).get("vector_ref")
-                    if vref:
-                        if await asyncio.to_thread(svc.delete, vref):
-                            vector_deleted += 1
+            if is_vector_memory_enabled() and items:
+                from app.memory.vector_sync import delete_memory_points
+
+                point_ids = [item.id for item in items] + [
+                    (item.provenance_ref or {}).get("vector_ref") for item in items
+                ]
+                try:
+                    vector_deleted = await asyncio.to_thread(delete_memory_points, point_ids)
+                except Exception as exc:
+                    logger.warning("Compaction vector delete deferred to reconcile: %s", exc)
             for item in items:
                 item.valid_to = datetime.utcnow()
                 count += 1

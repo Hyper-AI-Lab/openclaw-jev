@@ -27,9 +27,10 @@ def schedule_terminal_index(task_id: str) -> None:
 
 
 async def index_terminal_task_async(task_id: str) -> None:
-    from app.task_registry.indexer import index_terminal_task
+    """Queue a finished task for the registry index; the vector outbox drains it."""
+    from app.memory.vector_sync import enqueue_registry_index
 
     try:
-        await index_terminal_task(task_id)
+        await enqueue_registry_index(task_id)
     except Exception as exc:
-        logger.warning("Terminal index failed for %s: %s", task_id, exc)
+        logger.warning("Registry index enqueue failed for %s: %s", task_id, exc)
