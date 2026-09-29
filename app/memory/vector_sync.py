@@ -22,7 +22,7 @@ from app.db.database import AsyncSessionLocal
 from app.db.models import MemoryItem, Task, TaskRegistryEntry, VectorOutbox
 from app.memory.vector import INDEXABLE_TYPES, embed_query_text, scope_to_mem0_ids
 from app.notification_policy import is_internal_task
-from app.orchestrator.decision_engine import TERMINAL_STATUSES
+from app.orchestrator.decision_engine import INTAKE_PLACEHOLDER, TERMINAL_STATUSES
 
 logger = logging.getLogger("rmp.vector_sync")
 
@@ -201,7 +201,7 @@ async def reconcile(apply: bool = True) -> Dict[str, Any]:
         now = datetime.utcnow()
         ended = (
             await db.execute(
-                select(Task.id, Task.goal, Task.task_type).where(
+                select(Task.id, Task.goal, Task.task_type, Task.supplementary_context).where(
                     Task.status.in_(TERMINAL_STATUSES),
                     Task.created_at >= now - timedelta(days=int(get_task_registry_config().get("backfill_days", 90))),
                     Task.updated_at < now - timedelta(minutes=UNINDEXED_SETTLE_MINUTES),
@@ -241,6 +241,7 @@ async def reconcile(apply: bool = True) -> Dict[str, Any]:
         if t.id not in entries
         and ("registry", t.id) not in pending
         and not is_internal_task(t.goal or "", t.task_type or "", [])
+        and (t.supplementary_context or {}).get("closed_reason") != INTAKE_PLACEHOLDER
     ]
 
     stats = {

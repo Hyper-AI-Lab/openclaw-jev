@@ -29,6 +29,7 @@ from app.config import (
 from app.db.database import get_db, init_db
 from app.db.models import Artifact, Event, MemoryItem, Observation, ProcessRun, Task
 from app.metrics import format_prometheus, get_counters, inc as metrics_inc
+from app.orchestrator.decision_engine import INTAKE_PLACEHOLDER
 from app.production.readiness import get_last_backup_info, run_all_checks
 from app.memory.router import MemoryRouter
 from app.cron.reconciler import cron_reconciler_loop, reconcile_cron_once
@@ -279,6 +280,7 @@ async def _cancel_intake_reservation(task: Task, db: AsyncSession) -> None:
         return
     task.status = "cancelled"
     ctx["intake_reserved"] = False
+    ctx["closed_reason"] = INTAKE_PLACEHOLDER
     task.supplementary_context = ctx
     await db.commit()
 

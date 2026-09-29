@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "stopped_by_user", "compensated", "cancelled"}
 )
+# closed_reason of a request's intake reservation once intake handled the message elsewhere.
+INTAKE_PLACEHOLDER = "intake_placeholder"
 RETRYABLE_STATUSES = frozenset({"pending", "needs_replan"})
 
 

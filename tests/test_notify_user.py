@@ -190,6 +190,19 @@ def test_second_post_does_not_start_another_intake_while_reserved():
     assert reservation_retry_should_run_intake(worked) is False
 
 
+async def test_a_reservation_intake_resolved_elsewhere_closes_as_a_placeholder():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.api.server import _cancel_intake_reservation
+    from app.orchestrator.decision_engine import INTAKE_PLACEHOLDER
+
+    task = SimpleNamespace(status="created", supplementary_context={"intake_reserved": True})
+    await _cancel_intake_reservation(task, SimpleNamespace(commit=AsyncMock()))
+    assert task.status == "cancelled"
+    assert task.supplementary_context == {"intake_reserved": False, "closed_reason": INTAKE_PLACEHOLDER}
+
+
 def test_plugin_post_timeout_covers_intake_budget():
     from pathlib import Path
 

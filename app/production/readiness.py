@@ -693,6 +693,7 @@ def check_task_registry_index_fresh() -> CheckResult:
     from app.db.database import DATABASE_URL
     from app.db.models import Task, TaskRegistryEntry
     from app.notification_policy import is_internal_task
+    from app.orchestrator.decision_engine import INTAKE_PLACEHOLDER
     from app.task_registry.indexer import TERMINAL_STATUSES
 
     cfg = get_task_registry_config()
@@ -705,7 +706,7 @@ def check_task_registry_index_fresh() -> CheckResult:
     try:
         with engine.connect() as conn:
             ended = conn.execute(
-                select(Task.id, Task.goal, Task.task_type).where(
+                select(Task.id, Task.goal, Task.task_type, Task.supplementary_context).where(
                     Task.status.in_(list(TERMINAL_STATUSES)), Task.created_at >= cutoff
                 )
             ).all()
@@ -716,7 +717,11 @@ def check_task_registry_index_fresh() -> CheckResult:
             "warn",
             f"Registry index check failed: {exc}",
         )
-    user = [t.id for t in ended if not is_internal_task(t.goal or "", t.task_type or "", [])]
+    user = [
+        t.id for t in ended
+        if not is_internal_task(t.goal or "", t.task_type or "", [])
+        and (t.supplementary_context or {}).get("closed_reason") != INTAKE_PLACEHOLDER
+    ]
     if not user:
         return CheckResult("task_registry_index", "pass", "No terminal tasks to index")
     indexed_n = sum(1 for tid in user if tid in indexed)

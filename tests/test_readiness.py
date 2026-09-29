@@ -160,6 +160,9 @@ def test_registry_freshness_counts_finished_user_tasks_only(tmp_path, monkeypatc
     with Session(engine) as db:
         db.add_all([Task(id=f"c{i}", goal=canary, task_type="canary", status="completed") for i in range(50)])
         db.add_all([Task(id=f"u{i}", goal="Compare visa rules", status="completed") for i in range(10)])
+        db.add_all([Task(id=f"p{i}", goal="Also give it in EUR.", status="cancelled",
+                         supplementary_context={"intake_reserved": False, "closed_reason": "intake_placeholder"})
+                    for i in range(20)])
         db.add_all([TaskRegistryEntry(id=f"r{i}", task_id=f"u{i}") for i in range(9)])
         db.commit()
     monkeypatch.setattr("app.db.database.DATABASE_URL", url)

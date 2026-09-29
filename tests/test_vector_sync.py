@@ -88,10 +88,13 @@ async def test_reconcile_backfills_missing_rows_and_tasks_deletes_orphans_and_re
     rows = [(ROW, {}), ("r-legacy", {"vector_ref": legacy_ref}), ("r-seeded", {}), ("r-missing", {})]
     points = [(ROW, {"memory_id": ROW}), (legacy_ref, {}), ("p-seeded", {"memory_id": "r-seeded"}), ("p-orphan", {})]
     ended = [
-        SimpleNamespace(id="t-indexed", goal="Compare visa rules", task_type="user"),
-        SimpleNamespace(id="t-ended", goal="summarize inbox", task_type="cron"),
-        SimpleNamespace(id="c1", goal="RMP CANARY: Reply with exactly CANARY_OK on its own line.", task_type="canary"),
-        SimpleNamespace(id="t-queued", goal="Draft the memo", task_type="user"),
+        SimpleNamespace(id="t-indexed", goal="Compare visa rules", task_type="user", supplementary_context=None),
+        SimpleNamespace(id="t-ended", goal="summarize inbox", task_type="cron", supplementary_context={}),
+        SimpleNamespace(id="c1", goal="RMP CANARY: Reply with exactly CANARY_OK on its own line.", task_type="canary",
+                        supplementary_context=None),
+        SimpleNamespace(id="t-queued", goal="Draft the memo", task_type="user", supplementary_context=None),
+        SimpleNamespace(id="t-placeholder", goal="Also give it in EUR.", task_type="user",
+                        supplementary_context={"intake_reserved": False, "closed_reason": "intake_placeholder"}),
     ]
     db = MagicMock()
     results = []
