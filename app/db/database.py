@@ -103,6 +103,8 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS ix_task_messages_slack_ts ON task_messages (slack_ts)",
     "CREATE INDEX IF NOT EXISTS ix_memory_items_content_fts ON memory_items USING gin (to_tsvector('simple', coalesce(content, '')))",
     "CREATE INDEX IF NOT EXISTS ix_vector_outbox_pending ON vector_outbox (next_attempt_at) WHERE done_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS ix_events_type_time ON events (event_type, occurred_at)",
+    "CREATE INDEX IF NOT EXISTS ix_events_entity_id ON events (entity_id)",
 ]
 
 

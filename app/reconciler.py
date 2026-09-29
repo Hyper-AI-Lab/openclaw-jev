@@ -12,6 +12,7 @@ from app.db.models import Event, ProcessRun, Task
 from app.llm.quota_broker import reap_stale_llm_slots_sync
 from app.metrics import inc as metrics_inc
 from app.notification_policy import is_internal_task
+from app.orchestrator.decision_engine import TERMINAL_STATUSES
 from app.production.alerting import send_alert
 
 logger = logging.getLogger("rmp.reconciler")
@@ -22,6 +23,22 @@ STUCK_REPAIR_MINUTES = 45
 # Recover completed OpenClaw replies quickly after worker crashes mid-notify.
 ORPHAN_REPLY_MIN_AGE_SEC = 90
 ORPHAN_REPLY_MAX_AGE_MINUTES = 30
+
+RUN_TERMINAL_STATES = (
+    "completed",
+    "failed_terminal",
+    "stopped_by_user",
+    "canceled",
+    "compensated",
+    "superseded",
+)
+RUN_STATE_FOR_TASK_STATUS = {
+    "completed": "completed",
+    "failed": "failed_terminal",
+    "cancelled": "canceled",
+    "stopped_by_user": "stopped_by_user",
+    "compensated": "compensated",
+}
 
 _temporal_client: Client | None = None
 
@@ -549,11 +566,14 @@ async def reconcile_once() -> dict:
             except Exception as e:
                 logger.warning("Could not signal stale task %s: %s", task.id, e)
 
+        closed = await close_runs_of_ended_tasks(db, now)
+        if closed:
+            stats["events"] += closed
+            stats["process_runs_closed"] = closed
+
         pr_result = await db.execute(
             select(ProcessRun).where(
-                ProcessRun.current_state.notin_(
-                    ("completed", "failed_terminal", "stopped_by_user", "canceled", "compensated")
-                ),
+                ProcessRun.current_state.notin_(RUN_TERMINAL_STATES),
                 ProcessRun.next_check_at < now,
             )
         )
@@ -566,16 +586,6 @@ async def reconcile_once() -> dict:
                     stats["re_signaled"] += 1
                 except Exception as e:
                     logger.debug("Process run signal failed: %s", e)
-            db.add(
-                Event(
-                    correlation_id=run.task_id,
-                    entity_type="process_run",
-                    entity_id=run.id,
-                    event_type="reconciler.process_check",
-                    event_payload={"state": run.current_state},
-                )
-            )
-            stats["events"] += 1
 
         await db.commit()
 
@@ -588,6 +598,35 @@ async def reconcile_once() -> dict:
     return stats
 
 
+async def close_runs_of_ended_tasks(db, now: datetime) -> int:
+    """A task can end on a path that never closes its process run."""
+    rows = await db.execute(
+        select(ProcessRun, Task.status)
+        .join(Task, Task.id == ProcessRun.task_id)
+        .where(
+            ProcessRun.current_state.notin_(RUN_TERMINAL_STATES),
+            Task.status.in_(TERMINAL_STATUSES),
+        )
+    )
+    closed = 0
+    for run, task_status in rows.all():
+        db.add(
+            Event(
+                correlation_id=run.task_id,
+                entity_type="process_run",
+                entity_id=run.id,
+                event_type="reconciler.process_run_closed",
+                event_payload={"state": run.current_state, "task_status": task_status},
+            )
+        )
+        run.current_state = RUN_STATE_FOR_TASK_STATUS[task_status]
+        run.ended_at = now
+        run.lease_owner = None
+        run.next_check_at = None
+        closed += 1
+    return closed
+
+
 async def reconciler_loop(stop_event: asyncio.Event):
     logger.info("Reconciler started (interval=%ss)", RECONCILE_INTERVAL_SEC)
     while not stop_event.is_set():
@@ -595,7 +634,12 @@ async def reconciler_loop(stop_event: asyncio.Event):
             stats = await reconcile_once()
             if stats.get("skipped"):
                 pass
-            elif stats.get("stale_tasks") or stats.get("re_signaled") or stats.get("repaired"):
+            elif (
+                stats.get("stale_tasks")
+                or stats.get("re_signaled")
+                or stats.get("repaired")
+                or stats.get("process_runs_closed")
+            ):
                 logger.info("Reconciler pass: %s", stats)
         except Exception as e:
             logger.exception("Reconciler error: %s", e)

@@ -203,6 +203,7 @@ async def test_reconciler_indexes_the_tasks_it_completes_after_commit():
          patch.object(reconciler, "AsyncSessionLocal") as session, \
          patch.object(reconciler, "_recover_orphaned_session_reply", side_effect=recover), \
          patch.object(reconciler, "_cleanup_orphan_plan_children", new_callable=AsyncMock, return_value=0), \
+         patch.object(reconciler, "close_runs_of_ended_tasks", new_callable=AsyncMock, return_value=0), \
          patch.object(reconciler, "_notify_repair", new_callable=AsyncMock), \
          patch("app.task_registry.hooks.index_terminal_task_async", index):
         session.return_value.__aenter__.return_value = db
