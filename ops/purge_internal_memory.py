@@ -4,7 +4,7 @@ Deletes user and procedural memory rows whose source task is internal, the regis
 internal tasks, and their vectors. Dry run by default; --apply deletes after writing a JSON backup
 of every row it removes to $RMP_DATA_DIR/backups/.
 
-    venv/bin/python ops/purge_internal_memory.py [--apply]
+    venv/bin/python -m ops.purge_internal_memory [--apply]
 """
 from __future__ import annotations
 
@@ -46,6 +46,37 @@ async def _collect():
     return internal, items, entries
 
 
+def _sweep_shared_canary_vectors(apply: bool) -> int:
+    """User/procedural points whose text is canary output, including ones no row references."""
+    from qdrant_client.http import models as rest
+
+    from app.config import get_vector_memory_config
+    from app.task_registry.vector_store import _get_qdrant_client
+
+    client = _get_qdrant_client()
+    collection = get_vector_memory_config().get("collection_name")
+    doomed, offset = [], None
+    while True:
+        points, offset = client.scroll(collection, limit=512, offset=offset, with_payload=True, with_vectors=False)
+        for point in points:
+            payload = point.payload or {}
+            text = str(payload.get("data") or "")
+            if payload.get("scope_type") in ("user", "procedural") and (
+                "CANARY" in text.upper() or "Cushy Gloom" in text
+            ):
+                doomed.append(point.id)
+        if offset is None:
+            break
+    if apply:
+        for start in range(0, len(doomed), 256):
+            client.delete(
+                collection_name=collection,
+                points_selector=rest.PointIdsList(points=doomed[start:start + 256]),
+                wait=True,
+            )
+    return len(doomed)
+
+
 def _delete_vectors(items, entries) -> tuple[int, int]:
     from qdrant_client.http import models as rest
 
@@ -79,8 +110,12 @@ async def main(apply: bool) -> None:
     print(f"internal tasks: {len(internal)}")
     print(f"memory rows to delete: {len(items)} {by_scope}")
     print(f"registry entries to delete: {len(entries)}")
+    swept = await asyncio.to_thread(_sweep_shared_canary_vectors, apply)
+    print(f"shared canary vectors {'deleted' if apply else 'to delete'}: {swept}")
     if not apply:
         print("dry run: nothing deleted (use --apply)")
+        return
+    if not items and not entries:
         return
 
     backup_dir = os.path.join(RMP_DATA_DIR, "backups")
