@@ -1,14 +1,15 @@
 """GenericTaskWorkflow conversational path is still RMP-owned and always gated."""
 import inspect
 
-from app.workflows import generic_execute_child, generic_task
+from app.workflows import generic_execute_child, generic_task, judgment
 
 
 def test_quality_gate_runs_before_slack_on_generic_complete():
     source = inspect.getsource(generic_task.GenericTaskWorkflow._judge_and_deliver)
     assert "await self._judge(" in source
-    assert "notify_slack_user" in source
-    assert source.find("await self._judge(") < source.rfind("notify_slack_user")
+    assert "await self._deliver_final(" in source
+    assert source.find("await self._judge(") < source.rfind("await self._deliver_final(")
+    assert "notify_slack_user" in inspect.getsource(judgment.EvaluatorRetry._deliver_final)
     assert "verify_response_quality" in inspect.getsource(generic_task.GenericTaskWorkflow._judge)
 
 

@@ -43,7 +43,7 @@ with workflow.unsafe.imports_passed_through():
         build_strategy_change_prompt,
         next_loop_action,
     )
-    from app.orchestrator.decision_engine import decide_completion_gate
+    from app.orchestrator.decision_engine import SLACK_DELIVERY_FAILED, decide_completion_gate
     from app.orchestrator.step_predicates import extract_agent_facts
     from app.workflows.catalog import get_template, normalize_catalog_type
     from app.notification_policy import format_workflow_error, is_silent_system_ack, sanitize_user_facing_text
@@ -906,8 +906,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 )
 
             summary = clean_result
-            await workflow.execute_activity(
-                notify_slack_user,
+            delivered = await self._deliver_final(
                 {
                     "session_key": session_key,
                     "task_id": task_id,
@@ -915,9 +914,10 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     "task_type": payload.get("task_type", ""),
                     "tags": payload.get("tags") or [],
                     "message": summary,
-                },
-                start_to_close_timeout=timedelta(seconds=30),
+                }
             )
+            if not delivered:
+                return {"status": "failed", "task_id": task_id, "reason": SLACK_DELIVERY_FAILED}
             return await self._finish_durable_catalog(
                 payload,
                 user_intent,

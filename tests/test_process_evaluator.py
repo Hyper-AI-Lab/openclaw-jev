@@ -73,7 +73,7 @@ def test_conversational_no_longer_bypasses_quality_gate():
     assert "await self._judge(" in source
     assert "internal = is_internal_task(user_intent, task_type, tags)" in source
     verify_pos = source.find("await self._judge(")
-    notify_complete = source.find("notify_slack_user", verify_pos)
+    notify_complete = source.find("await self._deliver_final(", verify_pos)
     assert notify_complete != -1
     assert verify_pos < notify_complete
 

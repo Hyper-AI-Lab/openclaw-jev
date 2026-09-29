@@ -5,7 +5,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
 from temporalio import activity
@@ -42,6 +42,8 @@ from app.telemetry import traced_activity
 
 # Only these stop reasons indicate a final assistant turn worth evaluating.
 TERMINAL_STOP_REASONS = frozenset({"stop", "error", "maxTokens"})
+# notify_slack_user outcomes: sent; not sent by policy or config; refused by Slack for good.
+SLACK_DELIVERED, SLACK_SUPPRESSED, SLACK_REFUSED = "delivered", "suppressed", "refused"
 # OpenClaw/Kimi use "toolUse"; older transcripts may say "toolCalls".
 NON_TERMINAL_STOP_REASONS = frozenset({"toolCalls", "toolUse"})
 # Left of an activity's start-to-close budget for parsing and persisting after the LLM turn.
@@ -675,15 +677,16 @@ async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"result": {"payloads": [{"text": text_content}]}}
 
 
+# Union: histories recorded before Sep 30 2026 hold booleans, and replays decode them through this hint.
 @traced_activity("slack.notify")
-async def notify_slack_user(payload: Dict[str, Any]) -> bool:
+async def notify_slack_user(payload: Dict[str, Any]) -> Union[bool, str]:
     from app.activities.side_effects import send_slack_message_idempotent
     from app.db.database import AsyncSessionLocal
     from app.db.models import Task
 
     if should_suspend_slack():
         activity.logger.info("Slack delivery suppressed (development_mode)")
-        return False
+        return SLACK_SUPPRESSED
 
     session_key = payload.get("session_key", "agent:main:main")
     message = payload.get("message", "")
@@ -704,13 +707,13 @@ async def notify_slack_user(payload: Dict[str, Any]) -> bool:
 
     clean = _clean_slack_text(message)
     if not clean:
-        return False
+        return SLACK_SUPPRESSED
 
     if not should_deliver_slack(intent, task_type, tags, clean):
         activity.logger.info(
             "Slack delivery suppressed (internal/system): task=%s", task_id
         )
-        return False
+        return SLACK_SUPPRESSED
 
     bot_token = get_slack_bot_token()
     user_id = _get_slack_user_id(session_key)
@@ -719,14 +722,15 @@ async def notify_slack_user(payload: Dict[str, Any]) -> bool:
         activity.logger.warning(
             "Slack delivery skipped: token=%s user=%s", bool(bot_token), bool(user_id)
         )
-        return False
+        return SLACK_SUPPRESSED
 
-    return await send_slack_message_idempotent(
+    delivered = await send_slack_message_idempotent(
         task_id=task_id,
         user_id=user_id,
         message=clean,
         bot_token=bot_token,
     )
+    return SLACK_DELIVERED if delivered else SLACK_REFUSED
 
 
 @traced_activity("openclaw.validate_output")

@@ -8,6 +8,8 @@ TERMINAL_STATUSES = frozenset(
 )
 # closed_reason of a request's intake reservation once intake handled the message elsewhere.
 INTAKE_PLACEHOLDER = "intake_placeholder"
+# closed_reason of a task whose accepted reply Slack refused for good.
+SLACK_DELIVERY_FAILED = "slack_delivery_failed"
 RETRYABLE_STATUSES = frozenset({"pending", "needs_replan"})
 
 

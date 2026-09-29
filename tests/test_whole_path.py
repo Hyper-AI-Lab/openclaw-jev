@@ -338,14 +338,18 @@ async def test_a_long_answer_reaches_slack_in_ordered_parts_with_one_ledger_row(
     assert receipts == {"slack": 1, "slack.part": len(h.slack)}
 
 
-async def test_a_permanent_slack_error_is_recorded_once_and_not_retried(h, monkeypatch):
+async def test_a_permanent_slack_error_is_recorded_once_and_fails_the_task_with_that_reason(h, monkeypatch):
     h.slack_error = "channel_not_found"
     h.intake = [{"decision": "create_fresh"}]
     h.drafts = ["Hello, the heater in my flat stopped working on Monday. Could you send someone this week?"]
 
     tid = (await h.send("Draft a note to my landlord about the heater.", "1790000006.000100"))["task_id"]
-    await h.finish(tid)
+    result = await h.finish(tid)
 
+    assert (result["status"], result["reason"]) == ("failed", "slack_delivery_failed")
+    task, run = await h.task(tid), (await h.rows(ProcessRun, ProcessRun.task_id == tid))[0]
+    assert (task.status, task.supplementary_context["closed_reason"]) == ("failed", "slack_delivery_failed")
+    assert run.current_state == "failed_terminal"
     assert len(h.slack) == 1
     failures = await h.rows(Event, Event.event_type == "slack.delivery_failed")
     assert [(e.entity_id, e.event_payload["error"]) for e in failures] == [(tid, "channel_not_found")]

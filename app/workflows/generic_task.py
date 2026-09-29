@@ -30,7 +30,7 @@ with workflow.unsafe.imports_passed_through():
         ensure_brief_header,
         format_user_catchup,
     )
-    from app.orchestrator.decision_engine import decide_completion_gate
+    from app.orchestrator.decision_engine import SLACK_DELIVERY_FAILED, decide_completion_gate
     from app.orchestrator.completion_rework import (
         build_escalation_message,
         build_rework_prompt,
@@ -290,6 +290,9 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 return {"status": "compensated", "task_id": task_id, "reason": err_text}
 
         if isinstance(result, dict) and result.get("status") in ("compensated", "failed"):
+            # Slack refusing the reply for good is recorded and alerted; a notice would be refused too.
+            if result.get("reason") == SLACK_DELIVERY_FAILED:
+                return result
             if not result.get("user_notified") and not is_internal_task(
                 user_intent,
                 payload.get("task_type", "generic"),
@@ -618,9 +621,9 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
             )
             attempt += 1
 
+        delivered = True
         if not internal:
-            await workflow.execute_activity(
-                notify_slack_user,
+            delivered = await self._deliver_final(
                 {
                     "session_key": session_key,
                     "task_id": task_id,
@@ -628,8 +631,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     "task_type": task_type,
                     "tags": tags,
                     "message": clean_result,
-                },
-                start_to_close_timeout=timedelta(seconds=30),
+                }
             )
             if write_episodic:
                 # Conversational steps defer their episodic write to here, after Slack.
@@ -643,20 +645,21 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     start_to_close_timeout=timedelta(seconds=90),
                     retry_policy=RetryPolicy(maximum_attempts=1),
                 )
-        await workflow.execute_activity(
-            update_process_state,
-            {
-                "process_run_id": self.process_run_id,
-                "state": "completed",
-                "ended": True,
-            },
-            start_to_close_timeout=timedelta(seconds=10),
-        )
-        await workflow.execute_activity(
-            update_task_status,
-            {"task_id": task_id, "status": "completed"},
-            start_to_close_timeout=timedelta(seconds=10),
-        )
+        if delivered:
+            await workflow.execute_activity(
+                update_process_state,
+                {
+                    "process_run_id": self.process_run_id,
+                    "state": "completed",
+                    "ended": True,
+                },
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            await workflow.execute_activity(
+                update_task_status,
+                {"task_id": task_id, "status": "completed"},
+                start_to_close_timeout=timedelta(seconds=10),
+            )
         await workflow.execute_activity(
             promote_completion_memory,
             {
@@ -668,6 +671,8 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
             start_to_close_timeout=timedelta(seconds=30),
         )
         await self._resubmit_leftovers(task_id, session_key)
+        if not delivered:
+            return {"status": "failed", "task_id": task_id, "final_result": clean_result, "reason": SLACK_DELIVERY_FAILED}
         return {"status": "completed", "task_id": task_id, "final_result": clean_result}
 
     async def _escalate(

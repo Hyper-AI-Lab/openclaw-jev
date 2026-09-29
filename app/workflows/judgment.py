@@ -9,8 +9,9 @@ from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from app.activities.db_activities import finalize_task_failure, record_event
-    from app.activities.openclaw_activities import notify_slack_user, verify_response_quality
+    from app.activities.openclaw_activities import SLACK_REFUSED, notify_slack_user, verify_response_quality
     from app.notification_policy import is_internal_task
+    from app.orchestrator.decision_engine import SLACK_DELIVERY_FAILED
     from app.task_registry.stop_command import is_whole_message_stop
 
 # Waits between evaluator attempts that produced no verdict: about two hours in all.
@@ -27,6 +28,26 @@ class EvaluatorRetry:
 
     def _stop_requested(self) -> bool:
         return self._cancel_requested or any(is_whole_message_stop(str(m)) for m in self.user_inputs)
+
+    async def _deliver_final(self, notify_payload: Dict[str, Any]) -> bool:
+        """Post the accepted reply. False when Slack refused it for good; the task has then failed."""
+        outcome = await workflow.execute_activity(
+            notify_slack_user, notify_payload, start_to_close_timeout=timedelta(seconds=30)
+        )
+        if outcome != SLACK_REFUSED:
+            return True
+        await workflow.execute_activity(
+            finalize_task_failure,
+            {
+                "task_id": notify_payload["task_id"],
+                "process_run_id": self.process_run_id,
+                "task_status": "failed",
+                "process_state": "failed_terminal",
+                "closed_reason": SLACK_DELIVERY_FAILED,
+            },
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+        return False
 
     async def _judge(
         self,

@@ -238,6 +238,11 @@ async def finalize_task_failure(payload: Dict[str, Any]) -> bool:
             if task:
                 task.status = payload.get("task_status", "failed")
                 task.next_check_at = None
+                if payload.get("closed_reason"):
+                    task.supplementary_context = {
+                        **(task.supplementary_context or {}),
+                        "closed_reason": payload["closed_reason"],
+                    }
         if process_run_id:
             pr = await db.execute(
                 select(ProcessRun).where(ProcessRun.id == process_run_id)

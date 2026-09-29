@@ -19,7 +19,8 @@ async def _signal_own_workflow(message: str) -> None:
 
 class Recorder:
     def __init__(self, verdicts: List[str], reworks: List[str], signals_during_judging=(), signal_on_completed=None,
-                 signals_during_rework=()):
+                 signals_during_rework=(), slack_result: Any = "delivered"):
+        self.slack_result = slack_result
         self.verdicts = list(verdicts)
         self.reworks = list(reworks)
         self.slack: List[str] = []
@@ -95,9 +96,9 @@ class Recorder:
             return {"result": {"payloads": [{"text": text}]}}
 
         @activity.defn(name="notify_slack_user")
-        async def notify_slack_user(payload: Dict[str, Any]) -> bool:
+        async def notify_slack_user(payload: Dict[str, Any]) -> Any:
             rec.slack.append(payload["message"])
-            return True
+            return rec.slack_result
 
         return [ensure_process_run, record_event, update_task_status, update_process_state,
                 promote_completion_memory, finalize_task_failure, execute_compensation,
@@ -123,6 +124,11 @@ async def test_a_recovered_draft_is_judged_before_it_is_delivered():
     assert result["status"] == "completed"
     assert rec.judged == ["Pack layers and a light rain jacket."]
     assert rec.slack == ["Pack layers and a light rain jacket."]
+
+
+async def test_a_delivery_result_recorded_as_a_boolean_before_sep_30_still_decodes():
+    rec = Recorder(verdicts=["accept"], reworks=[], slack_result=True)
+    assert (await _run(rec))["status"] == "completed"
 
 
 async def test_a_rejected_draft_is_reworked_and_only_the_accepted_rework_is_sent():
