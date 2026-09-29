@@ -187,3 +187,26 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - Tests with a mocked Slack API: splitting keeps all text and breaks at paragraphs; 503 → internal_error → ok delivers with one ledger entry; three 503s raise `SlackTransientError` with no ledger entry; 429 with `Retry-After: 7` waits 7 s; `channel_not_found` is not retried, is recorded and alerted; a 9,000-character reply goes out as 3 ordered parts, and after a failure on part 2 the retry sends only parts 2–3, with one full-text ledger row.
 - Full suite 548 passed, 3 skipped; undefined-name check 0.
 - Live after reload (19:45): Slack `auth.test` ok; health canary `CANARY OK`. A long user-visible reply is part of the Step 12 acceptance DMs.
+
+---
+
+## Step 8 — Ingress identity, threads, attachments, origins (A1, A2, A3, A8, A12, A13)
+
+**Date:** 2026-09-29 (19:47–20:06 CEST)
+
+**What changed:**
+
+- Plugin (`plugins/rmp_adapter/index.js`): every hook builds one inbound record from OpenClaw's event (text, Slack `messageId`, `threadId`, reply-to id/body/sender, attachments with path, type and name). Intake idempotency and the plugin's 30 s claim window key on the Slack message id (text only when Slack gave none), so two separate "ok" messages are two tasks while one message seen by two hooks is one. Attachment-only DMs are claimed and routed; attachments are appended to the text as an `[Attachments]` block Aura can open. `rmpFetch` errors read `HTTP 502: {…}` (the `[object Object]` came from FastAPI's object `detail`); route errors log message and stack.
+- API: `POST /tasks` accepts `slack_message_id`, `thread_id`, `reply_to`, `attachments`; the task keeps them in `supplementary_context.slack`; user messages record `task_messages.slack_ts`. Delivery records the Slack ts of every part Aura posts (part receipts, the whole-reply receipt and `task_messages.slack_ts`).
+- Intake: `task_for_slack_message` maps a replied-to (or thread-parent) ts to its task; `assemble_intake_context` adds `reply_to` (quoted text + task) and puts a finished replied-to task among the candidates; the LLM prompt and Jev (`state.replied_to` with its R/F alias) treat it as strong evidence; the intake cache key includes the replied-to id.
+- Policy: cron and other scheduled origins never get a clarify (`non_interactive_no_clarify` → create_fresh).
+- `app/cron/reconciler.py` reads OpenClaw 2026.9's `state/openclaw.sqlite` `cron_jobs` (falls back to `jobs.json` on older installs).
+- Migration (approved): `task_messages.slack_ts` + index via `ops/migrate_task_registry_schema.sh`, applied before the code.
+
+**Correction to A13:** the two cron jobs with `delivery: null` are OpenClaw's own declared jobs (heartbeat, disabled; weekly skill review, never requests delivery). All agent-turn jobs already use `delivery: none`, so nothing to change there.
+
+**Verification:**
+
+- Node tests (15): identical texts with different Slack ids → two POSTs with id-based keys, and the second hook does not re-post the same id; attachment-only DM claimed with the file in text and payload; reply-to and thread ids forwarded; structured 502 logged readably, never `[object Object]`; the live plugin copy matches the repo.
+- Python tests: Slack context stored; ts → task through Kirill's messages or Aura's reply parts; a reply to a finished task makes it candidate F1 and Jev's `replied_to` names it; cron clarify → create_fresh while user clarify stays; cron jobs read from a state database; the intake cache separates identical texts replying to different messages; delivery records the Slack ts. Full suite 554 passed, 3 skipped; undefined-name check 0.
+- Live: migration applied (`slack_ts` present); API/worker reloaded 20:01; plugin copied (cmp identical), gateway healthy after 50 s, plugin registered; health canary `CANARY OK`; cron reader: 4 jobs from the state database, no read warnings since reload, snapshots written. Replies, threads and attachments from Kirill are part of the Step 12 acceptance DMs.
