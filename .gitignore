@@ -1,5 +1,6 @@
 # Secrets & local runtime
 settings.json
+settings.json.lock
 *.env
 .env.*
 /etc/

@@ -1578,7 +1578,7 @@ async def dashboard_data(db: AsyncSession = Depends(get_db)):
         },
         "model": _read_current_model(),
         "model_catalog": MODEL_CATALOG,
-        "settings": load_settings(),
+        "settings": _without_secrets(load_settings()),
         "workflow_catalog": list_catalog(),
         "vector_memory": await MemoryRouter.vector_status(),
         "telemetry": telemetry_status(),
