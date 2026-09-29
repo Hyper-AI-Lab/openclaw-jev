@@ -40,3 +40,18 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - The Responses API path sends `store: true`: OpenAI keeps response objects (prompts and replies) for its retention window, which Chat Completions did not. OpenClaw uses the stored reasoning items across turns. Open item for the audit plan.
 - OpenClaw 2026.9.6 (2026-09-23) supports GPT-6 natively. Upgrading would retire Patch 6e. Open item for the audit plan.
 - Scratch sessions left in the OpenClaw store: `rmp_task_lunacheck_*`, `rmp_task_lunaeffort_*`, `rmp_verify_lunacheck_*` (no RMP task rows, `deliver: false`).
+
+---
+
+## Audit (read-only) — findings that define Steps 2–12
+
+**Date:** 2026-09-29. **Method:** 30 days of Postgres rows, OpenClaw transcripts, service, canary and plugin logs, code, and web research for the fix designs (Temporal message handling, Slack message identity, agent-as-a-judge trajectory evaluation, Postgres→Qdrant outbox). Grok subagents were unavailable (provider usage limit until 2026-10-01 00:00 UTC), so the audit was done directly.
+
+**Plan:** `/root/.cursor/plans/system_audit_hardening.plan.md`, with the evidence for each finding.
+
+- P0: settings rewritten on every read, non-atomically; a race deleted the `jev` section today, so Jev intake and promotion are silently off (D1). The reconciler delivers unjudged replies (10 of 23 user deliveries in 30 days) and can kill live workflows (B1). Attached messages that arrive during the last step, evaluation or rework are never addressed (B3). Canary replies are stored as user facts and appear in every user-task prompt (C1).
+- P1: last rework draft delivered unjudged if limits are misconfigured (B4); evaluator blind to Aura's actions (B9); evaluator outages rework Aura (B5); Slack failures lose replies (B6); replies truncated (B7); text-hash dedupe swallows new identical DMs (A1); thread/reply context dropped (A2); attachment-only DMs dropped (A3); cron can clarify (A12); no Postgres↔Qdrant reconciliation, 432 rows unindexed (C3); API key in a world-readable log (A7); raw replies as "procedural" memory (C2); no monitor for any of this (M1); no real workflow tests (T1).
+- P2: `[object Object]` errors, timeout statuses, stale cron path, strategy-change cadence, stray `.bak`, model catalog (A8, A11, A13, B8, A4, A5).
+- Healthy: every DM claimed; Sep 27 self-attach fixed same day; Jev-era decisions sensible; related-task context; suppressed deliveries all canaries; no Slack API errors; catalog gate sound; canaries 24/24 per day since Sep 16.
+
+**Kirill's decisions (2026-09-29):** plan approved, execute Steps 2–12 in order; attach a message to every running task it clearly relates to; turn OpenAI response storage off if OpenClaw can carry reasoning without it (verify first); approved: rotate the RMP API key and purge the old plugin log, delete canary-derived memory rows and vectors, add DB tables/columns, retire the three legacy Qdrant collections after verification, restore the `jev` section.
