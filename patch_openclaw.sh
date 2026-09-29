@@ -29,7 +29,7 @@ fi
 mapfile -t CANDIDATES < <(
   if command -v rg >/dev/null 2>&1; then
     rg -l --glob '*.js' \
-      'hasHooks\("before_message_write"\)|filterBootstrapFilesForSession|runSubagentAnnounceFlow|async function deliverReplies|fallbackConfigured = false && hasConfiguredModelFallbacks|function normalizeAgentPayload|allowUnsafeExternalContent: value\.allowUnsafeExternalContent|DEFAULT_LLM_IDLE_TIMEOUT_MS|scanCanonicalSqliteSessionEntries|function parseSqliteSessionEntryRecord|status === 410|cleanedWorkspaceRoots' \
+      'hasHooks\("before_message_write"\)|filterBootstrapFilesForSession|runSubagentAnnounceFlow|async function deliverReplies|fallbackConfigured = false && hasConfiguredModelFallbacks|function normalizeAgentPayload|allowUnsafeExternalContent: value\.allowUnsafeExternalContent|DEFAULT_LLM_IDLE_TIMEOUT_MS|scanCanonicalSqliteSessionEntries|function parseSqliteSessionEntryRecord|status === 410|cleanedWorkspaceRoots|function buildOpenAIThinkingProfile' \
       "$DIST_DIR" 2>/dev/null || true
   else
     find "$DIST_DIR" -name '*.js'
@@ -337,6 +337,36 @@ PY
         fi
     fi
 
+    # Patch 6e: OpenClaw 2026.9.1 offers "max" only to gpt-5.6* and ignores declared
+    # efforts outside the codex runtime, so a gpt-6-luna session clamped max to high.
+    # Backport 2026.9.6's GPT-6 branch: levels come from the declared efforts. Releases
+    # that already know GPT-6 (OPENAI_GPT_6_MODEL_IDS) are left alone.
+    if grep -q 'function buildOpenAIThinkingProfile(params) {' "$f" 2>/dev/null \
+       && ! grep -qE 'RMP_GPT6_THINKING_BACKPORT|OPENAI_GPT_6_MODEL_IDS' "$f" 2>/dev/null; then
+        python3 - "$f" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+if "RMP_GPT6_THINKING_BACKPORT" in text or "OPENAI_GPT_6_MODEL_IDS" in text:
+    raise SystemExit(0)
+old = "\tconst codexEfforts = params.compat?.supportedReasoningEfforts?.map(normalizeLowercaseStringOrEmpty);\n"
+new = old + (
+    "\tif (/^gpt-6(?:-|$)/u.test(modelId)) { /* RMP_GPT6_THINKING_BACKPORT */\n"
+    "\t\tconst rmpGpt6Efforts = codexEfforts?.length ? codexEfforts : [\"none\", \"low\", \"medium\", \"high\", \"xhigh\", \"max\"];\n"
+    "\t\treturn { levels: buildCodexLevels(rmpGpt6Efforts), ...rmpGpt6Efforts.includes(\"medium\") ? { defaultLevel: \"medium\" } : {} };\n"
+    "\t}\n"
+)
+if text.count(old) != 1:
+    print("skip gpt6-thinking-backport (dist shape changed)")
+    raise SystemExit(0)
+path.write_text(text.replace(old, new, 1))
+print("patched-gpt6-thinking-backport")
+PY
+        if grep -q 'RMP_GPT6_THINKING_BACKPORT' "$f" 2>/dev/null; then
+            applied="${applied} gpt6-thinking-backport"
+        fi
+    fi
+
     # Patch 7: 2026.9 session_nodes.entry_valid=0/-1 rows fail-closed the entire
     # store (every /hooks/agent). Keep placeholders skippable and allow parseable
     # pending rows through the canonical scan.
@@ -474,6 +504,7 @@ require_marker 'RMP_FORCE_ALLOW_UNSAFE' 'allow-unsafe-rmp-force'
 require_marker 'RMP_LLM_IDLE_5S' 'llm-idle-5s'
 require_marker 'RMP_OPENAI_FIRST_BYTE_20S' 'openai-first-byte-20s'
 require_marker 'RMP_OPENAI_MAX_EFFORT_120S' 'openai-max-effort-120s'
+require_marker 'RMP_GPT6_THINKING_BACKPORT|OPENAI_GPT_6_MODEL_IDS' 'gpt6-thinking-levels'
 require_marker 'RMP_410_SKIP' '410-skip-model-not-found'
 require_marker 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
 require_marker 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'

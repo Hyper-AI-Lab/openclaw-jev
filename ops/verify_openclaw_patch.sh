@@ -48,6 +48,7 @@ check_present 'RMP_ALLOW_UNSAFE_EXTERNAL|RMP_FORCE_ALLOW_UNSAFE' 'allowUnsafeExt
 check_present 'RMP_LLM_IDLE_5S' 'llm-idle-5s'
 check_present 'RMP_OPENAI_FIRST_BYTE_20S' 'openai-first-byte-20s'
 check_present 'RMP_OPENAI_MAX_EFFORT_120S' 'openai-max-effort-120s'
+check_present 'RMP_GPT6_THINKING_BACKPORT|OPENAI_GPT_6_MODEL_IDS' 'gpt6-thinking-levels'
 check_present 'RMP_410_SKIP' '410-skip-model-not-found'
 check_present 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
 check_present 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'

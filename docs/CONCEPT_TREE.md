@@ -206,7 +206,7 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 | Primary | `openai/gpt-6-luna` (`api: openai-responses`, `agentRuntime.id: openclaw`). Chat Completions rejects function tools with any reasoning effort on this model and has no `max`. |
 | Fallbacks | `nvidia/openai/gpt-oss-20b`: NVIDIA auth with key rotation, despite the `openai/` model id. No GLM, DeepSeek or MiniMax (all HTTP 410). No Gemini unless configured. |
 | Subagents / Process Evaluator | `openai/gpt-6-luna` (`agents.defaults.subagents.model`). |
-| Thinking | `max` for Aura's user-task runs (RMP passes it per run); `medium` default (`agents.defaults.thinkingDefault`) for intake, the Process Evaluator, canaries and the rest. |
+| Thinking | `max` for Aura's user-task runs (RMP passes it per run); `medium` default (`agents.defaults.thinkingDefault`) for intake, the Process Evaluator, canaries and the rest. OpenClaw 2026.9.1 needs `RMP_GPT6_THINKING_BACKPORT` to offer `max` to gpt-6-luna. |
 | Idle | ~5s then rotate. Do not restore 120s globally. First byte: OpenAI 20s (`RMP_OPENAI_FIRST_BYTE_20S`, stream creation, first chunk and the provider's first-event guard); NVIDIA 5s, where key rotation exists. Gaps between chunks: 5s for all. Exception: OpenAI calls at thinking `max` get 120s for the first byte and 30s between chunks (`RMP_OPENAI_MAX_EFFORT_120S`); gpt-6-luna at max sent nothing for 69s on one probe. |
 | HTTP 410 | Skip to next model. |
 | 429 | Rotate NVIDIA keys; wait on true quota after rotation; do not hop providers for 429. |
