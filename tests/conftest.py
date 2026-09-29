@@ -13,7 +13,11 @@ if "RMP_SETTINGS_PATH" not in os.environ:
     os.environ["RMP_ROOT"] = str(Path(__file__).resolve().parents[1])
     os.environ["RMP_DATA_DIR"] = str(_root / "data")
     os.environ["RMP_SETTINGS_PATH"] = str(_root / "settings.json")
-    os.environ.setdefault("DATABASE_URL", f"sqlite+aiosqlite:///{_root / 'unmocked.db'}")
     for sub in ("agents/main/agent", "agents/main/sessions", "workspace", "cron"):
         (_root / "openclaw" / sub).mkdir(parents=True, exist_ok=True)
     (_root / "data").mkdir(parents=True, exist_ok=True)
+
+# The app's default URL, and the one /etc/rmp/rmp.env exports, is the live database on this host.
+os.environ["DATABASE_URL"] = (
+    f"sqlite+aiosqlite:///{Path(tempfile.mkdtemp(prefix='rmp-tests-db-')) / 'unmocked.db'}"
+)
