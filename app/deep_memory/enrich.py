@@ -135,16 +135,21 @@ async def _enrich_section(
     headers: Dict[str, str] = {}
     for start in range(0, len(chunks), CHUNKS_PER_CALL):
         batch = list(chunks[start:start + CHUNKS_PER_CALL])
-        result = await structured_call(
-            SectionEnrichment,
-            purpose="deep_memory.section",
-            instructions=SECTION_INSTRUCTIONS,
-            input_text=_section_input(doc, task, sections, section, batch),
-            priority="enrich",
-            max_output_tokens=8000,
-        )
-        given = {c.chunk: " ".join(c.context.split()) for c in result.value.contexts if c.context.strip()}
-        if set(given) != set(range(len(batch))):
+        for attempt in (1, 2):
+            result = await structured_call(
+                SectionEnrichment,
+                purpose="deep_memory.section",
+                instructions=SECTION_INSTRUCTIONS,
+                input_text=_section_input(doc, task, sections, section, batch),
+                priority="enrich",
+                max_output_tokens=8000,
+            )
+            given = {c.chunk: " ".join(c.context.split()) for c in result.value.contexts if c.context.strip()}
+            if set(given) == set(range(len(batch))):
+                break
+            logger.warning("Section %s got contexts for %s of %d chunks (attempt %d)",
+                           section.id, sorted(given), len(batch), attempt)
+        else:
             raise ValueError(f"section {section.id} got contexts for {sorted(given)} of {len(batch)} chunks")
         headers.update({chunk.id: given[n] for n, chunk in enumerate(batch)})
         summaries.append(" ".join(result.value.summary.split()))

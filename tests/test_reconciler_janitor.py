@@ -55,6 +55,66 @@ async def test_cleanup_orphan_plan_children():
 
 
 @pytest.mark.asyncio
+async def test_a_running_deep_recall_of_a_terminal_task_is_cleaned_up():
+    from types import SimpleNamespace
+
+    from temporalio.client import WorkflowExecutionStatus
+
+    async def no_plan_children(*args, **kwargs):
+        return
+        yield
+
+    client = MagicMock()
+    client.list_workflows = no_plan_children
+    client.get_workflow_handle.return_value.describe = AsyncMock(
+        return_value=SimpleNamespace(status=WorkflowExecutionStatus.RUNNING)
+    )
+    with patch("app.reconciler._terminate_workflow", new_callable=AsyncMock, return_value=True) as term:
+        assert await _cleanup_orphan_plan_children(client, "task-1") == 1
+    assert term.await_args.args[1] == "task-1-recall"
+
+
+@pytest.mark.asyncio
+async def test_the_janitor_reads_the_task_of_a_deep_recall(monkeypatch):
+    import importlib.util
+    from datetime import timezone
+
+    from app.config import RMP_ROOT
+
+    spec = importlib.util.spec_from_file_location("workflow_janitor", os.path.join(RMP_ROOT, "ops", "workflow_janitor.py"))
+    janitor_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(janitor_mod)
+    old = datetime.now(timezone.utc) - timedelta(hours=30)
+    live, done = MagicMock(id="t-live-recall", start_time=old), MagicMock(id="t-done-recall", start_time=old)
+
+    async def fake_list(*args, **kwargs):
+        yield live
+        yield done
+
+    client = MagicMock()
+    client.list_workflows = fake_list
+    client.get_workflow_handle.return_value.terminate = AsyncMock()
+    looked_up = []
+
+    async def execute(query):
+        task_id = query.compile().params["id_1"]
+        looked_up.append(task_id)
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = MagicMock(status="running" if task_id == "t-live" else "completed")
+        return result
+
+    with patch.object(janitor_mod, "Client") as mock_client_cls:
+        mock_client_cls.connect = AsyncMock(return_value=client)
+        with patch.object(janitor_mod, "AsyncSessionLocal") as mock_session:
+            db = AsyncMock()
+            db.execute = execute
+            mock_session.return_value.__aenter__.return_value = db
+            stats = await janitor_mod.janitor_once(max_age_hours=24)
+    assert looked_up == ["t-live", "t-done"] and stats["terminated"] == 1
+    client.get_workflow_handle.assert_called_with("t-done-recall")
+
+
+@pytest.mark.asyncio
 async def test_count_stuck_created_task_workflows():
     wf = MagicMock()
     wf.id = "workflow-stuck-created"
@@ -108,6 +168,32 @@ async def test_count_stuck_running_workflows():
             db.execute = AsyncMock(return_value=result)
             count = await count_stuck_running_workflows()
     assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_deep_recall_counts_as_stuck_only_once_its_task_has_ended():
+    async def fake_list(*args, **kwargs):
+        yield MagicMock(id="t-done-recall")
+        yield MagicMock(id="t-busy-recall")
+
+    client = MagicMock()
+    client.list_workflows = fake_list
+    stale = datetime.utcnow() - timedelta(minutes=50)
+
+    async def execute(query):
+        task_id = query.compile().params["id_1"]
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = MagicMock(
+            status="completed" if task_id == "t-done" else "running", updated_at=stale
+        )
+        return result
+
+    with patch("app.reconciler._get_temporal", new_callable=AsyncMock, return_value=client):
+        with patch("app.reconciler.AsyncSessionLocal") as mock_session:
+            db = AsyncMock()
+            db.execute = execute
+            mock_session.return_value.__aenter__.return_value = db
+            assert await count_stuck_running_workflows() == 1
 
 
 @pytest.mark.asyncio

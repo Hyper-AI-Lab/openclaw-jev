@@ -53,6 +53,8 @@ async def purge_running(
             task_id = None
         elif "-plan-" in wf.id:
             task_id = wf.id.split("-plan-", 1)[0]
+        elif wf.id.endswith("-recall"):
+            task_id = wf.id.removesuffix("-recall")
 
         terminate = force_recovery
         if not terminate:

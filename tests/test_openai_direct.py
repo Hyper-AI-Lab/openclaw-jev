@@ -46,13 +46,21 @@ def _event(name, payload):
     return f"event: {name}\ndata: {json.dumps(payload)}\n\n".encode()
 
 
-def openai_stream(text, *, delay_before_output=0.0, gap=0.0, usage=None):
+def openai_stream(text, *, delay_before_output=0.0, gap=0.0, usage=None, reasoning=None):
     usage = usage or {"input_tokens": 120, "input_tokens_details": {"cached_tokens": 20}, "output_tokens": 40}
     chunks = [
         (0.0, _event("response.created", {"type": "response.created", "response": {"id": "r1"}})),
         (0.0, _event("response.in_progress", {"type": "response.in_progress"})),
-        (delay_before_output, _event("response.output_item.added", {"type": "response.output_item.added"})),
     ]
+    if reasoning is not None:
+        item = {"type": "reasoning"}
+        chunks += [
+            (0.0, _event("response.output_item.added", {"type": "response.output_item.added", "item": item})),
+            (reasoning, _event("response.output_item.done", {"type": "response.output_item.done", "item": item})),
+        ]
+    chunks.append(
+        (delay_before_output, _event("response.output_item.added", {"type": "response.output_item.added"}))
+    )
     for piece in (text[: len(text) // 2], text[len(text) // 2 :]):
         chunks.append((gap, _event("response.output_text.delta", {"type": "response.output_text.delta", "delta": piece})))
     chunks.append(
@@ -150,6 +158,29 @@ async def test_reasoning_silence_before_output_is_within_first_output_budget(env
     install(handler)
     result = await _call()
     assert result.model == "gpt-6-luna" and result.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_silence_while_the_model_reasons_is_within_the_first_output_budget(env):
+    async def handler(request):
+        # The reasoning item opens at once, then 0.25 s of thinking: longer than the 0.2 s gap, inside 0.3 s.
+        return httpx.Response(200, stream=openai_stream(json.dumps(GOOD), reasoning=0.25))
+
+    install(handler)
+    result = await _call()
+    assert result.model == "gpt-6-luna" and result.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_reasoning_past_the_first_output_budget_falls_back(env):
+    async def handler(request):
+        if request.url.host == "api.openai.com":
+            return httpx.Response(200, stream=openai_stream(json.dumps(GOOD), reasoning=1.0))
+        return httpx.Response(200, stream=nvidia_stream(json.dumps(GOOD)))
+
+    install(handler)
+    result = await _call()
+    assert result.model == "openai/gpt-oss-20b" and result.attempts == 3
 
 
 @pytest.mark.asyncio

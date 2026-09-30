@@ -33,9 +33,10 @@ async def sessions(tmp_path, monkeypatch):
 class FakeModel:
     """Answers each schema from its input; records every call."""
 
-    def __init__(self, drop_context=False):
+    def __init__(self, drop_context=False, extra_contexts=0):
         self.calls = []
         self.drop_context = drop_context
+        self.extra_contexts = extra_contexts
 
     async def __call__(self, schema, *, purpose, instructions, input_text, priority, max_output_tokens):
         self.calls.append((purpose, input_text))
@@ -44,6 +45,9 @@ class FakeModel:
             numbers = [n for n in range(count) if f"[{n}] " in input_text]
             if self.drop_context:
                 numbers = numbers[:-1]
+            if self.extra_contexts:
+                self.extra_contexts -= 1
+                numbers = numbers + [len(numbers)]
             value = schema(summary=f"Summary of {purpose} with {len(numbers)} chunks.",
                            contexts=[{"chunk": n, "context": f"Context for chunk {n}."} for n in numbers])
         elif schema is enrich.TaskEnrichment:
@@ -149,12 +153,23 @@ async def test_a_rewritten_chunk_is_enriched_again_with_its_section_and_document
 
 
 async def test_an_answer_missing_a_chunk_writes_nothing_so_the_job_retries(sessions, monkeypatch):
-    monkeypatch.setattr(enrich, "structured_call", FakeModel(drop_context=True))
+    model = FakeModel(drop_context=True)
+    monkeypatch.setattr(enrich, "structured_call", model)
     await seed_task_document(sessions)
     with pytest.raises(ValueError, match="got contexts for"):
         await run_enrich(sessions)
     assert all(c.context_header is None for c in await all_rows(sessions, DeepChunk))
     assert (await all_rows(sessions, DeepDocument))[0].status == "raw"
+    assert [p for p, _ in model.calls].count("deep_memory.section") >= 2
+
+
+async def test_a_miscounted_answer_is_asked_again_once(sessions, monkeypatch):
+    model = FakeModel(extra_contexts=1)
+    monkeypatch.setattr(enrich, "structured_call", model)
+    await seed_task_document(sessions)
+    assert await run_enrich(sessions) == "done"
+    assert [p for p, _ in model.calls].count("deep_memory.section") == 3
+    assert all(c.context_header.startswith("Context for chunk") for c in await all_rows(sessions, DeepChunk))
 
 
 async def test_a_chunk_rewritten_during_the_model_call_keeps_no_stale_header(sessions, monkeypatch):

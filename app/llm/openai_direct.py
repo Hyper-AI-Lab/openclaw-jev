@@ -44,6 +44,11 @@ MAX_OUTPUT_CHARS = 400_000
 # Lifecycle events arrive before the model has produced anything.
 _OPENAI_LIFECYCLE = frozenset({"response.created", "response.queued", "response.in_progress"})
 
+
+def _thinking(kind: str, payload: Dict[str, Any]) -> bool:
+    """A reasoning event: the stream opens the reasoning item, then stays silent while the model thinks."""
+    return kind.startswith("response.reasoning") or (payload.get("item") or {}).get("type") == "reasoning"
+
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -267,7 +272,7 @@ async def _openai_attempt(
                 raise _AttemptError("stream_ended")
             payload = json.loads(data)
             kind = event or str(payload.get("type") or "")
-            if kind not in _OPENAI_LIFECYCLE:
+            if kind not in _OPENAI_LIFECYCLE and not _thinking(kind, payload):
                 output_started = True
             if kind == "response.output_text.delta":
                 delta = str(payload.get("delta") or "")

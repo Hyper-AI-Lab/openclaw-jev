@@ -46,6 +46,8 @@ async def janitor_once(max_age_hours: int = JANITOR_MAX_AGE_HOURS) -> dict:
                 task_id = wf.id.removeprefix("workflow-")
             elif "-plan-" in wf.id:
                 task_id = wf.id.split("-plan-", 1)[0]
+            elif wf.id.endswith("-recall"):
+                task_id = wf.id.removesuffix("-recall")
 
             should_terminate = task_id is None
             if task_id:

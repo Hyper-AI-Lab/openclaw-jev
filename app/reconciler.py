@@ -230,7 +230,7 @@ async def _terminate_workflow(client: Client, wf_id: str, reason: str) -> bool:
 
 
 async def _cleanup_orphan_plan_children(client: Client, task_id: str) -> int:
-    """Terminate orphaned plan child workflows when parent is terminal."""
+    """Terminate orphaned plan and deep-recall child workflows when parent is terminal."""
     terminated = 0
     prefix = f"{task_id}-plan-"
     try:
@@ -241,6 +241,14 @@ async def _cleanup_orphan_plan_children(client: Client, task_id: str) -> int:
                 terminated += 1
     except Exception as exc:
         logger.debug("Orphan child scan failed for %s: %s", task_id, exc)
+    try:
+        desc = await client.get_workflow_handle(f"{task_id}-recall").describe()
+        if desc.status == WorkflowExecutionStatus.RUNNING and await _terminate_workflow(
+            client, f"{task_id}-recall", "Orphan deep recall — parent terminal"
+        ):
+            terminated += 1
+    except Exception as exc:
+        logger.debug("No running deep recall for %s: %s", task_id, exc)
     return terminated
 
 
@@ -337,14 +345,17 @@ async def _repair_stuck_running_task(
 
 
 async def count_stuck_running_workflows() -> int:
-    """Count parent workflows still RUNNING while task row is non-active."""
+    """Count parent workflows and deep recalls still RUNNING while task row is non-active."""
     try:
         client = await _get_temporal()
         count = 0
         async for wf in client.list_workflows('ExecutionStatus="Running"'):
-            if not wf.id.startswith("workflow-"):
+            if wf.id.startswith("workflow-"):
+                task_id, recall = wf.id.removeprefix("workflow-"), False
+            elif wf.id.endswith("-recall"):
+                task_id, recall = wf.id.removesuffix("-recall"), True
+            else:
                 continue
-            task_id = wf.id.removeprefix("workflow-")
             async with AsyncSessionLocal() as db:
                 result = await db.execute(select(Task).where(Task.id == task_id))
                 task = result.scalar_one_or_none()
@@ -356,6 +367,8 @@ async def count_stuck_running_workflows() -> int:
                     "cancelled",
                 ):
                     count += 1
+                elif recall:
+                    continue
                 elif task.status == "running":
                     threshold = datetime.utcnow() - timedelta(minutes=STUCK_REPAIR_MINUTES)
                     if task.updated_at and task.updated_at < threshold:
