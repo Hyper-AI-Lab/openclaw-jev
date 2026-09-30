@@ -61,6 +61,32 @@ async def test_intakes_recall_depth_reaches_the_task_workflow(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_the_workflow_learns_whether_to_recall_and_follow_up(monkeypatch):
+    from app import config, temporal_control
+
+    started = []
+
+    class FakeClient:
+        async def start_workflow(self, name, payload, **kwargs):
+            started.append(payload["deep_recall"])
+
+    async def fake_connect():
+        return FakeClient()
+
+    dm = {**config.DEFAULT_DEEP_MEMORY, "recall_enabled": True, "followups_enabled": True, "recall_deadline_sec": 90}
+    monkeypatch.setattr(config, "get_deep_memory_config", lambda: dm)
+    monkeypatch.setattr(temporal_control, "connect_temporal", fake_connect)
+    await temporal_control.start_task_workflow("t1", "Which docs did we use?", "s1", "user", tags=["user-request"])
+    await temporal_control.start_task_workflow("t2", "Good morning!", "s1", "user", recall_depth="none")
+    await temporal_control.start_task_workflow("t3", "RMP CANARY: Reply with exactly CANARY_OK", "s1", "canary",
+                                               tags=["canary"])
+    dm["recall_enabled"] = False
+    await temporal_control.start_task_workflow("t4", "Which docs did we use?", "s1", "user")
+    assert started[0] == {"enabled": True, "followups": True, "deadline_sec": 90, "wait_sec": 300}
+    assert [s["enabled"] for s in started] == [True, False, False, False]
+
+
+@pytest.mark.asyncio
 async def test_reconciler_reconnects_after_dead_client(monkeypatch):
     from app import reconciler
 

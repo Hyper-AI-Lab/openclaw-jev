@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from temporalio.testing import WorkflowEnvironment
@@ -346,6 +347,63 @@ async def test_an_irrelevant_report_is_empty(sessions, steps):
     steps.report = {**READY_REPORT, "relevant": False, "facts": []}
     result, row = await run_recall(sessions)
     assert result["status"] == row.status == "empty" and row.report["relevant"] is False
+
+
+async def test_the_novelty_judge_needs_points_to_add_or_correct(monkeypatch):
+    answers = [
+        {"verdict": "adds", "points": [" Kirill travels   carry-on only. ", " "], "reason": "a packing constraint"},
+        {"verdict": "corrects", "points": [], "reason": "no concrete point"},
+    ]
+    seen = []
+
+    async def model(schema, *, purpose, instructions, input_text, priority, max_output_tokens):
+        seen.append((purpose, priority, input_text))
+        return SimpleNamespace(value=schema(**answers.pop(0)), input_tokens=700, output_tokens=60, model="gpt-6-luna")
+
+    monkeypatch.setattr(recall, "structured_call", model)
+    verdict, usage = await recall.judge_novelty("What should I pack?", "x" * 30000, READY_REPORT)
+    assert verdict == {"verdict": "adds", "points": ["Kirill travels carry-on only."], "reason": "a packing constraint"}
+    assert usage["model"] == "gpt-6-luna"
+    purpose, priority, text = seen[0]
+    assert purpose == "deep_memory.novelty" and priority == "recall"
+    assert "x" * recall.NOVELTY_REPLY_CHARS in text and "x" * (recall.NOVELTY_REPLY_CHARS + 1) not in text
+    assert "DEEP RECALL" in text and "The code word is cedar." in text
+    verdict, _ = await recall.judge_novelty("What should I pack?", "Layers.", READY_REPORT)
+    assert verdict["verdict"] == "none" and verdict["points"] == []
+
+
+async def test_the_report_row_takes_the_tasks_id_and_records_how_the_task_used_it(sessions, monkeypatch):
+    await seed(sessions)
+    start = {"task_id": "t-now", "query": "q", "report_id": "rep-1"}
+    assert await deep_memory_activities.start_recall_report(start) == "rep-1"
+    assert await deep_memory_activities.start_recall_report(start) == "rep-1"
+
+    async def novelty(query, reply, report):
+        return {"verdict": "adds", "points": ["Kirill travels carry-on only."], "reason": "r"}, {"model": "gpt-6-luna"}
+
+    monkeypatch.setattr(recall, "judge_novelty", novelty)
+    verdict = await deep_memory_activities.judge_recall_novelty(
+        {"report_id": "rep-1", "query": "q", "reply": "Layers.", "report": READY_REPORT}
+    )
+    assert verdict["verdict"] == "adds"
+    await deep_memory_activities.settle_recall_report({"report_id": "rep-1", "consumed_by": "none",
+                                                        "status": "cancelled", "reason": "Kirill wrote again"})
+    await deep_memory_activities.settle_recall_report({"report_id": "missing", "consumed_by": "none"})
+    async with sessions() as db:
+        rows = (await db.execute(select(DeepContextReport))).scalars().all()
+    [row] = rows
+    assert row.id == "rep-1" and row.status == "cancelled" and row.consumed_by == "none"
+    assert row.report == {"reason": "Kirill wrote again"} and row.completed_at is not None
+    assert row.novelty["verdict"] == "adds" and row.novelty["usage"] == {"model": "gpt-6-luna"}
+
+    async with sessions() as db:
+        (await db.get(DeepContextReport, "rep-1")).status = "ready"
+        await db.commit()
+    await deep_memory_activities.settle_recall_report({"report_id": "rep-1", "consumed_by": "followup",
+                                                        "status": "cancelled", "reason": "late"})
+    async with sessions() as db:
+        row = await db.get(DeepContextReport, "rep-1")
+    assert row.status == "ready" and row.consumed_by == "followup"
 
 
 async def test_a_failed_read_is_retried_once_then_closes_the_report_as_failed(sessions, steps):

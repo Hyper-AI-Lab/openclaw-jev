@@ -49,6 +49,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from app.orchestrator.step_predicates import extract_agent_facts
     from app.workflows.judgment import EvaluatorRetry
+    from app.workflows.recall_phase import DeepRecallPhase
     from app.workflows.user_messages import AttachedMessages
 
 
@@ -71,7 +72,7 @@ def is_heartbeat_ack(text: str) -> bool:
 
 
 @workflow.defn
-class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
+class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
     def __init__(self) -> None:
         self.user_inputs: List[str] = []
         self.process_run_id: str = ""
@@ -83,6 +84,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
         self._catchup_chunks: List[str] = []
         # The brief plus the fast context Aura last worked from; the evaluator judges against it.
         self._memory_block: str = ""
+        self._init_recall()
 
     @workflow.signal
     def user_input(self, message: str) -> None:
@@ -195,6 +197,10 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
             {"task_id": task_id, "status": "running", "next_check_minutes": 10},
             start_to_close_timeout=timedelta(seconds=10),
         )
+        recall_cfg = payload.get("deep_recall") or {}
+        internal = is_internal_task(user_intent, payload.get("task_type", "generic"), payload.get("tags") or [])
+        if recall_cfg.get("enabled") and not internal and workflow.patched("deep-memory-two-phase"):
+            await self._start_recall(task_id, user_intent, session_key, recall_cfg)
 
         attempt_policy = {
             "max_attempts": int(payload.get("rework_max_attempts") or 20),
@@ -233,6 +239,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     attempt_policy=attempt_policy,
                 )
         except Exception as e:
+            await self._drop_recall("task compensated")
             await workflow.execute_activity(
                 execute_compensation,
                 {
@@ -257,6 +264,8 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
             )
             return {"status": "compensated", "task_id": task_id, "reason": err_text}
 
+        if isinstance(result, dict):
+            await self._drop_recall(f"task ended {result.get('status')}")
         if isinstance(result, dict) and result.get("status") == "stopped_by_user":
             return result
 
@@ -375,6 +384,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
         memory_block = compose_executor_memory(
             ensure_brief_header(initial_memory_block or ""),
             memory_fetched,
+            self._recall_block,
         )
         self._memory_block = memory_block
 
@@ -386,6 +396,8 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 return await self._finish_stop(
                     task_id, session_key, user_intent, task_type, tags
                 )
+            await self._merge_recall("steps")
+            memory_block = self._memory_block
             while self.user_inputs:
                 reply = self.user_inputs.pop(0).strip()
                 if reply:
@@ -445,6 +457,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                         memory_block = compose_executor_memory(
                             ensure_brief_header(initial_memory_block or ""),
                             memory_fetched,
+                            self._recall_block,
                         )
                         self._memory_block = memory_block
                     break
@@ -547,6 +560,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
         while True:
             if self._stop_pending():
                 return await self._finish_stop(task_id, session_key, user_intent, task_type, tags)
+            await self._merge_recall("evaluator")
             added = self._take_user_messages()
             if added:
                 clean_result = await self._fold_in(
@@ -617,6 +631,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 actions = await workflow.execute_activity(
                     task_actions_digest, {"task_id": task_id}, start_to_close_timeout=timedelta(seconds=60)
                 )
+            await self._merge_recall("steps")
             rework_prompt = prompt_fn(
                 user_intent,
                 clean_result,
@@ -674,6 +689,15 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     start_to_close_timeout=timedelta(seconds=90),
                     retry_policy=RetryPolicy(maximum_attempts=1),
                 )
+        followup = ""
+        if delivered and self._recall_open:
+            phase = await self._deep_recall_phase(
+                task_id, session_key, user_intent, task_type, tags, clean_result, attempt
+            )
+            if phase.get("stopped"):
+                return await self._finish_stop(task_id, session_key, user_intent, task_type, tags)
+            delivered = not phase.get("refused")
+            followup = phase.get("followup") or ""
         if delivered:
             await workflow.execute_activity(
                 update_process_state,
@@ -697,14 +721,15 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     "process_run_id": self.process_run_id,
                     "process_type": task_type,
                     "task_id": task_id,
-                    "content": clean_result[:3000],
+                    "content": "\n\n".join(t for t in (clean_result, followup) if t)[:3000],
                 },
                 start_to_close_timeout=timedelta(seconds=30),
             )
         await self._resubmit_leftovers(task_id, session_key)
         if not delivered:
             return {"status": "failed", "task_id": task_id, "final_result": clean_result, "reason": SLACK_DELIVERY_FAILED}
-        return {"status": "completed", "task_id": task_id, "final_result": clean_result}
+        return {"status": "completed", "task_id": task_id, "final_result": clean_result,
+                **({"followup": followup} if followup else {})}
 
     async def _escalate(
         self,

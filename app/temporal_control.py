@@ -113,6 +113,17 @@ async def start_task_workflow(
         payload["initial_memory_block"] = initial_memory_block
     if recall_depth:
         payload["recall_depth"] = recall_depth
+    from app.config import get_deep_memory_config
+    from app.notification_policy import is_internal_task
+
+    deep = get_deep_memory_config()
+    payload["deep_recall"] = {
+        "enabled": bool(deep.get("recall_enabled")) and recall_depth != "none"
+        and not is_internal_task(intent, task_type, tags or []),
+        "followups": bool(deep.get("followups_enabled")),
+        "deadline_sec": int(deep.get("recall_deadline_sec") or 180),
+        "wait_sec": int(deep.get("followup_wait_sec") or 300),
+    }
 
     from app.orchestrator.completion_rework import get_attempt_policy
     from app.orchestrator.execution_mode import resolve_execution_mode

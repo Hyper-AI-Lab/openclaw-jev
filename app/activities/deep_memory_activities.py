@@ -28,9 +28,14 @@ def _latency_ms(row: DeepContextReport) -> int:
 
 @activity.defn
 async def start_recall_report(payload: Dict[str, Any]) -> str:
+    """The report row, under the id the task chose when it has one (a retry finds it written)."""
     async with AsyncSessionLocal() as db:
+        if payload.get("report_id") and await db.get(DeepContextReport, payload["report_id"]):
+            return payload["report_id"]
         row = DeepContextReport(task_id=payload["task_id"], trigger=payload.get("trigger") or "task_start",
                                 status="running")
+        if payload.get("report_id"):
+            row.id = payload["report_id"]
         db.add(row)
         await db.commit()
         return row.id
@@ -81,4 +86,32 @@ async def close_recall_report(payload: Dict[str, Any]) -> None:
         await db.commit()
 
 
-RECALL_ACTIVITIES = [start_recall_report, plan_recall_step, retrieve_recall_step, read_recall_step, close_recall_report]
+@activity.defn
+async def judge_recall_novelty(payload: Dict[str, Any]) -> Dict[str, Any]:
+    verdict, usage = await recall.judge_novelty(
+        payload.get("query") or "", payload.get("reply") or "", payload.get("report") or {}
+    )
+    await _update(payload["report_id"], novelty={**verdict, "usage": usage})
+    return verdict
+
+
+@activity.defn
+async def settle_recall_report(payload: Dict[str, Any]) -> None:
+    """How the task used its recall; a report still running when the task let it go is closed."""
+    async with AsyncSessionLocal() as db:
+        row = await db.get(DeepContextReport, payload["report_id"])
+        if row is None:
+            return
+        row.consumed_by = payload.get("consumed_by") or row.consumed_by
+        if payload.get("status") and row.status == "running":
+            row.status = payload["status"]
+            row.report = {**(row.report or {}), "reason": payload.get("reason") or ""}
+            row.completed_at = datetime.utcnow()
+            row.latency_ms = _latency_ms(row)
+        await db.commit()
+
+
+RECALL_ACTIVITIES = [
+    start_recall_report, plan_recall_step, retrieve_recall_step, read_recall_step, close_recall_report,
+    judge_recall_novelty, settle_recall_report,
+]

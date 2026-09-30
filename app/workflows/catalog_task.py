@@ -46,7 +46,12 @@ with workflow.unsafe.imports_passed_through():
     from app.orchestrator.decision_engine import SLACK_DELIVERY_FAILED, decide_completion_gate
     from app.orchestrator.step_predicates import extract_agent_facts
     from app.workflows.catalog import get_template, normalize_catalog_type
-    from app.notification_policy import format_workflow_error, is_silent_system_ack, sanitize_user_facing_text
+    from app.notification_policy import (
+        format_workflow_error,
+        is_internal_task,
+        is_silent_system_ack,
+        sanitize_user_facing_text,
+    )
     from app.workflows.catalog_step_child import CatalogStepChildWorkflow
     from app.workflows.generic_task import is_heartbeat_ack, is_heartbeat_request, strip_json_eval
     from app.orchestrator.process_brief import (
@@ -55,11 +60,12 @@ with workflow.unsafe.imports_passed_through():
         format_user_catchup,
     )
     from app.workflows.judgment import EvaluatorRetry
+    from app.workflows.recall_phase import DeepRecallPhase
     from app.workflows.user_messages import AttachedMessages
 
 
 @workflow.defn
-class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
+class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
     def __init__(self) -> None:
         self.user_inputs: List[str] = []
         self.process_run_id: str = ""
@@ -72,6 +78,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
         self._initial_memory_block: str = ""
         # The brief plus the fast context of the latest attempt; the evaluator judges against it.
         self._memory_block: str = ""
+        self._init_recall()
 
     @workflow.signal
     def spawn_leg(self, payload: Dict[str, Any]) -> None:
@@ -145,6 +152,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
         task_kind: str,
     ) -> Dict[str, Any]:
         """After a completed catalog leg, wait for spawn_leg and continue-as-new."""
+        await self._drop_recall("catalog leg finished")
         if task_kind != "durable" or result.get("status") != "completed":
             return result
         while not self._cancel_requested:
@@ -190,7 +198,11 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
 
     @workflow.run
     async def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        result = await self._run(payload)
+        try:
+            result = await self._run(payload)
+        finally:
+            # Catalog work reads the recall only at step boundaries; one still running is let go.
+            await self._drop_recall("catalog task ended")
         await self._resubmit_leftovers(
             payload.get("task_id", "unknown"), payload.get("session_key", "agent:main:main")
         )
@@ -257,6 +269,10 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 {"task_id": task_id, "status": "running", "next_check_minutes": 10},
                 start_to_close_timeout=timedelta(seconds=10),
             )
+            recall_cfg = payload.get("deep_recall") or {}
+            internal = is_internal_task(user_intent, payload.get("task_type", ""), payload.get("tags") or [])
+            if recall_cfg.get("enabled") and not internal and workflow.patched("deep-memory-two-phase"):
+                await self._start_recall(task_id, user_intent, session_key, recall_cfg)
 
             await workflow.execute_activity(
                 write_process_memory,
@@ -464,9 +480,11 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                         },
                         start_to_close_timeout=timedelta(seconds=15),
                     )
+                    await self._merge_recall("steps")
                     memory_block = compose_executor_memory(
                         ensure_brief_header(self._initial_memory_block),
                         memory_fetched,
+                        self._recall_block,
                     )
                     self._memory_block = memory_block
 

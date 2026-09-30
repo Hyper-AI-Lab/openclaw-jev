@@ -13,6 +13,7 @@ import json
 import socket
 import sys
 from collections import Counter
+from datetime import timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -20,23 +21,25 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app import config, openclaw_sessions, temporal_control
 from app.activities import db_activities as db, openclaw_activities as oc, plan_activities
+from app.activities import deep_memory_activities as dm
 from app.activities.intake_activities import resubmit_user_messages
 from app.activities.side_effects import SLACK_PART_CHARS
 from app.api import server
 from app.db import database
 from app.db.models import (
-    Base, Event, MemoryItem, ProcessRun, SideEffectReceipt, Task, TaskIntakeDecision, TaskMessage,
+    Base, DeepContextReport, Event, MemoryItem, ProcessRun, SideEffectReceipt, Task, TaskIntakeDecision, TaskMessage,
 )
-from app.deep_memory import curator, index as deep_index
+from app.deep_memory import curator, index as deep_index, recall
 from app.memory import router
 from app.orchestrator import web_capability
+from app.orchestrator.completion_rework import RECALL_NOTICE
 from app.production import invariants
 from app.task_registry import intake_runner
 from app.task_registry.intake_decision_engine import apply_intake_policy
@@ -69,6 +72,20 @@ def rework(command):
     return {"verdict": "rework", "quality": "fail", "issues": command, "command_to_aura": command}
 
 
+@workflow.defn(name="DeepRecallWorkflow", sandboxed=False)
+class ScriptedRecall:
+    """The recall child with its real report row and a scripted search (the models are boundaries)."""
+
+    @workflow.run
+    async def run(self, payload):
+        report_id = await workflow.execute_activity(
+            dm.start_recall_report, payload, start_to_close_timeout=timedelta(seconds=15))
+        await workflow.execute_activity("recall_script", payload, start_to_close_timeout=timedelta(seconds=30))
+        return await workflow.execute_activity(
+            dm.read_recall_step, {"report_id": report_id, "query": payload["query"], "dialogue": "", "evidence": []},
+            start_to_close_timeout=timedelta(seconds=30))
+
+
 class Harness:
     """Scripts the stubbed boundaries and records what crossed them."""
 
@@ -82,6 +99,7 @@ class Harness:
         self.slack, self.channels, self.blocked = [], set(), []
         self.slack_error = None
         self.while_posting = None
+        self.recall_released = asyncio.Event()
 
     async def send(self, text, slack_ts):
         """A Slack DM as the rmp_adapter plugin posts it."""
@@ -134,7 +152,13 @@ class Harness:
             draft = h.drafts.pop(0) if h.drafts else "An Aura turn that no test scripted."
             return {"result": {"payloads": [{"text": draft if len(h.prompts) in h.bare else draft + FACTS}]}}
 
-        return [classify_task_intake, send_to_openclaw, *WORKER_ACTIVITIES]
+        @activity.defn(name="recall_script")
+        async def recall_script(payload):
+            """The recall's search, finishing once the test lets it."""
+            await h.recall_released.wait()
+
+        return [classify_task_intake, send_to_openclaw, recall_script, dm.start_recall_report, dm.read_recall_step,
+                dm.judge_recall_novelty, dm.settle_recall_report, *WORKER_ACTIVITIES]
 
     async def evaluator_turn(self, task_id, prompt, verdict=0):
         self.judged.append(prompt)
@@ -232,7 +256,8 @@ async def h(tmp_path, monkeypatch):
         harness = Harness(env, api, sessions)
         harness.install(monkeypatch)
         async with Worker(env.client, task_queue="openclaw-tasks", activities=harness.activities(),
-                          workflows=[GenericTaskWorkflow, GenericExecuteChildWorkflow, IntakeWorkflow]):
+                          workflows=[GenericTaskWorkflow, GenericExecuteChildWorkflow, IntakeWorkflow,
+                                     ScriptedRecall]):
             yield harness
     for module in session_users():
         if module.AsyncSessionLocal is sessions:  # first imported mid-test, so monkeypatch cannot undo it
@@ -480,3 +505,46 @@ async def test_a_reconciler_nudge_is_neither_folded_in_nor_resubmitted(h):
     assert (await h.finish(tid))["final_result"] == reply and h.slack == [reply]
     assert len(h.prompts) == 1 and [t.id for t in await h.rows(Task, Task.status != "cancelled")] == [tid]
     assert "task.messages_resubmitted" not in await h.events(tid)
+
+
+async def test_a_recall_that_adds_after_the_reply_is_noticed_refined_judged_and_sent(h, monkeypatch):
+    ask, reply = "What should I pack for Osaka in October?", "Pack light layers and a rain jacket."
+    refined = "I recalled that you travel carry-on only, so: light layers and a packable rain jacket."
+    found = {"relevant": True, "brief": "Kirill travels carry-on only.", "tasks": [], "sections": [], "gaps": [],
+             "facts": [{"statement": "Kirill travels carry-on only.", "status": "current", "as_of": "2026-09-02",
+                        "citations": ["fact:f1"]}]}
+    config.update_settings(lambda s: s.setdefault("deep_memory", {}).update(recall_enabled=True, followups_enabled=True))
+
+    async def read(query, dialogue, evidence):
+        return found, {"input_tokens": 900, "output_tokens": 80, "model": "gpt-6-luna"}
+
+    async def novelty(query, answer, report):
+        return {"verdict": "adds", "points": ["Kirill travels carry-on only."], "reason": "packing"}, {"model": "gpt-6-luna"}
+
+    async def release_the_recall():
+        h.recall_released.set()
+
+    monkeypatch.setattr(recall, "read", read)
+    monkeypatch.setattr(recall, "judge_novelty", novelty)
+    h.intake, h.drafts, h.while_posting = [{"decision": "create_fresh"}], [reply, refined], release_the_recall
+    tid = (await h.send(ask, "1790000013.000100"))["task_id"]
+    result = await h.finish(tid)
+
+    assert result == {"status": "completed", "task_id": tid, "final_result": reply, "followup": refined}
+    assert h.slack == [reply, RECALL_NOTICE, refined]
+    log = await h.rows(TaskMessage, TaskMessage.task_id == tid, order=TaskMessage.created_at)
+    assert [(m.role, m.kind) for m in log] == [
+        ("user", "request"), ("evaluator", "verdict"), ("assistant", "reply"),
+        ("assistant", "notice"), ("evaluator", "verdict"), ("assistant", "followup"),
+    ]
+    assert log[-1].meta["attempt"] == 2 and log[-2].meta["verdict"] == "accept"
+    assert h.sessions_used == ["", "__recall"] and h.verdict_sessions == [1, 2]
+    assert "WHAT YOUR MEMORY ADDS:\n- Kirill travels carry-on only." in h.prompts[1]
+    assert "FOLLOW-UP:" in h.judged[1] and reply in h.judged[1]
+    [report] = await h.rows(DeepContextReport, DeepContextReport.task_id == tid)
+    assert (report.status, report.consumed_by, report.novelty["verdict"]) == ("ready", "followup", "adds")
+    assert (await h.task(tid)).status == "completed"
+    events = Counter(await h.events(tid))
+    assert (events["evaluator.accept"], events["deep_recall.novelty"], events["deep_recall.followup"]) == (2, 1, 1)
+    checks = await invariants_once_settled(monkeypatch)
+    assert {name: c.status for name, c in checks.items()} == dict.fromkeys(checks, "pass")

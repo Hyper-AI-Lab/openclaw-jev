@@ -108,6 +108,58 @@ def build_strategy_change_prompt(
     )
 
 
+# Program-owned: what Kirill hears when deep recall finds more after Aura's reply.
+RECALL_NOTICE = (
+    "I recalled some more information from our earlier conversations. I need a little time to work "
+    "it into a more accurate answer, and I'll get back to you."
+)
+RECALL_UNCONFIRMED_NOTICE = "I couldn't confirm the refined answer, so my earlier reply stands."
+EARLIER_REPLY_BRIEF_CHARS = 12000
+
+
+def build_recall_refinement_prompt(
+    user_intent: str,
+    earlier_reply: str,
+    *,
+    verdict: str,
+    points: List[str],
+    memory_block: str = "",
+    actions: str = "",
+) -> str:
+    """The refinement brief (session __recall): request, the reply sent, what memory changes, memory, actions."""
+    block = [
+        "REFINE YOUR ANSWER FROM MEMORY. This is a fresh session: everything you need is below.",
+        f"ORIGINAL REQUEST:\n{user_intent[:REQUEST_CHARS]}",
+        f"YOUR REPLY (already sent to Kirill):\n{(earlier_reply or '')[:DRAFT_CHARS]}",
+        ("WHAT YOUR MEMORY CORRECTS:\n- " if verdict == "corrects" else "WHAT YOUR MEMORY ADDS:\n- ")
+        + "\n- ".join(points),
+    ]
+    if memory_block.strip():
+        block.append(memory_block.strip())
+    if actions.strip():
+        block.append(
+            "ACTIONS ALREADY TAKEN IN THIS TASK (reuse what succeeded; do not redo it):\n" + actions.strip()
+        )
+    block.append(
+        "Kirill has been told you recalled more and are working it in. Write your refined answer: say "
+        "briefly what you recalled, then give the whole corrected answer if your reply was short, or only "
+        "the parts that change if it was long. Do not repeat what stays the same. "
+        "End with facts JSON: ```json\n{\"facts\": {\"step_complete\": true}}\n```"
+    )
+    return "\n\n".join(block)
+
+
+def followup_brief(earlier_reply: str, verdict: str) -> str:
+    """What the evaluator needs to judge a follow-up rather than a first answer."""
+    change = "a correction" if verdict == "corrects" else "more"
+    return (
+        f"FOLLOW-UP: Aura's reply below was already sent. Memory then showed that it needed {change}; "
+        "AURA OUTPUT is her follow-up. Judge it as a follow-up to that reply: it must be right about what "
+        "memory says, and it need not repeat what the reply already said.\n"
+        f"EARLIER REPLY (sent):\n{(earlier_reply or '')[:EARLIER_REPLY_BRIEF_CHARS]}"
+    )
+
+
 def build_escalation_message(
     user_intent: str,
     prior_response: str,

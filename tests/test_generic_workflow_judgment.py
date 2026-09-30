@@ -34,6 +34,12 @@ class Recorder:
         self.signals_during_judging = list(signals_during_judging)
         self.signal_on_completed = signal_on_completed
         self.signals_during_rework = list(signals_during_rework)
+        self.events: List[Dict[str, Any]] = []
+        self.kinds: List[str] = []
+        self.verdict_payloads: List[Dict[str, Any]] = []
+        self.before_memory = None
+        self.signal_after_reply = None
+        self.after_reply = None
 
     def activities(self):
         rec = self
@@ -44,6 +50,7 @@ class Recorder:
 
         @activity.defn(name="record_event")
         async def record_event(payload: Dict[str, Any]) -> None:
+            rec.events.append(payload)
             return None
 
         @activity.defn(name="update_task_status")
@@ -77,6 +84,8 @@ class Recorder:
 
         @activity.defn(name="build_process_memory_context")
         async def build_process_memory_context(payload: Dict[str, Any]) -> str:
+            if rec.before_memory:
+                await rec.before_memory(payload)
             rec.memory_builds += 1
             return ("PROCESS-SCOPED MEMORY (use this before workspace files when answering):\n\n"
                     "RECENT DIALOGUE (same Slack session — continue this conversation):\n"
@@ -86,6 +95,7 @@ class Recorder:
         async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
             rec.judged.append(payload["agent_response"])
             rec.briefs.append(payload.get("process_brief") or "")
+            rec.verdict_payloads.append(payload)
             if rec.signals_during_judging:
                 await _signal_own_workflow(rec.signals_during_judging.pop(0))
             verdict = rec.verdicts.pop(0) if rec.verdicts else "rework"
@@ -114,6 +124,12 @@ class Recorder:
         @activity.defn(name="notify_slack_user")
         async def notify_slack_user(payload: Dict[str, Any]) -> Any:
             rec.slack.append(payload["message"])
+            rec.kinds.append(payload.get("message_kind") or "notice")
+            if payload.get("message_kind") == "reply" and rec.signal_after_reply:
+                await _signal_own_workflow(rec.signal_after_reply)
+                rec.signal_after_reply = None
+            if payload.get("message_kind") == "reply" and rec.after_reply:
+                rec.after_reply()
             return rec.slack_result
 
         return [ensure_process_run, record_event, update_task_status, update_process_state,
