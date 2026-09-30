@@ -445,3 +445,48 @@ So the fast path's floor applies to dense similarity, at 0.30 (`fast_context_fac
   - After the deploy, the worker logged "Fast-context clients warm in 4.7s".
 
 ---
+
+## Step 9 — Fresh sessions for reworks and verdicts
+
+**Date:** 2026-09-30, deployed 14:59 JST (`3d291c5`).
+
+**What changed:**
+- **Session keys:**
+  - `send_to_openclaw` takes `session_suffix`, allowed only as `__r<n>` or `__recall` (anything else raises).
+  - Rework *n* goes to `rmp_task_<id>__r<n>`; the refinement (Step 13) will use `__recall`.
+  - `_execute_on_internal_session(…, verdict=n)` puts verdict *n* in `rmp_verify_<id>__v<n>`, with the NVIDIA fallback in `__v<n>_fb1`. `verify_response_quality` passes the attempt number.
+- **Compact brief.** `build_rework_prompt` and `build_strategy_change_prompt` take `memory_block` and `actions`:
+  - the request, now up to 8,000 characters (was 1,500);
+  - the latest memory block (brief plus fast context; the recall report joins it in Step 13);
+  - the evaluator's issues and command;
+  - "ACTIONS ALREADY TAKEN IN THIS TASK (reuse what succeeded; do not redo it)", from the new activity `task_actions_digest` (the evaluator's trace format, across all of the task's sessions);
+  - the previous draft, now up to 40,000 characters (was 2,000).
+- **Workflow.** In `generic_task._judge_and_deliver` the rework fetches the digest, builds the brief and dispatches with `__r<attempt>`, behind `workflow.patched("deep-memory-fresh-rework-sessions")` because it adds an activity call. The worker and both harnesses register `task_actions_digest`.
+- **A retried plan step** gets "[<step> attempt <n> not accepted]: <reason>" in its step context.
+- **Readers follow the task across sessions.** `openclaw_sessions.task_session_keys` lists the first session, then each rework and refinement, by `created_at`, without the planner's `__plan`. `task_transcript_lines` feeds:
+  - `task_action_trace` (evaluator, digest, deep memory's Actions);
+  - `task_tool_results` (tool documents; call ids stay raw in the first session and are numbered per session after it);
+  - `session_recovery.read_completed_rmp_session_reply`, which takes the latest terminal reply across sessions.
+  - The usage monitor and broker already find the task id by pattern search, so the suffixed keys count for their task.
+
+**Deviations:**
+- Messages folded into a draft (`AttachedMessages._fold_in`) still go to the task's first session. They are short, and the plan's key list does not include them.
+- Catalog workflows keep their own rework path, since the plan names `generic_task.py` for this step.
+
+**Verification:**
+- New `tests/test_fresh_sessions.py` (7) covers:
+  - sessions found oldest first without the planner, in the SQLite and JSON stores;
+  - actions and page reads across the first session and a rework, with repeated call ids;
+  - recovery returning the newest session's reply;
+  - dispatch keys and refused suffixes;
+  - one evaluator session per verdict, including the fallback;
+  - the brief carrying the whole request, draft, memory and actions, in order.
+- Judgment harness: the rework ran in `__r2`, and its brief carries the memory block, the actions digest, the command and the previous draft.
+- Whole-path harness:
+  - the rework scenario used session "" then `__r2`, verdict sessions 1 and 2, and one memory block in the rework prompt;
+  - a new scenario shows a retried plan step told "attempt 1 not accepted]: Output validation failed".
+- Updated evaluator-trace test.
+- Full suite: 694 passed, 4 skipped.
+- **Live, scratch sessions, nothing delivered:** three real gpt-6-luna turns (medium) on one ask, a first attempt and two reworks with the compact brief. Prompt tokens: first 28,054, rework 2 **24,204**, rework 3 **24,183**, so **flat**. The roughly 24k floor is OpenClaw's system prompt, tools and workspace files. Before, a task's session grew with every attempt: the Kubernetes guide reached about 160k tokens over five reworks. The scratch sessions `rmp_task_12ac088f…` (first, `__r2`, `__r3`) stay in the OpenClaw store.
+
+---
