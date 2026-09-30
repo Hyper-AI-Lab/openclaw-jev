@@ -818,3 +818,46 @@ Against the targets:
 - The durable fix is a direct gateway client. The gateway's connection is device-authenticated (the client signs the challenge nonce with a device key pair and applies OpenClaw's token rules), so that touches authentication and needs Kirill's approval. Not done.
 
 ---
+
+## Follow-ups approved after acceptance — warm gateway helper, legacy user memory
+
+**Date:** 2026-09-30 (Kirill approved both: "build" for the stop client, "clean" for legacy memory).
+
+**Warm gateway helper:**
+- `app/openclaw_gateway.mjs` (new): a node process that loads OpenClaw's own gateway SDK once (`callGatewayFromCli` from the package's exported `./plugin-sdk/gateway-runtime`) and serves one JSON line per call over stdin and stdout. It serves only `sessions.abort`.
+  - It uses the same device identity and token rules as the CLI. There is no new credential and no patch to OpenClaw's dist.
+  - Each call opens its own gateway connection, as the CLI does.
+- `app/openclaw_control.py`:
+  - `GatewayHelper` starts the helper on demand (10 s to be ready) and again after it exits. Calls wait up to 20 s.
+  - The helper runs in its own process group, which is killed if it is slow to start or at shutdown. It exits when the API's stdin closes.
+  - `abort_session` tries the helper first. It uses the CLI when the helper refuses, times out or exits.
+- `app/api/server.py`: the lifespan starts the helper in the background and closes it on shutdown.
+- `tests/conftest.py`: the helper's command is refused in every test unless a test provides one, so no test reaches the live gateway.
+- `tests/test_openclaw_control.py` (+4):
+  - the helper aborts without the CLI;
+  - a refused or lost call falls back to the CLI, and the helper restarts;
+  - a helper slow to start is not waited for past its limit;
+  - the real `.mjs` against a fake OpenClaw package calls the SDK with the timeout and `json`, and refuses other methods.
+
+**Legacy user memory:**
+- `ops/purge_legacy_user_memory.py` (new):
+  - It selects user rows the new fact extractor did not write: chunks of workspace files (`provenance.source = workspace_seed`), and the removed promotion heuristic's notes (a `promotion_stage` key, which no code writes any more).
+  - Dry run by default. `--apply` writes a JSON backup of the rows and their links (mode 600), deletes their deep-memory points (point id = row id), then deletes the links and rows.
+- `tests/test_purge_legacy_user_memory.py` (1): only seeded chunks and heuristic notes go, after a backup. Extracted facts, API-written rows and other scopes stay; links are backed up and removed.
+
+**Verification:**
+- Full suite: 779 passed, 4 skipped, plus the purge test (collected after the run began).
+- **Live helper**, scratch run (five-page `web_fetch`, medium thinking, nothing delivered): the helper was ready in 4.2 s (once, at startup). The abort of the running run answered `aborted` in 0.63 s, and the session was `killed` 0.7 s after the abort began. A second call answered `no-active-run` in 0.08 s. Through the CLI, the same abort had taken 44.6 s on this host.
+- **Live purge** at 20:02 JST:
+  - The dry run selected 51 rows: `AGENTS.md` 30, `MEMORY.md` 7, `SOUL.md` 4, `USER.md` 2, daily notes 2, and 6 "Site referenced" notes.
+  - `--apply`: backup `data/backups/purge-legacy-user-memory-20260930T110202Z.json` (51 rows, 0 links). Deleted 51 rows and 51 deep-memory points.
+  - Afterwards the reconcile dry run shows deep 88 objects = 88 points (139 before), legacy 2,521 = 2,521, registry 221 = 221, nothing missing, no orphans.
+  - Readiness: 38 pass, 1 warn (telemetry), 0 fail. `memory_hygiene`, `deep_index_internal`, `vector_sync` and `judged_followups` pass.
+  - The four extracted facts stay (KESTREL-58, the 1.34 end of life, the earlier v1.37.1 report, the accepted Kubernetes answer).
+
+**Notes:**
+- The `USER.md` row held Kirill's name, pronouns, timezone, Slack id and hours. RMP's task prompts already give his name and JST local time, and the Slack id is in RMP's config. His pronouns (he/him) and "usually online during Japanese daytime" no longer reach RMP sessions, which load only `TOOLS.md`. The row is in the backup.
+- `make seed-vector-memory` (`app/memory/seed.py`) would write the workspace chunks back as user facts. Nothing runs it on a schedule.
+- `rmp-canary-sentinel` exits 1 on the known 24 h prompt budget (6.4M over 5M, as in Step 11's observations). No invariant is broken.
+
+---
