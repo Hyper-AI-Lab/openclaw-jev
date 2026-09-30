@@ -220,11 +220,14 @@ async def hybrid_search_bounded(
     limit: int = 5,
     deadline_sec: float = 10.0,
 ) -> Dict[str, Any]:
+    from app.task_registry.hybrid_retriever import assemble_evidence_pack, evidence_legs
+
     cfg = get_task_registry_config()
     min_score = float(cfg.get("similarity_threshold", 0.72))
     half_life = float(cfg.get("temporal_half_life_days", 30))
-    # Independent I/O: overlap Postgres legs with bounded vector search.
-    active, recent, vector_hits = await asyncio.gather(
+    # Independent I/O, each evidence source within its own deadline: a slow embedder
+    # costs only its own leg.
+    active, recent, vector_hits, legs = await asyncio.gather(
         fetch_active_tasks(
             session_key=session_key,
             recurrence_key=recurrence_key,
@@ -242,27 +245,22 @@ async def hybrid_search_bounded(
             min_score=min_score * 0.5,
             deadline_sec=deadline_sec,
         ),
+        evidence_legs(intent, limit=max(limit, 8), deadline_sec=deadline_sec),
     )
     vector_hits = _apply_temporal_decay(vector_hits, recent, half_life_days=half_life)
-    pack: Dict[str, Any] = {}
-    if deadline_sec >= 3.0:
-        from app.task_registry.hybrid_retriever import assemble_evidence_pack
-
-        try:
-            pack = await asyncio.wait_for(
-                assemble_evidence_pack(
-                    intent,
-                    active=active,
-                    recent=recent,
-                    dense=vector_hits,
-                    limit=max(limit, 8),
-                    include_liveness=deadline_sec >= 3.0,
-                ),
-                timeout=min(max(deadline_sec, 1.0), 4.0),
-            )
-        except Exception as exc:
-            logger.warning("Evidence pack fusion skipped: %s", exc)
-            pack = {}
+    try:
+        pack = await assemble_evidence_pack(
+            intent,
+            active=active,
+            recent=recent,
+            dense=vector_hits,
+            legs=legs,
+            limit=max(limit, 8),
+            include_liveness=deadline_sec >= 3.0,
+        )
+    except Exception as exc:
+        logger.warning("Evidence pack fusion skipped: %s", exc)
+        pack = {}
     return {
         "active_tasks": active,
         "recent_registry": recent,

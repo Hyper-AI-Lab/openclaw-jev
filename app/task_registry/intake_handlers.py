@@ -173,6 +173,8 @@ async def handle_intake_outcome(
     llm_raw = dict(decision.get("llm_raw") or {})
     if exec_mode:
         llm_raw["execution_mode"] = exec_mode
+    if decision.get("recall_depth"):
+        llm_raw["recall_depth"] = decision["recall_depth"]
     relation_class = decision.get("relation_class") or ""
 
     decision_id = await record_intake_decision(
@@ -203,6 +205,7 @@ async def handle_intake_outcome(
                 "target_task_id": decision.get("target_task_id"),
                 "execution_mode": exec_mode,
                 "relation_class": relation_class,
+                "recall_depth": decision.get("recall_depth"),
             },
         )
     )

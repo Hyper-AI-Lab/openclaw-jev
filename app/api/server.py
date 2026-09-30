@@ -225,6 +225,7 @@ async def _start_task_workflow(
     initial_memory_block: Optional[str] = None,
     task_kind: Optional[str] = None,
     execution_mode: Optional[str] = None,
+    recall_depth: Optional[str] = None,
 ) -> None:
     from app.temporal_control import start_task_workflow
 
@@ -240,6 +241,7 @@ async def _start_task_workflow(
         initial_memory_block=initial_memory_block,
         task_kind=task_kind,
         execution_mode=execution_mode,
+        recall_depth=recall_depth,
     )
 
 
@@ -586,6 +588,7 @@ async def create_task(
                         initial_memory_block=guided_resume or None,
                         execution_mode=outcome.get("execution_mode") or execution_mode,
                         tags=request.tags or [],
+                        recall_depth=intake_result.get("recall_depth"),
                     )
                 except Exception as exc:
                     logger.warning("Clarify resume workflow start failed: %s", exc)
@@ -746,6 +749,7 @@ async def create_task(
                 initial_memory_block=initial_memory_block or None,
                 task_kind=task_kind,
                 execution_mode=execution_mode,
+                recall_depth=intake_result.get("recall_depth"),
             )
     except Exception as e:
         task.status = "failed"

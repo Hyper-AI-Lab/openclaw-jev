@@ -17,7 +17,7 @@ DONE_ID = "33333333-3333-4333-8333-333333333333"
 OTHER_ID = "44444444-4444-4444-8444-444444444444"
 ALIASES = {"R1": RUN_ID, "F1": DONE_ID}
 STATUS_PING = {"relation": "running", "execution_mode": "conversational", "catalog": "none", "web_intent": "none",
-    "running_target": "R1", "running_action": "asks_status", "finished_target": "none"}
+    "recall_depth": "deep", "running_target": "R1", "running_action": "asks_status", "finished_target": "none"}
 
 
 def context(intent="How is the invoice export going?", running=True, finished=True):
@@ -36,7 +36,8 @@ def context(intent="How is the invoice export going?", running=True, finished=Tr
          "intent_snippet": "RMP CANARY health check", "outcome_summary": "CANARY_OK", "task_ended_at": None},
     ] if finished else []
     return {"intent": intent, "session_key": SLACK, "active_tasks": active, "recent_registry": registry,
-        "memory_hits": [{"snippet": "Kirill prefers metric units"}], "tags": ["user-request"], "task_type": "user"}
+        "memory_hits": [{"snippet": "Kirill prefers metric units"}], "tags": ["user-request"], "task_type": "user",
+        "recent_dialogue": ["[21:03] Kirill: please export March invoices"]}
 
 
 def answer(choice, confidence=.97, is_max=True, probabilities=None):
@@ -64,7 +65,6 @@ def jev_body(questions, choices, confidence=.97):
 def provider(monkeypatch):
     """Wire intake to a MockTransport client; returns the list of outbound requests."""
     monkeypatch.setenv("TYPESAFE_API_KEY", "offline-test-key")
-    monkeypatch.setattr(intake, "_recent_dialogue", AsyncMock(return_value=["Kirill: please export March invoices"]))
     calls = []
 
     def install(mode, handler=None):
@@ -89,14 +89,15 @@ def test_state_uses_aliases_and_drops_distractors():
     assert state["running_tasks"][0]["last_update"] == "updated in the last 10 minutes"
     assert state["finished_tasks"][0]["ended"] == "ended within the last week"
     assert state["recent_dialogue"] == ["Kirill: please export March invoices"]
-    assert set(questions) == {"relation", "execution_mode", "catalog", "web_intent",
+    assert set(questions) == {"relation", "execution_mode", "catalog", "web_intent", "recall_depth",
         "running_target", "running_action", "finished_target"}
     assert set(questions["catalog"]["criteria"]) == set(intake.CATALOG_RUBRIC) | {"none"}
 
 
 def test_questions_follow_available_candidates():
     _, questions, aliases = intake.build_intake_request(context(running=False, finished=False), [], now=NOW)
-    assert set(questions) == {"relation", "execution_mode", "catalog", "web_intent"} and aliases == {}
+    assert set(questions) == {"relation", "execution_mode", "catalog", "web_intent", "recall_depth"}
+    assert aliases == {}
 
 
 def test_task_text_in_criteria_is_redacted():
@@ -165,6 +166,43 @@ def test_confidence_is_the_weakest_required_answer_and_web_intent_is_gated():
     result = intake.compose_intake_result(
         answers(relation=relation, web_intent=answer("search", .5)), ALIASES, Policy())
     assert result["confidence"] == 93 and result["web_intent"] is None
+
+
+@pytest.mark.parametrize("depth,expected", [
+    (answer("none"), "none"),
+    (answer("deep"), "deep"),
+    (answer("none", .6), "deep"),
+    (answer("none", is_max=False), "deep"),
+    (None, "deep"),
+])
+def test_recall_depth_is_jevs_answer_only_above_its_threshold(depth, expected):
+    result = intake.compose_intake_result(answers(relation=answer("new"), recall_depth=depth), ALIASES, Policy())
+    assert result["recall_depth"] == expected
+
+
+@pytest.mark.parametrize("llm,expected", [
+    ({"recall_depth": "none", "confidence": 80}, "none"),
+    ({"recall_depth": "None ", "confidence": 80}, "none"),
+    ({"recall_depth": "none", "confidence": 40}, "deep"),
+    ({"recall_depth": "shallow", "confidence": 90}, "deep"),
+    ({"confidence": 90}, "deep"),
+])
+def test_the_policy_keeps_recall_depth_only_when_it_is_confident(llm, expected):
+    from app.task_registry.intake_decision_engine import apply_intake_policy
+
+    result = apply_intake_policy({"decision": "create_fresh", "rationale": "", **llm},
+                                 {"intent": "Good morning!", "session_key": SLACK, "active_tasks": []},
+                                 tags=["user-request"])
+    assert result["recall_depth"] == expected
+
+
+async def test_jev_reads_the_dialogue_intake_assembled(provider):
+    client = provider("shadow")
+    _, record = await intake.review_intake(context(), tags=["user-request"])
+    state = json.loads(provider.calls[0].content)["state"]
+    assert state["recent_dialogue"] == ["Kirill: please export March invoices"]
+    assert record["proposal"]["recall_depth"] == "deep"
+    await client.aclose()
 
 
 async def test_off_internal_and_empty_messages_never_call(provider):

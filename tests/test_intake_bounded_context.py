@@ -98,6 +98,9 @@ async def test_assemble_intake_context_loads_messages_concurrently():
     with patch(
         "app.task_registry.intake_context.hybrid_search_bounded",
         new=AsyncMock(return_value=retrieval),
+    ), patch(
+        "app.task_registry.intake_context.recent_session_dialogue_block",
+        new=AsyncMock(return_value=""),
     ):
         with patch(
             "app.task_registry.intake_context.list_task_messages",
@@ -109,6 +112,29 @@ async def test_assemble_intake_context_loads_messages_concurrently():
 
     assert set(result["supplementary_messages"]) == {"t1", "t2", "t3"}
     assert elapsed < 0.30
+
+
+@pytest.mark.asyncio
+async def test_intake_reads_the_dialogue_beside_retrieval_once():
+    from app.task_registry.intake_context import assemble_intake_context
+
+    async def slow_retrieval(*args, **kwargs):
+        await asyncio.sleep(0.15)
+        return {"active_tasks": [], "recent_registry": [], "vector_similar": []}
+
+    async def slow_dialogue(session_key):
+        await asyncio.sleep(0.15)
+        return "RECENT DIALOGUE (same Slack session — continue this conversation):\n[21:03] Kirill: hi\n[21:04] Aura: Hello!"
+
+    with patch("app.task_registry.intake_context.hybrid_search_bounded", new=AsyncMock(side_effect=slow_retrieval)), \
+         patch("app.task_registry.intake_context.recent_session_dialogue_block", new=AsyncMock(side_effect=slow_dialogue)) as dialogue:
+        started = time.monotonic()
+        result = await assemble_intake_context("Which one?", session_key="s1")
+        elapsed = time.monotonic() - started
+
+    assert result["recent_dialogue"] == ["[21:03] Kirill: hi", "[21:04] Aura: Hello!"]
+    dialogue.assert_awaited_once_with("s1")
+    assert elapsed < 0.28
 
 
 @pytest.mark.asyncio

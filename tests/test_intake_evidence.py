@@ -89,6 +89,19 @@ def test_intake_prompt_includes_memory_and_evidence_pack():
     assert "ADVISORY ONLY" in prompt
 
 
+def test_the_analyst_reads_the_recent_dialogue_and_answers_recall_depth():
+    prompt = build_intake_prompt({
+        "intent": "Which one was the cheapest?",
+        "active_tasks": [],
+        "recent_dialogue": ["[21:03] Kirill: find me three hotels in Osaka",
+                            "[21:05] Aura: Hotel A 12,000 yen, Hotel B 9,500 yen, Hotel C 15,000 yen.",
+                            "[21:06] Kirill: 一番安いのはどれ？"],
+    })
+    assert "Hotel B 9,500 yen" in prompt and "一番安いのはどれ？" in prompt
+    assert prompt.index('"recent_dialogue"') < prompt.index('"active_tasks"')
+    assert '"recall_depth": "none|deep' in prompt and "- recall_depth: deep when" in prompt
+
+
 def test_intake_prompt_carries_full_raw_text_not_500_chars():
     long_intent = "please review this spec: " + ("alpha " * 400)
     assert len(long_intent) > 500

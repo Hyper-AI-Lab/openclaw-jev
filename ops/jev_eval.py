@@ -26,6 +26,7 @@ MIN_REQUEST_SPACING_SEC = 60 / EVAL_POLICY.requests_per_minute
 RUNNING_DECISIONS = frozenset({"attach_active", "wait_active", "rebuild_stale"})
 INTAKE_DECISIONS = RUNNING_DECISIONS | {"create_fresh", "create_guided", "clarify", "abstain"}
 EXECUTION_MODES = frozenset({"conversational", "structured_work"})
+RECALL_DEPTHS = frozenset({"none", "deep"})
 # Enforce only when a live run meets every bound.
 INTAKE_GATE = {"max_harmful": 0, "min_accuracy_on_accepted": 0.9, "min_coverage": 0.5, "max_p95_ms": 1500}
 
@@ -147,12 +148,17 @@ def load_intake_cases(paths: list[Path], max_cases: int) -> tuple[list[dict], in
             raise ValueError(f"{c['id']}: unknown execution mode")
         if exp.get("catalog") is not None and set(exp["catalog"]) - (set(CATALOG) | {"none"}):
             raise ValueError(f"{c['id']}: unknown catalog label")
+        if exp.get("recall_depth") is not None and exp["recall_depth"] not in RECALL_DEPTHS:
+            raise ValueError(f"{c['id']}: unknown recall depth")
         labeled.append(c)
     return labeled, len(cases) - len(labeled)
 
 
 def score_intake(case: dict, proposal: dict | None, aliases: dict) -> dict:
-    """Harmful: an accepted attach/wait/rebuild on the wrong target, or a wrong catalog template."""
+    """Harmful: an accepted attach/wait/rebuild on the wrong target, or a wrong catalog template.
+
+    Recall depth is scored on its own: a wrong one changes how much memory Aura gets, not the route.
+    """
     exp = case["expect"]
     if proposal is None:
         return {"accepted": False, "correct": None, "harmful": False, "errors": []}
@@ -173,8 +179,10 @@ def score_intake(case: dict, proposal: dict | None, aliases: dict) -> dict:
         errors.append("catalog")
     harmful = (decision in RUNNING_DECISIONS and bool({"decision", "target"} & set(errors))) or (
         proposal["catalog_hint"] is not None and "catalog" in errors)
+    depth = proposal["recall_depth"]
     return {"accepted": True, "correct": not errors, "harmful": harmful, "errors": errors,
-        "decision": decision, "target": target, "catalog": proposal["catalog_hint"]}
+        "decision": decision, "target": target, "catalog": proposal["catalog_hint"], "recall_depth": depth,
+        "recall_depth_correct": depth == exp["recall_depth"] if exp.get("recall_depth") else None}
 
 
 async def run_intake(cases: list[dict], policy: Policy) -> dict:
@@ -198,6 +206,7 @@ async def run_intake(cases: list[dict], policy: Policy) -> dict:
     correct = sum(bool(r["correct"]) for r in accepted)
     harmful = sum(r["harmful"] for r in records)
     abstain_ids = {c["id"] for c in cases if c["expect"]["decision"] == ["abstain"]}
+    depth_scored = [r["recall_depth_correct"] for r in accepted if r["recall_depth_correct"] is not None]
     usage = _usage(records)
     accuracy = correct / len(accepted) if accepted else None
     coverage = len(accepted) / len(records)
@@ -209,7 +218,9 @@ async def run_intake(cases: list[dict], policy: Policy) -> dict:
         "intake": {"accepted": len(accepted), "coverage": coverage, "correct_on_accepted": correct,
             "accuracy_on_accepted": accuracy, "harmful_errors": harmful,
             "abstain_expected": len(abstain_ids),
-            "abstained_when_expected": sum(not r["accepted"] for r in records if r["id"] in abstain_ids)},
+            "abstained_when_expected": sum(not r["accepted"] for r in records if r["id"] in abstain_ids),
+            "recall_depth_labeled": len(depth_scored),
+            "recall_depth_accuracy": sum(depth_scored) / len(depth_scored) if depth_scored else None},
         "gate": gate, "records": records,
         "scope": "Labeled input comparison only; not an end-to-end Aura or original-LLM benchmark."}
 

@@ -42,6 +42,25 @@ async def test_connect_temporal_with_retry_raises_after_exhaustion(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_intakes_recall_depth_reaches_the_task_workflow(monkeypatch):
+    from app import temporal_control
+
+    started = []
+
+    class FakeClient:
+        async def start_workflow(self, name, payload, **kwargs):
+            started.append(payload)
+
+    async def fake_connect():
+        return FakeClient()
+
+    monkeypatch.setattr(temporal_control, "connect_temporal", fake_connect)
+    await temporal_control.start_task_workflow("t1", "Good morning!", "s1", "user", recall_depth="none")
+    await temporal_control.start_task_workflow("t2", "Good morning!", "s1", "user")
+    assert started[0]["recall_depth"] == "none" and "recall_depth" not in started[1]
+
+
+@pytest.mark.asyncio
 async def test_reconciler_reconnects_after_dead_client(monkeypatch):
     from app import reconciler
 

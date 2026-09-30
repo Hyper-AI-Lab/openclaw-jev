@@ -80,6 +80,7 @@ async def start_task_workflow(
     initial_memory_block: Optional[str] = None,
     task_kind: Optional[str] = None,
     execution_mode: Optional[str] = None,
+    recall_depth: Optional[str] = None,
 ) -> None:
     from app.workflows.catalog import CATALOG, CATALOG_ALIASES, get_template, normalize_catalog_type
 
@@ -110,6 +111,8 @@ async def start_task_workflow(
         payload["process_type"] = catalog_type
     if initial_memory_block:
         payload["initial_memory_block"] = initial_memory_block
+    if recall_depth:
+        payload["recall_depth"] = recall_depth
 
     from app.orchestrator.completion_rework import get_attempt_policy
     from app.orchestrator.execution_mode import resolve_execution_mode

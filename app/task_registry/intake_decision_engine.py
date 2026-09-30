@@ -284,6 +284,9 @@ def apply_intake_policy(
     )
 
     relation_class = _relation_class_for(decision, llm_result)
+    recall_depth = str(llm_result.get("recall_depth") or "").strip().lower()
+    if recall_depth not in ("none", "deep") or confidence < threshold:
+        recall_depth = "deep"
 
     target_task_ids: List[str] = [target_task_id] if target_task_id else []
     if decision == "attach_active" and target_task_id:
@@ -318,6 +321,7 @@ def apply_intake_policy(
         "llm_raw": llm_result,
         "execution_mode": execution_mode,
         "relation_class": relation_class,
+        "recall_depth": recall_depth,
     }
     from app.orchestrator.web_capability import merge_web_into_intake
 

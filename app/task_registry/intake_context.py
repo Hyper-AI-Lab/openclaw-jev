@@ -2,11 +2,24 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import get_task_registry_config
-from app.task_registry.messages import list_task_messages
+from app.task_registry.messages import list_task_messages, recent_session_dialogue_block
 from app.task_registry.retriever import hybrid_search_bounded
+
+logger = logging.getLogger("rmp.intake_context")
+
+
+async def _dialogue_lines(session_key: str) -> List[str]:
+    """The conversation before this message, one line per turn, for Jev and the analyst."""
+    try:
+        block = await recent_session_dialogue_block(session_key)
+    except Exception as exc:
+        logger.warning("Intake dialogue unavailable: %s", type(exc).__name__)
+        return []
+    return block.splitlines()[1:] if block else []
 
 
 async def _load_supplementary_messages(
@@ -70,12 +83,15 @@ async def assemble_intake_context(
 ) -> Dict[str, Any]:
     cfg = get_task_registry_config()
     deadline = float(cfg.get("intake_vector_deadline_sec", 10))
-    retrieval = await hybrid_search_bounded(
-        intent,
-        session_key=session_key or None,
-        recurrence_key=recurrence_key,
-        limit=5,
-        deadline_sec=deadline,
+    retrieval, dialogue = await asyncio.gather(
+        hybrid_search_bounded(
+            intent,
+            session_key=session_key or None,
+            recurrence_key=recurrence_key,
+            limit=5,
+            deadline_sec=deadline,
+        ),
+        _dialogue_lines(session_key),
     )
     from app.task_registry.intake_decision_engine import user_visible_active_tasks
 
@@ -106,6 +122,7 @@ async def assemble_intake_context(
         "session_key": session_key,
         "recurrence_key": recurrence_key,
         "tags": tags or [],
+        "recent_dialogue": dialogue,
         "active_tasks": retrieval["active_tasks"],
         "recent_registry": retrieval["recent_registry"],
         "vector_similar": retrieval["vector_similar"],

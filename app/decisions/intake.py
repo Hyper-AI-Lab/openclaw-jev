@@ -141,6 +141,14 @@ def build_intake_request(
             {**{k: v for k, v in CATALOG_RUBRIC.items() if k in CATALOG},
              "none": "None of these templates: conversation, questions, research or other work."}),
         "web_intent": choice("What web access does the work in state.message need?", WEB_RUBRIC),
+        "recall_depth": choice(
+            "Does answering state.message need a search of Aura's long-term memory: conversations before "
+            "state.recent_dialogue, past tasks and what they produced, documents she read or wrote, or "
+            "remembered facts and preferences of Kirill's?",
+            {"none": "No. The message, state.recent_dialogue and general knowledge are enough, as for a "
+                     "greeting, thanks, or a self-contained question or task.",
+             "deep": "Yes. It refers to or builds on something from before, or remembered facts or earlier "
+                     "work could change the answer."}),
     }
     if running:
         questions["running_target"] = choice(
@@ -212,7 +220,7 @@ def compose_intake_result(answers: dict, aliases: dict, policy: Policy) -> dict 
             kind, decision = "new", "create_fresh"
             rationale = "Intake (Jev): this is a new request in the same conversation."
     execution_mode = mode["choice"] if _passes(mode, policy.intake_min_confidence) else None
-    catalog, web = answers["catalog"], answers["web_intent"]
+    catalog, web, depth = answers["catalog"], answers["web_intent"], answers.get("recall_depth")
     catalog_hint = None
     if execution_mode == "structured_work" and catalog["choice"] != "none" and _passes(catalog, CATALOG_MIN_CONFIDENCE):
         catalog_hint = catalog["choice"]
@@ -227,25 +235,15 @@ def compose_intake_result(answers: dict, aliases: dict, policy: Policy) -> dict 
         "target_task_ids": targets or ([target] if target else []),
         "catalog_hint": catalog_hint,
         "web_intent": web["choice"] if _passes(web, policy.intake_min_confidence) else None,
+        "recall_depth": depth["choice"] if _passes(depth, policy.intake_min_confidence) else "deep",
         "guidance_notes": "",
         "decision_source": "jev",
     }
 
 
-async def _recent_dialogue(session_key: str) -> list[str]:
-    from app.task_registry.messages import recent_session_dialogue_block
-
-    try:
-        block = await recent_session_dialogue_block(session_key)
-    except Exception as exc:
-        logger.warning("jev intake dialogue unavailable: %s", type(exc).__name__)
-        return []
-    return block.splitlines()[1:] if block else []
-
-
 async def _review(context: dict, policy: Policy) -> tuple[dict | None, dict]:
     session_key = context.get("session_key") or ""
-    state, questions, aliases = build_intake_request(context, await _recent_dialogue(session_key))
+    state, questions, aliases = build_intake_request(context, context.get("recent_dialogue") or [])
     purpose = "intake." + hashlib.sha256(session_key.encode()).hexdigest()[:16]
     ev = await get_client().evaluate(state, questions, purpose=purpose, rubric=INTAKE_RUBRIC, policy=policy)
     answers = ev.result["answers"] if ev.status == "ok" else {}
@@ -255,7 +253,8 @@ async def _review(context: dict, policy: Policy) -> tuple[dict | None, dict]:
         "reason": ev.reason, "latency_ms": ev.latency_ms, "request_hash": ev.request_hash,
         "accepted": proposal is not None,
         "proposal": {k: proposal[k] for k in ("decision", "relation_class", "execution_mode", "confidence",
-            "target_task_id", "target_task_ids", "similar_task_ids", "catalog_hint", "web_intent")} if proposal else None,
+            "target_task_id", "target_task_ids", "similar_task_ids", "catalog_hint", "web_intent",
+            "recall_depth")} if proposal else None,
         "answers": {qid: {"choice": a["choice"], "confidence": round(a["confidence"], 3)} for qid, a in answers.items()},
     }
     logger.info("jev intake %s", json.dumps(record, sort_keys=True))

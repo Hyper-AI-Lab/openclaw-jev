@@ -3,10 +3,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.task_registry import hybrid_retriever
 from app.task_registry.hybrid_retriever import (
     fuse_evidence,
+    or_query,
     reciprocal_rank_fusion,
-    sanitize_fts_query,
     status_boost,
 )
 
@@ -28,11 +29,10 @@ def test_status_boost_active_over_old_completed():
     assert status_boost("completed", age_days=2) > status_boost("failed")
 
 
-def test_sanitize_fts_query_strips_operators():
-    assert sanitize_fts_query("") == ""
-    cleaned = sanitize_fts_query("foo & bar! (baz)")
-    assert "&" not in cleaned
-    assert "foo" in cleaned and "bar" in cleaned
+def test_the_text_query_asks_for_any_word_without_operators():
+    assert or_query("") == "" and or_query("& ! ()") == ""
+    assert or_query("Foo & bar! (baz) -qux foo to") == "foo or bar or baz or qux"
+    assert or_query(" ".join(f"word{i}" for i in range(30))).count(" or ") == 15
 
 
 def test_fuse_rrf_exact_token_and_dense_paraphrase():
@@ -124,3 +124,60 @@ async def test_the_incoming_requests_own_reservation_is_not_evidence():
     await search_fts("Remember this for later: my test code word", db=_Db())
     [tasks_sql] = [s for s in statements if "FROM tasks," in s]
     assert "coalesce(supplementary_context->>'intake_reserved', 'false') <> 'true'" in tasks_sql
+
+
+@pytest.mark.asyncio
+async def test_text_search_matches_any_word_of_recent_user_work_only():
+    from datetime import datetime, timedelta
+
+    from app.task_registry.hybrid_retriever import search_fts
+
+    calls = []
+
+    class _Rows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self.rows
+
+    class _Db:
+        async def execute(self, stmt, params):
+            calls.append((str(stmt), params))
+            if "FROM task_messages" in str(stmt):
+                return _Rows([{"task_id": "m1", "snippet": "RMP CANARY: reply with CANARY_OK", "task_type": "user"},
+                              {"task_id": "m2", "snippet": "The code word is PELICAN-47", "task_type": "user"}])
+            return _Rows([])
+
+    hits = await search_fts("What's my test code word?", db=_Db())
+    assert [h["task_id"] for h in hits] == ["m2"]
+    assert len(calls) == 3
+    for sql, params in calls:
+        assert "websearch_to_tsquery('english', :q)" in sql and "plainto_tsquery" not in sql
+        assert "NOT IN ('canary', 'heartbeat')" in sql and ">= :since" in sql
+        assert params["q"] == "what or test or code or word"
+        assert timedelta(days=89) < datetime.utcnow() - params["since"] < timedelta(days=91)
+
+
+@pytest.mark.asyncio
+async def test_a_slow_memory_search_costs_only_its_own_leg(monkeypatch):
+    import asyncio
+
+    from app.task_registry.hybrid_retriever import assemble_evidence_pack
+
+    async def text_hits(query, limit):
+        return [{"citation": "task:t9", "task_id": "t9", "snippet": "code word PELICAN-47", "source": "fts_message"}]
+
+    async def slow_memory(query, limit):
+        await asyncio.sleep(5)
+        return [{"citation": "memory:m1", "snippet": "never arrives", "source": "memory"}]
+
+    monkeypatch.setattr(hybrid_retriever, "search_fts", text_hits)
+    monkeypatch.setattr(hybrid_retriever, "search_user_memory", slow_memory)
+    monkeypatch.setattr(hybrid_retriever, "MEMORY_DEADLINE_SEC", 0.1)
+    pack = await asyncio.wait_for(assemble_evidence_pack("code word", include_liveness=False), timeout=2)
+    assert [h["task_id"] for h in pack["fts_hits"]] == ["t9"] and pack["memory_hits"] == []
+    assert [r["task_id"] for r in pack["ranked"]] == ["t9"]

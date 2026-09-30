@@ -16,6 +16,7 @@ INTAKE_JSON_SCHEMA = {
     "target_task_id": "optional task id for attach/wait/rebuild/spawn",
     "target_task_ids": ["attach_active only: every running task id this message adds to or changes (usually one)"],
     "web_intent": "optional none|search|fetch|crawl|adaptive_extract|schema_extract|interact — soft hint for web tool routing",
+    "recall_depth": "none|deep — whether answering needs a search of Aura's long-term memory",
 }
 
 
@@ -27,6 +28,7 @@ def build_intake_prompt(context: Dict[str, Any]) -> str:
     catalog_ids = sorted(CATALOG.keys())
     payload = {
         "incoming_intent": intent,
+        "recent_dialogue": context.get("recent_dialogue"),
         "session_key": context.get("session_key"),
         "recurrence_key": context.get("recurrence_key"),
         "tags": context.get("tags"),
@@ -44,6 +46,8 @@ def build_intake_prompt(context: Dict[str, Any]) -> str:
     }
     return f"""You are the RMP TASK INTAKE ANALYST (not Aura). You decide how this user message relates to work, the way a careful professional operator would.
 
+recent_dialogue is the conversation just before this message, oldest first: the strongest evidence for what it refers to.
+recent_registry holds finished tasks, each with its outcome and the answer Aura gave.
 Hybrid retrieval in evidence_pack / memory_hits / fts_hits / vector_similar is EVIDENCE ONLY.
 soft_catalog_candidates and advisory_hits are ADVISORY ONLY — dismiss false positives (awareness, meta chat).
 
@@ -72,6 +76,7 @@ RULES:
 - catalog_hint: YOU assign (or null). Valid ids are in available_catalog_types.
   Never set tool_self_upgrade for awareness ("are you aware", "now you can").
 - web_intent: search|fetch|crawl|adaptive_extract|schema_extract|interact|none. interact only for real click/login/screenshot.
+- recall_depth: deep when the message refers to or builds on anything from before recent_dialogue (earlier conversations, past tasks and their results, documents Aura read or wrote, remembered facts or preferences of Kirill's), or when such memory could change the answer; none for greetings, thanks, and self-contained questions or tasks. When unsure, deep.
 - reply_to, when present, is the earlier message this one directly replies to (quoted) and the task it belongs to: strong evidence for relation_class and the target.
 - Never invent task IDs; use only IDs from context.
 
@@ -80,7 +85,7 @@ Respond with ONLY a single JSON object matching this schema (no markdown fences,
 
 CONTEXT:
 ```json
-{json.dumps(payload, default=str)[:16000]}
+{json.dumps(payload, default=str, ensure_ascii=False)[:16000]}
 ```
 
 [INTERNAL_RMP]"""

@@ -22,7 +22,11 @@ RRF_K = 60
 ACTIVE_STATUSES = frozenset(
     {"created", "running", "pending", "pending_user_input", "blocked", "needs_replan"}
 )
-_SAFE_QUERY = re.compile(r"[^\w\s\-\.]+", re.UNICODE)
+_FTS_WORD = re.compile(r"[^\W_]{3,}", re.UNICODE)
+MAX_FTS_WORDS = 16
+FTS_DAYS = 90
+FTS_DEADLINE_SEC = 3.0
+MEMORY_DEADLINE_SEC = 4.0
 
 
 def reciprocal_rank_fusion(
@@ -53,10 +57,10 @@ def status_boost(status: Optional[str], *, age_days: float = 0.0) -> float:
     return 1.0
 
 
-def sanitize_fts_query(raw: str) -> str:
-    cleaned = _SAFE_QUERY.sub(" ", raw or "")
-    cleaned = " ".join(cleaned.split())
-    return cleaned[:500]
+def or_query(raw: str) -> str:
+    """Any of the message's words, for websearch_to_tsquery: a message rarely repeats every word of a task."""
+    words = list(dict.fromkeys(w.lower() for w in _FTS_WORD.findall(raw or "")))[:MAX_FTS_WORDS]
+    return " or ".join(words)
 
 
 def _citation_id(*, kind: str, raw_id: str) -> str:
@@ -69,8 +73,8 @@ async def search_fts(
     limit: int = 8,
     db: Optional[AsyncSession] = None,
 ) -> List[Dict[str, Any]]:
-    """Lexical hits over registry, task goals, and recent messages."""
-    q = sanitize_fts_query(query)
+    """Lexical hits over registry, task goals, and recent messages: any word, user work, the last 90 days."""
+    q = or_query(query)
     if not q:
         return []
 
@@ -84,10 +88,12 @@ async def search_fts(
                  q.query
                ) AS rank
         FROM task_registry_entries,
-             plainto_tsquery('english', :q) AS q(query)
+             websearch_to_tsquery('english', :q) AS q(query)
         WHERE to_tsvector('english',
                 coalesce(intent_snippet,'') || ' ' || coalesce(outcome_summary,''))
               @@ q.query
+          AND coalesce(process_type, '') NOT IN ('canary', 'heartbeat')
+          AND coalesce(task_ended_at, indexed_at) >= :since
         ORDER BY rank DESC
         LIMIT :lim
         """
@@ -96,9 +102,11 @@ async def search_fts(
         """
         SELECT id AS task_id, goal, status, task_type, openclaw_session_key AS session_key,
                ts_rank(to_tsvector('english', coalesce(goal,'')), q.query) AS rank
-        FROM tasks, plainto_tsquery('english', :q) AS q(query)
+        FROM tasks, websearch_to_tsquery('english', :q) AS q(query)
         WHERE to_tsvector('english', coalesce(goal,'')) @@ q.query
           AND status IN ('created','running','pending','pending_user_input','blocked','needs_replan')
+          AND coalesce(task_type, '') NOT IN ('canary', 'heartbeat')
+          AND updated_at >= :since
           -- An intake reservation is the incoming request itself, not existing work.
           AND coalesce(supplementary_context->>'intake_reserved', 'false') <> 'true'
         ORDER BY rank DESC
@@ -111,16 +119,19 @@ async def search_fts(
                ts_rank(to_tsvector('english', coalesce(m.content,'')), q.query) AS rank
         FROM task_messages m
         JOIN tasks t ON t.id = m.task_id,
-             plainto_tsquery('english', :q) AS q(query)
+             websearch_to_tsquery('english', :q) AS q(query)
         WHERE to_tsvector('english', coalesce(m.content,'')) @@ q.query
+          AND coalesce(t.task_type, '') NOT IN ('canary', 'heartbeat')
+          AND m.created_at >= :since
         ORDER BY rank DESC
         LIMIT :lim
         """
     )
+    since = datetime.utcnow() - timedelta(days=FTS_DAYS)
 
     async def _run_one(session: AsyncSession, stmt, source: str) -> List[Dict[str, Any]]:
         rows_out: List[Dict[str, Any]] = []
-        result = await session.execute(stmt, {"q": q, "lim": limit})
+        result = await session.execute(stmt, {"q": q, "lim": limit, "since": since})
         for row in result.mappings().all():
             tid = str(row.get("task_id") or "")
             if not tid:
@@ -131,6 +142,8 @@ async def search_fts(
                 or row.get("snippet")
                 or ""
             )
+            if is_internal_task(str(snippet), str(row.get("process_type") or row.get("task_type") or ""), []):
+                continue
             rows_out.append(
                 {
                     "citation": _citation_id(kind="task", raw_id=tid),
@@ -286,25 +299,41 @@ def fuse_evidence(
     return ranked[:limit]
 
 
+async def _bounded_leg(leg, seconds: float, name: str) -> List[Dict[str, Any]]:
+    """One evidence source within its own deadline; a slow or failing source adds nothing."""
+    try:
+        return await asyncio.wait_for(leg, timeout=seconds)
+    except asyncio.TimeoutError:
+        logger.warning("Evidence leg %s timed out after %.1fs", name, seconds)
+    except Exception as exc:
+        logger.warning("Evidence leg %s failed: %s", name, exc)
+    return []
+
+
+async def evidence_legs(
+    query: str, *, limit: int, deadline_sec: Optional[float] = None
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Text search and user memory, concurrently, each within its own deadline (at most ``deadline_sec``)."""
+    cap = float("inf") if deadline_sec is None else deadline_sec
+    fts, memory = await asyncio.gather(
+        _bounded_leg(search_fts(query, limit=limit), min(FTS_DEADLINE_SEC, cap), "fts"),
+        _bounded_leg(search_user_memory(query, limit=5), min(MEMORY_DEADLINE_SEC, cap), "memory"),
+    )
+    return fts, memory
+
+
 async def assemble_evidence_pack(
     query: str,
     *,
     active: Optional[List[Dict[str, Any]]] = None,
     recent: Optional[List[Dict[str, Any]]] = None,
     dense: Optional[List[Dict[str, Any]]] = None,
+    legs: Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = None,
     limit: int = 12,
     include_liveness: bool = True,
 ) -> Dict[str, Any]:
-    """Fuse provided buckets with FTS + memory. Fail-soft on extra legs."""
-    fts_task = asyncio.create_task(search_fts(query, limit=limit))
-    mem_task = asyncio.create_task(search_user_memory(query, limit=5))
-    fts_raw, mem_raw = await asyncio.gather(fts_task, mem_task, return_exceptions=True)
-    fts = fts_raw if isinstance(fts_raw, list) else []
-    memory = mem_raw if isinstance(mem_raw, list) else []
-    if not isinstance(fts_raw, list):
-        logger.warning("FTS pack leg failed: %s", fts_raw)
-    if not isinstance(mem_raw, list):
-        logger.warning("Memory pack leg failed: %s", mem_raw)
+    """Fuse provided buckets with FTS + memory (run here unless ``legs`` already holds them)."""
+    fts, memory = legs if legs is not None else await evidence_legs(query, limit=limit)
 
     active_rows = []
     for row in active or []:
