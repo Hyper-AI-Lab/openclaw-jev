@@ -15,21 +15,21 @@ die() { echo "[claude-login] ERROR: $*" >&2; exit 1; }
 [[ "$(id -u)" == "0" ]] || die "run as root"
 [[ -x "${CLAUDE}" ]] || die "Claude Code is not installed; run: bash ${RMP_ROOT}/ops/setup_aura_coder.sh"
 
-store() {
-  # The token arrives on stdin so it never shows up in a process list.
-  (cd "${RMP_ROOT}" && "${PY}" -c '
-import sys
-from app.coding.credentials import write_token
-from app.coding.units import TOKEN_ENV_FILE, TOKEN_META_FILE
-meta = write_token(sys.stdin.read().strip(), TOKEN_ENV_FILE, TOKEN_META_FILE)
-print(f"[claude-login] token stored ({meta[\"length\"]} chars, fingerprint {meta[\"fingerprint\"]}, expires {meta[\"expires_at\"][:10]})")
-')
-}
+# The token travels on stdin, so it never shows up in a process list.
+store() { (cd "${RMP_ROOT}" && "${PY}" -m app.coding.credentials store); }
 
 if [[ "${1:-}" == "--paste" ]]; then
   read -rsp "Paste the token from 'claude setup-token' (input hidden): " token
   echo
-  printf '%s' "${token}" | tr -d '[:space:]' | store || die "the token was not stored"
+  token="$(printf '%s' "${token}" | tr -d '[:space:]')"
+  if (( ${#token} < 100 )); then
+    # A token copied from a wrapped terminal arrives in two lines.
+    read -rsp "That looks cut (${#token} characters). Paste the rest, or press Enter: " rest
+    echo
+    token="${token}$(printf '%s' "${rest}" | tr -d '[:space:]')"
+    unset rest
+  fi
+  printf '%s' "${token}" | store || die "the token was not stored"
   unset token
 else
   work="$(mktemp -d /tmp/claude-login.XXXXXX)"
@@ -43,14 +43,10 @@ else
   (cd "${work}" && runuser -u "${CODER}" -- env HOME="${work}/home" TERM="${TERM:-xterm-256color}" \
     script -qfec "stty cols 400 rows 50 2>/dev/null; exec ${CLAUDE} setup-token" "${work}/session.log") \
     || die "claude setup-token did not finish"
-  (cd "${RMP_ROOT}" && "${PY}" -c '
-import sys
-from app.coding.credentials import extract_token
-token = extract_token(open(sys.argv[1], encoding="utf-8", errors="replace").read())
-if not token:
-    sys.exit("[claude-login] no token found in the setup-token output; rerun with --paste")
-sys.stdout.write(token)
-' "${work}/session.log") | store || die "the token was not stored"
+  token="$(cd "${RMP_ROOT}" && "${PY}" -m app.coding.credentials extract "${work}/session.log")" \
+    || die "no token found; run: bash ${RMP_ROOT}/ops/claude_code_login.sh --paste"
+  printf '%s' "${token}" | store || die "the token was not stored"
+  unset token
 fi
 
 echo "[claude-login] checking the token with a real Claude Code call…"

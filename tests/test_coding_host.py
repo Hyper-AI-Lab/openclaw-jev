@@ -1,8 +1,11 @@
 """The coding runner's host layer: hardened units, the aura-coder firewall, and the stored token."""
+import io
 import json
 import stat
 import subprocess
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +14,7 @@ from app.coding import credentials, firewall, units
 from app.config import DEFAULT_CODING, load_settings
 
 TOKEN = "sk-ant-oat01-" + "Ab3_-" * 19
+REPO = Path(__file__).resolve().parents[1]
 
 
 def test_every_coding_unit_is_hardened_limited_and_blind_to_secrets():
@@ -114,6 +118,26 @@ def test_the_token_is_stored_for_systemd_only_with_metadata_but_no_secret(tmp_pa
     assert credentials.read_meta(meta_file) == meta
     with pytest.raises(ValueError):
         credentials.write_token("not-a-token", env_file, meta_file)
+
+
+def test_the_login_commands_extract_and_store_the_token_through_stdin(tmp_path, monkeypatch, capsys):
+    transcript = tmp_path / "session.log"
+    transcript.write_text("\u2713 Long-lived authentication token created successfully!\r\n"
+                          f" Your OAuth token (valid for 1 year):\r\n \r\n {TOKEN}\r\n\r\n"
+                          " Store this token securely. You won't be able to see it again.\r\n")
+    run = subprocess.run([sys.executable, "-m", "app.coding.credentials", "extract", str(transcript)],
+                         capture_output=True, text=True, cwd=REPO)
+    assert run.returncode == 0 and run.stdout == TOKEN
+    env_file, meta_file = tmp_path / "s" / "claude.env", tmp_path / "s" / "claude-token.json"
+    monkeypatch.setattr("sys.stdin", io.StringIO(TOKEN[:60] + "\n" + TOKEN[60:] + "\n"))
+    assert credentials.main(["store"], env_file=env_file, meta_file=meta_file) == 0
+    assert env_file.read_text() == f"CLAUDE_CODE_OAUTH_TOKEN={TOKEN}\n"
+    assert "token stored" in capsys.readouterr().out
+    monkeypatch.setattr("sys.stdin", io.StringIO("sk-ant-api03-not-a-token"))
+    assert credentials.main(["store"], env_file=tmp_path / "x.env", meta_file=tmp_path / "x.json") == 1
+    assert not (tmp_path / "x.env").exists()
+    (tmp_path / "failed.log").write_text("Error: authorization cancelled\n")
+    assert credentials.main(["extract", str(tmp_path / "failed.log")]) == 1
 
 
 def test_coding_settings_merge_over_their_defaults():
