@@ -66,6 +66,8 @@ def unit_properties(
         "ProtectControlGroups=yes",
         "ProtectClock=yes",
         "ProtectHostname=yes",
+        # Other users' command lines carry secrets (Temporal's container gets its Postgres password as an argument).
+        "ProtectProc=invisible",
         "RestrictSUIDSGID=yes",
         "RestrictRealtime=yes",
         "LockPersonality=yes",

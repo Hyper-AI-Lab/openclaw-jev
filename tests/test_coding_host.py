@@ -22,7 +22,8 @@ def test_every_coding_unit_is_hardened_limited_and_blind_to_secrets():
                                   cpu_quota="250%", tasks_max=1024, runtime_max_sec=5400,
                                   env_file=units.TOKEN_ENV_FILE)
     for required in ("NoNewPrivileges=yes", "PrivateTmp=yes", "ProtectSystem=strict", "ProtectHome=read-only",
-                     "CapabilityBoundingSet=", "RestrictSUIDSGID=yes", "MemoryMax=3G", "MemorySwapMax=0",
+                     "ProtectProc=invisible", "CapabilityBoundingSet=", "RestrictSUIDSGID=yes", "MemoryMax=3G",
+                     "MemorySwapMax=0",
                      "TasksMax=1024", "CPUQuota=250%", "RuntimeMaxSec=5400", "CPUWeight=50"):
         assert required in props
     hidden = next(p for p in props if p.startswith("InaccessiblePaths="))

@@ -66,6 +66,9 @@ def unix(path):
         s.connect(path)
     finally:
         s.close()
+def other_processes():
+    if not [p for p in os.listdir("/proc") if p.isdigit() and os.stat("/proc/" + p).st_uid != os.getuid()]:
+        raise PermissionError("no other user's process is visible")
 def own_server():
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
@@ -77,6 +80,8 @@ for path in ("/etc/rmp/rmp.env", "/etc/openclaw/openclaw.env", "/etc/aura-coder/
              "/root/.config/github_pat", "/root/.openclaw/openclaw.json", "/root/.openclaw/rmp/settings.json"):
     attempt("read " + path, lambda p=path: read(p))
 attempt("list /root", lambda: os.listdir("/root"))
+attempt("see other users' processes", other_processes)
+attempt("read /proc/1/cmdline", lambda: read("/proc/1/cmdline"))
 for port in (22, 5432, 6333, 7233, 8000, 8791, 9222, 18789):
     attempt("connect 127.0.0.1:%d" % port, lambda p=port: connect("127.0.0.1", p))
 attempt("connect [::1]:18789", lambda: connect("::1", 18789))

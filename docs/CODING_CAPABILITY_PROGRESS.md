@@ -279,3 +279,91 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
 - `node --check` passes on every patched file of both versions, as on their pristine originals.
 - The pre-flight on `openclaw@2026.9.7` reports only "needs Node >=24.16.0 <25 || >=26.1.0; this host runs v22.23.2". `openclaw@2026.9.1` passes.
 - The live verifier passes: the audit is clean on the installed dist, the MoltMarket skill is present, and the model policy holds.
+
+---
+
+## Step 5 — Node 24 and a staging 2026.9.7 on real data
+
+**Date:** 2026-09-30.
+
+**Research:** read in the 2026.9.7 package's docs.
+- `gateway/multiple-gateways.md`:
+  - each instance needs its own config path, state directory, workspace and port;
+  - base ports must be at least 120 apart, because derived ports reach base + 110;
+  - `OPENCLAW_STATE_DIR` alone does not isolate a managed service.
+- `help/environment.md`: `OPENCLAW_HOME` relocates every OpenClaw path default, and explicit path variables take precedence over it.
+- `gateway/health.md`:
+  - `/healthz`: the HTTP server is live;
+  - `/startupz`: startup has settled;
+  - `/readyz`: agent databases are admitted and channels pass. 2026.9.1 serves it too.
+- Cron: `cron.enabled: false` or `OPENCLAW_SKIP_CRON=1` disables it.
+- 2026.9.7 still exports `./plugin-sdk/gateway-runtime` with `callGatewayFromCli`, which RMP's abort helper uses.
+- Node: v24.21.0, the current 24.x LTS ("Krypton", 2026-09-07), satisfies `>=24.16.0 <25`.
+
+**What changed:**
+- `ops/openclaw_staging.py` (new) builds a staging gateway on a copy of production's data. Subcommands: `node`, `build`, `start`, `stop`, `status`, `cli`, `install`, `restore-pre`, `destroy`.
+  - **Separate tree and port:** its own `OPENCLAW_HOME`, `HOME`, state directory, config and workspace under `/srv/openclaw-staging`, on port 19789.
+  - **Cut off from production's outside connections:** Slack off with its tokens removed, cron off in the config and through `OPENCLAW_SKIP_CRON`, fresh gateway and hook tokens. The RMP plugin's copy calls a closed port.
+  - **Copied data:** the stores through the backup API, then 2,059 stored production paths rewritten in the operational tables (agent database lease, workspace, cron store, exec-approvals socket, plugin installs). The copied lease is dropped. History tables with integrity chains are left as they were.
+  - **The production upgrade's order:** plugins update, then `doctor --fix` with `OPENCLAW_SERVICE_REPAIR_POLICY=external`, then TOOLS.md restore and skill links, settle, patch and audit.
+  - **Hardened units:** every staging process runs in a transient unit with `ProtectSystem=strict`, `ProtectHome=read-only` and only `/srv/openclaw-staging` writable. The systemd and D-Bus sockets and `/etc/rmp` are hidden. Commands are resolved to the staging binaries.
+- `ops/openclaw_probe.py` (new, reusable for production). Nine probes, each through RMP's own code paths:
+  - `health`: `/healthz`, `/startupz` and `/readyz`;
+  - `plugins`: every configured plugin loads, RMP's own included;
+  - `hook_run`: a `/hooks/agent` run with RMP's payload, read back through RMP's reader and reply poller, including whether the marker turn was compressed;
+  - `bootstrap`: an RMP session gets no persona files;
+  - `session_entry`: `patch_session_entry` leaves the row pending (`entry_valid` 0), and runs on that session and a new one still work;
+  - `settle`: the settle script on the migrated schema;
+  - `abort`: `sessions.abort` through RMP's SDK helper, retried while the session still shows running;
+  - `history`: pre-migration sessions read back unchanged, as a prefix;
+  - `patched`: the running dist passes the patch audit.
+- `ops/rollback_openclaw.sh` (new; the plan puts it in step 6, but it is written here so that the rehearsal ran the real script).
+  - Steps: refuse while user tasks run, stop, reinstall the version from before, restore the stores, restore config, local plugins and workspace files, reinstall each npm plugin at its old version, settle, audit, start, wait for `/readyz`.
+  - `ROLLBACK_TARGET=staging` swaps only the primitives.
+- `app/coding/units.py`: `ProtectProc=invisible` (see the findings). `ops/claude_code_smoke.py` gains two probes: another user's processes, and `/proc/1/cmdline`.
+- Tests: `tests/test_openclaw_staging.py` (4) covers the staging config, the stored-path rewrite and lease drop, the plugin isolation, and staged commands in hardened units with the staging binaries. `tests/test_coding_host.py` now requires `ProtectProc=invisible`.
+
+**Host changes:**
+- Node v24.21.0 at `/opt/node-v24.21.0-linux-x64` (sha256 verified), linked from `/opt/node24`, not on `PATH`. `node` on `PATH` is still v22.23.2.
+- `/srv/openclaw-staging`: the staging tree, now stopped. It is removed after the cutover.
+
+**Findings for the cutover (step 6):**
+1. `doctor --fix` refuses while an agent database lease is held by a live gateway. The upgrade stops the gateway first.
+2. 2026.9.7's doctor archives the workspace `TOOLS.md`, whose content `AGENTS.md` already carries. The upgrade's `restore_tools_md` puts it back.
+3. Doctor disables the MoltMarket skill as unusable: it needs `MOLTMARKET_API_KEY`, which production doesn't have. Nothing is lost.
+4. 2026.9.7's `plugins update` creates new plugin generations and deletes the old ones. So a rollback must reinstall each plugin at its old version, which the script does.
+5. `openclaw.json` must be backed up before any 2026.9.7 command touches it: `plugins update` writes metadata (`meta.migrations.utilityModelSeparation`) that 2026.9.1 rejects. The upgrade backs up first.
+6. Changes that don't affect RMP:
+   - on start, 2026.9.7 posts an `[OpenClaw session event]` into `agent:main:main`, with no reply;
+   - it keeps `systemPromptReport` and other large entry fields in `session_entry_snapshots`, which RMP doesn't read.
+7. `session_transcript_cold_archives` is empty after the migration. If 2026.9.7 later moves old sessions there, RMP's reader won't see them, which matters little because RMP reads recent sessions.
+8. The staging gateway's memory reached 1.5 GiB, OpenClaw's warning threshold.
+9. `sessions.abort` can answer `no-active-run` just after a session turns running. RMP's stop aborts once and doesn't retry. The fix belongs with step 10's stop handling.
+10. **Security:** the Temporal container gets its Postgres password as a command-line argument, visible in any process list. So coding units now hide other users' processes.
+11. **Inline secrets:** the live `openclaw.json` holds secrets inline (Slack tokens, the hooks and gateway tokens, and skill API keys), against the secrets rule. That predates this work and is not changed here.
+
+**Deviations and why:**
+- **Rollback script moved earlier:** `ops/rollback_openclaw.sh` is written in step 5, not step 6, so the rehearsal exercised the real script.
+- **Bugs caught in the staging tool before they did any harm:**
+  - systemd looks commands up on its own `PATH`, so staged `openclaw` commands would have run production's `/usr/bin/openclaw`. Executables are now resolved to absolute paths.
+  - The copied lease blocked doctor.
+  - The first rehearsal backup was taken after a 2026.9.7 command had already changed the config. `save_upgrade_backup` now runs before any 2026.9.7 command.
+- **Probe fixes:** two probe bugs were fixed. The `/healthz` body's `status` shadowed the HTTP code, and the prompt report now lives in snapshots.
+- **ProtectProc:** the Step 2 area, fixed here where it was found.
+- **No subagent for the probe suite:** I wrote it myself, because it runs next to production.
+
+**Verification:**
+- **Staging build on real data:** 551 s. 2026.9.7 installed and patched (all 15), plugins updated to 2026.9.7, doctor complete after the lease drop, settle ok.
+- **Boot:** ready 54.0 s after the unit started, without patch 9. Production 2026.9.1, with patch 9, took 73 s at its last start. So patch 9 stays required only where its target exists.
+- **Probes on staging 2026.9.7: 9/9 passed.**
+  - `hook_run`: `PROBE_OK` in 6.6 s, with the marker turn stored compressed.
+  - `bootstrap`: no persona files injected.
+  - `session_entry`: the row stayed pending after the patch, and later turns on it and on a new session worked.
+  - `settle`: ok on 2026.9.7's triggers, which add `canonical_pending_*`.
+  - `abort`: `aborted` on the first try at 3.6 s; the session ended `killed`.
+  - `history`: 40 sessions and 779 lines unchanged; 566 of 15,694 events compressed.
+  - `plugins`: 8 loaded. `patched`: the audit is clean.
+- **Rollback rehearsal with the real script** (`ROLLBACK_TARGET=staging`): back to 2026.9.1 in 237 s, ready after 19.5 s, and the probes passed 9/9 on the rolled-back gateway. History is identical, with no appends and 0 compressed events.
+- **Coding sandbox:** smoke with `ProtectProc`: 34 isolation probes as intended, and `claude opus` ok in 6.7 s.
+- **Production untouched:** readiness 38 pass, 1 warn (telemetry), 0 fail, the same as the baseline. The gateway's `/readyz` returns 200.
+- **Tests:** full suite 831 passed, 4 skipped (296 s).
