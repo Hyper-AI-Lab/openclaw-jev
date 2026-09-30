@@ -1529,6 +1529,20 @@ async def production_readiness():
     return await run_all_checks()
 
 
+@app.get("/api/deep_memory/status")
+async def deep_memory_status():
+    from app.deep_memory.health import deep_memory_status as status
+
+    return await status()
+
+
+@app.get("/api/deep_memory/reports/{task_id}")
+async def deep_memory_reports(task_id: str):
+    from app.deep_memory.health import deep_memory_reports as reports
+
+    return {"task_id": task_id, "reports": await reports(task_id)}
+
+
 @app.get("/api/cron/jobs")
 async def cron_jobs_snapshot():
     from app.cron.reconciler import load_openclaw_cron_jobs

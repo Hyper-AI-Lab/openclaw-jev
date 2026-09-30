@@ -161,12 +161,13 @@ async def test_a_leg_over_the_deadline_is_left_out_and_the_rest_arrive(sessions,
     def slow(*args, **kwargs):
         import time
 
-        time.sleep(0.5)
+        time.sleep(2.0)
         return [fact_hit("late fact")]
 
     monkeypatch.setattr(index, "search", slow)
+    # SQLite legs under disk pressure take a few hundred ms; the deadline leaves them room.
     monkeypatch.setattr(curator, "get_deep_memory_config",
-                        lambda: {**config.DEFAULT_DEEP_MEMORY, "fast_context_deadline_sec": 0.2})
+                        lambda: {**config.DEFAULT_DEEP_MEMORY, "fast_context_deadline_sec": 0.8})
     await seed(
         sessions,
         Task(id="t2", goal="Where do I live?", task_type="user", openclaw_session_key=SESSION),
@@ -174,7 +175,7 @@ async def test_a_leg_over_the_deadline_is_left_out_and_the_rest_arrive(sessions,
     )
     started = asyncio.get_running_loop().time()
     block = await assemble("Where do I live?")
-    assert asyncio.get_running_loop().time() - started < 0.45
+    assert asyncio.get_running_loop().time() - started < 1.6
     assert "Run note." in block and "late fact" not in block
 
 

@@ -1,6 +1,6 @@
 # Aura System Architecture
 
-**Last updated:** 2026-09-29  
+**Last updated:** 2026-09-30  
 **Host:** Single Linux VPS (Europe/Berlin timezone on server; Kirill in JST)  
 **Status:** Production live (`development_mode: false`)
 
@@ -14,6 +14,7 @@ Related logs:
 - [`docs/history/PRODUCTION_PLAN.md`](docs/history/PRODUCTION_PLAN.md) — Phases 12–20 (historical)
 - [`docs/CONTROL_PLANE_PROGRESS.md`](docs/CONTROL_PLANE_PROGRESS.md) — Analyst control-plane log (append-only)
 - [`docs/SYSTEM_AUDIT_PROGRESS.md`](docs/SYSTEM_AUDIT_PROGRESS.md) — Sep 29 2026 system audit and hardening log (append-only)
+- [`docs/DEEP_MEMORY_PROGRESS.md`](docs/DEEP_MEMORY_PROGRESS.md) — deep memory and two-phase answering log (append-only)
 - [`docs/runbooks/slack-sockets.md`](docs/runbooks/slack-sockets.md) — this-host Slack sockets only; never `apps.connections.open`
 
 ---
@@ -119,10 +120,11 @@ Aura is a **three-layer system** on one machine:
 2. **`rmp_adapter`** claims the turn (`inbound_claim` / `message_received`) and `POST /tasks` with the **full Slack text** (not a truncated intent). **No native OpenClaw Slack fallback** — fail closed (claim + suppress) if intake/API is down.
 3. **`before_message_write`**: blocks Slack DM persistence / native assistant turns while RMP owns delivery (`{ block: true }`).
 4. **Intake Analyst** (not Aura) classifies the message against hybrid-retrieved evidence into one of four relation classes, then applies a decision (`clarify` / attach / wait / rebuild / guided / fresh). See §5.0.0. The request's own reservation row (`intake_reserved`) is never evidence; when intake handles the message elsewhere, it closes as `cancelled` with `closed_reason: intake_placeholder` and stays out of the task registry.
-5. If work proceeds, Temporal starts **GenericTaskWorkflow** or **CatalogTaskWorkflow** (catalog type is **intake-LLM only**).
-6. Aura executes in `agent:main:rmp_task_*` via **`send_to_openclaw`** (`deliver: false`).
+5. If work proceeds, Temporal starts **GenericTaskWorkflow** or **CatalogTaskWorkflow** (catalog type is **intake-LLM only**). Unless intake answered `recall_depth: none`, the run starts the IA's deep recall beside it (§6.3), which never delays it.
+6. Aura executes in `agent:main:rmp_task_*` via **`send_to_openclaw`** (`deliver: false`), with one memory block: the IA's fast context (§6.3), plus the recall report once it is ready.
 7. **Process Evaluator** (not Aura; session `rmp_verify_*`) must **accept** the result before Slack. Conversational replies are gated too. Canary/system stay on the short deterministic path. It sees Aura's action trace (tool calls and results from her transcript) and the run's artifacts. If the evaluator itself fails, the run waits for it on durable timers (1, 2, 4 … 60 min), sends a hold notice after two failures, and after the last one closes the task without sending the unchecked draft. Messages that arrive while Aura works, while she is judged or during rework are folded into the draft, which is judged again.
 8. **`notify_slack_user`** → idempotent RMP `chat.postMessage`, in ordered parts of at most 3,500 characters. Transient Slack errors retry; a permanent one is recorded (`slack.delivery_failed`) and alerted, and the task ends `failed` with `closed_reason: slack_delivery_failed` (Kirill, Sep 30 2026), with no further notice Slack would refuse too. Insufficient work is reworked (attempts 1–19, with one strategy change at 10) or escalated with a diagnosis (attempt 20). Messages that arrive after the reply go back to intake (`resubmit_user_messages`).
+9. **Two-phase answering.** When the recall report arrives after the reply, the task stays running for at most `followup_wait_sec`. The IA's novelty judge decides whether the report adds to or corrects the reply. If it does, RMP sends a notice, Aura refines in `rmp_task_*__recall`, the evaluator judges the refinement as a follow-up, and only an accepted one is sent (`task_messages.kind = followup`). At most one per task; a stop or a new message during the wait lets the recall go.
 
 ### 3.2 Cron (e.g. MoltMarket)
 
@@ -352,6 +354,8 @@ Primary path for Slack DMs, cron, and most automation.
 
 Messages signalled while the run works are taken at each turn and folded into the draft (`AttachedMessages`, `app/workflows/user_messages.py`); leftovers after delivery, stop or escalation are resubmitted to intake. A run the reconciler restarts after a crash carries `recovered_draft`, which is judged before anything is sent.
 
+Deep recall (`DeepRecallPhase`, `app/workflows/recall_phase.py`): the run starts `{task_id}-recall` when the payload's `deep_recall.enabled` says so. A finished report is merged, without waiting, before each plan step, judgment and rework brief. A report that arrives after the reply leads to the follow-up phase of §3.1 step 9. The report row records its consumer (`steps`, `evaluator`, `followup`, `none`), and every exit settles it.
+
 Exception path: any uncaught workflow error triggers compensation + user-facing error message (formatted via `notification_policy`).
 
 #### CatalogTaskWorkflow (`app/workflows/catalog_task.py`)
@@ -368,7 +372,7 @@ Structured multi-step flows for repeatable business processes. Seven templates i
 | 6 | Browser automation | navigation, extract |
 | 7 | Tool self-upgrade | draft → tests → approval → controlled restart → verify |
 
-Each catalog step maps to a **`predicate_id`** and runs in **`CatalogStepChildWorkflow`** (same OpenClaw dispatch pattern as generic children).
+Each catalog step maps to a **`predicate_id`** and runs in **`CatalogStepChildWorkflow`** (same OpenClaw dispatch pattern as generic children). A catalog run reads the deep recall report only at step boundaries and never follows up.
 
 #### Child workflows
 
@@ -376,8 +380,9 @@ Each catalog step maps to a **`predicate_id`** and runs in **`CatalogStepChildWo
 |----------|------|
 | `GenericExecuteChildWorkflow` | One OpenClaw dispatch per generic plan step; isolated session `agent:main:rmp_task_{id}` |
 | `CatalogStepChildWorkflow` | One dispatch per catalog step with template-specific prompt |
+| `DeepRecallWorkflow` | The IA's deep recall: plan, retrieve, read (`app/workflows/deep_recall.py`), bounded by `recall_deadline_sec` |
 
-Child IDs use pattern `{task_id}-plan-{step_name}-{attempt}` for orphan detection by reconciler/janitor.
+Child IDs use pattern `{task_id}-plan-{step_name}-{attempt}` and `{task_id}-recall` for orphan detection by reconciler/janitor.
 
 ### 5.3 Process management (Postgres entities)
 
@@ -442,7 +447,8 @@ The orchestrator keeps **program logic** in charge; the LLM proposes actions and
 | **Workflow janitor** | `ops/workflow_janitor.py`, `rmp-janitor.timer` | Daily sweep of orphaned Temporal executions >24h |
 | **Canary timers** | `rmp-canary.timer`, `rmp-memory-canary.timer` | Hourly E2E + 6h memory/vector canary; results in logs + `data/last_memory_canary.json` |
 | **Canary sentinel** | `app/production/canary_sentinel.py`, `rmp-canary-sentinel.timer` | Every 30 min: canary health with remediation, then the invariant checks; pages Kirill by Slack DM on a failure (4 h cooldown per incident) |
-| **Readiness** | `GET /api/production/readiness` | Stuck workflow count, canary freshness, LLM orchestration snapshot, and the invariants (`app/production/invariants.py`): completions without an accept, attached messages neither answered nor resubmitted, Slack delivery failures, internal traces in shared memory, vector outbox and drift, orphan recoveries |
+| **Readiness** | `GET /api/production/readiness` | Stuck workflow count, canary freshness, LLM orchestration snapshot, deep memory (`app/deep_memory/health.py`: ingest lag, enrichment, index drift, memory-lane budget, recall latency and follow-up rate), and the invariants (`app/production/invariants.py`): completions without an accept, attached messages neither answered nor resubmitted, Slack delivery failures, internal traces in shared memory, vector outbox and drift, orphan recoveries, finished user tasks without an enriched task document after 30 min, internal content in deep memory, follow-ups without an accept |
+| **Deep ingest** | `app/deep_memory/ingest.py` (API loop) | Drains `dm_ingest_queue` every 10 s (claim lease, backoff up to 1 h; a spent model budget defers to the next UTC day) |
 
 This layer makes the single-VPS deployment **set-and-forget**: transient worker crashes, hung OpenClaw sessions, and orphaned children are repaired without operator intervention.
 
@@ -457,6 +463,8 @@ Key endpoints:
 | `POST /tasks/{id}/signal` | `user_input`, `cancel`, `approve`, `retry` |
 | `POST /tasks/{id}/cancel` | Cancel workflow |
 | `GET /api/production/readiness` | Go-live readiness score |
+| `GET /api/deep_memory/status` | Switches, ingest queue, documents, index points vs objects, memory lane, recall outcomes of the last 24 h |
+| `GET /api/deep_memory/reports/{task_id}` | A task's deep recall reports: plan, candidates, report, latency, use, novelty |
 | `GET /metrics` | Prometheus counters |
 | `GET /tasks/{id}/export` | Postmortem bundle |
 | `/memory/*` | Write, lookup, compact, graph, process context |
@@ -601,15 +609,31 @@ Wipe Qdrant before changing embedder model or dimensions, then reconcile to re-q
 
 **Future option:** Local embeddings (Ollama / sentence-transformers) — no API quota, ops tradeoff; not required for chat-model compatibility.
 
-### 6.3 Memory promotion (`app/memory/promotion.py`)
+### 6.3 Deep memory and the Internal Agent (`app/deep_memory/`)
 
-Episodic → semantic/procedural pipeline (partial vs original 4-stage vision). Canary, heartbeat and system runs are never promoted and never indexed in the registry (`app/memory/hygiene.py` defines their traces; `ops/purge_internal_memory.py` removes any). Procedural memory stores a procedure — task, steps, tools used, failed calls, result — not the reply.
+The **Internal Agent (IA)** does RMP's memory work with direct OpenAI Responses API calls (`app/llm/openai_direct.py`): `gpt-6-luna`, `reasoning.effort=medium`, `store: false`, strict JSON schemas. It gets one retry, then falls back to `nvidia/openai/gpt-oss-20b` with the same schema. Its own lane limiter lives in the broker state: concurrency, per-minute rate, circuit breaker, a daily token budget, recall before enrichment, and enrichment down to 1 slot while user tasks run. Usage is recorded as `memory_llm`. Timeouts follow the idle law: 20 s to the first output, with the reasoning phase inside it, then 5 s gaps.
 
-### 6.4 Artifacts
+| Part | What it does |
+|------|--------------|
+| **Index** (`index.py`) | Qdrant `rmp_deep_memory_v1`: dense `text-embedding-3-large` at 1536-d plus server-side BM25 (IDF), fused with weighted RRF. Levels: chunk, section, document, fact. Postgres text search (OR semantics) answers when the index cannot |
+| **Ingestion** (`ingest.py`, `chunking.py`) | Queue `dm_ingest_queue`, drained by the API. Stage 1 (no model): one task document per user task (Conversation, Path history, Deliverables, Actions), long deliverables, pages and files Aura read (web content marked untrusted), text attachments. Markdown-aware ~1,400-character chunks with 200 characters of overlap; each chunk carries its section path and conversation metadata. User work only |
+| **Enrichment** (`enrich.py`) | Stage 2: section summaries, 50–100-token context headers per chunk, document summaries, and for a task its outcome and answer (the registry leads with them) |
+| **Facts** (`facts.py`) | Stage 3: atomic facts from delivered conversations, compared with their nearest neighbours. Same, update (the old fact gets `valid_to` and a `supersedes` link), contradicts (a `contradicts` link), or new. No credentials; Jev reviews in its promotion mode |
+| **Fast context** (`curator.py`) | One memory block per run within 3 s and 6,000 characters: dialogue, relevant facts, linked tasks, the run's memory, procedures |
+| **Deep recall** (`recall.py`, `app/workflows/deep_recall.py`) | Plan (need, up to 4 sub-queries, levels, a time window that ranks rather than filters), hybrid retrieval never returning the current task, expansion (section and document summaries with the TOC, neighbours, linked tasks, fact versions), and a cited context report in `dm_context_reports`. Novelty judge for reports that arrive after the reply |
+| **Health** (`health.py`) | Readiness checks, invariants, `GET /api/deep_memory/status` and `/reports/{task_id}`; healthcheck prints the lines |
+
+Switches in `settings.json` `deep_memory`: `enabled` (ingestion, index, fast context), `recall_enabled` (deep recall during user tasks) and `followups_enabled` (the follow-up phase), with `recall_deadline_sec` (180) and `followup_wait_sec` (300). Intake's `recall_depth` (Jev typed question, or the analyst's answer; deep below thresholds) skips recall for requests that need no memory.
+
+### 6.4 Memory promotion (`app/memory/promotion.py`)
+
+Episodic → semantic/procedural pipeline (partial vs original 4-stage vision). Canary, heartbeat and system runs are never promoted and never indexed in the registry (`app/memory/hygiene.py` defines their traces; `ops/purge_internal_memory.py` removes any). Procedural memory stores a procedure — task, steps, tools used, failed calls, result — not the reply. User facts come from the deep memory facts stage (§6.3).
+
+### 6.5 Artifacts
 
 Content-addressed store under `/root/.openclaw/rmp/data/artifacts`; completion outputs registered per task.
 
-### 6.5 OpenClaw workspace memory
+### 6.6 OpenClaw workspace memory
 
 Daily notes: `/root/.openclaw/workspace/memory/YYYY-MM-DD.md`  
 Long-term notes: `MEMORY.md`, `USER.md`
@@ -638,6 +662,7 @@ Scanner catalog synced by RMP (`app/scanners/`) when `development_mode: false`.
 |-----------|--------|
 | Readiness API | ✅ includes the invariant checks; 30 pass, 1 warn, 0 fail at the Sep 29 2026 audit close |
 | Invariant monitors | ✅ `app/production/invariants.py`; the canary sentinel pages Kirill on a broken one |
+| Deep memory | ✅ readiness checks and invariants in `app/deep_memory/health.py`; `GET /api/deep_memory/status` |
 | Prometheus `/metrics` | ✅ |
 | Hourly canary | ✅ `:07` past each hour |
 | Daily backup | ✅ `ops/backup.sh` |
@@ -818,12 +843,15 @@ Prioritized for stability first, then capability.
     │   └── qdrant-server/        # Vector index (Qdrant server bind mount)
     ├── app/
     │   ├── orchestrator/         # decision_engine, step_predicates, prompt_policy, process_evaluator
-    │   ├── workflows/            # generic_task, catalog_task, child workflows,
-    │   │                         # judgment (evaluator retry), user_messages (fold-in, resubmit)
+    │   ├── workflows/            # generic_task, catalog_task, child workflows, deep_recall,
+    │   │                         # judgment (evaluator retry), user_messages (fold-in, resubmit),
+    │   │                         # recall_phase (merge in time, else the judged follow-up)
     │   ├── production/           # readiness, invariants, canary_sentinel, ops_notify
     │   ├── reconciler.py         # Stale task + stuck workflow repair, orphan re-judging, run closing
+    │   ├── deep_memory/          # index, chunking, ingest, enrich, facts, curator, recall, health
     │   ├── llm/
-    │   │   ├── quota_broker.py   # NVIDIA key gate, balanced rotation, slots
+    │   │   ├── openai_direct.py  # The IA's direct Responses API client and memory lane
+    │   │   ├── quota_broker.py   # NVIDIA key gate, balanced rotation, slots, memory lane state
     │   │   └── usage_monitor.py  # Per-key daily usage ledger
     │   └── memory/
     │       ├── vector.py         # Mem0/Qdrant service

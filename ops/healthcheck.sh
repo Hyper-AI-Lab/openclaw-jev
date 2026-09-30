@@ -36,6 +36,11 @@ if canary:
     print('memory_canary:', canary['status'], canary['message'])
 if stuck:
     print('stuck_workflows:', stuck['status'], stuck['message'])
+deep = ('deep_memory_ingest', 'deep_memory_enrichment', 'deep_memory_index', 'memory_lane', 'deep_recall',
+        'task_documents', 'deep_index_internal', 'judged_followups')
+for c in r.get('checks', []):
+    if c['name'] in deep:
+        print(c['name'] + ':', c['status'], c['message'])
 " 2>/dev/null || { echo "WARN: readiness check error"; FAIL=1; }
 
 "${RMP_ROOT}/venv/bin/python" "${RMP_ROOT}/ops/llm_usage_report.py" 2>/dev/null \

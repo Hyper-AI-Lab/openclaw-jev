@@ -1,7 +1,7 @@
 # Aura / RMP concept tree (source of truth)
 
 **Status:** Binding constitution for this host.  
-**Last updated:** 2026-09-29  
+**Last updated:** 2026-09-30  
 **How to use:** This document is *why* and *what must remain true*. [`ARCHITECTURE.md`](../ARCHITECTURE.md) is *how it is built*. Cursor rules are *must not violate while coding*. Aura-facing [`TOOLS.md`](/root/.openclaw/workspace/TOOLS.md) is executor notes, not this constitution.
 
 If a later chat, plan, or nested rule disagrees with this file, this file wins after applying the conflict law in §2.
@@ -61,6 +61,7 @@ RMP API (:8000) + Temporal worker
   Intake Analyst   session rmp_intake_*   (not Aura)
   Aura execute     session rmp_task_*     (tools / LLM)
   Process Evaluator session rmp_verify_*  (not Aura)
+  Internal Agent   direct OpenAI calls    (memory work; not Aura, not OpenClaw)
         │
         ▼
 RMP chat.postMessage (idempotent)
@@ -83,6 +84,7 @@ RMP chat.postMessage (idempotent)
 | Intake Analyst | `agent:main:rmp_intake_*` | Clarify questions via RMP notify only |
 | Aura | `agent:main:rmp_task_*` | Never first. Never native gateway delivery. |
 | Process Evaluator | `agent:main:rmp_verify_*` | Diagnosis at attempt 20 via RMP |
+| Internal Agent (IA) | none: direct Responses API calls (`gpt-6-luna`, `medium`, `store: false`) | No. RMP sends its program-owned notice; Aura writes any follow-up, judged. |
 | Heartbeat | off (`heartbeat.every: "0m"`); old `heartbeat` session archived | No |
 | Health canary | tags `canary` / `system` | Silent on success; not user work |
 
@@ -90,6 +92,7 @@ RMP chat.postMessage (idempotent)
 
 - **Postgres `rmp_db`:** Task, ProcessRun, Step, Observation, Event, MemoryItem, Artifact, SideEffectReceipt, `task_messages`, intake decisions, registry entries. The record of memory: a memory row and its `vector_outbox` row commit together.
 - **Qdrant:** advisory dense retrieval for memory/registry, an index of Postgres kept by the outbox drain and a daily reconcile. Recall falls back to Postgres full text when it does not answer. Must not assign workflows. Health must not claim a dead embedder is ready.
+- **Deep memory:** Postgres `dm_documents`, `dm_sections`, `dm_chunks`, `dm_links`, `dm_ingest_queue`, `dm_context_reports`, plus user facts in `memory_items` (dated, superseded or contradicted, never deleted). Qdrant `rmp_deep_memory_v1` indexes them with dense and BM25 vectors. Postgres stays the record; ingestion is asynchronous and never on the reply's path.
 - **OpenClaw JSONL:** executor transcripts for `rmp_*` sessions. Not the user-visible Slack log.
 - **Workspace files:** `USER.md` (human facts, including Japan/JST), `TOOLS.md` (Aura-visible ops). Main-session `MEMORY.md` is **not** the production recall path for RMP-owned DMs.
 
@@ -98,6 +101,7 @@ RMP chat.postMessage (idempotent)
 - **GenericTaskWorkflow** — default for user DMs and most work. Plan-driven steps.
 - **CatalogTaskWorkflow** — named templates (registration, login, email verify, procurement, outreach, browser automation, tool self-upgrade). **Assigned by Intake Analyst `catalog_hint`**, never by keyword alone.
 - **IntakeWorkflow** — classify. If it fails, still create an RMP user task (`create_fresh` + Generic). Never native Slack.
+- **DeepRecallWorkflow** — the IA's deep recall, a bounded child `{task_id}-recall` of a user task: plan, hybrid retrieval with expansion, and a cited context report.
 
 ---
 
@@ -115,9 +119,12 @@ RMP chat.postMessage (idempotent)
 - Canary, heartbeat and system runs never reach user or procedural memory or the task registry. Procedural memory holds procedures (steps, tools, failures), not replies.
 - Slack delivery cannot fail silently: a long reply goes out whole in ordered parts, transient errors retry, a permanent failure is recorded and alerted, and the task ends `failed` (`slack_delivery_failed`) so its status matches what Kirill received.
 - RMP owns every question to Kirill: inside RMP runs Aura cannot use tools that wait for his answer (`ask_user`, `secrets` request); she asks in her reply.
-- Invariants are monitored, not assumed: readiness shows them, and the canary sentinel pages Kirill when one breaks (a completion without an accept, a dropped attached message, a Slack failure, internal traces in shared memory, a stuck vector outbox).
+- Invariants are monitored, not assumed: readiness shows them, and the canary sentinel pages Kirill when one breaks (a completion without an accept, a dropped attached message, a Slack failure, internal traces in shared memory, a stuck vector outbox, a finished task without its memory document, internal content in deep memory, a follow-up without an accept).
 - Attempts: 1–9 rework; ~10 strategy change; 11–19 continue; ~20 stop and Slack a diagnosis.
 - Process-scoped memory is injected on execute. Across `create_fresh`, prior same-conversation Slack turns are injected (RECENT DIALOGUE). “This is new” labels a **new task row**, not a new person.
+- Aura's prompt carries one memory block, assembled once by the IA's fast context (dialogue, facts, linked tasks, the run's memory, procedures), within a time and size budget.
+- Two-phase answering: Aura answers at once from the fast context while the IA's deep recall runs beside her and never delays her. A report ready before the final judgment joins her and the evaluator's memory. One that arrives after the reply leads to a follow-up only when the IA judges that it adds to or corrects what she said: RMP tells Kirill she recalled more, she refines, the evaluator judges, and only an accepted follow-up is sent. At most one per task.
+- Every finished user task gets an enriched task document; canary, heartbeat, cron and system runs never enter deep memory.
 - User-local clock is a **fact** (`USER LOCAL TIME` / Japan Standard Time). Server Europe/Berlin is not Kirill’s clock.
 - Primary model: `openai/gpt-6-luna` over the OpenAI Responses API. Fallback: `nvidia/openai/gpt-oss-20b` (NVIDIA-hosted; MiniMax M3 ended 2026-09-09). Subagent sessions, including the Process Evaluator, run on `openai/gpt-6-luna`. Thinking: `max` for Aura's user-task runs; `medium` for intake, the Process Evaluator, canaries and anything else. Intake: when `jev.intake_mode` is `enforce`, the pinned decision model `jev-1.13.0` answers typed intake questions first and counts only above program thresholds; otherwise the same chain decides. `apply_intake_policy` stays the authority either way.
 - LLM idle ~5s then rotate keys/models. OpenAI alone gets 20s for the first byte; gaps between chunks stay 5s for every provider. The one exception is OpenAI calls at thinking `max`: 120s for the first byte and 30s between chunks (Kirill, Sep 29 2026; measured, not “to be safe”). HTTP 410 is skip (next model), not an idle retry.
@@ -163,6 +170,7 @@ RMP chat.postMessage (idempotent)
 7. Aura in `rmp_task_*`. Program-owned plan and code predicates advance steps.
 8. Process Evaluator in `rmp_verify_*` accepts or reworks, judging Aura's action trace. Messages that arrived meanwhile are folded in and judged again.
 9. RMP `chat.postMessage`, idempotent, in ordered parts when long. Assistant text and its Slack `ts` stored on `task_messages`. Messages that arrive after it go back to intake.
+10. Deep recall, started with the run (unless intake said `recall_depth: none`): ready in time, it joined memory in steps 7–8; later, the task waits a bounded time for it, and a report that adds or corrects leads to the RMP notice, a refinement in `rmp_task_*__recall`, a judgment, and a follow-up.
 
 **Stop:** A **whole-message** stop/cancel/abort/halt may signal the active Temporal workflow (programmatic control). Incidental “stop” inside a normal sentence must still go through intake.
 
@@ -190,6 +198,9 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 | RECENT DIALOGUE (`task_messages`) | Same Slack **conversation** continuity across `create_fresh`. Must key off the real Slack session, not `agent:main:main`. |
 | USER LOCAL TIME | Clock **fact** in the user timezone (Asia/Tokyo). Not a greeting-phrase table. |
 | Hybrid retrieval | Evidence pack for Intake Analyst. Advisory. Fail-soft if vectors die. |
+| Deep memory | Everything Kirill and Aura said and did, and the pages and files she read, as documents with a table of contents, summarized sections, chunks with context headers, and dated facts. The IA searches it; Postgres text search answers when the index cannot. |
+| Fast context | The one memory block in Aura's and the evaluator's prompts, assembled once per run. |
+| Deep recall report | What the IA found for one request, cited, with facts marked current, superseded or conflicting. |
 | Workspace MEMORY.md | Human notes for main/heartbeat. Forbidden as first recall during RMP execute (`PROCESS-SCOPED MEMORY` / dialogue instead). |
 
 `create_fresh` means: new Task row for this message. Kirill still said the previous lines. Point out “this is new work” when it **is** new; do not wipe the dialogue.
@@ -222,6 +233,7 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 | NVIDIA auth | `nvidia:default` → `key2` → `key3`, balanced. |
 | OmniRoute | Not in the live Slack path. |
 | Decision model | `jev-1.13.0` (TypeSafe), pinned. Typed intake and memory-promotion decisions only; never writes text. `TYPESAFE_API_KEY` in `/etc/openclaw/openclaw.env`. Modes in `settings.json` `jev`; `AURA_JEV_MODE=off` disables both. |
+| Internal Agent | Direct OpenAI Responses API calls: `gpt-6-luna`, `reasoning.effort=medium`, `store: false`, strict JSON schemas; one retry, then `nvidia/openai/gpt-oss-20b`. Its own lane limiter (concurrency, rate, breaker, daily token budget; recall before enrichment) and the `memory_llm` ledger. The quota broker only paces NVIDIA keys for its fallback. |
 
 ---
 
@@ -263,6 +275,7 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 | Intake decides only through the LLM chain | Jev typed decision first; LLM chain below thresholds | Sep 28 2026: 11 of 14 DMs in 30 days fell to the zero-confidence fallback. |
 | An orphaned reply may go out as it is, so Kirill is not left waiting | A restarted run judges it first | Sep 29 2026 audit: 6 replies reached Slack unjudged on Sep 27–28 through the reconciler. |
 | OpenAI keeps responses (`store: true`, OpenClaw's default) | `store: false`; encrypted reasoning replay | Sep 29 2026: Kirill chose storage off if reasoning survives without it; verified live before and after the patch. |
+| Memory model work runs as OpenClaw turns, paced by the quota broker | The IA calls OpenAI directly (`gpt-6-luna`, `medium`, `store: false`) under its own lane limiter | Sep 30 2026: Kirill chose direct calls; the broker selects and paces NVIDIA keys and writes OpenClaw's auth store on every reservation. |
 | gpt-5-nano primary at thinking `low`, Chat Completions | `openai/gpt-6-luna` over the Responses API; `max` for Aura's user tasks, `medium` elsewhere; OpenAI `max` calls get 120s first byte and 30s chunk gaps | Sep 29 2026 Kirill: "switch everything to gpt-6-luna with max effort", then chose max for task work and medium for intake, evaluator and canaries. Live probes: Chat Completions rejects tools with reasoning and has no `max`; max on an intake prompt took 36s vs 6s at medium with the same decision. |
 
 ---
@@ -276,6 +289,7 @@ If a heartbeat ever runs again, the plugin still creates no RMP task for it and 
 | [`CONTROL_PLANE_PROGRESS.md`](CONTROL_PLANE_PROGRESS.md) | Append-only control-plane execution log |
 | [`CONCEPT_TREE_PROGRESS.md`](CONCEPT_TREE_PROGRESS.md) | Append-only log for this constitution work |
 | [`SYSTEM_AUDIT_PROGRESS.md`](SYSTEM_AUDIT_PROGRESS.md) | Append-only log of the Sep 29 2026 system audit and hardening |
+| [`DEEP_MEMORY_PROGRESS.md`](DEEP_MEMORY_PROGRESS.md) | Append-only log of deep memory and two-phase answering (Sep 30 2026) |
 | `/root/.cursor/rules/rmp-architecture.mdc` | Thin always-on coding binding |
 | `/root/.cursor/rules/openclaw-upgrade.mdc` | Upgrade/patch law |
 | `/root/.openclaw/workspace/TOOLS.md` | Aura executor notes (PROCESS BRIEF, tools). Not Cursor constitution. |

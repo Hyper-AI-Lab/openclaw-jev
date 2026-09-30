@@ -36,7 +36,7 @@ from app.db import database
 from app.db.models import (
     Base, DeepContextReport, Event, MemoryItem, ProcessRun, SideEffectReceipt, Task, TaskIntakeDecision, TaskMessage,
 )
-from app.deep_memory import curator, index as deep_index, recall
+from app.deep_memory import curator, health as deep_health, index as deep_index, recall
 from app.memory import router
 from app.orchestrator import web_capability
 from app.orchestrator.completion_rework import RECALL_NOTICE
@@ -548,3 +548,4 @@ async def test_a_recall_that_adds_after_the_reply_is_noticed_refined_judged_and_
     assert (events["evaluator.accept"], events["deep_recall.novelty"], events["deep_recall.followup"]) == (2, 1, 1)
     checks = await invariants_once_settled(monkeypatch)
     assert {name: c.status for name, c in checks.items()} == dict.fromkeys(checks, "pass")
+    assert (await deep_health.check_judged_followups()).status == "pass"

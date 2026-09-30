@@ -13,6 +13,7 @@ from sqlalchemy.orm import aliased
 
 from app.config import is_vector_memory_enabled
 from app.db.database import AsyncSessionLocal
+from app.deep_memory.health import INVARIANT_CHECKS as DEEP_MEMORY_INVARIANTS
 from app.db.models import Event, Task, VectorOutbox
 from app.memory.hygiene import canary_text_rows, internal_traces
 from app.notification_policy import is_internal_task
@@ -213,6 +214,7 @@ CHECKS = (
     check_orphan_recoveries,
     check_memory_hygiene,
     check_vector_sync,
+    *DEEP_MEMORY_INVARIANTS,
 )
 
 

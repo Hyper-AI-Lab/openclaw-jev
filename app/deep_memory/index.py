@@ -124,6 +124,10 @@ def collection_exists() -> bool:
     return bool(_client().collection_exists(name))
 
 
+def count_points() -> int:
+    return int(_client().count(collection_name(), exact=True).count)
+
+
 def ensure_collection() -> None:
     """Create the collection and its payload indexes once per process (indexes before points)."""
     from qdrant_client import models
