@@ -531,3 +531,67 @@ So the fast path's floor applies to dense similarity, at 0.30 (`fast_context_fac
 **Step 8 addendum, live:** the 15:07 JST canary ran on the new code and completed. Its prompt had 2,308 characters with one memory block (the empty-memory variant, since a canary gets only its own run, which was still empty) and no dialogue. `memory.fast_context` recorded 20 ms and 37 ms.
 
 ---
+
+## Step 11 — Deep recall workflow and context report
+
+**Date:** 2026-09-30, deployed 15:53 JST (`2ecf4bf`), follow-up 15:55 JST (`5b0de85`).
+
+**Research** ([LongMemEval, ICLR 2025](https://arxiv.org/abs/2410.10813) and [its code](https://github.com/xiaowu0162/LongMemEval); [Think Big, Search Small, arXiv 2607.07548](https://arxiv.org/html/2607.07548); the Step 1 sources on update chains):
+- Time-aware query expansion: an LLM infers a time range from the query and narrows the search. Recall rose 6.8–11.3%, but only with a strong model inferring the range.
+- Reading matters even with perfect retrieval. Items presented as JSON and sorted by date, read by extracting notes from each item before reasoning (Chain-of-Note), gained up to 10 points. GPT-4o kept improving past 20k retrieved tokens.
+- Turn-level values beat whole sessions, and extracted facts help multi-session questions. This matches our chunks per turn plus facts.
+- Decomposing a search into focused sub-queries doubles as context management: the searcher returns a condensed report, not raw passages. This is the IA's report to Aura.
+
+**What changed:**
+- `app/deep_memory/recall.py` (new):
+  - **Plan** (gpt-6-luna, `recall` priority): whether memory is needed, up to 4 sub-queries with the levels to search, entities, and a time window.
+  - **Retrieve:** fused hybrid search per sub-query. The current task's own content is never returned. When the index cannot answer, Postgres text search does.
+  - **Expand, within 40 items and 40,000 characters:** a chunk's section summary, its document summary with the table of contents, neighbouring chunks that are still valid, and the tasks linked to its task by lineage (never the current task). A fact brings its supersedes chain, the value that replaced it and the facts that contradict it, each marked current, superseded or conflicting.
+  - **Read** (gpt-6-luna): the evidence as numbered JSON items in date order, noted item by item before the report is written. The ContextReport has facts (status, as-of date, citations), past tasks (summary, outcome), document sections, gaps and a brief for Aura. Evidence numbers resolve to refs (`chunk:…`, `fact:…`); numbers the model writes into the brief are stripped.
+  - `format_report` gives the block Aura and the evaluator will read in Step 13. An irrelevant report gives nothing.
+  - Dates are Kirill's local (Tokyo) day, for index timestamps too. The window covers whole local days: `until` includes its day.
+- `app/activities/deep_memory_activities.py` (new): start, plan, retrieve, read and close, each recording its step in `dm_context_reports`: status (running → ready, empty, skipped or failed), plan, candidate refs, report, brief, token use and latency.
+- `app/workflows/deep_recall.py` (new): `DeepRecallWorkflow`, id `{task_id}-recall`. Plan, retrieve and read each get two tries. A request that needs no memory closes as skipped, nothing found as empty, and a failed step as failed, so the parent always learns the outcome. Step 13's parent bounds the runtime with an execution timeout.
+- `worker.py` registers the workflow and activities.
+- **The janitor, the purge tool, the reconciler's orphan cleanup and the stuck-workflow count recognise `-recall`.** A running recall counts as stuck only once its task has ended; the parent bounds it while the task runs.
+- **Two fixes from the live run:**
+  - `app/llm/openai_direct.py`: the reasoning item no longer counts as the first output. Timed live: the stream opens the reasoning item at +2.2 s, then stays silent for 4.4 s while the model thinks (599 reasoning tokens). A read that needed more thinking passed the 5 s gap, both gpt-6-luna attempts were cut off, and gpt-oss-20b answered after 27 s. The model now has the 20 s first-output budget for thinking, then the 5 s gaps, as the rule states.
+  - `app/deep_memory/enrich.py`: a section answer that miscounts its chunk contexts is asked again once. Live, the model returned contexts 0–3 for a 3-chunk guide section. Three reruns of the same call returned 0–2, correctly aligned. Before, one slip discarded every section call of the document and the job redid them all (about 40k tokens for the guide).
+
+**Deviations:**
+- The window ranks rather than filters, unlike LongMemEval. Hits inside the window come first and the others still count, since people misdate things ("last week" for ten days ago). The reader sees both.
+- The recall modules were drafted before this research was logged. The research then changed the reader (JSON items in date order, note before writing, 24,000 → 40,000 evidence characters) and confirmed the rest.
+
+**Verification:**
+- New `tests/test_deep_recall.py` (12), on a fixture index over a real SQLite schema, covers:
+  - expansion, with the current task excluded and a retired neighbour skipped;
+  - the evidence budget;
+  - window ranking with Tokyo day bounds;
+  - text-search fallback;
+  - plan trimming;
+  - cited reading in date order, with untrusted items flagged;
+  - the formatted block;
+  - the workflow in Temporal's test server (ready, skipped, empty, irrelevant, and a failed read retried once), with the persisted row.
+- Other new tests:
+  - `tests/test_reconciler_janitor.py` (+3): orphan recall cleanup, the janitor reading a recall's task, the stuck count.
+  - `tests/test_openai_direct.py` (+2): thinking within the first-output budget stays on gpt-6-luna; thinking past it falls back. The first failed on the old code.
+  - `tests/test_deep_enrich.py` (+1): a miscounted answer is asked again.
+- Full suite: 717 passed, 4 skipped.
+- **Live over real past tasks**, on production Postgres rolled back, with a scratch Qdrant collection deleted afterwards. The code-word and Kubernetes-guide tasks were ingested and enriched (82 s), and 161 points indexed with the 51 live user facts. Recall ran as a new task, each question once:
+
+  | Question | Plan | Retrieve | Read | Total | Report |
+  |---|---|---|---|---|---|
+  | "What's my test code word?" | 1.7 s | 0.5 s | 5.4 s | 7.6 s | PELICAN-47, current, cited to the earlier answer |
+  | "Which Kubernetes docs did we use for the home cluster guide?" | 2.3 s | 0.4 s | 27.4 s (fallback, fixed above) | 30.1 s | releases page and eight K3s docs |
+  | "How many servers did you recommend for etcd, and why?" | 2.1 s | 0.4 s | 7.1 s | 9.6 s | three, quorum of two tolerates one loss |
+
+  Every citation resolved to retrieved evidence.
+- **Live on the worker** after the deploy: `{task_id}-recall` workflows for a real task, `trigger=probe`. They ran in 11.7 s and 15.9 s and ended `ready`, with the plan, 8 candidates, token use and latency (10,892 and 14,887 ms) persisted. The first run's brief ended with a bracketed note echoing the new instruction against evidence numbers. The instruction was removed; the strip does that job (`5b0de85`), and the second brief is clean. The two probe rows stay in `dm_context_reports`.
+- Readiness after the deploy: 30 pass, 1 warn (telemetry, by design), 0 fail.
+
+**Observations:**
+- **The live index holds no documents yet.** There have been no user tasks since go-live, and there is no backfill. The three queued task jobs are hourly canaries, closed as `internal` as designed.
+- **Most of the 51 active user-memory rows are legacy noise:** "Site referenced: …" entries from the old promotion heuristic, and fragments of Aura's workspace files (USER.md, the imperatives, heartbeat notes). They show up as evidence, and the reader discards them. Removing them needs Kirill's approval; Step 14's invariants will surface them.
+- The healthcheck warns that OpenClaw prompt tokens over 24 h (6.0M) exceed its 5M budget. The total comes from 32 user tasks (with yesterday's reworked Kubernetes guide), 35 canaries and the Step 9–10 scratch runs. The memory lane is separate (142k today).
+
+---
