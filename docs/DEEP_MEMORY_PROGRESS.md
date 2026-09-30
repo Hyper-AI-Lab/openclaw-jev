@@ -490,3 +490,44 @@ So the fast path's floor applies to dense similarity, at 0.30 (`fast_context_fac
 - **Live, scratch sessions, nothing delivered:** three real gpt-6-luna turns (medium) on one ask, a first attempt and two reworks with the compact brief. Prompt tokens: first 28,054, rework 2 **24,204**, rework 3 **24,183**, so **flat**. The roughly 24k floor is OpenClaw's system prompt, tools and workspace files. Before, a task's session grew with every attempt: the Kubernetes guide reached about 160k tokens over five reworks. The scratch sessions `rmp_task_12ac088f…` (first, `__r2`, `__r3`) stay in the OpenClaw store.
 
 ---
+
+## Step 10 — A stop aborts Aura's in-flight run
+
+**Date:** 2026-09-30, deployed 15:18 JST (`38cd795`).
+
+**Live probes first** (scratch sessions; a five-page `web_fetch` run; nothing delivered):
+- The source (`dist/sessions-abort-D87RoCsf.js`): `sessions.abort` takes `{key, runId?, agentId?, clearQueued?}` and answers `{abortedRunId, status: "aborted" | "no-active-run"}`. `clearQueued` applies only to a key-only call.
+- `/hooks/agent` returns `{"ok": true, "runId": …}`, but that id is **not** in the gateway's abort registry. Aborting by `runId` answered `no-active-run`, and the run fetched all remaining pages.
+- `tasks.list` does not list hook runs either, so `tasks.cancel` cannot reach them.
+- **Aborting by key with `clearQueued: true` works:**
+  - An abort sent while a fetch was in flight: the fetch finished 1.3 s later, then the run ended with stop reason `aborted` at +4.4 s, with no new tool call.
+  - Another run carried out one call the model had already issued at the moment of the abort.
+
+**What changed:**
+- `app/openclaw_control.py` (new):
+  - `abort_session(key)` runs `openclaw gateway call sessions.abort --json --params {key, clearQueued: true}` and returns aborted, no-active-run, error or timeout.
+  - `abort_task_runs(task_id, reason)` aborts every session of the task concurrently (up to 6; each CLI call starts node): Aura's first session, reworks, refinement and planner, and the evaluator's `rmp_verify_…` sessions including fallbacks. It records `openclaw.aborted` (reason, sessions, aborted, unconfirmed).
+  - `schedule_abort` runs it in the background, so a stop or an intake decision never waits on the gateway.
+  - `openclaw_sessions.task_run_session_keys` lists those sessions.
+- **Call sites:**
+  - `/tasks/{id}/signal` on a whole-message stop or a `cancel` signal. This is how the plugin routes Kirill's "stop".
+  - `/tasks/{id}/cancel`.
+  - `temporal_control.terminate_task_workflow`, which intake uses for `rebuild_stale` and supersede.
+  - `/dev/suspend-all`.
+  - The workflow still sees the stop at its next step, as before. Aura's run is now stopped at once instead of running on to its end.
+- `tests/conftest.py`: tests never spawn the real CLI; the abort call is stubbed unless a test drives it.
+
+**Verification:**
+- New `tests/test_openclaw_control.py` (5), with a fake `openclaw` executable that logs its arguments, covers:
+  - every session aborted with `clearQueued`, with gateway answers, errors and timeouts told apart and the event recorded;
+  - a task without sessions spawns nothing;
+  - the session list covers Aura and the evaluator;
+  - stop, cancel, supersede and rebuild all schedule the abort, and an ordinary attached message does not;
+  - a failing background abort is logged, not raised.
+- Full suite: 699 passed, 4 skipped.
+- **Live, end to end through the module** on a scratch run it found in the live store: the gateway answered `aborted`, and the run ended with stop reason `aborted` 4.5 s after the stop began. Almost all of that is the CLI starting node and connecting. One tool call the model issued at +2.3 s, while the CLI was still starting, still ran; nothing ran after the gateway received the abort.
+- A stop of a real long task by Kirill is part of Step 15's acceptance.
+
+**Step 8 addendum, live:** the 15:07 JST canary ran on the new code and completed. Its prompt had 2,308 characters with one memory block (the empty-memory variant, since a canary gets only its own run, which was still empty) and no dialogue. `memory.fast_context` recorded 20 ms and 37 ms.
+
+---
