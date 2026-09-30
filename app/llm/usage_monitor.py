@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.config import OPENCLAW_HOME, RMP_DATA_DIR
+from app.openclaw_transcripts import decode_event, event_columns
 
 logger = logging.getLogger("rmp.llm_usage")
 
@@ -437,7 +438,7 @@ def scrape_openclaw_sessions(limit_events: int = 5000) -> Dict[str, Any]:
                 ).fetchone()
                 last_rowid = max(0, int(row[0] or 1) - 1)
             rows = db.execute(
-                "SELECT e.rowid, e.session_id, e.event_json, "
+                f"SELECT e.rowid, e.session_id, {event_columns(db, 'e')}, "
                 "(SELECT w.session_key FROM session_windows w WHERE w.session_id = e.session_id) "
                 "FROM transcript_events e WHERE e.rowid > ? ORDER BY e.rowid LIMIT ?",
                 (last_rowid, limit_events),
@@ -449,10 +450,10 @@ def scrape_openclaw_sessions(limit_events: int = 5000) -> Dict[str, Any]:
         return {"new_events": 0, "scanned_events": 0, "source": "error"}
 
     turns: List[Dict[str, Any]] = []
-    for rowid, session_id, event_json, session_key in rows:
+    for rowid, session_id, event_json, event_zstd, utf8_bytes, session_key in rows:
         last_rowid = int(rowid)
         try:
-            entry = json.loads(event_json)
+            entry = json.loads(decode_event(event_json, event_zstd, utf8_bytes))
         except (TypeError, json.JSONDecodeError):
             continue
         turn = _assistant_llm_turn(
@@ -588,7 +589,7 @@ def transcript_usage(hours: float = 24, *, now_ms: Optional[int] = None) -> Dict
         db = _open_agent_db()
         try:
             rows = db.execute(
-                "SELECT e.session_id, e.seq, e.event_json, e.created_at, "
+                f"SELECT e.session_id, e.seq, {event_columns(db, 'e')}, e.created_at, "
                 "(SELECT w.session_key FROM session_windows w WHERE w.session_id = e.session_id) "
                 "FROM transcript_events e WHERE e.created_at >= ? AND e.created_at <= ? "
                 "ORDER BY e.session_id, e.seq",
@@ -609,9 +610,9 @@ def transcript_usage(hours: float = 24, *, now_ms: Optional[int] = None) -> Dict
     report["direct"] = _direct_usage(since_ms, now_ms)
 
     turns: List[Dict[str, Any]] = []
-    for session_id, _seq, event_json, created_at, session_key in rows:
+    for session_id, _seq, event_json, event_zstd, utf8_bytes, created_at, session_key in rows:
         try:
-            entry = json.loads(event_json)
+            entry = json.loads(decode_event(event_json, event_zstd, utf8_bytes))
         except (TypeError, json.JSONDecodeError):
             continue
         msg = entry.get("message") or {}

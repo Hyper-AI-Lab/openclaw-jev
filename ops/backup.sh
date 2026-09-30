@@ -74,6 +74,11 @@ PY
   fi
 fi
 
+# OpenClaw's agent and state stores (sessions, transcripts, auth, cron): SQLite backup API
+log "Backing up OpenClaw stores..."
+"${RMP_ROOT}/venv/bin/python" "${RMP_ROOT}/ops/backup_openclaw_state.py" backup --dest "${DEST}/openclaw-state" \
+  >>"${LOG}" 2>&1 || log "WARN: OpenClaw store backup failed"
+
 # Config snapshots
 cp -a "${RMP_ROOT}/settings.json" "${DEST}/settings.json" 2>/dev/null || true
 cp -a /root/.openclaw/openclaw.json "${DEST}/openclaw.json" 2>/dev/null || true
@@ -83,7 +88,7 @@ cp -a /root/.openclaw/cron/jobs.json "${DEST}/cron_jobs.json" 2>/dev/null || tru
 cat > "${DEST}/manifest.json" <<EOF
 {
   "timestamp": "${STAMP}",
-  "components": ["postgres", "qdrant", "artifacts", "temporal", "settings"],
+  "components": ["postgres", "qdrant", "artifacts", "temporal", "openclaw-state", "settings"],
   "host": "$(hostname)"
 }
 EOF

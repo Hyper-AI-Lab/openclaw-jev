@@ -203,8 +203,7 @@ fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_DIR="${BACKUP_ROOT}/openclaw-update-${STAMP}"
-mkdir -p "${BACKUP_DIR}/plugins" "${BACKUP_DIR}/state" "${BACKUP_DIR}/workspace" \
-  "${BACKUP_DIR}/agents/main/agent"
+mkdir -p "${BACKUP_DIR}/plugins" "${BACKUP_DIR}/workspace" "${BACKUP_DIR}/agents/main/agent"
 log "Backup → ${BACKUP_DIR}"
 
 cp -a "${OPENCLAW_HOME}/openclaw.json" "${BACKUP_DIR}/openclaw.json"
@@ -217,9 +216,9 @@ for plug in rmp_adapter aura_web; do
     cp -a "${OPENCLAW_HOME}/plugins/${plug}" "${BACKUP_DIR}/plugins/${plug}"
   fi
 done
-if [[ -f "${OPENCLAW_HOME}/state/openclaw.sqlite" ]]; then
-  cp -a "${OPENCLAW_HOME}/state/openclaw.sqlite" "${BACKUP_DIR}/state/openclaw.sqlite"
-fi
+# Sessions, transcripts and state, while the gateway still runs: the new version migrates them.
+"${RMP_ROOT}/venv/bin/python" "${RMP_ROOT}/ops/backup_openclaw_state.py" backup --dest "${BACKUP_DIR}/openclaw-state" \
+  || die "OpenClaw store backup failed; nothing was stopped or installed"
 if [[ -f "${OPENCLAW_HOME}/workspace/TOOLS.md" ]]; then
   cp -a "${OPENCLAW_HOME}/workspace/TOOLS.md" "${BACKUP_DIR}/workspace/TOOLS.md"
 fi
@@ -311,4 +310,4 @@ fi
 log "Restarting RMP + gateway"
 bash "${RMP_ROOT}/ops/restart_rmp.sh"
 log "Done. Backup: ${BACKUP_DIR}"
-log "Rollback: reinstall the version in ${BACKUP_DIR}/VERSIONS.txt (openclaw_before), openclaw plugins install each plugin_before spec, restore openclaw.json + plugins, bash patch_openclaw.sh, restart"
+log "Rollback: reinstall the version in ${BACKUP_DIR}/VERSIONS.txt (openclaw_before), openclaw plugins install each plugin_before spec, restore openclaw.json + plugins, stop the gateway and run ops/backup_openclaw_state.py restore ${BACKUP_DIR}/openclaw-state --yes, bash patch_openclaw.sh, restart"

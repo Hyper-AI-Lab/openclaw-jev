@@ -2,8 +2,9 @@
 
 Downloads the target with ``npm pack`` and checks what a rehearsal against 2026.9.7 found
 broken (2026-09-30): the Node versions it supports, whether ``patch_openclaw.sh`` applies to
-its dist, and whether every transcript event keeps plain ``event_json``, which RMP's
-transcript readers need. Exit 0 when the target passes, 1 with the reasons when it does not.
+its dist, and whether RMP's transcript reader (``app/openclaw_transcripts.py``) can read the way
+it stores transcript events: plain ``event_json``, or zstd in ``event_zstd`` with
+``event_utf8_bytes``. Exit 0 when the target passes, 1 with the reasons when it does not.
 ``ops/upgrade_openclaw.sh`` runs it first; it can also be run alone:
 
     venv/bin/python ops/openclaw_preflight.py [openclaw@latest]
@@ -18,13 +19,15 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 RMP_ROOT = Path(__file__).resolve().parent.parent
 PATCHER = RMP_ROOT / "patch_openclaw.sh"
 TRANSCRIPT_TABLE = "CREATE TABLE IF NOT EXISTS transcript_events"
 _COMPARATOR = re.compile(r"^(>=|<=|>|<|=)?v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
 _EVENT_JSON = re.compile(r"\bevent_json\s+TEXT(\s+NOT\s+NULL)?", re.I)
+_EVENT_ZSTD = re.compile(r"\bevent_zstd\s+BLOB\b", re.I)
+_EVENT_UTF8_BYTES = re.compile(r"\bevent_utf8_bytes\s+INTEGER\b", re.I)
 # A definition has columns after the parenthesis; code that locates it in the schema has a quote.
 _DEFINITION = re.compile(re.escape(TRANSCRIPT_TABLE) + r"\s*\(\s*[A-Za-z_]")
 
@@ -58,9 +61,9 @@ def satisfies(version: str, spec: str) -> bool:
     return False
 
 
-def transcript_json_required(dist: Path) -> Optional[bool]:
-    """Whether every transcript table definition keeps ``event_json TEXT NOT NULL``; None if none is found."""
-    found: List[bool] = []
+def transcript_layouts(dist: Path) -> List[str]:
+    """Each transcript table definition's layout: "plain", "zstd" (what RMP decodes) or "unknown"."""
+    layouts: List[str] = []
     for path in dist.rglob("*"):
         if path.suffix not in (".js", ".mjs") or not path.is_file():
             continue
@@ -69,10 +72,18 @@ def transcript_json_required(dist: Path) -> Optional[bool]:
         while start >= 0:
             window = text[start:start + 800].replace("\\n", " ").replace("\\t", " ")
             if _DEFINITION.match(window):
-                column = _EVENT_JSON.search(window)
-                found.append(bool(column and column.group(1)))
+                layouts.append(_layout(window))
             start = text.find(TRANSCRIPT_TABLE, start + 1)
-    return all(found) if found else None
+    return layouts
+
+
+def _layout(definition: str) -> str:
+    column = _EVENT_JSON.search(definition)
+    if column and column.group(1):
+        return "plain"
+    if column and _EVENT_ZSTD.search(definition) and _EVENT_UTF8_BYTES.search(definition):
+        return "zstd"
+    return "unknown"
 
 
 def patches_apply(dist: Path) -> Tuple[bool, str]:
@@ -105,11 +116,12 @@ def check(spec: str) -> List[str]:
         applied, detail = patches_apply(package / "dist")
         if not applied:
             problems.append(f"RMP's patches do not apply: {detail}")
-        json_required = transcript_json_required(package / "dist")
-        if json_required is None:
+        layouts = transcript_layouts(package / "dist")
+        if not layouts:
             problems.append("no transcript table definition found, so RMP's transcript reads cannot be confirmed")
-        elif not json_required:
-            problems.append("transcript events may be stored without event_json (compressed), which RMP cannot read")
+        elif "unknown" in layouts:
+            problems.append("it stores transcript events in a layout RMP's reader does not know "
+                            f"(found: {', '.join(sorted(set(layouts)))})")
         return problems
 
 

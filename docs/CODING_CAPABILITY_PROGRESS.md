@@ -182,3 +182,52 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
 - Claude Code: `opus` answered as `claude-opus-5-5` in 7.1 s, over 2 turns, using the Read tool, in `bypassPermissions` mode with no MCP servers. So Kirill's plan allows Opus, and `opus` stays the default model.
 - The token is 108 characters, root-only, and expires 2027-09-30.
 - The version is still 2.1.280, with one version installed.
+
+---
+
+## Step 3 — Backups and compressed transcripts (2026.9.1 and 2026.9.7)
+
+**Date:** 2026-09-30.
+
+**Research:**
+- **What 2026.9.7 compresses.** Read in the 2026.9.7 dist (`transcript-payload-*.mjs`, `prepareTranscriptPayload`): events of at least 1024 UTF-8 bytes are compressed at zstd level 1 with a checksum, whenever that saves at least max(64 B, 10%).
+  - Skipped: events containing `\u` escapes or NUL, and session headers.
+  - Stored: `event_json` NULL, `event_zstd`, `event_utf8_bytes` and a `navigation_json` projection.
+  - The limit is `MAX_COMPRESSED_EVENT_BYTES` = 4 MiB.
+- **Decoding in Python.** `zstandard` decodes frames written by Node's `zlib.zstdCompressSync` (test below). `max_output_size` is only an upper bound, because the frames carry their content size.
+
+**What changed:**
+- `app/openclaw_transcripts.py` (new) is the one decode point:
+  - `event_columns(con, alias)` selects `(event_json, event_zstd, event_utf8_bytes)` when the column exists, else `(event_json, NULL, NULL)`;
+  - `decode_event` returns the JSON text, or None for a frame it cannot decode (logged). It uses a decompressor per call, because zstandard contexts are not thread-safe.
+- The readers use it: `app/openclaw_sessions.py` `read_transcript_lines` (reply polling, session recovery, the evaluator's action trace, deep-memory ingestion, the canary check), and `app/llm/usage_monitor.py` `scrape_openclaw_sessions` and `transcript_usage`.
+- `requirements.txt`: `zstandard==0.25.0`, the version already installed through `langsmith`.
+- `ops/backup_openclaw_state.py` (new):
+  - `backup` uses SQLite's backup API for `openclaw-agent.sqlite` and `state/openclaw.sqlite`: a consistent snapshot while the gateway writes.
+  - Each copy becomes a self-contained rollback-journal file, is checked with `PRAGMA quick_check`, and is described in `manifest.json`: bytes, sha256, the source's mode and owner, and the OpenClaw version.
+  - `verify` checks the checksums and integrity.
+  - `restore --yes` refuses while the gateway runs, verifies first, restores mode and owner, and removes a stale `-wal`/`-shm`, which SQLite would otherwise replay onto the restored file.
+- The two callers:
+  - `ops/upgrade_openclaw.sh` takes this backup into `openclaw-update-*/openclaw-state` before anything stops, and dies if it fails. It replaces the old hot `cp` of the state database (without its WAL), and the rollback hint names the restore command.
+  - `ops/backup.sh` (nightly): adds `openclaw-state` to each nightly backup.
+- `ops/openclaw_preflight.py`: `transcript_layouts` classifies each transcript table definition as `plain`, `zstd` (what the reader decodes) or `unknown`. It refuses unknown layouts, or no definition at all.
+- Tests:
+  - `tests/openclaw97.py` (new helper): the 2026.9.7 schema, with events stored the way 2026.9.7 stores them.
+  - `tests/test_openclaw_transcripts.py` (6):
+    - decode, including a frame compressed by Node's zlib;
+    - the 2026.9.1 schema reads unchanged;
+    - reply polling finds its marker in a compressed user turn;
+    - session recovery, deep-memory tool results and the memory canary read compressed history;
+    - usage accounting counts compressed turns.
+  - `tests/test_backup_openclaw_state.py` (4): a consistent snapshot while a writer holds an open transaction; a tampered copy fails verify; restore replaces the store, drops a stale WAL and keeps modes; restore refuses while the gateway runs or without `--yes`.
+  - `tests/test_openclaw_preflight.py`: layouts, with 2026.9.7's real definition accepted and an unknown one refused.
+
+**Deviation:**
+- The first live backup left `-wal`/`-shm` sidecars: the copies kept WAL mode, and reading them created the files. The copies now switch to `journal_mode=DELETE` before their check, and a test asserts the directory holds exactly the manifest and the two databases.
+
+**Verification:**
+- Full suite: 823 passed, 4 skipped (317 s).
+- **Live reads unchanged on 2026.9.1:** the old reader (`main`) and the new one (worktree) returned identical results on the live agent database:
+  - the 25 most recent sessions: 673 lines, content hash `ea81d60f41290267`;
+  - `transcript_usage(24 h)`: 251 attempts, 802,247 input, 4,778,951 cache-read and 295,364 output tokens.
+- **Live backup:** agent 92 MiB and state 18 MiB in 5.0 s, with the gateway running; `quick_check` ok and `verify` ok. Kept at `data/backups/openclaw-state/20260930T143147Z`.

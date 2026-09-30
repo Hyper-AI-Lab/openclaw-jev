@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.config import OPENCLAW_HOME, SESSIONS_JSON_PATH as _SESSIONS_JSON
+from app.openclaw_transcripts import decode_event, event_columns
 
 SESSIONS_JSON_PATH = Path(_SESSIONS_JSON)
 AGENT_DB_PATH = Path(OPENCLAW_HOME) / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
@@ -201,7 +202,7 @@ def read_transcript_lines(session_id: str) -> List[str]:
         con = _connect(AGENT_DB_PATH, readonly=True)
         try:
             rows = con.execute(
-                "SELECT event_json FROM transcript_events WHERE session_id = ? "
+                f"SELECT {event_columns(con)} FROM transcript_events WHERE session_id = ? "
                 "ORDER BY CAST(seq AS INTEGER), seq",
                 (session_id,),
             ).fetchall()
@@ -209,7 +210,7 @@ def read_transcript_lines(session_id: str) -> List[str]:
             con.close()
     except Exception:
         return []
-    return [row[0] for row in rows if row and row[0]]
+    return [line for line in (decode_event(*row) for row in rows) if line]
 
 
 def _clip(text: str, limit: int) -> str:

@@ -12,7 +12,11 @@ NODE_24_ONLY = ">=24.16.0 <25 || >=26.1.0"
 TABLE_91 = ("CREATE TABLE IF NOT EXISTS transcript_events (\n  session_id TEXT NOT NULL,\n"
             "  seq INTEGER NOT NULL,\n  event_json TEXT NOT NULL,\n  created_at INTEGER NOT NULL")
 TABLE_97 = ("CREATE TABLE IF NOT EXISTS transcript_events (\\n  session_id TEXT NOT NULL,\\n"
-            "  seq INTEGER NOT NULL,\\n  event_json TEXT,\\n  created_at INTEGER NOT NULL,\\n  event_zstd BLOB")
+            "  seq INTEGER NOT NULL,\\n  event_json TEXT,\\n  created_at INTEGER NOT NULL,\\n  event_zstd BLOB,\\n"
+            "  event_utf8_bytes INTEGER CHECK (event_utf8_bytes IS NULL OR event_utf8_bytes >= 0),\\n"
+            "  navigation_json TEXT")
+TABLE_UNKNOWN = ("CREATE TABLE IF NOT EXISTS transcript_events (\\n  session_id TEXT NOT NULL,\\n"
+                 "  seq INTEGER NOT NULL,\\n  payload BLOB NOT NULL,\\n  created_at INTEGER NOT NULL")
 needs_node = pytest.mark.skipif(not (shutil.which("node") and shutil.which("npm")), reason="needs node and npm")
 
 
@@ -34,17 +38,19 @@ def test_a_range_it_cannot_read_is_an_error_not_a_pass(spec):
         pf.satisfies("v24.16.0", spec)
 
 
-def test_every_transcript_table_definition_must_keep_event_json(tmp_path):
+def test_every_transcript_table_definition_is_read_for_its_layout(tmp_path):
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "migrate.js").write_text(
         'const start = SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS transcript_events (", from);')
-    assert pf.transcript_json_required(dist) is None
+    assert pf.transcript_layouts(dist) == []
     (dist / "worker.mjs").write_text("const ddl = `" + TABLE_91 + "`;")
     (dist / "maintenance.js").write_text('const ddl = "' + TABLE_91.replace("\n", "\\n") + '";')
-    assert pf.transcript_json_required(dist) is True
+    assert sorted(pf.transcript_layouts(dist)) == ["plain", "plain"]
     (dist / "store.mjs").write_text('const ddl = "' + TABLE_97 + '";')
-    assert pf.transcript_json_required(dist) is False
+    assert sorted(pf.transcript_layouts(dist)) == ["plain", "plain", "zstd"]
+    (dist / "later.mjs").write_text('const ddl = "' + TABLE_UNKNOWN + '";')
+    assert "unknown" in pf.transcript_layouts(dist)
 
 
 def test_the_patcher_rehearses_on_the_dist_it_is_given(tmp_path):
@@ -66,16 +72,17 @@ def package(tmp_path, node_range, table):
 @needs_node
 def test_a_target_that_fails_is_refused_with_every_reason(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(pf, "patches_apply", lambda dist: (False, "ERROR: required patch missing after apply: x"))
-    assert pf.main(package(tmp_path, ">=99.0.0", TABLE_97)) == 1
+    assert pf.main(package(tmp_path, ">=99.0.0", TABLE_UNKNOWN)) == 1
     out = capsys.readouterr().out
     assert "target: openclaw@2026.9.7" in out
     assert "FAIL: it needs Node >=99.0.0; this host runs v" in out
     assert "FAIL: RMP's patches do not apply: ERROR: required patch missing after apply: x" in out
-    assert "FAIL: transcript events may be stored without event_json" in out
+    assert "FAIL: it stores transcript events in a layout RMP's reader does not know (found: unknown)" in out
 
 
 @needs_node
-def test_a_target_that_passes_is_cleared(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("table", [TABLE_91.replace("\n", "\\n"), TABLE_97])
+def test_a_target_that_passes_is_cleared(tmp_path, monkeypatch, capsys, table):
     monkeypatch.setattr(pf, "patches_apply", lambda dist: (True, ""))
-    assert pf.main(package(tmp_path, ">=18.0.0", TABLE_91.replace("\n", "\\n"))) == 0
+    assert pf.main(package(tmp_path, ">=18.0.0", table)) == 0
     assert "OK:" in capsys.readouterr().out
