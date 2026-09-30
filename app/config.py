@@ -243,6 +243,28 @@ def get_deep_memory_config() -> dict:
     return dict(load_settings().get("deep_memory") or DEFAULT_DEEP_MEMORY)
 
 
+DEFAULT_CODING = {
+    # Coding tasks: Claude Code as the aura-coder user, run and verified by RMP.
+    "enabled": True,
+    "claude_version": "2.1.280",
+    "model": "opus",
+    "fallback_model": "sonnet",
+    "max_turns": 200,
+    "max_rounds": 3,
+    "run_timeout_sec": 5400,
+    "memory_max": "3G",
+    "cpu_quota": "250%",
+    "tasks_max": 1024,
+    # This host's services on loopback; aura-coder may not connect to them.
+    "blocked_tcp_ports": [22, "4317-4318", 5432, 6006, "6333-6334", "6933-6939", "7233-7243",
+                          8000, 8791, 9222, "18789-18899"],
+}
+
+
+def get_coding_config() -> dict:
+    return dict(load_settings().get("coding") or DEFAULT_CODING)
+
+
 def get_intake_models() -> list[str]:
     """Ordered intake LLM models: primary then fallbacks (OpenClaw provider/model refs)."""
     cfg = get_task_registry_config()
@@ -350,6 +372,8 @@ def load_settings() -> dict:
     settings["task_registry"] = {**DEFAULT_TASK_REGISTRY, **tr}
     dm = settings.get("deep_memory") or {}
     settings["deep_memory"] = {**DEFAULT_DEEP_MEMORY, **dm}
+    coding = settings.get("coding") or {}
+    settings["coding"] = {**DEFAULT_CODING, **coding}
     return settings
 
 

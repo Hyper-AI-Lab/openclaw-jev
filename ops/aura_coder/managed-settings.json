@@ -1,0 +1,29 @@
+{
+  "env": {
+    "DISABLE_UPDATES": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "permissions": {
+    "deny": [
+      "Bash(git push)",
+      "Bash(git push *)",
+      "Bash(gh *)",
+      "Bash(sudo *)",
+      "Bash(su *)",
+      "Bash(systemctl *)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(nft *)",
+      "Bash(iptables *)"
+    ]
+  },
+  "allowManagedPermissionRulesOnly": true,
+  "allowManagedHooksOnly": true,
+  "allowManagedMcpServersOnly": true,
+  "allowedMcpServers": [],
+  "disableClaudeAiConnectors": true,
+  "disableSideloadFlags": true,
+  "disableSkillShellExecution": true,
+  "strictKnownMarketplaces": [],
+  "cleanupPeriodDays": 30
+}

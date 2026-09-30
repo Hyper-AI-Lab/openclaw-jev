@@ -1,0 +1,16 @@
+[Unit]
+Description=Firewall for Aura's coding runs (aura-coder cannot reach this host's services)
+Wants=network-pre.target
+After=network-pre.target
+Before=rmp-api.service rmp-worker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/root/.openclaw/rmp
+Environment=PYTHONPATH=/root/.openclaw/rmp
+ExecStart=/root/.openclaw/rmp/venv/bin/python -m app.coding.firewall apply
+ExecStop=/root/.openclaw/rmp/venv/bin/python -m app.coding.firewall remove
+
+[Install]
+WantedBy=multi-user.target
