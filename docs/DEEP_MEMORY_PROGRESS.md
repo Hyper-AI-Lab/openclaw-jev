@@ -861,3 +861,5 @@ Against the targets:
 - `rmp-canary-sentinel` exits 1 on the known 24 h prompt budget (6.4M over 5M, as in Step 11's observations). No invariant is broken.
 
 ---
+
+**Follow-ups addendum, push:** `8afd1d4..13eeefe` pushed to `Hyper-AI-Lab/openclaw-jev`. CI [36708643883](https://github.com/Hyper-AI-Lab/openclaw-jev/actions/runs/36708643883): success, 779 passed, 5 skipped (the runner also skips the rule-copy test).
