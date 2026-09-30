@@ -95,7 +95,7 @@ Each consumer runs `off`, `shadow` (record Jev's proposal, act on the existing p
 
 ### Prerequisites
 
-- Linux, Python 3.12, and Node.js 22.22.3+ (OpenClaw 2026.9 supports 22.22.3+, 24.15+ or 25.9+)
+- Linux, Python 3.12, and Node.js 24.16+ (OpenClaw 2026.9.7 supports 24.16+ on 24.x, or 26.1+)
 - [OpenClaw](https://github.com/openclaw/openclaw) 2026.9 gateway with Slack configured
 - PostgreSQL, a [Temporal](https://temporal.io) server and [Qdrant](https://qdrant.tech)
 - An OpenAI API key (chat, the IA's memory work, and `text-embedding-3-small` / `text-embedding-3-large` embeddings); NVIDIA API keys for the fallback model are optional
@@ -132,6 +132,7 @@ make readiness          # readiness report, invariant checks included
 make canary             # end-to-end canary task
 make restart-rmp        # restart API, worker and gateway; waits for health
 make upgrade-openclaw   # after every OpenClaw update: re-apply and verify patches
+bash ops/rollback_openclaw.sh   # back to the version and data from before the last upgrade
 curl -H "X-RMP-API-Key: $KEY" localhost:8000/api/deep_memory/status   # deep memory at a glance
 venv/bin/python -m ops.reconcile_vectors [--apply]   # compare Postgres with Qdrant
 venv/bin/python -m pytest tests/ -q                  # hermetic: private SQLite, sealed network

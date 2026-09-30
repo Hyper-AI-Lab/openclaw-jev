@@ -367,3 +367,63 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
 - **Coding sandbox:** smoke with `ProtectProc`: 34 isolation probes as intended, and `claude opus` ok in 6.7 s.
 - **Production untouched:** readiness 38 pass, 1 warn (telemetry), 0 fail, the same as the baseline. The gateway's `/readyz` returns 200.
 - **Tests:** full suite 831 passed, 4 skipped (296 s).
+
+---
+
+## Step 6 — Production cutover
+
+**Date:** 2026-10-01, between 22:21Z and 23:15Z on 2026-09-30. Kirill approved both windows back to back, and no user task was active.
+
+**Window 1, Node 24:**
+- Online backup of both stores, as a rollback point.
+- NodeSource `node_22.x` switched to `node_24.x`, then `apt-get install nodejs`: 22.23.2-1nodesource1 became 24.21.0-1nodesource1, with npm 11.19.0.
+- `ops/restart_rmp.sh`, then the kairos daemons restarted on Node 24 through their cron script.
+- Timing: apt 36 s, restart to `/readyz` 33 s, 69 s in total. Aura was offline for about 33 s.
+
+**Window 2, OpenClaw 2026.9.7:**
+- `OPENCLAW_PACKAGE=openclaw@2026.9.7 bash ops/upgrade_openclaw.sh`: the pre-flight passed, then backups, install, plugins update (brave, mistral and slack to 2026.9.7), doctor, TOOLS.md restore, settle, key sync (3 NVIDIA plus OpenAI), all 15 patches in 15 files, skills, verify, restart.
+- Timing: the script started at 22:24:36Z. The gateway stopped at 22:26:08Z, started at 22:38:15Z and was ready at 22:39:28Z.
+  - Aura was offline for 13 min 20 s, longer than the plan's "few minutes"; npm install, plugins update and doctor took most of it.
+  - The first start took 73 s, migration included.
+- **Migration:** it imported 107,415 events from 5,773 JSONL-era sessions (February to September 4) into `transcript_events`, with their original `created_at`, and compressed 23,265 of the resulting 122,963 events.
+
+**Follow-ups found on production, with Kirill's approval where they changed production:**
+1. **Upgrade ordering bug, fixed before window 2.** `upgrade_openclaw.sh` verified before linking skills. A fresh npm install drops the MoltMarket link, so the verifier would have failed with the gateway already stopped. Skills are now linked first. The old verifier failed the same way.
+2. **Usage double count, prevented.** The imported history sits at rowids after the usage scrape's cursor, and the scrape deduplicates only the last 10,000 message IDs, so its next run would have re-counted months of turns.
+   - Fix: the scrape now skips events created more than a day before its previous run.
+   - Proven on production: the first scrape took exactly the 147 real pre-upgrade events (rowids 24,765 to 24,911, 28 turns) and skipped the import.
+   - Test: `test_history_imported_at_new_rowids_is_not_counted_again`. The 24-hour transcript usage was unaffected (539 events before and after).
+3. **LangSearch failed to load.** 2026.9.7 loads a captured copy of each plugin (`tmp/plugin-captures/…`), and langsearch required `../aura_web/lib/client.js` by relative path.
+   - Fix: it falls back to the file under the state directory.
+   - Tests: `tests/node/langsearch.test.js`, which fails without the fix.
+   - Deploy: synced to the live plugin directory, followed by a gateway restart (ready in 118 s).
+4. **Utility-model calls turned off.** Unset, 2026.9.7 derives `gpt-5.6-luna` for activity recaps (which send transcript excerpts), progress narration and titles. Kirill turned them off.
+   - `apply_openclaw_policy` sets `agents.defaults.utilityModel: ""`, and the verifier fails when it is not "".
+   - Since that restart, the journal shows no `gpt-5.6-luna` calls.
+5. **A probe blind spot.** The plugin probe read the `openclaw` CLI's list, which loads plugins in its own process and showed langsearch as loaded. It now reads the running gateway's journal: no "failed during load", and every local plugin, plus Slack when enabled, in its "http server listening" line. Staging's line had lacked langsearch too.
+6. **Docs:**
+   - `MIN_NODE` is 24.16.0, and CI runs `node-version: "24"`.
+   - The README (prerequisites, rollback command) and ARCHITECTURE (version, utility model, patch rows, upgrade checklist with rehearsal, probes and rollback) are updated.
+   - `docs/runbooks/openclaw-update.md` is rewritten: rehearse, upgrade, check, roll back.
+   - Rule item 5 names the rollback script, and both copies are identical.
+
+**Deviations and why:**
+- **Window 2 was longer than planned:** Aura was offline 13 min 20 s.
+- **Unplanned fixes:** items 1 to 4 above were fixes the cutover itself surfaced.
+- **Rollback script:** written and rehearsed in step 5; production never needed it.
+- **Left on disk:** the staging tree and the `/opt` Node tarball stay until Kirill decides on them. The staging copy holds production data and the config's inline secrets.
+
+**Verification:**
+- **After window 1** (Node 24, OpenClaw 2026.9.1):
+  - Probes 8/8 (settle is skipped on production).
+  - Intake canary PASS (8 s), readiness 38/1/0.
+  - The kairos daemons run on v24.21.0, and cron has run every 5 minutes since the switch with nothing in its log.
+- **After window 2** (2026.9.7):
+  - Probes 8/8: the hook run replied in 10.1 s with the marker turn compressed; abort landed at 3.3 s; the 40 most recent sessions (777 lines) read back unchanged.
+  - Verifier passed, intake canary PASS (12 s), readiness 38/1/0.
+- **After the follow-ups:**
+  - Probes 8/8 with the gateway-side plugin check: aura_web, langsearch, memory-core, openai, rmp_adapter and slack loaded, with no load failures.
+  - Verifier "OK: utility-model route off".
+  - Health canary `ops/canary.sh` CANARY OK in 15 s.
+- **Real DM round trip:** Kirill DMed Aura and she answered normally. Task `e31c6311`: created at 23:14:10Z, the evaluator accepted it, and `slack.delivered` followed at 23:14:47Z, 37 s end to end.
+- **Tests:** full suite 832 passed, 4 skipped (284 s); node 22/22.
