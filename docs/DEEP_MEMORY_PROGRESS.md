@@ -235,3 +235,58 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - This was index migration only. There was no model enrichment and no backfill.
 
 ---
+
+## Step 5 — Ingestion stage 1: documents, tables of contents, chunks (no model)
+
+**Date:** 2026-09-30, deployed 12:47 JST (`70073ce`).
+
+**Correction to the entries above:** the clock times in the Step 3 and Step 4 entries were wrong. The reload log (UTC) shows the Step 3 deploy at 11:48 JST and the Step 4 deploy and migration at 12:17 JST, not 12:48 and 14:17. From here on, times come from the system clock.
+
+**What changed:**
+- `app/deep_memory/chunking.py` (new), structure-aware chunking:
+  - ATX and setext markdown headings become the TOC, with `A > B > C` paths. Headings inside fenced code are not headings; `---` after a blank line is a thematic break, not a heading.
+  - Headings with no text are dropped but stay in their children's paths.
+  - Titles are cleaned of emphasis, trailing colons, and the anchor links page extractors glue onto headings.
+  - Chunks of about 1,400 characters: blocks are packed greedily, fenced code stays whole, an oversized block splits at sentences and then at words, a tiny tail is merged, and a 200-character overlap starts on a word boundary.
+- `app/deep_memory/ingest.py` (new), stage 1:
+  - **Queue:** `enqueue()` writes `dm_ingest_queue` in the writer's transaction with `ON CONFLICT DO NOTHING`, so a pending duplicate never breaks the message write. It is fed by:
+    - `add_task_message`: Kirill's `request`, `attached` and `clarify_answer` turns;
+    - `send_slack_message_idempotent`: Aura's `reply` and `followup` turns (RMP notices are not turns);
+    - `index_terminal_task_async`: finished tasks.
+  - **Drain:** `deep_ingest_loop` runs in the API lifespan next to the vector outbox. It claims jobs with `SKIP LOCKED` and a 5-minute lease, then runs each job in its own transaction, so a failure leaves nothing half-written and retries with backoff.
+  - **Turn:** a `Kirill:` or `Aura:` chunk in the task document's Conversation section. It carries task, session, process run, message, role, source time, kind, Slack ts and intake decision, and is queued for the index at once.
+    - A reply of 2,400+ characters or with two headings becomes a **deliverable** document with its own TOC; the conversation keeps a pointer chunk to it (title, size, section titles, opening).
+    - Rows written before kinds existed are read as `request` or `reply`, so a task spanning the deploy keeps its early turns.
+  - **Task:** at task end the document gets its **Path history**, **Deliverables** and **Actions** sections, and its TOC.
+    - Path history: status and closed reason, JST times and duration, the intake decision with confidence, rationale and related tasks, plan steps, each evaluator verdict per attempt, attached messages, deliveries, escalations and failures.
+    - Actions: every tool call, with ok or failed.
+    - Pages and files Aura read (8 reading tools, results of at least `tool_document_min_chars`) become **tool documents**. `readable_result()` takes the page out of `web_fetch`'s JSON envelope and OpenClaw's `EXTERNAL_UNTRUSTED_CONTENT` markers (security preamble dropped, real page title kept). Web pages are flagged `untrusted`, and identical pages are kept once.
+    - Lineage: `part_of` links from deliverables, tool documents and attachments to the task; `related` or `continues` links to the tasks its intake decision named.
+  - **Attachment:** plain-text files, only from OpenClaw's inbound media directory (no path escapes) and up to 2 MB, become documents keyed by content hash and linked to the task.
+  - Ids are derived from sources (uuid5), so ingesting again changes nothing, and a shrinking unit retires its old chunks, which queues their index deletion.
+  - Canary, heartbeat and cron runs, internal intents and intake placeholders never enter.
+- `app/openclaw_sessions.py`: `task_tool_results()` returns the full results of named tools, secrets redacted.
+- `tests/conftest.py`: an autouse fixture makes the deep index unreachable in tests (no live Qdrant, no real key), except the opt-in integration test. This fix came from the whole-path harness catching an unstubbed search. The harness stubs the new index as a boundary, like the legacy one.
+
+**Deviation:** I wrote the chunking module myself (see Step 4 on the Grok subagents).
+
+**Verification:**
+- `tests/test_chunking.py` (12) and `tests/test_deep_ingest.py` (12) cover:
+  - a pending job queued once, and which writers queue turns;
+  - a turn chunk with its metadata, idempotent on a second run;
+  - a long reply as a deliverable with its TOC, pointer and link;
+  - a fixture task's whole tree: sections, path-history facts, the actions digest, a page as a deduplicated tool document, lineage;
+  - a shrinking unit retiring its chunks;
+  - canary, heartbeat, cron and placeholders excluded;
+  - attachments: text read; image, oversized, outside-path and `..` escape refused;
+  - the drain: done, failed with backoff, no partial rows;
+  - page-envelope extraction.
+- Full suite: 659 passed, 4 skipped.
+- Real data, ingested against production Postgres inside a rolled-back transaction (0 documents afterwards). For the Kubernetes-guide task:
+  - the 27,854-character reply became a deliverable with 15+ TOC sections;
+  - the task document got Conversation, Path history and Actions;
+  - its 4 fetched pages became clean tool documents titled "Releases | Kubernetes", "Manual Upgrades | K3s" and so on;
+  - 5 `part_of` links and 73 index rows.
+- Live: the watcher restarted both services at 12:47:56 JST, health is OK, and the ingest loop is claiming every 10 s. The queue stays empty until the next real message, because there is no backfill.
+
+---
