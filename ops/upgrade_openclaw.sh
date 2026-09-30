@@ -293,8 +293,9 @@ log "Sync LLM keys into OpenClaw auth store (SQLite on 2026.9+)"
 
 log "Applying RMP dist patches"
 bash "${RMP_ROOT}/patch_openclaw.sh"
-bash "${RMP_ROOT}/ops/verify_openclaw_patch.sh"
+# npm replaced the package directory, and with it the skill links the verifier checks.
 bash "${RMP_ROOT}/ops/ensure_openclaw_skills.sh"
+bash "${RMP_ROOT}/ops/verify_openclaw_patch.sh"
 
 if [[ "${SKIP_RESTART}" == "1" ]]; then
   log "SKIP_RESTART=1 — gateway left stopped if it was stopped"
