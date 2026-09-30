@@ -182,4 +182,56 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - Unit tests cover: the pending-job index rejects a duplicate and accepts the same source once the first is done; empty metadata is dropped; the migrations list; settings merge and example parity; `lane_policy` reads settings and falls back on invalid values.
 - Live Postgres, in one transaction that was rolled back: two full rounds of `create_all` plus all 52 migrations succeeded, and created the 3 columns, the 6 tables and all indexes. Afterwards 0 `dm_*` tables existed.
 
+**Deployed** 12:48 JST (`7ada166`). The watcher restarted both services, and startup created the 6 tables and 3 columns on the production database. The API was healthy, with no startup errors.
+
+---
+
+## Step 4 — Hybrid index; user memory moves into it
+
+**Date:** 2026-09-30 (12:50–14:20 JST)
+
+**Research before coding:**
+- Qdrant server-side BM25 ([inference](https://qdrant.tech/documentation/inference/inference-bm25/)), payload index types and ordering ([indexing](https://qdrant.tech/documentation/manage-data/indexing/)). Payload indexes should exist before points, so that HNSW adds filter-aware edges.
+- A scratch probe on this Qdrant 1.17 (collection deleted afterwards):
+  - `models.Document(text, model="qdrant/bm25")` works self-hosted for upserts and queries, and accepts `options={"language": "english"}`;
+  - IDF-weighted BM25 found the exact "PELICAN-47" document first;
+  - `RrfQuery(rrf=Rrf(k=2, weights=[…]))` fuses dense and BM25 prefetches.
+
+**What changed:**
+- `app/deep_memory/index.py` (new; see the deviation below):
+  - **Collection** `rmp_deep_memory_v1`: named dense vector (`text-embedding-3-large` at 1536 dimensions) plus sparse `bm25` (IDF). `ensure_collection()` refuses an existing collection with other vectors, and creates the 10 payload indexes (level, ref_id, document_id, task_id, session_key, source_kind, scope_id, memory_type, valid, source_at) before any point.
+  - **Embedding:** `embed_texts` batches 64 inputs per request, orders the results and records usage as `embed`. The ledger had no embedding rows before this. `embed_query` keeps a thread-safe single-flight cache with a 5-minute TTL, so the six scope reads of one memory block embed the query once.
+  - **Writing:** `upsert_points` writes the dense vector and a server-side BM25 document.
+  - **Search:** `search()` prefetches dense and BM25 candidates under one filter (level, validity, exact and any-of matches, a time range on `source_at`), then fuses them with weighted RRF.
+  - **Points from the record:** `build_points(db, refs)` turns refs (`chunk:`, `section:`, `document:`, `fact:<id>`) into points from the Postgres rows, or None when a row is gone, retired, has no summary, or is not user memory (the caller then deletes the point). Chunk points embed the contextual header together with the text, and carry the TOC pointer (`section_path`), the conversation metadata and the source time.
+  - **Fallback:** `fts_search()` is Postgres text search over the same objects, with OR semantics (`websearch_to_tsquery('english', 'a or b …')` for dm tables, `simple` for facts).
+- `app/memory/vector_sync.py`:
+  - Outbox kind `deep`, drained in batches with one embedding request per 64 points. While deep memory is off these rows are left out of the query, so they cannot crowd out other work.
+  - A legacy `memory` row for a user-scope item only removes its legacy point.
+  - The reconcile covers the new collection: every valid chunk, summarized section and document, and user fact is expected there, with the same orphan guard. The legacy collection now expects only process and procedural memory.
+  - Drain batch 50 → 100.
+- `app/memory/router.py`:
+  - User-scope writes queue `deep` rows, and user-scope semantic search asks the new index for this user's facts.
+  - If the index cannot answer (collection missing, disabled, timeout, error), Postgres text search answers instead, as before.
+  - `read()` now filters `valid_to IS NULL` (finding: superseded rows were read).
+  - Episodic compaction also removes user points from the new index.
+- `app/memory/vector.py`: a failed embedder probe is retried after 60 s instead of staying failed until a restart, and `status()` re-probes after that time.
+- `app/production/invariants.py`: `vector_sync` counts drift in the new collection too.
+
+**Deviation:** the plan gave the index adapter to a Grok 4.7 extra-high subagent, and the chunking module (Step 5) to a second one. Both started, but neither did anything in 11 to 16 minutes; their transcripts held only the prompt. The previous audit met a Grok provider usage limit until 2026-10-01 00:00 UTC. Both subagents were told to stop, and I wrote the adapter to the same spec.
+
+**Verification:**
+- Tests:
+  - New `tests/test_deep_index.py` (13 tests: fake Qdrant plus a real SQLite schema).
+  - `tests/test_vector_sync.py` has 4 tests updated for the new split and 7 new: deep batch and retry, deep rows held while off, deep reconcile, user search through the new index, superseded rows never read, probe retry.
+  - Full suite: 635 passed, 4 skipped.
+- New opt-in `tests/test_deep_index_integration.py` (`RMP_QDRANT_IT=1`) against the real Qdrant, through the shared client, which prefers gRPC, on a throwaway collection: hybrid ranking, level and validity filters, match, scroll and delete. Passed.
+- `fts_search` ran read-only against production Postgres and returned OR-matched rows.
+
+**Deployed** 14:17 JST (`5ae9b2b`), then `ops/reconcile_vectors --apply` as the migration.
+- It removed the 51 user-scope points from the legacy collection, and queued and indexed the 51 user-scope rows in the new one (0 failures).
+- A dry-run reconcile afterwards: legacy 2,552 rows = 2,552 points; registry 214 = 214; new collection 51 objects = 51 points; nothing missing, no orphans.
+- A live `/memory/lookup` (user, semantic) returned vector hits from the new index.
+- This was index migration only. There was no model enrichment and no backfill.
+
 ---
