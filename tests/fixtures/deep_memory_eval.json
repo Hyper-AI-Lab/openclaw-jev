@@ -8,7 +8,7 @@
     {"id": "f05", "level": "fact", "text": "Kirill travels with carry-on luggage only and never checks a bag."},
     {"id": "f06", "level": "fact", "text": "Kirill's company is Hyper-AI-Lab."},
     {"id": "f07", "level": "fact", "text": "Kirill writes his weekly status report in English."},
-    {"id": "f08", "level": "fact", "text": "Kirill is allergic to shellfish."},
+    {"id": "f08", "level": "fact", "text": "Kirill prefers a window seat on flights."},
     {"id": "f09", "level": "fact", "text": "Kirill's Osaka trip runs from October 12 to 14, 2026."},
     {"id": "f10", "level": "fact", "text": "Kirill runs a three-node home Kubernetes cluster on K3s."},
     {"id": "f11", "level": "fact", "text": "Kirill wants summaries of long documents limited to five bullet points."},
@@ -82,7 +82,7 @@
     {"id": "q27", "kind": "paraphrase", "query": "What broke the evaluator on September 28?", "relevant": ["c41"]},
     {"id": "q28", "kind": "paraphrase", "query": "How did the home cluster guide task end?", "relevant": ["d36"]},
     {"id": "q29", "kind": "paraphrase", "query": "What should I pack for Osaka?", "relevant": ["d40", "f05"]},
-    {"id": "q30", "kind": "paraphrase", "query": "Am I allergic to any food?", "relevant": ["f08"]},
+    {"id": "q30", "kind": "paraphrase", "query": "Which seat do I like on a plane?", "relevant": ["f08"]},
     {"id": "q31", "kind": "paraphrase", "query": "Which storage should the cluster use for data I care about?", "relevant": ["c26"]},
     {"id": "q32", "kind": "paraphrase", "query": "Where do I like to eat ramen in Osaka?", "relevant": ["c47"]}
   ]
