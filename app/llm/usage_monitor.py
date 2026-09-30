@@ -421,17 +421,19 @@ def _open_agent_db():
 def scrape_openclaw_sessions(limit_events: int = 5000) -> Dict[str, Any]:
     """Record new assistant LLM turns from OpenClaw's SQLite transcripts in the usage store.
 
-    Resumes from the last ``transcript_events`` rowid. The first run starts 24 h back.
+    Resumes from the last ``transcript_events`` rowid. The first run starts 24 h back. Events
+    created more than 24 h before the previous scrape are skipped: OpenClaw 2026.9.7's migration
+    imported months of JSONL history at new rowids, and those turns were counted long ago.
     """
     if not AGENT_DB_PATH.is_file():
         return {"new_events": 0, "scanned_events": 0, "source": "missing"}
     cursor = _read_cursor()
     last_rowid = int(cursor.get("transcript_rowid") or 0)
+    since_ms = int(cursor.get("last_scrape_ms") or time.time() * 1000) - 86_400_000
     try:
         db = _open_agent_db()
         try:
             if not last_rowid:
-                since_ms = int((time.time() - 86400) * 1000)
                 row = db.execute(
                     "SELECT MIN(rowid) FROM transcript_events WHERE created_at >= ?",
                     (since_ms,),
@@ -440,8 +442,8 @@ def scrape_openclaw_sessions(limit_events: int = 5000) -> Dict[str, Any]:
             rows = db.execute(
                 f"SELECT e.rowid, e.session_id, {event_columns(db, 'e')}, "
                 "(SELECT w.session_key FROM session_windows w WHERE w.session_id = e.session_id) "
-                "FROM transcript_events e WHERE e.rowid > ? ORDER BY e.rowid LIMIT ?",
-                (last_rowid, limit_events),
+                "FROM transcript_events e WHERE e.rowid > ? AND e.created_at >= ? ORDER BY e.rowid LIMIT ?",
+                (last_rowid, since_ms, limit_events),
             ).fetchall()
         finally:
             db.close()

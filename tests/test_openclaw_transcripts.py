@@ -17,7 +17,6 @@ from tests.openclaw97 import Store97, compress_like_openclaw
 
 PAD = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor. " * 30
 TASK = "5d3c2a10-0000-4000-8000-00000000abcd"
-NOW_MS = 1_790_600_000_000
 
 
 def text_event(role, text, *, at=2000, stop=None, **message):
@@ -125,16 +124,40 @@ def test_usage_accounting_counts_compressed_turns(store, tmp_path, monkeypatch):
     monkeypatch.setattr(um, "_task_kinds_sync", lambda ids: {TASK: "user"})
     monkeypatch.setattr(um, "_ended_task_ids_sync", lambda ids: set())
     store.session(f"agent:main:rmp_task_{TASK}", "sid-3")
+    now_ms = int(um.time.time() * 1000)  # the scrape counts only the last day
     for n, (prompt, output, long) in enumerate([(30_000, 400, True), (32_000, 300, False)]):
-        at = NOW_MS - (2 - n) * 3_600_000
+        at = now_ms - (2 - n) * 3_600_000
         store.event("sid-3", text_event(
             "assistant", ("A long answer. " + PAD) if long else "Short.", at=at, stop="stop",
             provider="openai", model="gpt-6-luna",
             usage={"input": prompt, "cacheRead": 0, "output": output, "totalTokens": prompt + output},
             timestamp=at), created_at=at)
     assert store.compressed == 1
-    report = um.transcript_usage(hours=24, now_ms=NOW_MS)
+    report = um.transcript_usage(hours=24, now_ms=now_ms)
     assert report["totals"]["attempts"] == 2 and report["totals"]["input_tokens"] == 62_000
     assert report["max_live_context"] == {"session_key": f"agent:main:rmp_task_{TASK}", "tokens": 32_000}
     scraped = um.scrape_openclaw_sessions()
     assert scraped["scanned_events"] == 2 and scraped["source"] == "sqlite"
+
+
+def test_history_imported_at_new_rowids_is_not_counted_again(store, tmp_path, monkeypatch):
+    """Oct 1: 2026.9.7's migration imported 107k JSONL-era events (Feb-Sep) at rowids after the cursor."""
+    monkeypatch.setattr(um, "USAGE_PATH", tmp_path / "llm_usage.json")
+    monkeypatch.setattr(um, "CURSOR_PATH", tmp_path / "cursor.json")
+    monkeypatch.setattr(um, "LOCK_PATH", tmp_path / ".lock")
+    now_ms = int(um.time.time() * 1000)
+    store.session(f"agent:main:rmp_task_{TASK}", "sid-4")
+
+    def assistant(at, msg_id):
+        return {**text_event("assistant", "ok", at=at, stop="stop", provider="openai", model="gpt-6-luna",
+                             usage={"input": 100, "cacheRead": 0, "output": 5, "totalTokens": 105}, timestamp=at),
+                "id": msg_id}
+
+    store.event("sid-4", assistant(now_ms - 3_600_000, "live-1"), created_at=now_ms - 3_600_000)
+    assert um.scrape_openclaw_sessions()["new_events"] == 1
+    for n in range(3):
+        old = now_ms - (120 + n) * 86_400_000
+        store.event("sid-4", assistant(old, f"imported-{n}"), created_at=old)
+    store.event("sid-4", assistant(now_ms - 60_000, "live-2"), created_at=now_ms - 60_000)
+    scraped = um.scrape_openclaw_sessions()
+    assert (scraped["scanned_events"], scraped["new_events"]) == (1, 1)
