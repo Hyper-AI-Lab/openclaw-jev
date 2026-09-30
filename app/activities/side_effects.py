@@ -197,8 +197,10 @@ async def send_slack_message_idempotent(
     )
     try:
         from app.db.models import Event, TaskMessage
+        from app.deep_memory.ingest import TURN_KINDS, enqueue
         import uuid as _uuid
 
+        message_id = str(_uuid.uuid4())
         async with AsyncSessionLocal() as db:
             db.add(
                 Event(
@@ -211,7 +213,7 @@ async def send_slack_message_idempotent(
             )
             db.add(
                 TaskMessage(
-                    id=str(_uuid.uuid4()),
+                    id=message_id,
                     task_id=task_id,
                     role="assistant",
                     content=message,
@@ -222,6 +224,9 @@ async def send_slack_message_idempotent(
                     meta={**(meta or {}), "parts": len(parts)},
                 )
             )
+            if kind in TURN_KINDS:
+                await db.flush()
+                await enqueue(db, "turn", message_id)
             await db.commit()
     except Exception as exc:
         logger.warning("Slack ledger write failed for %s: %s", task_id, exc)

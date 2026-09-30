@@ -98,11 +98,13 @@ async def lifespan(app: FastAPI):
     _scanner_task = asyncio.create_task(scanner_monitor_loop(_scanner_stop))
     _cron_stop = asyncio.Event()
     _cron_task = asyncio.create_task(cron_reconciler_loop(_cron_stop))
+    from app.deep_memory.ingest import deep_ingest_loop
     from app.memory.vector_sync import vector_outbox_loop
 
     _vector_stop = asyncio.Event()
     _vector_task = asyncio.create_task(vector_outbox_loop(_vector_stop))
-    logger.info("RMP API started with reconciler, scanner monitor, cron reconciler, vector outbox")
+    deep_task = asyncio.create_task(deep_ingest_loop(_vector_stop))
+    logger.info("RMP API started with reconciler, scanner monitor, cron reconciler, vector outbox, deep-memory ingest")
     yield
     if _reconciler_stop:
         _reconciler_stop.set()
@@ -120,6 +122,7 @@ async def lifespan(app: FastAPI):
         _vector_stop.set()
     if _vector_task:
         await _vector_task
+    await deep_task
     from app.decisions.jev import close_jev_client
     from app.llm.openai_direct import close_direct_clients
 

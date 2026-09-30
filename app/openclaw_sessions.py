@@ -217,6 +217,49 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def task_tool_results(task_id: str, *, tools: Iterable[str], min_chars: int) -> List[Dict[str, Any]]:
+    """Full results of the named tools in the task's rmp_task session, at least min_chars long.
+
+    Each item: call_id, tool, arguments (dict), text (secrets redacted), timestamp (ms or None).
+    """
+    from app.memory.policy import redact_secrets
+
+    wanted = set(tools)
+    entry = get_session_entry(f"agent:main:rmp_task_{task_id}")
+    calls: Dict[str, Dict[str, Any]] = {}
+    out: List[Dict[str, Any]] = []
+    for line in read_transcript_lines(entry.get("sessionId") or ""):
+        try:
+            msg = (json.loads(line) or {}).get("message") or {}
+        except (ValueError, AttributeError):
+            continue
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
+            for part in msg["content"]:
+                if isinstance(part, dict) and part.get("type") == "toolCall" and part.get("name") in wanted:
+                    args = part.get("arguments")
+                    calls[str(part.get("id"))] = {
+                        "tool": str(part["name"]),
+                        "arguments": args if isinstance(args, dict) else {},
+                    }
+        elif msg.get("role") == "toolResult" and str(msg.get("toolCallId")) in calls and not msg.get("isError"):
+            content = msg.get("content")
+            if isinstance(content, list):
+                content = "\n".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
+            text = str(content or "")
+            if len(text) < min_chars:
+                continue
+            call_id = str(msg["toolCallId"])
+            out.append(
+                {
+                    "call_id": call_id,
+                    **calls[call_id],
+                    "text": redact_secrets(text),
+                    "timestamp": msg.get("timestamp") if isinstance(msg.get("timestamp"), (int, float)) else None,
+                }
+            )
+    return out
+
+
 def task_action_trace(
     task_id: str, *, since_ms: Optional[int] = None, limit: int = 40
 ) -> List[Dict[str, Any]]:

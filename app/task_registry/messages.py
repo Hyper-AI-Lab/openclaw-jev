@@ -44,16 +44,20 @@ async def add_task_message(
         meta={k: v for k, v in (meta or {}).items() if v not in (None, "", [], {})} or None,
     )
 
-    async def _commit(session: AsyncSession) -> None:
+    async def _add(session: AsyncSession) -> None:
+        from app.deep_memory.ingest import TURN_KINDS, enqueue
+
         session.add(row)
-        await session.commit()
+        await session.flush()
+        if role == "user" and kind in TURN_KINDS:
+            await enqueue(session, "turn", msg_id)
 
     if db is not None:
-        db.add(row)
-        await db.flush()
+        await _add(db)
         return msg_id
     async with AsyncSessionLocal() as session:
-        await _commit(session)
+        await _add(session)
+        await session.commit()
     return msg_id
 
 

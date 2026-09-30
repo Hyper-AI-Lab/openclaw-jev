@@ -34,6 +34,7 @@ from app.db import database
 from app.db.models import (
     Base, Event, MemoryItem, ProcessRun, SideEffectReceipt, Task, TaskIntakeDecision, TaskMessage,
 )
+from app.deep_memory import index as deep_index
 from app.memory import router
 from app.orchestrator import web_capability
 from app.production import invariants
@@ -197,6 +198,8 @@ class Harness:
             (plan_activities, "send_to_openclaw", h.planner),
             (openclaw_sessions, "task_action_trace", lambda *args, **kwargs: []),
             (router, "get_vector_service", lambda: SimpleNamespace(search=lambda *args: [])),
+            (deep_index, "collection_exists", lambda: True),
+            (deep_index, "search", lambda *args, **kwargs: []),
             (web_capability, "obscura_available", lambda: False),
         ):
             monkeypatch.setattr(target, name, value)

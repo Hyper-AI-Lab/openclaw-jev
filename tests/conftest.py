@@ -7,6 +7,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
+
 if "RMP_SETTINGS_PATH" not in os.environ:
     _root = Path(tempfile.mkdtemp(prefix="rmp-tests-"))
     os.environ["OPENCLAW_HOME"] = str(_root / "openclaw")
@@ -21,3 +23,17 @@ if "RMP_SETTINGS_PATH" not in os.environ:
 os.environ["DATABASE_URL"] = (
     f"sqlite+aiosqlite:///{Path(tempfile.mkdtemp(prefix='rmp-tests-db-')) / 'unmocked.db'}"
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_deep_index(monkeypatch):
+    """The deep-memory index would reach this host's Qdrant and embed with its key; tests stub it."""
+    if os.environ.get("RMP_QDRANT_IT") == "1":
+        return
+    from app.deep_memory import index
+
+    def off_limits():
+        raise RuntimeError("hermetic tests: the deep-memory index is off limits")
+
+    monkeypatch.setattr(index, "_client", off_limits)
+    monkeypatch.setattr(index, "_read_openai_key", lambda: "")
