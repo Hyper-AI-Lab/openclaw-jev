@@ -1,5 +1,18 @@
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const client = require(path.join(__dirname, '..', 'aura_web', 'lib', 'client.js'));
+
+// OpenClaw 2026.9.7 loads a captured copy of each plugin, without its sibling plugins.
+function auraWebClient() {
+  const stateDir = process.env.OPENCLAW_STATE_DIR || path.join(os.homedir(), '.openclaw');
+  const candidates = [
+    path.join(__dirname, '..', 'aura_web', 'lib', 'client.js'),
+    path.join(stateDir, 'plugins', 'aura_web', 'lib', 'client.js'),
+  ];
+  return require(candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0]);
+}
+
+const client = auraWebClient();
 
 module.exports = {
   id: 'langsearch',

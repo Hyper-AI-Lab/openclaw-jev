@@ -190,6 +190,12 @@ def apply_openclaw_policy(config_path: Optional[Path] = None) -> Dict[str, Any]:
         subagents["model"] = SUBAGENT_MODEL
         changed.append("agents.defaults.subagents.model")
 
+    # Unset, OpenClaw 2026.9.7 derives gpt-5.6-luna for its own activity recaps and progress
+    # narration, which send transcript excerpts; Kirill turned them off on 2026-10-01.
+    if defaults.get("utilityModel") != "":
+        defaults["utilityModel"] = ""
+        changed.append("agents.defaults.utilityModel")
+
     heartbeat = defaults.setdefault("heartbeat", {})
     if heartbeat.get("every") != HEARTBEAT_EVERY:
         heartbeat["every"] = HEARTBEAT_EVERY

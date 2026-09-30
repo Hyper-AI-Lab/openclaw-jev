@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -59,6 +60,7 @@ class Target:
     state_dir: Path
     package_dir: Path
     node: Path
+    unit: str
     helper_env: Dict[str, str] = field(default_factory=dict)
     cli: Callable[[Sequence[str]], subprocess.CompletedProcess] = None  # type: ignore[assignment]
 
@@ -73,7 +75,7 @@ def staging_target() -> Target:
     config = json.loads((staging.OC / "openclaw.json").read_text())
     return Target(
         name="staging", url=f"http://127.0.0.1:{config['gateway']['port']}", hooks_token=config["hooks"]["token"],
-        state_dir=staging.OC, package_dir=staging.PACKAGE, node=staging.node_bin() / "node",
+        state_dir=staging.OC, package_dir=staging.PACKAGE, node=staging.node_bin() / "node", unit=staging.UNIT,
         helper_env={**os.environ, **staging.env()},
         cli=lambda args: staging.staged(["openclaw", *args], timeout=600, check=False),
     )
@@ -86,7 +88,7 @@ def production_target() -> Target:
     return Target(
         name="production", url=f"http://127.0.0.1:{config['gateway']['port']}", hooks_token=config["hooks"]["token"],
         state_dir=home, package_dir=cli_path.parent, node=Path(shutil.which("node") or "/usr/bin/node"),
-        helper_env=dict(os.environ),
+        unit="openclaw-gateway", helper_env=dict(os.environ),
         cli=lambda args: subprocess.run(["openclaw", *args], capture_output=True, text=True, timeout=600),
     )
 
@@ -187,9 +189,39 @@ def probe_health(target: Target, ctx: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": ok, **out}
 
 
+def gateway_log(target: Target) -> List[str]:
+    """The gateway's journal since its current start."""
+    since = subprocess.run(["systemctl", "show", "-p", "ActiveEnterTimestamp", "--value", target.unit],
+                           capture_output=True, text=True).stdout.strip()
+    run = subprocess.run(["journalctl", "-u", target.unit, "--since", since or "-1h", "--no-pager", "-o", "cat"],
+                         capture_output=True, text=True, timeout=60)
+    return run.stdout.splitlines()
+
+
 def probe_plugins(target: Target, ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Loaded in the running gateway: no load failure, and every runtime plugin in its listening line.
+
+    The CLI's own list loads plugins in its own process and missed 2026.9.7 refusing langsearch.
+    Provider plugins (brave, openai, ...) never appear in the listening line.
+    """
     config = json.loads((target.state_dir / "openclaw.json").read_text())
-    wanted = sorted(k for k, v in (config.get("plugins") or {}).get("entries", {}).items() if v.get("enabled", True))
+    entries = (config.get("plugins") or {}).get("entries", {})
+    runtime = {Path(p).name for p in (config.get("plugins") or {}).get("load", {}).get("paths", [])}
+    runtime |= {name for name, channel in (config.get("channels") or {}).items()
+                if isinstance(channel, dict) and channel.get("enabled") and entries.get(name, {}).get("enabled", True)}
+    lines = gateway_log(target)
+    failed = sorted({m.group(1) for line in lines for m in [re.search(r"\[plugins\] (\S+) failed during load from", line)] if m})
+    listening = [m for line in lines for m in [re.search(r"http server listening \(\d+ plugins: ([^;)]+)", line)] if m]
+    loaded = {name.strip() for name in listening[-1].group(1).split(",")} if listening else set()
+    missing = sorted(runtime - loaded)
+    result = {"ok": bool(listening) and not failed and not missing, "gateway_loaded": sorted(loaded),
+              "failed_during_load": failed, "runtime_missing": missing}
+    result["cli"] = cli_plugin_status(target, entries)
+    return result
+
+
+def cli_plugin_status(target: Target, entries: Dict[str, Any]) -> Dict[str, Any]:
+    wanted = sorted(k for k, v in entries.items() if v.get("enabled", True))
     run = target.cli(["plugins", "list", "--json"])
     try:
         listed = json.loads(run.stdout[run.stdout.index("{") if "{" in run.stdout else 0:] or "{}")

@@ -95,6 +95,8 @@ def test_apply_openclaw_policy_writes_combo_and_drops_retired_models(tmp_path):
     assert "nvidia/z-ai/glm-5.2" not in json.dumps(cfg)
     assert "deepseek" not in json.dumps(cfg)
     assert cfg["agents"]["defaults"]["subagents"] == {"maxConcurrent": 2, "model": mp.PRIMARY_MODEL}
+    assert cfg["agents"]["defaults"]["utilityModel"] == ""
+    assert "agents.defaults.utilityModel" in result["changed"]
     runtime = cfg["agents"]["defaults"]["models"]["openai/gpt-6-luna"]["agentRuntime"]
     assert runtime == {"id": "openclaw"}
     assert cfg["agents"]["defaults"]["models"]["openai/gpt-6-luna"]["params"] == {

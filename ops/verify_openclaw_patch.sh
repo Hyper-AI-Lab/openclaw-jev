@@ -47,6 +47,13 @@ if [[ "${FALLBACKS}" == *"glm"* ]]; then
   echo "FAIL: GLM must not be in agent fallbacks (${FALLBACKS})"
   FAIL=1
 fi
+UTILITY=$(python3 -c "import json; c=json.load(open('/root/.openclaw/openclaw.json')); print(repr(c['agents']['defaults'].get('utilityModel')))")
+if [[ "${UTILITY}" != "''" ]]; then
+  echo "FAIL: agents.defaults.utilityModel must be \"\" so OpenClaw makes no utility-model calls (got ${UTILITY})"
+  FAIL=1
+else
+  echo "OK: utility-model route off"
+fi
 if [[ "$FAIL" -ne 0 ]]; then
   echo "Run: bash /root/.openclaw/rmp/ops/upgrade_openclaw.sh  (or apply_openclaw_policy)"
   exit 1
