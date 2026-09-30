@@ -11,6 +11,7 @@ The runner refuses to start a job while the table is missing.
 from __future__ import annotations
 
 import argparse
+import pwd
 import re
 import subprocess
 import sys
@@ -96,9 +97,15 @@ def remove() -> None:
 
 
 def active() -> bool:
-    """The table is loaded with its user rules (the runner's precondition)."""
+    """The table is loaded with all four user rules (the runner's precondition)."""
+    try:
+        uid = pwd.getpwnam(CODER_USER).pw_uid
+    except KeyError:
+        return False
     run = subprocess.run(["nft", "list", "table", "inet", TABLE], capture_output=True, text=True)
-    return run.returncode == 0 and f'skuid "{CODER_USER}"' in run.stdout and "@local_ports" in run.stdout
+    # nft lists the user by uid once it resolved the name.
+    rules = re.findall(rf'meta skuid (?:{uid}|"{re.escape(CODER_USER)}") ', run.stdout)
+    return run.returncode == 0 and len(rules) == 4 and "@local_ports" in run.stdout
 
 
 def uncovered_listeners(ports: Iterable[Port]) -> List[str]:

@@ -59,6 +59,21 @@ def test_the_ruleset_replaces_itself_and_blocks_services_and_private_networks():
     assert not firewall.covers(elements, 53)
 
 
+def test_the_firewall_counts_as_active_only_with_all_four_user_rules(monkeypatch):
+    monkeypatch.setattr(firewall.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=997))
+    listed = firewall.render([22]).replace('"aura-coder"', "997")
+    monkeypatch.setattr(firewall.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=listed, returncode=0))
+    assert firewall.active()
+    monkeypatch.setattr(firewall.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(stdout=firewall.render([22]), returncode=0))
+    assert firewall.active()
+    partial = "\n".join(line for line in listed.splitlines() if "ip6" not in line)
+    monkeypatch.setattr(firewall.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=partial, returncode=0))
+    assert not firewall.active()
+    monkeypatch.setattr(firewall.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="", returncode=1))
+    assert not firewall.active()
+
+
 def test_listeners_the_rules_leave_open_are_reported(monkeypatch):
     ss = "\n".join([
         "LISTEN 0 4096 127.0.0.1:8000 0.0.0.0:*",
