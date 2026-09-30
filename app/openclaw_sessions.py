@@ -233,6 +233,16 @@ def task_session_keys(task_id: str) -> List[str]:
     return [main, *keys]
 
 
+def task_run_session_keys(task_id: str) -> List[str]:
+    """Every session a task's runs may use: Aura's (planner and reworks included) and the evaluator's."""
+    keys: List[str] = []
+    for prefix in (f"agent:main:rmp_task_{task_id}", f"agent:main:rmp_verify_{task_id}"):
+        for key, _ in _task_session_rows(prefix):
+            if key == prefix or key.startswith(prefix + "__") or key.startswith(prefix + "_fb"):
+                keys.append(key)
+    return sorted(set(keys))
+
+
 def _task_session_rows(main: str) -> List[Tuple[str, Optional[int]]]:
     path = SESSIONS_JSON_PATH
     if path.is_file():

@@ -913,6 +913,9 @@ async def cancel_task(task_id: str, reason: str = "api_cancel", db: AsyncSession
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    from app.openclaw_control import schedule_abort
+
+    schedule_abort(task_id, reason=reason)
     try:
         client = await connect_temporal()
         handle = client.get_workflow_handle(f"workflow-{task_id}")
@@ -1032,10 +1035,13 @@ async def suspend_all_running(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Task).where(Task.status.in_(["running", "pending_user_input", "created"]))
     )
+    from app.openclaw_control import schedule_abort
+
     stopped = 0
     for task in result.scalars().all():
         task.status = "cancelled"
         task.supplementary_context = {**(task.supplementary_context or {}), "closed_reason": "dev_suspend"}
+        schedule_abort(task.id, reason="dev_suspend")
         stopped += 1
     await db.commit()
 
@@ -1070,10 +1076,17 @@ async def signal_task(
             meta={"signal_type": signal.signal_type.lower()},
         )
         await db.commit()
+    st = signal.signal_type.lower()
+    from app.task_registry.stop_command import is_whole_message_stop
+
+    if st == "cancel" or (st == "user_input" and is_whole_message_stop(signal.message or "")):
+        from app.openclaw_control import schedule_abort
+
+        # The workflow sees the stop at its next step; Aura's run is stopped now.
+        schedule_abort(task_id, reason="stop" if st == "user_input" else "cancel")
     try:
         client = await connect_temporal()
         handle = client.get_workflow_handle(f"workflow-{task_id}")
-        st = signal.signal_type.lower()
         if st == "cancel":
             await handle.signal("cancel", signal.message or "Cancelled")
         elif st == "approve":

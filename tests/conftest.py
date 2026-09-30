@@ -37,3 +37,14 @@ def _no_live_deep_index(monkeypatch):
 
     monkeypatch.setattr(index, "_client", off_limits)
     monkeypatch.setattr(index, "_read_openai_key", lambda: "")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_gateway_abort(monkeypatch):
+    """Stopping a task calls the openclaw CLI against this host's gateway; tests stub it."""
+    from app import openclaw_control
+
+    async def refused(session_key):
+        return {"key": session_key, "status": "error", "error": "hermetic tests: no gateway"}
+
+    monkeypatch.setattr(openclaw_control, "abort_session", refused)

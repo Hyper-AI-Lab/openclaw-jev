@@ -39,6 +39,10 @@ async def connect_temporal_with_retry(
 
 
 async def terminate_task_workflow(task_id: str, reason: str = "superseded") -> bool:
+    """End a task's workflow and Aura's runs for it (rebuild_stale and supersede)."""
+    from app.openclaw_control import schedule_abort
+
+    schedule_abort(task_id, reason=reason)
     try:
         client = await connect_temporal()
         handle = client.get_workflow_handle(f"workflow-{task_id}")
