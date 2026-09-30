@@ -39,16 +39,19 @@ install -d -o "${CODER}" -g "${CODER}" -m 700 /srv/aura-code/cache
 install -d -o root -g root -m 700 /etc/aura-coder
 log "directories ready under /srv/aura-code and /etc/aura-coder"
 
-install -d -o root -g root -m 755 /etc/claude-code
-install -o root -g root -m 644 "${RMP_ROOT}/ops/aura_coder/managed-settings.json" /etc/claude-code/managed-settings.json
-log "managed settings installed at /etc/claude-code/managed-settings.json"
-
+MANAGED=/etc/claude-code/managed-settings.json
 current="$(as_coder "${CLAUDE}" --version 2>/dev/null | awk '{print $1}' || true)"
 if [[ "${current}" != "${VERSION}" ]]; then
   log "installing Claude Code ${VERSION} for ${CODER} (was: ${current:-none})"
+  # The managed settings' DISABLE_UPDATES blocks every install path, the pinned one included.
+  rm -f "${MANAGED}"
   as_coder bash -c "curl -fsSL https://claude.ai/install.sh | bash -s ${VERSION}"
   current="$(as_coder "${CLAUDE}" --version 2>/dev/null | awk '{print $1}' || true)"
 fi
+
+install -d -o root -g root -m 755 /etc/claude-code
+install -o root -g root -m 644 "${RMP_ROOT}/ops/aura_coder/managed-settings.json" "${MANAGED}"
+log "managed settings installed at ${MANAGED}"
 [[ "${current}" == "${VERSION}" ]] || die "Claude Code is ${current:-missing}, expected ${VERSION}"
 log "Claude Code ${current} at ${CLAUDE}"
 
