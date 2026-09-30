@@ -22,7 +22,8 @@ def test_every_coding_unit_is_hardened_limited_and_blind_to_secrets():
                      "TasksMax=1024", "CPUQuota=250%", "RuntimeMaxSec=5400", "CPUWeight=50"):
         assert required in props
     hidden = next(p for p in props if p.startswith("InaccessiblePaths="))
-    for path in ("/root", "/etc/aura-coder", "/etc/rmp", "/etc/openclaw", "/var/run/docker.sock"):
+    for path in ("/root", "/etc/aura-coder", "/etc/rmp", "/etc/openclaw", "/run/docker.sock", "/run/postgresql",
+                 "/run/dbus", "/run/user"):
         assert f"-{path}" in hidden.split("=", 1)[1].split()
     assert "ReadWritePaths=/srv/aura-code/jobs/t1 /home/aura-coder" in props
     assert "EnvironmentFile=/etc/aura-coder/claude.env" in props

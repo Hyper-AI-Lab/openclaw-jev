@@ -82,8 +82,11 @@ for port in (22, 5432, 6333, 7233, 8000, 8791, 9222, 18789):
 attempt("connect [::1]:18789", lambda: connect("::1", 18789))
 attempt("connect 172.17.0.1:6333", lambda: connect("172.17.0.1", 6333))
 attempt("connect 169.254.169.254:80", lambda: connect("169.254.169.254", 80))
-attempt("docker socket", lambda: unix("/var/run/docker.sock"))
-attempt("postgres socket", lambda: unix("/var/run/postgresql/.s.PGSQL.5432"))
+for name, path in (("docker socket", "/run/docker.sock"), ("postgres socket", "/run/postgresql/.s.PGSQL.5432"),
+                   ("postgres socket via /var/run", "/var/run/postgresql/.s.PGSQL.5432"),
+                   ("dbus system bus", "/run/dbus/system_bus_socket"), ("snapd socket", "/run/snapd.socket"),
+                   ("containerd socket", "/run/containerd/containerd.sock")):
+    attempt(name, lambda p=path: unix(p))
 for path in ("/srv/aura-code/venvs/.probe", "/etc/.aura-probe", "/usr/local/bin/.aura-probe",
              "/root/.openclaw/.aura-probe"):
     attempt("write " + os.path.dirname(path), lambda p=path: write(p))
@@ -98,7 +101,7 @@ print(json.dumps(results))
 def _coder_version() -> str:
     run = subprocess.run(["runuser", "-u", CODER_USER, "--", str(CLAUDE_BIN), "--version"],
                          capture_output=True, text=True, timeout=60, cwd=str(CODER_HOME),
-                         env={"HOME": str(CODER_HOME), "PATH": "/usr/bin:/bin"})
+                         env={"HOME": str(CODER_HOME), "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"})
     return run.stdout.split()[0] if run.returncode == 0 and run.stdout.split() else ""
 
 

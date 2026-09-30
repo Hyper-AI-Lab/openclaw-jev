@@ -23,13 +23,21 @@ TOKEN_META_FILE = SECRETS_DIR / "claude-token.json"
 MANAGED_SETTINGS = Path("/etc/claude-code/managed-settings.json")
 UNIT_PREFIX = "aura-claude-"
 # Hidden from every coding unit whatever their file modes; missing ones are skipped.
+# Sockets are named by their /run paths: /var/run is a symlink to /run.
 HIDDEN_PATHS = (
     "/root",
     str(SECRETS_DIR),
     "/etc/rmp",
     "/etc/openclaw",
     "/var/lib/postgresql",
-    "/var/run/docker.sock",
+    "/run/postgresql",
+    "/run/dbus",
+    "/run/docker.sock",
+    "/run/containerd",
+    "/run/snapd.socket",
+    "/run/snapd-snap.socket",
+    "/run/lxd-installer.socket",
+    "/run/user",
 )
 BASE_PATH = f"{CODER_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
