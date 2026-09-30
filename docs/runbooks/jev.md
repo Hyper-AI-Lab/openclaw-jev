@@ -122,9 +122,6 @@ typed answers, never raw text or credentials.
 
 ## Known gaps
 
-- User tasks since September have no `task_registry_entries` rows, so
-  finished-work evidence for recent follow-ups is missing for the LLM analyst and
-  for Jev alike.
 - DMs where Jev abstains still take the slot-gated OpenClaw intake turn.
 - The original PostgreSQL memory read path does not filter `valid_to`.
 

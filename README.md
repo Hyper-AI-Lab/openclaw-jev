@@ -1,185 +1,184 @@
-# Aura
+# OpenClaw + Jev
 
-![Aura: The Reliability & Memory Plane for Production Slack Agents](docs/assets/AI_Agent_Reliability_Architecture.jpg)
+![OpenClaw + Jev: every message routed, judged and remembered](docs/assets/openclaw-jev-social.png)
 
+[![CI](https://github.com/Hyper-AI-Lab/openclaw-jev/actions/workflows/ci.yml/badge.svg)](https://github.com/Hyper-AI-Lab/openclaw-jev/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](requirements.txt)
-[![OpenClaw](https://img.shields.io/badge/runtime-OpenClaw-0ea5e9.svg)](https://github.com/openclaw/openclaw)
-[![Org](https://img.shields.io/badge/org-Hyper--AI--Lab-111827.svg)](https://github.com/Hyper-AI-Lab)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](requirements.txt)
+[![OpenClaw 2026.9](https://img.shields.io/badge/runtime-OpenClaw%202026.9-0ea5e9.svg)](https://github.com/openclaw/openclaw)
+[![Temporal](https://img.shields.io/badge/orchestration-Temporal-111827.svg)](https://temporal.io)
 
-**Aura is a reliability & memory control plane for a production Slack agent.**  
-It sits beside [OpenClaw](https://github.com/openclaw/openclaw) and turns every user turn into a durable Temporal workflow: intake routing, process memory, evidence gates, idempotent Slack delivery, multi-key LLM orchestration, and a routed galaxy web-research stack.
+**A production control plane for [OpenClaw](https://github.com/openclaw/openclaw) agents.** Every Slack message is routed to the work it belongs to, executed as a durable Temporal workflow, judged by a separate evaluator before anything reaches the user, and remembered in two stores that back each other up. Routing decisions use [Jev](https://docs.typesafe.ai/api), TypeSafe's typed decision model, with an LLM analyst for the cases Jev is unsure about.
 
-Built by [Hyper-AI-Lab](https://github.com/Hyper-AI-Lab) · Homepage: [hyperailab.com](https://hyperailab.com/)
+OpenClaw stays the execution engine (model, tools, sessions). This repository is the layer around it, called the RMP (Reliability and Memory Plane): it owns intake, orchestration, judgment, memory and delivery. It runs Aura, a personal assistant on Slack, in production.
+
+Built by [Hyper-AI-Lab](https://github.com/Hyper-AI-Lab) · [hyperailab.com](https://hyperailab.com/)
 
 ---
 
-## Why Aura exists
+## Why
 
-Chat-agent stacks are great at tools and models — and terrible at **ops truth**:
+An agent runtime is good at models and tools. Left alone, it is weak at the things an always-on assistant needs:
 
-- Slack replies race with native gateway delivery  
-- Sessions forget process context across turns  
-- Rate limits stall the whole agent with no fair key rotation  
-- “Done” is whatever the model claimed, not what evidence allows  
-- Canary restarts can kill mid-flight user work if remediation is too aggressive  
+- A follow-up message starts a fresh conversation instead of joining the task it belongs to.
+- "Done" means the model said so, not that the work was checked.
+- A crash between the answer and the Slack post loses the answer, or sends an unchecked one.
+- Memory is one global pile, or it silently drifts out of sync with its index.
+- Rate limits, stalls and runaway contexts are found on the bill.
 
-Aura (the **Reliability & Memory Plane**, RMP) is the sidecar that owns those guarantees while OpenClaw stays the execution engine.
+OpenClaw + Jev closes those gaps without forking OpenClaw: a plugin claims every message, and everything after that is program-owned.
+
+## What happens to a message
+
+```mermaid
+flowchart LR
+  DM["Slack DM"] --> Plugin["rmp_adapter plugin<br/>claims it; no native reply"]
+  Plugin -->|"POST /tasks"| Intake["Intake<br/>Jev, then the LLM analyst"]
+  Intake -->|"joins running work"| Signal["Signal to every<br/>related running task"]
+  Intake -->|"new work or follow-up"| WF["Temporal workflow"]
+  Intake -->|"unsure"| Clarify["One question to the user"]
+  Signal --> WF
+  WF --> Aura["Aura in OpenClaw<br/>rmp_task session"]
+  Aura --> Eval["Process Evaluator<br/>rmp_verify session"]
+  Eval -->|"rework"| Aura
+  Eval -->|"accept"| Slack["Slack reply<br/>idempotent, in ordered parts"]
+  WF <--> Mem[("Memory<br/>Postgres record + Qdrant index")]
+```
+
+1. **Claim.** The `rmp_adapter` OpenClaw plugin claims the DM (text, Slack message id, thread and reply-to ids, attachments) and posts it to the RMP API. OpenClaw never answers on its own; if the API is down, the message stays claimed and the user gets an RMP notice.
+2. **Intake.** Deterministic gates first (duplicates, recurring jobs, health checks), then a hybrid evidence pack (full-text and vector search over running tasks, finished tasks and memory, plus the recent dialogue). Jev answers typed questions about the message; below its thresholds the LLM analyst decides. The outcome is one of: attach to running work (to *every* related running task), a follow-up of finished work, a new task, a clarifying question, or a short acknowledgement.
+3. **Orchestrate.** A Temporal workflow runs a program-owned plan. Step completion is decided by code predicates on structured output, not by the model saying it is done. Seven catalog templates (registration, login, email verification, procurement, outreach, browser automation, tool self-upgrade) cover repeatable processes; everything else runs as a generic plan.
+4. **Execute.** Aura works in an isolated OpenClaw session with her tools and the process-scoped memory for this task.
+5. **Judge.** A separate Process Evaluator, in its own session, sees the request, the draft, Aura's action trace (tool calls and their results) and the run's artifacts. It accepts or sends a specific correction back. Attempts 1–9 are reworks, attempt 10 changes strategy, and at attempt 20 the user gets a diagnosis instead of a guess. Messages that arrive meanwhile are folded into the draft, which is judged again.
+6. **Deliver.** Only an accepted reply is posted, once, in ordered parts of at most 3,500 characters. Transient Slack errors retry; a permanent refusal is recorded, alerted, and ends the task `failed` with that reason. Messages that arrive after the reply go back to intake as new requests.
 
 ## What you get
 
-| Capability | What Aura provides |
+| Area | Guarantee |
 | --- | --- |
-| Durable task intake | Fast path → hybrid evidence (retrieval informs, never assigns) → Intake Analyst (Jev typed decision above thresholds, else the LLM) with `off` / `shadow` / `enforce` modes; a message related to several running tasks attaches to all of them |
-| Workflow control plane | Temporal `GenericTask` / `CatalogTask` workflows, child steps, reconciler + janitor |
-| Process memory | Process-scoped recall + promotion; Postgres is the record, Qdrant (OpenAI `text-embedding-3-small`) its index via a transactional outbox, Postgres full text as the fallback |
-| Slack ownership | OpenClaw plugin routes DMs to RMP; RMP posts the final reply (no double-send / no native fallback) |
-| LLM orchestration | Balanced NVIDIA key rotation, concurrency caps, fast idle rotate (~5s), usage ledger |
-| Galaxy web stack | Brave + LangSearch search; Jina Reader; Crawl4AI / Scrapling / Crawlee / ScrapeGraphAI; OpenClaw `browser` + browser-use + Obscura CDP |
-| Web capability routing | Intake analyzer picks `search` / `fetch` / `crawl` / `extract` / `interact` and injects a tool brief |
-| Production gates | Readiness API with invariant checks, hourly canaries with **soft-fail deferral** (no worker restart while user tasks run), a sentinel that DMs Kirill when an invariant breaks; a reply left by a dead run is judged by a restarted run |
+| **Routing** | Every message becomes a task or a follow-up; none is dropped. A message related to several running tasks reaches all of them. Retrieval is evidence for the analyst, never the decision. |
+| **Judgment** | Nothing unjudged reaches Slack: not a recovered draft after a crash, not a draft held by an evaluator outage (the run waits for the evaluator on durable timers and tells the user it is still working). Whether an answer is good enough is the evaluator's call, never a length rule. |
+| **Durability** | Temporal workflows survive restarts. A reconciler restarts dead runs so their drafts are judged, closes process runs whose task already ended, and re-signals stalled work. |
+| **Memory** | Postgres is the record; Qdrant is its index, kept in step by a transactional outbox, a 15-second drain and a daily reconcile. When the index does not answer, recall falls back to Postgres full-text search. |
+| **Hygiene** | Canary, heartbeat and system runs never reach shared memory or the task registry. Procedural memory holds procedures (steps, tools, failures), not replies. |
+| **LLM operations** | `openai/gpt-6-luna` over the OpenAI Responses API with `store: false`, thinking `max` for Aura's task work and `medium` elsewhere, `nvidia/openai/gpt-oss-20b` as fallback with balanced key rotation. Idle calls fail fast and rotate. A quota broker caps concurrent runs (3 user slots and 1 canary slot) and gives intake its own lane. |
+| **Monitoring** | A readiness API and six invariant checks: completions without an evaluator accept, attached messages neither answered nor resubmitted, Slack delivery failures, internal traces in shared memory, a stuck vector outbox, and orphaned runs. A sentinel pages the operator by Slack DM when one breaks. |
+| **Web research** | Search (Brave, LangSearch), readers (Jina), crawlers and extractors (Crawl4AI, Scrapling, Crawlee, ScrapeGraphAI), and browsers (OpenClaw `browser`, browser-use, Obscura CDP), picked per situation. |
 
-## Architecture
+## Memory
 
-### Control-plane flow (current)
+| Layer | What it holds | How it is used |
+| --- | --- | --- |
+| Dialogue | Every message and reply (`task_messages`) | The last four tasks of the same Slack conversation are shown to Aura as RECENT DIALOGUE |
+| Task registry | Each finished task's request and outcome, in Postgres and Qdrant | Intake searches it to recognise follow-ups of finished work |
+| Process memory | Episodic and working notes of one run | Injected into that run's steps and reworks |
+| User memory | Semantic facts and workspace notes | Retrieved by meaning at the start of each task |
+| Procedural memory | How similar work was done: steps, tools, failed calls | Retrieved for the same kind of process |
 
-```mermaid
-flowchart TD
-  User["Slack_user_DM"] --> OC["OpenClaw_gateway"]
-  OC --> Plugin["rmp_adapter_claim"]
-  Plugin -->|"POST_/tasks"| API["RMP_FastAPI"]
-  API --> Intake["3_layer_intake"]
-  Intake --> WebCap["WebCapabilityAnalyzer"]
-  Intake --> Mode{"execution_mode"}
-  Mode -->|conversational_or_structured| Generic["GenericTaskWorkflow"]
-  Mode -->|interact_gated| Catalog["CatalogTask_browser_automation"]
-  WebCap -.->|preferred_tools_brief| Generic
-  WebCap -.->|preferred_tools_brief| Catalog
-  Generic --> Worker["rmp_worker"]
-  Catalog --> Worker
-  Worker -->|"hooks/agent_rmp_task"| OC2["OpenClaw_execution"]
-  OC2 --> Tools["Tools"]
-  Tools --> Native["web_search_web_fetch_browser"]
-  Tools --> AuraWeb["aura_web_plugin"]
-  AuraWeb --> LangSearch["LangSearch"]
-  AuraWeb --> Jina["Jina_Reader"]
-  AuraWeb --> Stack["web_stack_:8791"]
-  Stack --> Crawl4AI
-  Stack --> Scrapling
-  Stack --> Crawlee
-  Stack --> ScrapeGraph
-  Stack --> BrowserUse["browser_use"]
-  Stack --> Obscura["Obscura_CDP_:9222"]
-  Worker --> PG["PostgreSQL"]
-  Worker --> Qdrant["Qdrant"]
-  Worker -->|"hooks/agent_rmp_verify"| Evaluator["Process_Evaluator"]
-  Evaluator -.->|"rework"| Worker
-  Evaluator -->|"accept_then_notify_slack_user"| Slack["Slack_DM_idempotent"]
-  Canary["hourly_health_canary"] --> Sentinel["canary_sentinel"]
-  Sentinel -->|"soft_timeout_+_active_users"| Defer["defer_worker_restart"]
-  Sentinel -->|"hard_stale_or_code_sync"| Restart["restart_rmp_api_worker"]
-  Sentinel -->|"broken_invariant"| Ops["ops_DM_to_Kirill"]
-  Reconciler["reconciler"] -->|"restart_dead_run_to_judge_its_draft"| Generic
-```
+Each memory row commits together with its outbox entry; the drain then writes the vector and retries a failed embedding instead of losing it, and a nightly reconcile repairs any drift between the two stores.
 
-| Layer | Role |
-| --- | --- |
-| **OpenClaw** | Slack socket, LLM/tools, isolated `rmp_task_*` sessions (execution only — not Slack delivery owner) |
-| **RMP (`app/`)** | API, workflows, intake, memory, quota broker, evidence, canary sentinel, reconciler |
-| **Plugin (`plugins/rmp_adapter`)** | Intercepts Slack → creates RMP tasks; suppresses native double-posts (fail closed) |
-| **Web (`plugins/aura_web`, `plugins/langsearch`, `web-stack/`)** | Multi-backend search/fetch/crawl/extract/browser tools + localhost FastAPI backends |
+## Jev
 
-**Binding rules:** every Slack DM goes through RMP; primary chat model is `openai/gpt-6-luna` (`nvidia/openai/gpt-oss-20b` fallback), thinking `max` for Aura's user tasks and `medium` elsewhere; LLM idle silence fails fast (~5s) and rotates keys. No GLM, no DeepSeek, no MiniMax.
+[Jev](https://docs.typesafe.ai/api) (`jev-1.13.0`, pinned) is TypeSafe's typed decision model. It answers multiple-choice questions with calibrated confidence in one HTTPS call, without an agent session. This project uses it for two decisions only, never for chat, for judging answers, or for choosing models:
 
-Deep dive: [`ARCHITECTURE.md`](ARCHITECTURE.md) · Runbooks: [`docs/runbooks/`](docs/runbooks/)
+- **Intake.** Up to seven typed questions per message: how it relates to running and finished work, which task, which execution mode, whether a catalog template applies, what kind of web work it needs. An answer counts only above program thresholds (0.85, and 0.92 to attach to a running task). Below them, the LLM analyst decides. Either way, the program's intake policy has the final say.
+- **Memory promotion.** Three typed questions per candidate fact (support, durability, scope), at 0.95, before anything becomes long-term memory.
 
-## Repository layout
-
-```text
-aura/
-├── app/                     # FastAPI + Temporal + memory + intake + web routing
-├── plugins/
-│   ├── rmp_adapter/         # Slack claim → RMP tasks
-│   ├── aura_web/            # Galaxy web tools (Jina, Crawl4AI, …)
-│   └── langsearch/          # LangSearch web_search provider + API key holder
-├── web-stack/               # Local FastAPI backends + Obscura compose/systemd
-├── ops/                     # Canaries, backup, janitor, patch verify
-├── tests/                   # Pytest suite
-├── docs/                    # Runbooks, history, architecture assets
-├── patch_openclaw.sh        # Re-apply dist patches after OpenClaw upgrades
-├── settings.example.json    # Config template (no secrets)
-├── worker.py                # Temporal worker entrypoint
-└── ARCHITECTURE.md          # Full system design
-```
+Each consumer runs `off`, `shadow` (record Jev's proposal, act on the existing path) or `enforce`. On the production host, intake is in `enforce` after passing an evaluation gate (zero harmful errors, accuracy of at least 0.9, coverage of at least 0.5, p95 under 1.5 s), and promotion is in `shadow`. See the [Jev runbook](docs/runbooks/jev.md).
 
 ## Quick start
 
 ### Prerequisites
 
-- Linux host (or VM) with Docker optional for Qdrant / Obscura / observability  
-- Python 3.12+, Node.js ≥ 22.23 (OpenClaw engines)  
-- PostgreSQL, Temporal, [OpenClaw](https://github.com/openclaw/openclaw) gateway  
-- NVIDIA NIM (or compatible) API keys for chat + embeddings  
-- Optional: Brave + [LangSearch](https://langsearch.com/) API keys; Obscura image `h4ckf0r0day/obscura`
+- Linux, Python 3.12, and Node.js 22.22.3+ (OpenClaw 2026.9 supports 22.22.3+, 24.15+ or 25.9+)
+- [OpenClaw](https://github.com/openclaw/openclaw) 2026.9 gateway with Slack configured
+- PostgreSQL, a [Temporal](https://temporal.io) server and [Qdrant](https://qdrant.tech)
+- An OpenAI API key (chat and `text-embedding-3-small` embeddings); NVIDIA API keys for the fallback model are optional
+- Optional: a TypeSafe API key for Jev; Brave and LangSearch keys for web search
 
 ### Setup
 
 ```bash
-git clone https://github.com/Hyper-AI-Lab/aura.git
-cd aura
+git clone https://github.com/Hyper-AI-Lab/openclaw-jev.git
+cd openclaw-jev
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
 cp settings.example.json settings.json
-# set api_key, production.slack_owner_user_id, vector/qdrant, task_registry.intake_mode
+# Set api_key, production.slack_owner_user_id, vector_memory, task_registry and jev.
 
-# Link plugins into your OpenClaw plugins dir (rmp_adapter, aura_web, langsearch), then:
+# Link plugins/rmp_adapter, plugins/aura_web and plugins/langsearch into OpenClaw's
+# plugins.load.paths, then patch and verify the OpenClaw dist:
 bash patch_openclaw.sh
 bash ops/verify_openclaw_patch.sh
 
-# Optional galaxy web backends + Obscura CDP
-# systemctl enable --now aura-web-backends aura-obscura
-
-# Start API + worker (systemd units or process manager of your choice)
-# then:
+# Run the API (uvicorn app.api.server:app) and the worker (python worker.py) under
+# systemd or your process manager, then:
 make production-check
 ```
 
-### Useful commands
+Keep secrets out of the repository: `settings.json`, `.env` files, auth profiles and `data/` are git-ignored. OpenClaw's model keys live in its own environment file.
+
+### Operations
 
 ```bash
-make production-check   # health + OpenClaw patch verify + intake canaries
-make canary             # manual E2E canary task
-pytest -q               # unit/integration tests
-curl -s http://127.0.0.1:8791/health   # web-stack backends (if enabled)
+make production-check   # health, OpenClaw patch check, intake canaries
+make readiness          # readiness report, invariant checks included
+make canary             # end-to-end canary task
+make restart-rmp        # restart API, worker and gateway; waits for health
+make upgrade-openclaw   # after every OpenClaw update: re-apply and verify patches
+venv/bin/python -m ops.reconcile_vectors [--apply]   # compare Postgres with Qdrant
+venv/bin/python -m pytest tests/ -q                  # hermetic: private SQLite, sealed network
+node --test tests/node/*.test.js                     # plugin tests
 ```
 
-## Configuration notes
+## Testing
 
-- **Never commit** `settings.json`, `.env`, auth profiles, or `data/`.  
-- Example config: [`settings.example.json`](settings.example.json).  
-- LangSearch / Jina keys live in OpenClaw `plugins.entries.*` (not this repo).  
-- Obscura remote mode: `OBSCURA_CDP_URL=http://127.0.0.1:9222` (Hermes-compatible).  
-- After every `npm install -g openclaw`, run `ops/upgrade_openclaw.sh` (never hand-edit dist; never `openclaw onboard`).  
-- Model stack: `openai/gpt-6-luna` primary (OpenAI Responses API) → `nvidia/openai/gpt-oss-20b` (NVIDIA); intake uses the same chain; subagents and the Process Evaluator run on gpt-6-luna. No GLM, no DeepSeek, no MiniMax.  
-- Health canary **soft** failures (`timeout`/`failed`) defer worker restart while user tasks are active. If a run dies after Aura answered, the reconciler restarts it and the evaluator judges the draft before anything reaches Slack.
+- **Unit and integration tests** for intake, workflows, the evaluator, memory, delivery, the quota broker, readiness and the invariants. Tests always run on a private SQLite database.
+- **Whole-path harness** (`tests/test_whole_path.py`): a Slack message goes through `POST /tasks`, intake, the task workflows, the real activities and evaluator code, and Slack delivery on a time-skipping Temporal server. Only the models, Aura's session and Slack's HTTP API are stubbed, and any other network access fails the test.
+- **Plugin tests** call every OpenClaw tool the way OpenClaw 2026.9 does.
+
+## Repository layout
+
+```text
+app/
+  api/            FastAPI: tasks, intake, settings, readiness, dashboard
+  workflows/      Temporal workflows: generic, catalog, intake, judgment, attached messages
+  activities/     OpenClaw dispatch, Slack delivery, database and memory activities
+  task_registry/  Intake: evidence, handlers, retrieval, registry
+  decisions/      Jev consumers (intake, memory promotion)
+  memory/         Memory router, vector sync (outbox, reconcile), promotion, hygiene
+  orchestrator/   Step predicates, rework rules, Process Evaluator
+  llm/            Quota broker, model policy, usage monitor
+  production/     Readiness, invariants, canary sentinel, ops alerts
+  reconciler.py   Orphan recovery, stale-work repair, process-run closing
+plugins/          rmp_adapter (Slack claim), aura_web (web tools), langsearch
+web-stack/        Local web backends (crawl, scrape, extract, browser)
+ops/              Canaries, backups, reconcile, OpenClaw upgrade and patch checks
+tests/            pytest suite, whole-path harness, node plugin tests
+docs/             Constitution, runbooks, audit log
+worker.py         Temporal worker
+```
+
+## Documentation
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): how the system is built, service by service
+- [`docs/CONCEPT_TREE.md`](docs/CONCEPT_TREE.md): what must stay true, and why
+- [`docs/runbooks/`](docs/runbooks/): Jev, invariant alerts, OpenClaw upgrades, backups, go-live, Slack sockets
+- [`docs/SYSTEM_AUDIT_PROGRESS.md`](docs/SYSTEM_AUDIT_PROGRESS.md): the September 2026 end-to-end audit and hardening
 
 ## Status
 
-This repository is a **production-shaped public snapshot** of Aura’s RMP control plane. Paths and host assumptions in older docs may reflect the original single-VPS deployment; adapt ports, systemd units, and secrets to your environment.
+Runs in production on a single VPS (OpenClaw 2026.9, one Temporal server, Postgres and Qdrant on the same host). This repository is a public snapshot of that deployment: host paths, ports and systemd units reflect it and need adapting to yours.
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). Issues and PRs welcome for docs, tests, and portable packaging improvements.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Issues and pull requests are welcome, especially for portable packaging, docs and tests.
+
+## Acknowledgements
+
+[OpenClaw](https://github.com/openclaw/openclaw) (agent runtime), [TypeSafe Jev](https://docs.typesafe.ai/api) (decision model), [Temporal](https://temporal.io) (durable execution), [Qdrant](https://qdrant.tech) (vector index).
 
 ## License
 
 [MIT](LICENSE) © Hyper-AI-Lab
-
-## Jev decisions
-
-TypeSafe Jev can answer the intake analyst's typed questions (new work, follow-up,
-running task, catalog) in one HTTPS request without an OpenClaw session, with the
-LLM analyst handling the uncertain cases, and can review memory promotion. Both
-start `off`; deterministic policy stays authoritative. See
-[the Jev runbook](docs/runbooks/jev.md).

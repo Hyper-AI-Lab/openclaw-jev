@@ -20,7 +20,7 @@ async def _fetch_page(url: str, timeout: float = 20.0) -> Dict[str, Any]:
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=timeout,
-        headers={"User-Agent": "AuraWebStack/1.0 (+https://github.com/Hyper-AI-Lab/aura)"},
+        headers={"User-Agent": "AuraWebStack/1.0 (+https://github.com/Hyper-AI-Lab/openclaw-jev)"},
     ) as client:
         resp = await client.get(url)
         resp.raise_for_status()
