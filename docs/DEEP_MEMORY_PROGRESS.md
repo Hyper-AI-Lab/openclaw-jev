@@ -595,3 +595,60 @@ So the fast path's floor applies to dense similarity, at 0.30 (`fast_context_fac
 - The healthcheck warns that OpenClaw prompt tokens over 24 h (6.0M) exceed its 5M budget. The total comes from 32 user tasks (with yesterday's reworked Kubernetes guide), 35 canaries and the Step 9–10 scratch runs. The memory lane is separate (142k today).
 
 ---
+
+## Step 12 — Intake upgrades
+
+**Date:** 2026-09-30, deployed 16:39 JST (`d14e16b`).
+
+**What changed:**
+- **`recall_depth`** (none or deep): whether answering needs a search of long-term memory.
+  - Jev: a new typed question in `app/decisions/intake.py`. Its answer counts at Jev's intake confidence bar (0.85) or above; otherwise the value is deep.
+  - The intake analyst returns it in its JSON; the prompt says when to choose deep, and deep when unsure.
+  - `apply_intake_policy` keeps none only when the decision's confidence reaches the intake threshold (65) and the value is valid. Otherwise it is deep: missing, invalid, degraded, or from a deterministic gate.
+  - It is written to the decision audit (`llm_raw`, the `intake.decided` event) and passed to the task workflow as `recall_depth`. Step 13 reads it.
+- **The analyst reads the recent dialogue.**
+  - `assemble_intake_context` fetches the session's recent turns once, beside retrieval, as `recent_dialogue`. Jev reads the same lines; its own fetch is gone.
+  - The analyst's context lists `recent_dialogue` first. It says that finished tasks carry their outcome and Aura's answer, which the registry leads with since Step 6.
+  - The analyst's context JSON keeps non-ASCII text as is (`ensure_ascii=False`). Before, Japanese turned into `\u` escapes, several times longer against the 16,000-character cap.
+- **Text search** (`search_fts` in `app/task_registry/hybrid_retriever.py`):
+  - any word of the message (`websearch_to_tsquery` with `or`), where `plainto_tsquery` needed every word;
+  - no canary or heartbeat rows, in SQL and again per row;
+  - the last 90 days only.
+- **Per-leg deadlines.** Text search (3 s) and user memory (4 s) run concurrently with the active, registry and vector legs, each within its own deadline, capped by the vector deadline. Before, both ran after the others inside one 4 s timeout, so a slow embedder threw away the text hits as well. The context phase now takes at most the vector deadline plus 2 s of liveness checks, instead of up to 14 s.
+- `ops/jev_eval.py` validates and scores an optional `recall_depth` label on its own; it is not part of the routing gate. 32 fixture cases are labelled: 17 none, 15 deep.
+
+**Verification:**
+- New tests:
+  - `tests/test_jev_intake.py` (+11): the question set, Jev's answer and its threshold, the policy's defaults, and Jev reading the assembled dialogue.
+  - `tests/test_hybrid_retriever.py` (+2, 1 replaced): the OR query; the SQL's OR, internal filter and time bound; a slow memory leg that keeps the text hits.
+  - `tests/test_intake_bounded_context.py` (+1): the dialogue is read once, beside retrieval.
+  - `tests/test_intake_evidence.py` (+1): the analyst's prompt, with Japanese kept readable.
+  - `tests/test_temporal_connect.py` (+1): `recall_depth` reaches the workflow payload.
+- Full suite: 733 passed, 4 skipped.
+- One timing test failed once at 0.36 s against a 0.30 s bound, because the new dialogue fetch ran against an empty SQLite file. The test now stubs the fetch, like its other I/O, and passed in three reruns and the full suite. The suite took 425–515 s instead of about 260 s, under measured disk-I/O pressure (`/proc/pressure/io`, about 7% full over 5 minutes). The whole-path harness took 105 s here and 95 s on `main`.
+- **Harness** (`ops/jev_eval.py --intake`): all 51 cases validate.
+  - Largest fixture request: 5,727 bytes. Worst case the builder allows in ASCII: 21,250 bytes, under the 24,000 limit.
+  - The same worst case in Japanese is 49,450 bytes. This predates this step, which adds about 450 bytes. Jev then answers `request_too_large` and the analyst decides.
+- **Harness live** against Jev, with the step before as baseline:
+
+  | | Accepted | Accuracy on accepted | Harmful | p95 |
+  |---|---|---|---|---|
+  | Before (`ab9565a`) | 34 of 51 | 0.882 | 0 | 312 ms |
+  | Step 12 | 35 of 51 | 0.886 | 0 | 424 ms |
+
+  - The gate's 0.9 accuracy bar fails before and after. The 4 errors are execution mode and catalog on running-task and login cases, not this step. The other answers moved only slightly, with one case crossing the bar each way.
+  - `recall_depth`: 20 of 23 labelled accepted cases right (0.87). Two misses were none answers below 0.85, which became deep. One was a confident none for "Create an account … using my work email", where memory is needed.
+- **Live previews** on the worker (`/tasks/intake/preview`: no task, no Slack), Kirill's session:
+  - "Which Kubernetes docs did we use for the home cluster guide?" (analyst): create_guided, deep, 19 s.
+  - The same question reworded, Jev first: Jev abstained (deep at 0.42); the analyst decided create_guided, deep.
+  - "Good morning!": Jev, none at 1.0, 1.7 s.
+  - "What's my test code word?": Jev, none at 0.88, 1.9 s. This is right: this session's recent dialogue holds that exact exchange with the answer.
+  - The analyst's prompt, read from OpenClaw's agent database, held the 8 recent turns and, among its text hits, the Kubernetes guide task.
+  - On live Postgres, that question's registry search found 0 entries with every word required and 12 with any word.
+  - No leg timeouts in the logs. Readiness: 30 pass, 1 warn, 0 fail.
+
+**Deviations:**
+- The `ensure_ascii=False` change is not in the plan. The analyst could not read Japanese dialogue without it.
+- A Japanese conversation at the builder's limits can exceed Jev's 24 KB. This is left to the analyst as designed, not trimmed.
+
+---
