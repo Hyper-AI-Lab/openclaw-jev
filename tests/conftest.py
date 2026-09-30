@@ -47,4 +47,8 @@ def _no_live_gateway_abort(monkeypatch):
     async def refused(session_key):
         return {"key": session_key, "status": "error", "error": "hermetic tests: no gateway"}
 
+    def no_helper(self):
+        raise RuntimeError("hermetic tests: no gateway helper")
+
     monkeypatch.setattr(openclaw_control, "abort_session", refused)
+    monkeypatch.setattr(openclaw_control.GatewayHelper, "_command", no_helper)

@@ -1,7 +1,11 @@
-"""Stopping Aura's in-flight runs: sessions.abort per session, through a fake openclaw CLI."""
+"""Stopping Aura's in-flight runs: sessions.abort per session, through the warm helper or the CLI (both fake)."""
 import asyncio
 import json
+import shutil
 import stat
+import sys
+import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -98,6 +102,97 @@ async def test_a_cli_past_its_timeout_is_killed_with_its_children(tmp_path, monk
     result = await REAL_ABORT(f"agent:main:rmp_task_{TID}")
     await asyncio.sleep(2.5)
     assert result["status"] == "timeout" and not marker.exists()
+
+
+FAKE_HELPER = (
+    "import json, sys, time\n"
+    "log = open(sys.argv[1], 'a')\n"
+    "log.write('start\\n'); log.flush()\n"
+    "if 'slow' in sys.argv[2:]:\n"
+    "    time.sleep(3)\n"
+    "print(json.dumps({'ready': True}), flush=True)\n"
+    "for line in sys.stdin:\n"
+    "    req = json.loads(line)\n"
+    "    key = req['params']['key']\n"
+    "    log.write(json.dumps(req) + '\\n'); log.flush()\n"
+    "    if key.endswith('__crash'):\n"
+    "        sys.exit(1)\n"
+    "    if key.endswith('__refused'):\n"
+    "        print(json.dumps({'id': req['id'], 'ok': False, 'error': 'gateway said no'}), flush=True)\n"
+    "        continue\n"
+    "    status = 'no-active-run' if '__' in key else 'aborted'\n"
+    "    print(json.dumps({'id': req['id'], 'ok': True, 'result': {'ok': True, 'status': status}}), flush=True)\n"
+)
+
+
+@pytest.fixture
+async def fake_helper(tmp_path, monkeypatch):
+    """The warm helper as a script speaking its protocol; the args list switches behaviour."""
+    log, script = tmp_path / "helper.log", tmp_path / "helper.py"
+    script.write_text(FAKE_HELPER)
+    args: list = []
+    monkeypatch.setattr(openclaw_control.GatewayHelper, "_command",
+                        lambda self: [sys.executable, str(script), str(log), *args])
+    monkeypatch.setattr(openclaw_control, "abort_session", REAL_ABORT)
+    yield SimpleNamespace(log=log, args=args, starts=lambda: log.read_text().count("start\n"))
+    await openclaw_control.close_gateway_helper()
+
+
+def helper_requests(log):
+    return [json.loads(line) for line in log.read_text().splitlines() if line.startswith("{")]
+
+
+async def test_the_warm_helper_aborts_without_the_cli(fake_helper, fake_cli):
+    openclaw_control.warm_up_gateway_helper()
+    await asyncio.sleep(0.5)
+    assert fake_helper.starts() == 1
+    assert await REAL_ABORT(f"agent:main:rmp_task_{TID}") == {"key": f"agent:main:rmp_task_{TID}", "status": "aborted"}
+    [request] = helper_requests(fake_helper.log)
+    assert request["method"] == "sessions.abort" and request["timeoutMs"] == openclaw_control.ABORT_TIMEOUT_MS
+    assert request["params"] == {"key": f"agent:main:rmp_task_{TID}", "clearQueued": True}
+    assert not fake_cli.exists() and fake_helper.starts() == 1
+
+
+async def test_a_refused_or_lost_helper_call_falls_back_to_the_cli_and_the_helper_restarts(fake_helper, fake_cli):
+    refused = await REAL_ABORT(f"agent:main:rmp_task_{TID}__refused")
+    crashed = await REAL_ABORT(f"agent:main:rmp_task_{TID}__crash")
+    assert [refused["status"], crashed["status"]] == ["no-active-run", "no-active-run"]
+    assert len(fake_cli.read_text().splitlines()) == 2
+    assert (await REAL_ABORT(f"agent:main:rmp_task_{TID}"))["status"] == "aborted"
+    assert fake_helper.starts() == 2 and len(fake_cli.read_text().splitlines()) == 2
+
+
+async def test_a_helper_slow_to_start_is_not_waited_for_past_its_limit(fake_helper, fake_cli, monkeypatch):
+    fake_helper.args.append("slow")
+    monkeypatch.setattr(openclaw_control, "HELPER_READY_SEC", 0.5)
+    started = time.monotonic()
+    result = await REAL_ABORT(f"agent:main:rmp_task_{TID}")
+    assert result["status"] == "aborted" and time.monotonic() - started < 2.5
+    assert len(fake_cli.read_text().splitlines()) == 1
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+async def test_the_node_helper_calls_openclaws_sdk_and_serves_only_abort(tmp_path, monkeypatch):
+    package = tmp_path / "openclaw"
+    (package / "dist").mkdir(parents=True)
+    (package / "package.json").write_text(json.dumps(
+        {"name": "openclaw", "type": "module",
+         "exports": {"./plugin-sdk/gateway-runtime": {"default": "./dist/sdk.mjs"}}}))
+    (package / "dist" / "sdk.mjs").write_text(
+        "export async function callGatewayFromCli(method, opts, params) {\n"
+        "  return { ok: true, status: 'aborted', method, timeout: opts.timeout, json: opts.json, key: params.key };\n"
+        "}\n")
+    monkeypatch.setattr(openclaw_control.GatewayHelper, "_command",
+                        lambda self: [shutil.which("node"), str(openclaw_control.HELPER_SCRIPT), str(package)])
+    helper = openclaw_control.GatewayHelper()
+    try:
+        result = await helper.call("sessions.abort", {"key": "agent:main:rmp_task_x", "clearQueued": True})
+        assert result == {"ok": True, "status": "aborted", "method": "sessions.abort", "timeout": "15000",
+                          "json": True, "key": "agent:main:rmp_task_x"}
+        with pytest.raises(RuntimeError, match="method not allowed: config.set"):
+            await helper.call("config.set", {})
+    finally:
+        await helper.close()
 
 
 def test_session_statuses_read_the_gateway_store(tmp_path, monkeypatch):

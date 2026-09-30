@@ -104,6 +104,9 @@ async def lifespan(app: FastAPI):
     _vector_stop = asyncio.Event()
     _vector_task = asyncio.create_task(vector_outbox_loop(_vector_stop))
     deep_task = asyncio.create_task(deep_ingest_loop(_vector_stop))
+    from app.openclaw_control import close_gateway_helper, warm_up_gateway_helper
+
+    warm_up_gateway_helper()
     logger.info("RMP API started with reconciler, scanner monitor, cron reconciler, vector outbox, deep-memory ingest")
     yield
     if _reconciler_stop:
@@ -128,6 +131,7 @@ async def lifespan(app: FastAPI):
 
     await close_jev_client()
     await close_direct_clients()
+    await close_gateway_helper()
 
 
 app = FastAPI(lifespan=lifespan)
