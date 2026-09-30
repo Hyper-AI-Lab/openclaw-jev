@@ -1,10 +1,11 @@
 """Postgres holds memory; Qdrant indexes it (transactional outbox + reconciler).
 
-Every indexable memory row and every registry entry gets a `vector_outbox` row in the
-transaction that writes it. The drainer embeds and upserts with point id = row id, so a
-retry overwrites instead of duplicating. The reconciler diffs Postgres with both indexes:
-missing rows and finished user tasks without a registry entry are queued, points no row
-references are deleted.
+Every indexable memory row, every registry entry and every deep-memory object gets a
+`vector_outbox` row in the transaction that writes it. The drainer embeds and upserts with
+point id = row id, so a retry overwrites instead of duplicating. User memory lives in the
+deep-memory collection (kind ``deep``); process and procedural memory in the legacy one.
+The reconciler diffs Postgres with the three indexes: missing rows and finished user tasks
+without a registry entry are queued, points no row references are deleted.
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ from app.orchestrator.decision_engine import INTAKE_PLACEHOLDER, TERMINAL_STATUS
 logger = logging.getLogger("rmp.vector_sync")
 
 DRAIN_INTERVAL_SEC = 15
-DRAIN_BATCH = 50
+DRAIN_BATCH = 100
 RECONCILE_INTERVAL_SEC = 24 * 3600
 MAX_BACKOFF_SEC = 3600
 # Refuse a reconcile that would delete most of an index: a failed Postgres read looks the same.
@@ -121,7 +122,12 @@ async def enqueue_registry_index(task_id: str) -> None:
 async def _apply(db, row: VectorOutbox) -> None:
     if row.kind == "memory":
         item = await db.get(MemoryItem, row.ref_id)
-        if item is None or item.valid_to is not None or item.memory_type not in INDEXABLE_TYPES:
+        if (
+            item is None
+            or item.valid_to is not None
+            or item.memory_type not in INDEXABLE_TYPES
+            or item.scope_type == "user"
+        ):
             legacy = (item.provenance_ref or {}).get("vector_ref") if item is not None else None
             await asyncio.to_thread(delete_memory_points, [row.ref_id, legacy])
             return
@@ -134,32 +140,69 @@ async def _apply(db, row: VectorOutbox) -> None:
         raise ValueError(f"unknown outbox kind {row.kind!r}")
 
 
+async def _apply_deep(db, rows: List[VectorOutbox]) -> Optional[str]:
+    """Index a batch of deep-memory objects with one embedding request per 64; the error or None."""
+    from app.deep_memory import index
+
+    points = await index.build_points(db, [row.ref_id for row in rows])
+    upserts = list({p.id: p for p in points.values() if p is not None}.values())
+    deletes = []
+    for ref, point in points.items():
+        if point is None:
+            try:
+                deletes.append(index.parse_ref(ref)[1])
+            except ValueError:
+                logger.warning("Deep outbox row with a bad ref dropped: %r", ref)
+    try:
+        await asyncio.to_thread(index.upsert_points, upserts)
+        await asyncio.to_thread(index.delete_points, deletes)
+    except Exception as exc:
+        return str(exc)[:500] or type(exc).__name__
+    return None
+
+
+def _mark(row: VectorOutbox, error: Optional[str], stats: Dict[str, int]) -> None:
+    if error is None:
+        row.done_at = datetime.utcnow()
+        row.last_error = None
+        stats["done"] += 1
+        return
+    row.attempts = (row.attempts or 0) + 1
+    row.last_error = error[:500]
+    backoff = min(MAX_BACKOFF_SEC, 30 * 2 ** min(row.attempts, 7))
+    row.next_attempt_at = datetime.utcnow() + timedelta(seconds=backoff)
+    stats["failed"] += 1
+
+
 async def drain_once(limit: int = DRAIN_BATCH) -> Dict[str, int]:
+    from app.deep_memory import index
+
     stats = {"done": 0, "failed": 0}
     now = datetime.utcnow()
     async with AsyncSessionLocal() as db:
+        q = select(VectorOutbox).where(VectorOutbox.done_at.is_(None), VectorOutbox.next_attempt_at <= now)
+        if not index.is_enabled():
+            # Deep rows wait until deep memory is on again, without holding the batch.
+            q = q.where(VectorOutbox.kind != "deep")
         rows = (
             await db.execute(
-                select(VectorOutbox)
-                .where(VectorOutbox.done_at.is_(None), VectorOutbox.next_attempt_at <= now)
-                .order_by(VectorOutbox.next_attempt_at)
-                .limit(limit)
-                .with_for_update(skip_locked=True)
+                q.order_by(VectorOutbox.next_attempt_at).limit(limit).with_for_update(skip_locked=True)
             )
         ).scalars().all()
+        deep = [row for row in rows if row.kind == "deep"]
         for row in rows:
+            if row.kind == "deep":
+                continue
             try:
                 await _apply(db, row)
             except Exception as exc:
-                row.attempts = (row.attempts or 0) + 1
-                row.last_error = str(exc)[:500]
-                backoff = min(MAX_BACKOFF_SEC, 30 * 2 ** min(row.attempts, 7))
-                row.next_attempt_at = datetime.utcnow() + timedelta(seconds=backoff)
-                stats["failed"] += 1
+                _mark(row, str(exc) or type(exc).__name__, stats)
             else:
-                row.done_at = datetime.utcnow()
-                row.last_error = None
-                stats["done"] += 1
+                _mark(row, None, stats)
+        if deep:
+            error = await _apply_deep(db, deep)
+            for row in deep:
+                _mark(row, error, stats)
         await db.commit()
     return stats
 
@@ -188,12 +231,70 @@ def _guarded(orphans: List[str], total: int, collection: str) -> List[str]:
     return orphans
 
 
+async def _deep_expected(db) -> Dict[str, str]:
+    """Point id -> outbox ref for everything the deep-memory collection should hold."""
+    from app.db.models import DeepChunk, DeepDocument, DeepSection
+    from app.deep_memory.index import point_ref
+
+    live_docs = select(DeepDocument.id).where(DeepDocument.valid_to.is_(None))
+    chunks = await db.execute(
+        select(DeepChunk.id).where(DeepChunk.valid_to.is_(None), DeepChunk.document_id.in_(live_docs))
+    )
+    sections = await db.execute(
+        select(DeepSection.id).where(
+            DeepSection.summary.is_not(None), DeepSection.summary != "", DeepSection.document_id.in_(live_docs)
+        )
+    )
+    documents = await db.execute(
+        select(DeepDocument.id).where(
+            DeepDocument.valid_to.is_(None), DeepDocument.summary.is_not(None), DeepDocument.summary != ""
+        )
+    )
+    facts = await db.execute(
+        select(MemoryItem.id).where(
+            MemoryItem.scope_type == "user",
+            MemoryItem.memory_type.in_(INDEXABLE_TYPES),
+            MemoryItem.valid_to.is_(None),
+        )
+    )
+    expected: Dict[str, str] = {}
+    for level, result in (("chunk", chunks), ("section", sections), ("document", documents), ("fact", facts)):
+        for (obj_id,) in result.all():
+            expected[obj_id] = point_ref(level, obj_id)
+    return expected
+
+
+async def _reconcile_deep(apply: bool, pending: set) -> Dict[str, Any]:
+    from app.deep_memory import index
+
+    async with AsyncSessionLocal() as db:
+        expected = await _deep_expected(db)
+    points = set(await asyncio.to_thread(index.scroll_point_ids))
+    missing = [ref for pid, ref in expected.items() if pid not in points and ("deep", ref) not in pending]
+    orphans = _guarded(sorted(points - set(expected)), len(points), index.collection_name())
+    if apply:
+        async with AsyncSessionLocal() as db:
+            db.add_all([VectorOutbox(kind="deep", ref_id=ref) for ref in missing])
+            await db.commit()
+        await asyncio.to_thread(index.delete_points, orphans)
+    return {
+        "deep_objects": len(expected),
+        "deep_points": len(points),
+        "deep_missing": len(missing),
+        "deep_orphans": len(orphans),
+    }
+
+
 async def reconcile(apply: bool = True) -> Dict[str, Any]:
+    from app.deep_memory import index
+
     async with AsyncSessionLocal() as db:
         rows = (
             await db.execute(
                 select(MemoryItem.id, MemoryItem.provenance_ref).where(
-                    MemoryItem.memory_type.in_(INDEXABLE_TYPES), MemoryItem.valid_to.is_(None)
+                    MemoryItem.memory_type.in_(INDEXABLE_TYPES),
+                    MemoryItem.valid_to.is_(None),
+                    MemoryItem.scope_type != "user",
                 )
             )
         ).all()
@@ -263,6 +364,8 @@ async def reconcile(apply: bool = True) -> Dict[str, Any]:
             await db.commit()
         await asyncio.to_thread(delete_memory_points, orphans)
         await asyncio.to_thread(_delete_points, registry_collection(), reg_orphans)
+    if index.is_enabled():
+        stats.update(await _reconcile_deep(apply, pending))
     logger.info("Vector reconcile: %s", stats)
     return stats
 

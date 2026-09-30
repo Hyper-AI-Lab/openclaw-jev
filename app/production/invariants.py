@@ -148,7 +148,7 @@ async def check_memory_hygiene() -> CheckResult:
 
 
 async def check_vector_sync() -> CheckResult:
-    """Postgres and both Qdrant indexes agree, and the outbox drains."""
+    """Postgres and the Qdrant indexes agree, and the outbox drains."""
     if not is_vector_memory_enabled():
         return CheckResult("vector_sync", "pass", "Vector memory disabled", {})
     from app.memory.vector_sync import reconcile
@@ -185,13 +185,15 @@ async def check_vector_sync() -> CheckResult:
             details,
         )
     unsynced = sum(
-        drift[k]
+        drift.get(k, 0)
         for k in (
             "memory_missing",
             "memory_orphans",
             "registry_missing",
             "registry_orphans",
             "registry_unindexed",
+            "deep_missing",
+            "deep_orphans",
         )
     )
     if unsynced:

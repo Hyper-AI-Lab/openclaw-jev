@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.deep_memory import index
 from app.memory import router, vector_sync
 from app.memory.vector_sync import memory_point_payload
 
@@ -40,11 +41,14 @@ async def test_a_memory_row_and_its_outbox_row_commit_together():
     db.commit = AsyncMock()
     with patch.object(router, "AsyncSessionLocal", _session(db)), \
          patch.object(router, "is_vector_memory_enabled", return_value=True):
-        mem_id = await router.MemoryRouter.write("user", "default", "semantic", "Kirill prefers metric units.")
+        fact = await router.MemoryRouter.write("user", "default", "semantic", "Kirill prefers metric units.")
+        episode = await router.MemoryRouter.write("process", "pr1", "episodic", "Step one found three trains.")
         await router.MemoryRouter.write("process", "pr1", "working", "scratch note for this step")
     kinds = [type(o).__name__ for o in added]
-    assert kinds == ["MemoryItem", "VectorOutbox", "MemoryItem"]
-    assert added[1].kind == "memory" and added[1].ref_id == mem_id
+    assert kinds == ["MemoryItem", "VectorOutbox", "MemoryItem", "VectorOutbox", "MemoryItem"]
+    # User memory is indexed in the deep-memory collection; process memory in the legacy one.
+    assert (added[1].kind, added[1].ref_id) == ("deep", f"fact:{fact}")
+    assert (added[3].kind, added[3].ref_id) == ("memory", episode)
     db.commit.assert_awaited()
 
 
@@ -53,20 +57,29 @@ def _outbox(kind="memory", ref=ROW):
                            next_attempt_at=datetime(2026, 9, 29), done_at=None)
 
 
-async def _drain(rows, db_get):
+async def _drain(rows, db_get, *, deep_enabled=True, statements=None):
     db = MagicMock()
     result = MagicMock()
     result.scalars.return_value.all.return_value = rows
-    db.execute = AsyncMock(return_value=result)
+
+    async def execute(statement):
+        if statements is not None:
+            compiled = statement.compile()
+            statements.append((str(compiled), dict(compiled.params)))
+        return result
+
+    db.execute = execute
     db.get = AsyncMock(side_effect=db_get)
     db.commit = AsyncMock()
-    with patch.object(vector_sync, "AsyncSessionLocal", _session(db)):
+    with patch.object(vector_sync, "AsyncSessionLocal", _session(db)), \
+         patch.object(index, "is_enabled", return_value=deep_enabled):
         return await vector_sync.drain_once()
 
 
 async def test_the_drain_indexes_retries_with_backoff_and_deletes_gone_rows():
     ok, broken, gone = _outbox(), _outbox(ref="r-broken"), _outbox(ref="r-gone")
-    rows = {ROW: item(), "r-broken": item(), "r-gone": None}
+    process = dict(scope_type="process", scope_id="pr1", memory_type="episodic")
+    rows = {ROW: item(**process), "r-broken": item(**process), "r-gone": None}
     upserts, deletes = [], []
 
     def upsert(it):
@@ -81,6 +94,47 @@ async def test_the_drain_indexes_retries_with_backoff_and_deletes_gone_rows():
     assert ok.done_at and gone.done_at and broken.done_at is None
     assert broken.attempts == 1 and "embedder down" in broken.last_error and broken.next_attempt_at > datetime.utcnow()
     assert deletes == [["r-gone", None]]
+
+
+async def test_a_user_row_left_in_the_legacy_outbox_only_leaves_the_legacy_index():
+    row = _outbox()
+    upserts, deletes = [], []
+    with patch.object(vector_sync, "_upsert_memory_point", side_effect=lambda it: upserts.append(it.id)), \
+         patch.object(vector_sync, "delete_memory_points", side_effect=lambda ids: deletes.append(list(ids))):
+        stats = await _drain([row], lambda model, key: item())
+    assert stats == {"done": 1, "failed": 0} and upserts == [] and deletes == [[ROW, None]]
+
+
+async def test_deep_rows_are_indexed_in_one_batch_and_a_failure_retries_them_all():
+    chunk, section, gone = _outbox("deep", "chunk:c1"), _outbox("deep", "section:s1"), _outbox("deep", "fact:f-gone")
+    points = {
+        "chunk:c1": index.IndexPoint(id="c1", level="chunk", text="Kobe beef at Mouriya", payload={}),
+        "section:s1": index.IndexPoint(id="s1", level="section", text="Lunch\nKobe beef", payload={}),
+        "fact:f-gone": None,
+    }
+    upserts, deletes = [], []
+    with patch.object(index, "build_points", AsyncMock(return_value=points)), \
+         patch.object(index, "upsert_points", side_effect=lambda pts: upserts.append([p.id for p in pts])), \
+         patch.object(index, "delete_points", side_effect=lambda ids: deletes.append(list(ids))):
+        stats = await _drain([chunk, section, gone], lambda model, key: None)
+    assert stats == {"done": 3, "failed": 0} and upserts == [["c1", "s1"]] and deletes == [["f-gone"]]
+
+    retry = [_outbox("deep", "chunk:c1"), _outbox("deep", "section:s1")]
+    with patch.object(index, "build_points", AsyncMock(return_value={k: points[k] for k in ("chunk:c1", "section:s1")})), \
+         patch.object(index, "upsert_points", side_effect=RuntimeError("qdrant down")), \
+         patch.object(index, "delete_points", side_effect=lambda ids: None):
+        stats = await _drain(retry, lambda model, key: None)
+    assert stats == {"done": 0, "failed": 2}
+    assert all(r.done_at is None and r.attempts == 1 and "qdrant down" in r.last_error for r in retry)
+
+
+async def test_deep_rows_wait_while_deep_memory_is_off():
+    statements = []
+    await _drain([], lambda model, key: None, deep_enabled=False, statements=statements)
+    await _drain([], lambda model, key: None, deep_enabled=True, statements=statements)
+    (off_sql, off_params), (on_sql, on_params) = statements
+    assert "vector_outbox.kind !=" in off_sql and "deep" in off_params.values()
+    assert "vector_outbox.kind !=" not in on_sql and "deep" not in on_params.values()
 
 
 async def test_reconcile_backfills_missing_rows_and_tasks_deletes_orphans_and_respects_legacy_links():
@@ -107,6 +161,7 @@ async def test_reconcile_backfills_missing_rows_and_tasks_deletes_orphans_and_re
     db.add_all = added.extend
     db.commit = AsyncMock()
     with patch.object(vector_sync, "AsyncSessionLocal", _session(db)), \
+         patch.object(index, "is_enabled", return_value=False), \
          patch.object(vector_sync, "_scroll", side_effect=[points, [("t-indexed", None), ("t-orphan", None)]]), \
          patch.object(vector_sync, "delete_memory_points", side_effect=lambda ids: deleted.append(("memory", list(ids)))), \
          patch.object(vector_sync, "_delete_points", side_effect=lambda coll, ids: deleted.append(("registry", list(ids)))):
@@ -123,6 +178,22 @@ def test_reconcile_refuses_to_delete_most_of_an_index():
     assert vector_sync._guarded(["a"], 100, "c") == ["a"]
 
 
+async def test_the_deep_reconcile_queues_missing_objects_and_deletes_orphans():
+    expected = {"c1": "chunk:c1", "c2": "chunk:c2", "f1": "fact:f1", "d1": "document:d1"}
+    db = MagicMock()
+    added, deleted = [], []
+    db.add_all = added.extend
+    db.commit = AsyncMock()
+    with patch.object(vector_sync, "AsyncSessionLocal", _session(db)), \
+         patch.object(vector_sync, "_deep_expected", AsyncMock(return_value=expected)), \
+         patch.object(index, "scroll_point_ids", return_value=["c1", "orphan-1"]), \
+         patch.object(index, "collection_name", return_value="rmp_deep_memory_v1"), \
+         patch.object(index, "delete_points", side_effect=lambda ids: deleted.append(list(ids))):
+        stats = await vector_sync._reconcile_deep(True, {("deep", "fact:f1")})
+    assert stats == {"deep_objects": 4, "deep_points": 2, "deep_missing": 2, "deep_orphans": 1}
+    assert sorted(o.ref_id for o in added) == ["chunk:c2", "document:d1"] and deleted == [["orphan-1"]]
+
+
 async def test_recall_falls_back_to_postgres_full_text_only_when_the_index_does_not_answer():
     db = MagicMock()
     empty = MagicMock()
@@ -133,12 +204,88 @@ async def test_recall_falls_back_to_postgres_full_text_only_when_the_index_does_
          patch.object(router, "is_vector_memory_enabled", return_value=True), \
          patch.object(router, "get_vector_service", return_value=MagicMock()), \
          patch.object(router, "_fts_search", fts):
-        with patch.object(router, "_vector_search_bounded", AsyncMock(return_value=None)):
+        # User memory: the deep index answers, else Postgres text search.
+        with patch.object(router, "_deep_fact_search", AsyncMock(return_value=None)):
             down = await router.MemoryRouter.read("user", "default", query="units")
-        with patch.object(router, "_vector_search_bounded", AsyncMock(return_value=[])):
+        with patch.object(router, "_deep_fact_search", AsyncMock(return_value=[])):
             up = await router.MemoryRouter.read("user", "default", query="units")
-    assert [h["source"] for h in down] == ["postgres_fts"]
-    assert up == [] and fts.await_count == 1
+        # Process memory: the legacy index.
+        with patch.object(router, "_vector_search_bounded", AsyncMock(return_value=None)) as legacy:
+            process_down = await router.MemoryRouter.read("process", "pr1", query="units")
+    assert [h["source"] for h in down] == ["postgres_fts"] and [h["source"] for h in process_down] == ["postgres_fts"]
+    assert up == [] and fts.await_count == 2 and legacy.await_count == 1
+
+
+async def test_user_memory_search_asks_the_deep_index_for_this_users_facts():
+    hits = [
+        index.Hit(id="f1", score=0.5, payload={"ref_id": "f1", "memory_type": "semantic", "text": "Code word PELICAN-47.",
+                                              "confidence": 90}),
+        index.Hit(id="f2", score=0.3, payload={"ref_id": "f2", "memory_type": "semantic"}),
+    ]
+    calls = []
+
+    def search(query, **kwargs):
+        calls.append((query, kwargs))
+        return hits
+
+    with patch.object(index, "is_enabled", return_value=True), patch.object(index, "search", side_effect=search), \
+         patch.object(index, "collection_exists", return_value=True):
+        found = await router._deep_fact_search("default", "code word", 5, "semantic")
+    with patch.object(index, "is_enabled", return_value=True), patch.object(index, "search", side_effect=search), \
+         patch.object(index, "collection_exists", return_value=False):
+        assert await router._deep_fact_search("default", "code word", 5, None) is None, "no collection yet"
+    assert calls == [("code word", {"levels": ("fact",), "match": {"scope_id": "default", "memory_type": "semantic"},
+                                     "limit": 5})]
+    assert found == [{"id": "f1", "memory_type": "semantic", "content": "Code word PELICAN-47.", "confidence": 90,
+                      "score": 0.5, "source": "vector"}]
+    with patch.object(index, "is_enabled", return_value=False):
+        assert await router._deep_fact_search("default", "code word", 5, None) is None
+
+
+async def test_a_superseded_memory_is_never_read(tmp_path):
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.db.models import Base, MemoryItem
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'm.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sessions = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with sessions() as db:
+        db.add(MemoryItem(id="old", scope_type="user", scope_id="default", memory_type="semantic",
+                          content="Test code word is PELICAN-47.", valid_to=datetime(2026, 9, 30)))
+        db.add(MemoryItem(id="new", scope_type="user", scope_id="default", memory_type="semantic",
+                          content="Test code word is HERON-12.", supersedes_memory_id="old"))
+        await db.commit()
+    with patch.object(router, "AsyncSessionLocal", sessions):
+        read = await router.MemoryRouter.read("user", "default", "semantic")
+    await engine.dispose()
+    assert [m["id"] for m in read] == ["new"]
+
+
+def test_a_failed_embedder_probe_is_retried_after_a_minute(monkeypatch):
+    from app.memory import vector
+
+    svc = vector.VectorMemoryService({"enabled": True})
+    probes = []
+
+    class Mem0:
+        @staticmethod
+        def from_config(config):
+            return object()
+
+    monkeypatch.setitem(__import__("sys").modules, "mem0", SimpleNamespace(Memory=Mem0))
+    monkeypatch.setattr(svc, "_build_mem0_config", lambda: {})
+    monkeypatch.setattr(svc, "_probe_embed", lambda: probes.append(1) or False)
+    now = [1000.0]
+    monkeypatch.setattr(vector.time, "monotonic", lambda: now[0])
+    assert svc._ensure_client() is False and probes == [1]
+    now[0] += vector.PROBE_RETRY_SEC - 1
+    assert svc._ensure_client() is False and probes == [1]
+    now[0] += 2
+    monkeypatch.setattr(svc, "_probe_embed", lambda: probes.append(2) or True)
+    assert svc._ensure_client() is True and probes == [1, 2]
 
 
 def test_procedural_recall_is_narrowed_to_its_process_type():

@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 from app.config import RMP_DATA_DIR
@@ -20,6 +21,8 @@ _service: Optional["VectorMemoryService"] = None
 _lock = threading.Lock()
 
 INDEXABLE_TYPES = frozenset({"semantic", "episodic", "procedural", "pinned"})
+# A failed embedder probe is retried after this long, not only after a restart.
+PROBE_RETRY_SEC = 60.0
 
 
 def _load_env_file(path: str) -> Dict[str, str]:
@@ -112,6 +115,7 @@ class VectorMemoryService:
         self._memory = None
         self._ready = False
         self._error: Optional[str] = None
+        self._error_at = 0.0
 
     def _qdrant_vector_store_config(self, embedding_dims: int) -> Dict[str, Any]:
         mode = (self.config.get("qdrant_mode") or "embedded").strip().lower()
@@ -212,8 +216,9 @@ class VectorMemoryService:
             return False
         if self._ready:
             return True
-        if self._error:
+        if self._error and time.monotonic() - self._error_at < PROBE_RETRY_SEC:
             return False
+        self._error = None
         try:
             from mem0 import Memory
 
@@ -222,12 +227,15 @@ class VectorMemoryService:
             if not self._probe_embed():
                 self._ready = False
                 self._memory = None
+                self._error = self._error or "embedder probe failed"
+                self._error_at = time.monotonic()
                 return False
             self._ready = True
             logger.info("Vector memory (Mem0/Qdrant) initialized")
             return True
         except Exception as e:
             self._error = str(e)
+            self._error_at = time.monotonic()
             logger.warning("Vector memory unavailable: %s", e)
             return False
 
@@ -263,7 +271,7 @@ class VectorMemoryService:
                 self._error = (
                     self.config.get("not_ready_reason") or "vector memory disabled"
                 )
-        elif not self._ready and not self._error:
+        elif not self._ready:
             self._ensure_client()
         mode = (self.config.get("qdrant_mode") or "embedded").strip().lower()
         out: Dict[str, Any] = {

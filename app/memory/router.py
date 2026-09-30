@@ -59,6 +59,62 @@ async def _vector_search_bounded(
         return None
 
 
+async def _deep_fact_search(
+    scope_id: str,
+    query: str,
+    limit: int,
+    memory_type: Optional[str],
+) -> Optional[List[Dict[str, Any]]]:
+    """User memory from the deep hybrid index; None when that index did not answer."""
+    from app.deep_memory import index
+
+    if not index.is_enabled():
+        return None
+    match: Dict[str, Any] = {"scope_id": scope_id}
+    if memory_type:
+        match["memory_type"] = memory_type
+    try:
+        if not await asyncio.to_thread(index.collection_exists):
+            return None
+        hits = await asyncio.wait_for(
+            asyncio.to_thread(index.search, query, levels=("fact",), match=match, limit=limit),
+            timeout=VECTOR_SEARCH_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Deep fact search timed out after %ss for user/%s", VECTOR_SEARCH_TIMEOUT_SEC, scope_id)
+        return None
+    except Exception as exc:
+        logger.warning("Deep fact search failed for user/%s: %s", scope_id, exc)
+        return None
+    return [
+        {
+            "id": hit.payload.get("ref_id") or hit.id,
+            "memory_type": hit.payload.get("memory_type") or "semantic",
+            "content": redact_secrets(hit.payload.get("text") or ""),
+            "confidence": int(hit.payload.get("confidence") or 0),
+            "score": hit.score,
+            "source": "vector",
+        }
+        for hit in hits
+        if hit.payload.get("text")
+    ]
+
+
+async def _semantic_hits(
+    scope_type: str,
+    scope_id: str,
+    query: str,
+    limit: int,
+    memory_type: Optional[str],
+) -> Optional[List[Dict[str, Any]]]:
+    """User memory lives in the deep index; process and procedural memory in the legacy one."""
+    if not is_vector_memory_enabled():
+        return None
+    if scope_type == "user":
+        return await _deep_fact_search(scope_id, query, limit, memory_type)
+    return await _vector_search_bounded(get_vector_service(), scope_type, scope_id, query, limit, memory_type)
+
+
 _FTS_WORD = re.compile(r"[^\W_]{3,}", re.UNICODE)
 
 
@@ -141,7 +197,12 @@ class MemoryRouter:
                 )
             )
             if is_vector_memory_enabled() and memory_type in INDEXABLE_TYPES:
-                db.add(VectorOutbox(kind="memory", ref_id=mem_id))
+                if scope_type == "user":
+                    from app.deep_memory.index import point_ref
+
+                    db.add(VectorOutbox(kind="deep", ref_id=point_ref("fact", mem_id)))
+                else:
+                    db.add(VectorOutbox(kind="memory", ref_id=mem_id))
             await db.commit()
         return mem_id
 
@@ -158,6 +219,7 @@ class MemoryRouter:
             q = select(MemoryItem).where(
                 MemoryItem.scope_type == scope_type,
                 MemoryItem.scope_id == scope_id,
+                MemoryItem.valid_to.is_(None),
             )
             if memory_type:
                 q = q.where(MemoryItem.memory_type == memory_type)
@@ -179,11 +241,7 @@ class MemoryRouter:
                 vm_cfg = get_vector_memory_config()
                 vector_limit = int(vm_cfg.get("semantic_recall_limit", 5))
                 indexed_type = memory_type if memory_type in INDEXABLE_TYPES else None
-                vector_hits = None
-                if is_vector_memory_enabled():
-                    vector_hits = await _vector_search_bounded(
-                        get_vector_service(), scope_type, scope_id, query, vector_limit, indexed_type
-                    )
+                vector_hits = await _semantic_hits(scope_type, scope_id, query, vector_limit, indexed_type)
                 if vector_hits is None:
                     vector_hits = await _fts_search(
                         scope_type, scope_id, query, vector_limit, indexed_type
@@ -215,11 +273,7 @@ class MemoryRouter:
         limit: int = 5,
         memory_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        hits = None
-        if is_vector_memory_enabled():
-            hits = await _vector_search_bounded(
-                get_vector_service(), scope_type, scope_id, query, limit, memory_type
-            )
+        hits = await _semantic_hits(scope_type, scope_id, query, limit, memory_type)
         if hits is None:
             hits = await _fts_search(scope_type, scope_id, query, limit, memory_type)
         return hits
@@ -331,6 +385,7 @@ class MemoryRouter:
             items = result.scalars().all()
             count = 0
             if is_vector_memory_enabled() and items:
+                from app.deep_memory import index
                 from app.memory.vector_sync import delete_memory_points
 
                 point_ids = [item.id for item in items] + [
@@ -338,6 +393,9 @@ class MemoryRouter:
                 ]
                 try:
                     vector_deleted = await asyncio.to_thread(delete_memory_points, point_ids)
+                    user_ids = [item.id for item in items if item.scope_type == "user"]
+                    if user_ids and index.is_enabled():
+                        vector_deleted += await asyncio.to_thread(index.delete_points, user_ids)
                 except Exception as exc:
                     logger.warning("Compaction vector delete deferred to reconcile: %s", exc)
             for item in items:
