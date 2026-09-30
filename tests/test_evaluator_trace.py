@@ -32,8 +32,8 @@ async def test_verify_sends_the_trace_and_artifacts_to_the_evaluator():
 
     seen = {}
 
-    async def execute(task_id, prompt):
-        seen["prompt"] = prompt
+    async def execute(task_id, prompt, verdict=0):
+        seen["prompt"], seen["verdict"] = prompt, verdict
         return '{"verdict": "accept", "quality": "pass", "reason": "ok"}'
 
     with patch("app.openclaw_sessions.task_action_trace", return_value=TRACE), \
@@ -45,7 +45,7 @@ async def test_verify_sends_the_trace_and_artifacts_to_the_evaluator():
         result = await oa.verify_response_quality(
             {"task_id": "t1", "user_intent": "save a packing plan", "agent_response": "I saved the plan.",
              "process_run_id": "pr1", "attempt": 1})
-    assert result["verdict"] == "accept"
+    assert result["verdict"] == "accept" and seen["verdict"] == 1
     assert "2. write" in seen["prompt"] and "- completion_output: plan.txt" in seen["prompt"]
 
 

@@ -217,18 +217,70 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
+def task_session_keys(task_id: str) -> List[str]:
+    """Aura's sessions for a task, oldest first: the first dispatch, then each rework and refinement.
+
+    The planner's session (``__plan``) is not Aura's work and is left out.
+    """
+    main = f"agent:main:rmp_task_{task_id}"
+    found: List[Tuple[int, str]] = []
+    for key, created in _task_session_rows(main):
+        if key == main or (key.startswith(main + "__") and not key.endswith("__plan")):
+            found.append((int(created or 0), key))
+    keys = [key for _, key in sorted(found)]
+    if main in keys:
+        keys.remove(main)
+    return [main, *keys]
+
+
+def _task_session_rows(main: str) -> List[Tuple[str, Optional[int]]]:
+    path = SESSIONS_JSON_PATH
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return [
+            (key, (entry or {}).get("createdAt") or (entry or {}).get("updatedAt"))
+            for key, entry in (data.items() if isinstance(data, dict) else [])
+            if str(key).startswith(main)
+        ]
+    if not _sqlite_sessions_available():
+        return []
+    try:
+        con = _connect(AGENT_DB_PATH, readonly=True)
+        try:
+            return con.execute(
+                "SELECT session_key, COALESCE(created_at, updated_at) FROM session_nodes "
+                "WHERE substr(session_key, 1, ?) = ?",
+                (len(main), main),
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return []
+
+
+def task_transcript_lines(task_id: str) -> List[Tuple[int, str]]:
+    """(session number, transcript line) across all of the task's sessions, oldest first."""
+    out: List[Tuple[int, str]] = []
+    for n, key in enumerate(task_session_keys(task_id)):
+        entry = get_session_entry(key)
+        out.extend((n, line) for line in read_transcript_lines(entry.get("sessionId") or ""))
+    return out
+
+
 def task_tool_results(task_id: str, *, tools: Iterable[str], min_chars: int) -> List[Dict[str, Any]]:
-    """Full results of the named tools in the task's rmp_task session, at least min_chars long.
+    """Full results of the named tools in the task's sessions, at least min_chars long.
 
     Each item: call_id, tool, arguments (dict), text (secrets redacted), timestamp (ms or None).
     """
     from app.memory.policy import redact_secrets
 
     wanted = set(tools)
-    entry = get_session_entry(f"agent:main:rmp_task_{task_id}")
     calls: Dict[str, Dict[str, Any]] = {}
     out: List[Dict[str, Any]] = []
-    for line in read_transcript_lines(entry.get("sessionId") or ""):
+    for session_no, line in task_transcript_lines(task_id):
         try:
             msg = (json.loads(line) or {}).get("message") or {}
         except (ValueError, AttributeError):
@@ -237,21 +289,23 @@ def task_tool_results(task_id: str, *, tools: Iterable[str], min_chars: int) -> 
             for part in msg["content"]:
                 if isinstance(part, dict) and part.get("type") == "toolCall" and part.get("name") in wanted:
                     args = part.get("arguments")
-                    calls[str(part.get("id"))] = {
+                    calls[f"{session_no}:{part.get('id')}"] = {
                         "tool": str(part["name"]),
                         "arguments": args if isinstance(args, dict) else {},
                     }
-        elif msg.get("role") == "toolResult" and str(msg.get("toolCallId")) in calls and not msg.get("isError"):
+        elif msg.get("role") == "toolResult" and not msg.get("isError"):
+            call_id = f"{session_no}:{msg.get('toolCallId')}"
+            if call_id not in calls:
+                continue
             content = msg.get("content")
             if isinstance(content, list):
                 content = "\n".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
             text = str(content or "")
             if len(text) < min_chars:
                 continue
-            call_id = str(msg["toolCallId"])
             out.append(
                 {
-                    "call_id": call_id,
+                    "call_id": str(msg.get("toolCallId")) if session_no == 0 else call_id,
                     **calls[call_id],
                     "text": redact_secrets(text),
                     "timestamp": msg.get("timestamp") if isinstance(msg.get("timestamp"), (int, float)) else None,
@@ -263,16 +317,15 @@ def task_tool_results(task_id: str, *, tools: Iterable[str], min_chars: int) -> 
 def task_action_trace(
     task_id: str, *, since_ms: Optional[int] = None, limit: int = 40
 ) -> List[Dict[str, Any]]:
-    """Aura's tool calls in the task's rmp_task session, oldest first, secrets redacted.
+    """Aura's tool calls across the task's sessions, oldest first, secrets redacted.
 
     Each item: tool, arguments, ok (None while no result was recorded), result.
     """
     from app.memory.policy import redact_secrets
 
-    entry = get_session_entry(f"agent:main:rmp_task_{task_id}")
     calls: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
-    for line in read_transcript_lines(entry.get("sessionId") or ""):
+    for session_no, line in task_transcript_lines(task_id):
         try:
             msg = (json.loads(line) or {}).get("message") or {}
         except (ValueError, AttributeError):
@@ -282,7 +335,7 @@ def task_action_trace(
         if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
             for part in msg["content"]:
                 if isinstance(part, dict) and part.get("type") == "toolCall":
-                    call_id = str(part.get("id") or len(order))
+                    call_id = f"{session_no}:{part.get('id') or len(order)}"
                     args = json.dumps(part.get("arguments") or {}, ensure_ascii=False)
                     calls[call_id] = {
                         "tool": str(part.get("name") or ""),
@@ -291,13 +344,13 @@ def task_action_trace(
                         "result": "",
                     }
                     order.append(call_id)
-        elif msg.get("role") == "toolResult" and str(msg.get("toolCallId")) in calls:
+        elif msg.get("role") == "toolResult" and f"{session_no}:{msg.get('toolCallId')}" in calls:
             content = msg.get("content")
             if isinstance(content, list):
                 content = " ".join(
                     str(p.get("text") or "") for p in content if isinstance(p, dict)
                 )
-            call = calls[str(msg["toolCallId"])]
+            call = calls[f"{session_no}:{msg['toolCallId']}"]
             call["ok"] = not msg.get("isError")
             call["result"] = redact_secrets(_clip(content, 300))
     return [calls[c] for c in order][-limit:]

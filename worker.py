@@ -28,6 +28,7 @@ from app.activities.openclaw_activities import (
     notify_slack_user,
     parse_agent_evaluation,
     send_to_openclaw,
+    task_actions_digest,
     validate_openclaw_output,
     verify_response_quality,
 )
@@ -69,6 +70,7 @@ async def main():
         ],
         activities=[
             send_to_openclaw,
+            task_actions_digest,
             validate_openclaw_output,
             parse_agent_evaluation,
             update_task_status,

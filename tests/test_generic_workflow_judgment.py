@@ -30,6 +30,7 @@ class Recorder:
         self.failed = 0
         self.memory_builds = 0
         self.briefs: List[str] = []
+        self.sessions: List[str] = []
         self.signals_during_judging = list(signals_during_judging)
         self.signal_on_completed = signal_on_completed
         self.signals_during_rework = list(signals_during_rework)
@@ -97,9 +98,14 @@ class Recorder:
             return {"verdict": verdict, "quality": quality, "issues": "incomplete",
                     "command_to_aura": "fix it", "reason": verdict, "parse_error": False}
 
+        @activity.defn(name="task_actions_digest")
+        async def task_actions_digest(payload: Dict[str, Any]) -> str:
+            return '1. web_fetch {"url": "https://www.jma.go.jp"} -> ok: Osaka October forecast'
+
         @activity.defn(name="send_to_openclaw")
         async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
             rec.prompts.append(payload["message"])
+            rec.sessions.append(payload.get("session_suffix") or "")
             if rec.signals_during_rework:
                 await _signal_own_workflow(rec.signals_during_rework.pop(0))
             text = rec.reworks.pop(0) if rec.reworks else "Another attempt at the answer."
@@ -113,7 +119,7 @@ class Recorder:
         return [ensure_process_run, record_event, update_task_status, update_process_state,
                 promote_completion_memory, finalize_task_failure, execute_compensation,
                 verify_response_quality, send_to_openclaw, notify_slack_user, resubmit_user_messages,
-                build_process_memory_context]
+                build_process_memory_context, task_actions_digest]
 
 
 async def _run(recorder: Recorder, **overrides) -> Dict[str, Any]:
@@ -150,6 +156,14 @@ async def test_a_rejected_draft_is_reworked_and_only_the_accepted_rework_is_sent
     assert result["status"] == "completed"
     assert rec.judged == ["Pack layers and a light rain jacket.", "Layers, a rain jacket and walking shoes."]
     assert rec.slack == ["Layers, a rain jacket and walking shoes."]
+    # The rework ran in its own fresh session, with everything it needs in its brief.
+    assert rec.sessions == ["__r2"]
+    brief = rec.prompts[0]
+    assert "Attempt 2 of 20. This is a fresh session" in brief
+    assert "ORIGINAL REQUEST:\nWhat should I pack for Osaka in October?" in brief
+    assert "Kirill: I'm off to Osaka in October." in brief, "the memory block rides along"
+    assert "ACTIONS ALREADY TAKEN IN THIS TASK" in brief and "jma.go.jp" in brief
+    assert "EVALUATOR COMMAND:\nfix it" in brief and "YOUR PRIOR RESPONSE:\nPack layers and a light rain jacket." in brief
 
 
 async def test_a_rework_limit_below_escalation_escalates_instead_of_sending_unjudged_work():

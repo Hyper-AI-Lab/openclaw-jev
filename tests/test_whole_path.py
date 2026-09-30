@@ -54,6 +54,7 @@ ACCEPT = {"verdict": "accept", "quality": "pass", "reason": "Answers the ask."}
 # worker.py's activities, less the two stubbed ones: Aura (send_to_openclaw) and the intake analyst.
 WORKER_ACTIVITIES = [
     oc.validate_openclaw_output, oc.parse_agent_evaluation, db.update_task_status, oc.notify_slack_user,
+    oc.task_actions_digest,
     oc.check_intermediate_updates_enabled, oc.verify_response_quality, db.ensure_process_run,
     db.acquire_process_run_lease, db.release_process_run_lease, db.finalize_task_failure,
     db.execute_compensation, db.update_process_state, db.record_step, db.record_observation, db.record_event,
@@ -76,6 +77,8 @@ class Harness:
         self.asgi = httpx.ASGITransport(app=server.app)
         self.intake, self.drafts, self.verdicts, self.during = [], [], [], {}
         self.prompts, self.plans, self.judged = [], [], []
+        self.sessions_used, self.verdict_sessions = [], []
+        self.bare = set()  # dispatch numbers whose draft comes back without its facts block
         self.slack, self.channels, self.blocked = [], set(), []
         self.slack_error = None
         self.while_posting = None
@@ -125,15 +128,17 @@ class Harness:
         @activity.defn(name="send_to_openclaw")
         async def send_to_openclaw(payload):
             h.prompts.append(payload["message"])
+            h.sessions_used.append(payload.get("session_suffix") or "")
             if len(h.prompts) in h.during:
                 await h.during.pop(len(h.prompts))(payload)
             draft = h.drafts.pop(0) if h.drafts else "An Aura turn that no test scripted."
-            return {"result": {"payloads": [{"text": draft + FACTS}]}}
+            return {"result": {"payloads": [{"text": draft if len(h.prompts) in h.bare else draft + FACTS}]}}
 
         return [classify_task_intake, send_to_openclaw, *WORKER_ACTIVITIES]
 
-    async def evaluator_turn(self, task_id, prompt):
+    async def evaluator_turn(self, task_id, prompt, verdict=0):
         self.judged.append(prompt)
+        self.verdict_sessions.append(verdict)
         return json.dumps(self.verdicts.pop(0) if self.verdicts else ACCEPT)
 
     async def planner(self, payload):
@@ -263,6 +268,9 @@ async def test_a_new_request_is_reworked_and_only_the_accepted_draft_reaches_sla
     assert await h.said(tid, "user") == [ask] and await h.said(tid, "assistant") == [second]
     checks = await invariants_once_settled(monkeypatch)
     assert {name: c.status for name, c in checks.items()} == dict.fromkeys(checks, "pass")
+    # The first draft came from the task's session, the rework from a fresh one; each verdict had its own.
+    assert h.sessions_used == ["", "__r2"] and h.verdict_sessions == [1, 2]
+    assert h.prompts[1].count(curator.HEADER) == 1 and "ACTIONS ALREADY TAKEN IN THIS TASK" in h.prompts[1]
 
 
 async def test_a_follow_up_sent_while_aura_works_is_folded_into_the_one_judged_reply(h, monkeypatch):
@@ -334,6 +342,14 @@ async def test_aura_and_the_evaluator_see_one_memory_block_with_the_dialogue(h):
     assert h.slack[-1] == second_reply
     fast = await h.rows(Event, Event.entity_id == tid, Event.event_type == "memory.fast_context")
     assert fast and "dialogue" in fast[0].event_payload["sections"]
+
+
+async def test_a_retried_plan_step_is_told_why_its_last_attempt_was_not_accepted(h):
+    answer = "Kobe beef lunch sets at Mouriya start around 5,000 yen."
+    h.intake, h.drafts, h.bare = [{"decision": "create_fresh"}], ["", answer], {1}
+    tid = (await h.send("What does a Kobe beef lunch cost?", "1790000013.000100"))["task_id"]
+    assert (await h.finish(tid))["final_result"] == answer
+    assert len(h.prompts) == 2 and "attempt 1 not accepted]: Output validation failed" in h.prompts[1]
 
 
 async def test_the_same_dm_delivered_twice_runs_once(h):

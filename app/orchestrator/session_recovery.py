@@ -10,7 +10,7 @@ from typing import Optional
 
 from app.config import OPENCLAW_HOME, SESSIONS_JSON_PATH
 from app.notification_policy import sanitize_user_facing_text
-from app.openclaw_sessions import get_session_entry, read_transcript_lines
+from app.openclaw_sessions import get_session_entry, read_transcript_lines, task_session_keys
 
 logger = logging.getLogger("rmp.session_recovery")
 
@@ -59,8 +59,16 @@ def _latest_assistant_text(jsonl_path: Path) -> Optional[str]:
 
 
 def read_completed_rmp_session_reply(task_id: str) -> Optional[str]:
-    """Return latest terminal assistant reply for an RMP task session, if any."""
-    session_key = f"agent:main:rmp_task_{task_id}"
+    """The latest terminal assistant reply across the task's sessions (reworks run in their own)."""
+    latest = None
+    for session_key in task_session_keys(task_id):
+        text = _session_reply(session_key, task_id)
+        if text:
+            latest = text
+    return latest
+
+
+def _session_reply(session_key: str, task_id: str) -> Optional[str]:
     session_id = None
     try:
         meta = get_session_entry(session_key, SESSIONS_JSON_PATH)

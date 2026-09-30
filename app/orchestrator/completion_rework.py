@@ -33,6 +33,11 @@ def next_loop_action(judged_attempt: int, policy: Optional[Dict[str, int]] = Non
     return "rework"
 
 
+# A rework starts in a fresh session, so its brief carries the whole request and draft.
+REQUEST_CHARS = 8000
+DRAFT_CHARS = 40000
+
+
 def build_rework_prompt(
     user_intent: str,
     prior_response: str,
@@ -42,20 +47,29 @@ def build_rework_prompt(
     command_to_aura: str = "",
     attempt: int = 1,
     max_attempts: int = 20,
+    memory_block: str = "",
+    actions: str = "",
 ) -> str:
+    """The rework brief: request, memory, the evaluator's issues, actions already taken, the draft."""
     issues = evidence_issues or []
     block = [
         "COMPLETION REJECTED — revise your answer or admit you cannot complete.",
-        f"Attempt {attempt} of {max_attempts}.",
-        f"ORIGINAL REQUEST:\n{user_intent[:1500]}",
+        f"Attempt {attempt} of {max_attempts}. This is a fresh session: everything you need is below.",
+        f"ORIGINAL REQUEST:\n{user_intent[:REQUEST_CHARS]}",
     ]
+    if memory_block.strip():
+        block.append(memory_block.strip())
     if issues:
         block.append("EVIDENCE ISSUES:\n- " + "\n- ".join(issues))
     if quality_issues:
         block.append(f"QUALITY ISSUES:\n{quality_issues}")
     if command_to_aura:
         block.append(f"EVALUATOR COMMAND:\n{command_to_aura}")
-    block.append(f"YOUR PRIOR RESPONSE:\n{(prior_response or '')[:2000]}")
+    if actions.strip():
+        block.append(
+            "ACTIONS ALREADY TAKEN IN THIS TASK (reuse what succeeded; do not redo it):\n" + actions.strip()
+        )
+    block.append(f"YOUR PRIOR RESPONSE:\n{(prior_response or '')[:DRAFT_CHARS]}")
     block.append(
         "Respond with a corrected user-facing answer. "
         "If impossible, state clearly that you cannot complete and why. "
@@ -73,6 +87,8 @@ def build_strategy_change_prompt(
     command_to_aura: str = "",
     attempt: int = 10,
     max_attempts: int = 20,
+    memory_block: str = "",
+    actions: str = "",
 ) -> str:
     base = build_rework_prompt(
         user_intent,
@@ -82,6 +98,8 @@ def build_strategy_change_prompt(
         command_to_aura=command_to_aura,
         attempt=attempt,
         max_attempts=max_attempts,
+        memory_block=memory_block,
+        actions=actions,
     )
     return (
         "STRATEGY CHANGE — do not repeat the prior approach. "

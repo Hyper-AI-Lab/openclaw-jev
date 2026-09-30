@@ -42,6 +42,8 @@ from app.telemetry import traced_activity
 
 # Only these stop reasons indicate a final assistant turn worth evaluating.
 TERMINAL_STOP_REASONS = frozenset({"stop", "error", "maxTokens"})
+# The fresh sessions a task may use besides its first: rework n, and the recall refinement.
+SESSION_SUFFIX = re.compile(r"__(r\d{1,3}|recall)")
 # notify_slack_user outcomes: sent; not sent by policy or config; refused by Slack for good.
 SLACK_DELIVERED, SLACK_SUPPRESSED, SLACK_REFUSED = "delivered", "suppressed", "refused"
 # OpenClaw/Kimi use "toolUse"; older transcripts may say "toolCalls".
@@ -648,6 +650,16 @@ async def _dispatch_openclaw_session(
     )
 
 
+@traced_activity("openclaw.actions_digest")
+async def task_actions_digest(payload: Dict[str, Any]) -> str:
+    """What Aura already did in this task, for a rework that starts in a fresh session."""
+    from app.openclaw_sessions import task_action_trace
+    from app.orchestrator.process_evaluator import format_action_trace
+
+    trace = await asyncio.to_thread(task_action_trace, payload.get("task_id", ""), limit=60)
+    return format_action_trace(trace)[:6000]
+
+
 @traced_activity("openclaw.dispatch")
 async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
     from app.config import get_primary_agent_model
@@ -655,7 +667,12 @@ async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
     from app.notification_policy import is_internal_task
 
     task_id = payload.get("task_id", "unknown")
-    internal_session_key = f"agent:main:rmp_task_{task_id}"
+    # Reworks and the recall refinement run in fresh sessions (__r<n>, __recall), so their
+    # context is the brief they carry, not every earlier attempt.
+    suffix = str(payload.get("session_suffix") or "")
+    if suffix and not SESSION_SUFFIX.fullmatch(suffix):
+        raise ValueError(f"invalid session suffix {suffix!r}")
+    internal_session_key = f"agent:main:rmp_task_{task_id}{suffix}"
     message = payload.get("message", "") + "\n\n[INTERNAL_RMP]"
     # User-facing / plan execute turns use policy primary unless caller overrides.
     model = payload.get("model") or get_primary_agent_model()
@@ -845,14 +862,19 @@ async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
         activity.logger.warning("Artifact list unavailable for %s: %s", task_id, exc)
         enriched["artifacts"] = "(artifact list unavailable)"
     verification_prompt = build_evaluator_prompt(enriched)
-    response = await _execute_on_internal_session(task_id, verification_prompt)
+    response = await _execute_on_internal_session(
+        task_id, verification_prompt, verdict=int(payload.get("attempt") or 0)
+    )
     result = parse_evaluator_response(response)
     await persist_evaluator_verdict(payload, result)
     return result
 
 
-async def _execute_on_internal_session(task_id: str, message: str) -> str:
-    """Process Evaluator turn: the primary, then the NVIDIA fallback, each with an explicit model."""
+async def _execute_on_internal_session(task_id: str, message: str, *, verdict: int = 0) -> str:
+    """Process Evaluator turn: the primary, then the NVIDIA fallback, each with an explicit model.
+
+    Each verdict gets its own session (``__v<n>``): a judgment never reads the earlier ones.
+    """
     from app.llm.model_policy import FALLBACK_MODELS, SUBAGENT_MODEL, drop_unwired_openai
     from app.orchestrator.process_evaluator import parse_evaluator_response
 
@@ -862,7 +884,7 @@ async def _execute_on_internal_session(task_id: str, message: str) -> str:
     for idx, model in enumerate(models):
         # A separate session per model, as intake does: no sticky model override or
         # half-written failed turn carries over to the fallback.
-        suffix = "" if idx == 0 else f"_fb{idx}"
+        suffix = (f"__v{verdict}" if verdict else "") + ("" if idx == 0 else f"_fb{idx}")
         try:
             text = await _dispatch_openclaw_session(
                 f"agent:main:rmp_verify_{task_id}{suffix}",

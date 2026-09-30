@@ -10,6 +10,7 @@ with workflow.unsafe.imports_passed_through():
     from app.activities.openclaw_activities import (
         notify_slack_user,
         send_to_openclaw,
+        task_actions_digest,
     )
     from app.activities.plan_activities import generate_process_plan, save_process_plan
     from app.activities.db_activities import (
@@ -484,6 +485,10 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                                 step_context += "\n" + format_user_catchup([reply])
                         continue
                     break
+                # The retry learns why this attempt was not accepted.
+                reason = str(result.get("reason") or "").strip()
+                if reason:
+                    step_context += f"\n[{step_name} attempt {attempt} not accepted]: {reason[:500]}"
 
         raw_result = final_text or step_context
         extracted = extract_agent_facts(raw_result)
@@ -604,6 +609,14 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 if action == "strategy_change"
                 else build_rework_prompt
             )
+            # Each rework runs in a fresh session (__r<n>) with a brief of what it needs, so
+            # its prompt does not grow with every earlier attempt.
+            fresh = workflow.patched("deep-memory-fresh-rework-sessions")
+            actions = ""
+            if fresh:
+                actions = await workflow.execute_activity(
+                    task_actions_digest, {"task_id": task_id}, start_to_close_timeout=timedelta(seconds=60)
+                )
             rework_prompt = prompt_fn(
                 user_intent,
                 clean_result,
@@ -612,6 +625,8 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 command_to_aura=quality.get("command_to_aura", ""),
                 attempt=attempt + 1,
                 max_attempts=max_rework,
+                memory_block=self._memory_block if fresh else "",
+                actions=actions,
             )
             rework_resp = await workflow.execute_activity(
                 send_to_openclaw,
@@ -621,6 +636,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     "session_key": session_key,
                     "task_type": task_type,
                     "tags": tags,
+                    **({"session_suffix": f"__r{attempt + 1}"} if fresh else {}),
                 },
                 start_to_close_timeout=timedelta(minutes=45),
             )
