@@ -219,7 +219,7 @@ Run: `bash /root/.openclaw/rmp/ops/upgrade_openclaw.sh` (`make upgrade-openclaw`
 | HTTP 410 skip | Classify 410 as `model_not_found` (next fallback), not timeout/idle retry |
 | Model fallbacks | **Left enabled** — gpt-6-luna → gpt-oss-20b (do not re-apply legacy no-fallback disable; do not restore GLM, DeepSeek or MiniMax) |
 
-Upgrade checklist: `ops/upgrade_openclaw.sh` (backup → Node ≥ 22.22.3 → `npm install -g openclaw@latest` → `openclaw plugins update --all` (newest plugin versions compatible with the core) → `OPENCLAW_SERVICE_REPAIR_POLICY=external openclaw doctor --fix --non-interactive` → restore RMP config keys / `TOOLS.md` → `ops/settle_openclaw_sessions.py` (never drop `session_nodes` entry_valid triggers) → `patch_openclaw.sh` → verify → skills → restart if no user tasks → `make production-check`). Do not run `openclaw update` (it re-runs doctor/restart on its own).
+Upgrade checklist: `ops/upgrade_openclaw.sh` (pre-flight `ops/openclaw_preflight.py`: the target is downloaded to a scratch directory and refused, before anything is stopped, when this host's Node is outside its range, RMP's patches do not apply to it, or its transcript events may lack `event_json` → backup → Node ≥ 22.22.3 → `npm install -g openclaw@latest` → `openclaw plugins update --all` (newest plugin versions compatible with the core) → `OPENCLAW_SERVICE_REPAIR_POLICY=external openclaw doctor --fix --non-interactive` → restore RMP config keys / `TOOLS.md` → `ops/settle_openclaw_sessions.py` (never drop `session_nodes` entry_valid triggers) → `patch_openclaw.sh` → verify → skills → restart if no user tasks → `make production-check`). Do not run `openclaw update` (it re-runs doctor/restart on its own).
 
 ---
 

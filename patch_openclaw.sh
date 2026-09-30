@@ -12,7 +12,8 @@
 # Model fallbacks (gpt-6-luna → gpt-oss-20b on NVIDIA) are INTENTIONAL — do not disable them.
 set -euo pipefail
 
-DIST_DIR="/usr/lib/node_modules/openclaw/dist"
+# OPENCLAW_DIST_DIR: another dist to patch (ops/openclaw_preflight.py rehearses a target there).
+DIST_DIR="${OPENCLAW_DIST_DIR:-/usr/lib/node_modules/openclaw/dist}"
 PATCHED=0
 RMP_GUARD='rmp_(task|verify|intake)_'
 

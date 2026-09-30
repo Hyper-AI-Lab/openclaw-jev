@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot OpenClaw upgrade for this RMP host.
-# backup → node check → npm i -g → plugins update → doctor --fix → config-key guard →
+# pre-flight → backup → node check → npm i -g → plugins update → doctor --fix → config-key guard →
 # patch_openclaw.sh → verify → skills → optional restart.
 #
 # Never: openclaw onboard, openclaw update, doctor --force, hand-edit dist.
@@ -193,6 +193,12 @@ log "node=${NODE_VER} npm=$(npm --version) openclaw=${BEFORE_OC}"
 UNIT_START="$(systemctl show -p ExecStart --value openclaw-gateway.service 2>/dev/null || true)"
 if [[ "${UNIT_START}" != *"/usr/bin/openclaw"* ]]; then
   log "WARN: openclaw-gateway ExecStart is not /usr/bin/openclaw: ${UNIT_START}"
+fi
+
+if [[ "${SKIP_NPM}" != "1" ]]; then
+  log "Pre-flight: rehearse ${PACKAGE} in a scratch directory (Node range, RMP patches, transcript format)"
+  "${RMP_ROOT}/venv/bin/python" "${RMP_ROOT}/ops/openclaw_preflight.py" "${PACKAGE}" \
+    || die "pre-flight refused ${PACKAGE}; nothing was backed up, stopped or installed"
 fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
