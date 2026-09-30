@@ -208,6 +208,7 @@ def agent_db(monkeypatch, tmp_path):
     monkeypatch.setattr(
         um, "_task_kinds_sync", lambda ids: {CANARY_TASK: "canary", USER_TASK: "user"}
     )
+    monkeypatch.setattr(um, "_ended_task_ids_sync", lambda ids: set())
 
     class Store:
         def __init__(self):
@@ -285,6 +286,25 @@ def test_transcript_usage_attributes_categories_and_aborted_prompts(agent_db):
         "tokens": 30_000,
     }
     assert sum(c["attempts"] for d in report["days"].values() for c in d.values()) == 7
+
+
+def test_sessions_that_get_no_more_turns_are_not_live(agent_db, monkeypatch):
+    """Sep 30: a finished guide's 170k-token session paged Kirill as a live context."""
+    done, running = "5d3c2a10-0000-4000-8000-000000000001", "5d3c2a10-0000-4000-8000-000000000002"
+    monkeypatch.setattr(um, "_ended_task_ids_sync", lambda ids: {done} & set(ids))
+    agent_db.session("t-done", f"agent:main:rmp_task_{done}")
+    agent_db.session("v-done", f"agent:main:rmp_verify_{done}")
+    agent_db.session("in", "agent:main:rmp_intake_abc123_def456")
+    agent_db.session("t-run", f"agent:main:rmp_task_{running}")
+    agent_db.turn("t-done", NOW_MS - HOUR_MS, prompt=170_000)
+    agent_db.turn("v-done", NOW_MS - HOUR_MS, prompt=90_000)
+    agent_db.turn("in", NOW_MS - HOUR_MS, prompt=80_000)
+    agent_db.turn("t-run", NOW_MS - HOUR_MS, prompt=40_000)
+
+    report = um.transcript_usage(hours=24, now_ms=NOW_MS)
+
+    assert report["max_live_context"] == {"session_key": f"agent:main:rmp_task_{running}", "tokens": 40_000}
+    assert um.usage_alerts(report, input_budget=10_000_000) == []
 
 
 def test_aborted_prompt_falls_back_to_the_previous_success(agent_db):

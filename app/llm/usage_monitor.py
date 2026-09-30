@@ -32,6 +32,11 @@ _RMP_TASK_RE = re.compile(
     r"rmp_task_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.IGNORECASE,
 )
+# A task's Aura and evaluator sessions; they get no more turns once the task has ended.
+_RMP_RUN_RE = re.compile(
+    r"rmp_(?:task|verify)_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
 
 # Sources:
 #   embed              — RMP vector embedding API calls
@@ -509,6 +514,39 @@ def _task_kinds_sync(task_ids: List[str]) -> Dict[str, str]:
     return kinds
 
 
+def _ended_task_ids_sync(task_ids: List[str]) -> set:
+    """Ids among ``task_ids`` whose task reached a terminal status."""
+    if not task_ids:
+        return set()
+    try:
+        from sqlalchemy import create_engine, text
+
+        from app.db.database import DATABASE_URL
+        from app.orchestrator.decision_engine import TERMINAL_STATUSES
+
+        engine = create_engine(DATABASE_URL.replace("+asyncpg", "+psycopg2"))
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text("SELECT id::text FROM tasks WHERE id::text = ANY(:ids) AND status = ANY(:ended)"),
+                    {"ids": list(task_ids), "ended": list(TERMINAL_STATUSES)},
+                ).fetchall()
+        finally:
+            engine.dispose()
+    except Exception as exc:
+        logger.debug("ended task lookup failed: %s", exc)
+        return set()
+    return {str(task_id).lower() for (task_id,) in rows}
+
+
+def _may_run_again(session_key: str, ended: set) -> bool:
+    """Intake sessions are single-use; a task's sessions end with the task."""
+    if "rmp_intake_" in session_key:
+        return False
+    match = _RMP_RUN_RE.search(session_key)
+    return not (match and match.group(1).lower() in ended)
+
+
 def _zero_attribution() -> Dict[str, int]:
     return {
         "attempts": 0,
@@ -636,9 +674,19 @@ def transcript_usage(hours: float = 24, *, now_ms: Optional[int] = None) -> Dict
 
     attempts = report["totals"]["attempts"]
     report["abort_rate"] = (report["totals"]["aborted"] / attempts) if attempts else 0.0
+    # Live means a session that will be billed again, not merely one that is not archived.
+    run_tasks = {
+        m.group(1).lower()
+        for session_id in latest_prompt
+        for m in [_RMP_RUN_RE.search(live.get(session_id) or "")]
+        if m
+    }
+    ended = _ended_task_ids_sync(sorted(run_tasks))
     for session_id, tokens in latest_prompt.items():
         key = live.get(session_id)
-        if key and tokens > report["max_live_context"]["tokens"]:
+        if not key or not _may_run_again(key, ended):
+            continue
+        if tokens > report["max_live_context"]["tokens"]:
             report["max_live_context"] = {"session_key": key, "tokens": tokens}
     return report
 
