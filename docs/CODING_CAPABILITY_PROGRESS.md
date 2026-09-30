@@ -231,3 +231,51 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
   - the 25 most recent sessions: 673 lines, content hash `ea81d60f41290267`;
   - `transcript_usage(24 h)`: 251 attempts, 802,247 input, 4,778,951 cache-read and 295,364 output tokens.
 - **Live backup:** agent 92 MiB and state 18 MiB in 5.0 s, with the gateway running; `quick_check` ok and `verify` ok. Kept at `data/backups/openclaw-state/20260930T143147Z`.
+
+---
+
+## Step 4 — Patcher and verifier for 2026.9.7 (still correct on 2026.9.1)
+
+**Date:** 2026-09-30.
+
+**Research:** read in the pristine `npm pack` packages of both versions.
+- **Where the targets are:** 2026.9.7 ships most of its dist as `.mjs`, and repeats most patch targets in `package-update-activation-recovery.mjs`, a 66 MB recovery bundle.
+- **How that bundle declares constants:** esbuild-style, as a hoisted `var DEFAULT_LLM_IDLE_TIMEOUT_MS, …` assigned inside an init function (`\tDEFAULT_LLM_IDLE_TIMEOUT_MS = 12e4;`).
+- **Minified copies:** worker bundles (`worker/worker.mjs`, `sqlite-store.worker.mjs`) hold some of the same functions minified. 2026.9.1 has always run with those copies unpatched.
+- **Patches 6c and 6d:** of 6c's five edits, only one anchor moved (2026.9.7 opens the closure with a `trackCleanup` line). `timeoutOptions.model.provider` and the stream `options.reasoning` are unchanged, so 6d applies once 6c does.
+- **Patch 7:** `validateCanonicalSessionRow`/`…RowEntry` still refuse a row whose `entry_valid` is 0 when admitting it. Only `{}` placeholders with -1 are skipped. The problem is not fixed upstream, so the patch is **rewritten, not dropped**.
+- **Patch 9:** the per-placement `resolveWorkspacePath` loop is gone. Cleanup was reworked (`cleanupPendingWorkspaceResultOrphans` over a change snapshot), and the changelog lists "reduce startup placement work" and "placement claims now run off the Gateway main thread". So patch 9 is **required only where its target exists** (2026.9.1). Step 5's staging boot on real data confirms it.
+
+**What changed:**
+- `ops/openclaw_patch_audit.py` (new) holds the single list of the 15 patches. For each: its marker, the exact code it rewrites, and a condition when a release may not need it.
+  - A dist passes when every required marker is present and none of the rewritten code remains in any `.js` or `.mjs` file. That catches a patch landing in one copy but not the other.
+  - Minified copies never match the rewritten code, so they don't cause false failures.
+  - It is used by the patcher and the verifier alike.
+- `patch_openclaw.sh`:
+  - scans `.js` and `.mjs` (candidates and the full-scan fallback);
+  - finishes with the audit instead of per-marker checks, so it fails on any unpatched copy;
+  - patch 6 handles the `const` and the hoisted-`var` forms;
+  - 6c anchors its closure edit on the `createIdleTimeoutError` line;
+  - 6c and 6d write 20 s, 120 s and 30 s inline, because a new `const` inside the recovery bundle's init function would be out of scope for `streamWithIdleTimeout`;
+  - patch 7 covers 2026.9.7's row validation and runs on any file with any of its targets. It also reports only when it changes a file, so a second run is clean.
+- `ops/verify_openclaw_patch.sh`: `OPENCLAW_DIST_DIR` override, the audit instead of its own lists, and the skill path taken from the dist.
+- Tests:
+  - `tests/fixtures/openclaw_dist/{2026.9.1,2026.9.7}`: 192 KB, 36 files, cut from the real packages by `build.py`. The script keeps only the regions around the patch targets and can rebuild the fixtures for a future release.
+  - `tests/test_patch_openclaw.py`, per version: every patch lands and the audit is clean; a second run leaves the files byte-identical; putting one pristine copy back fails, naming exactly that file, and patching again heals it. Also: patches a release no longer needs aren't required; the pre-flight rehearses with the same patcher.
+  - `tests/test_openclaw_preflight.py`: the empty-dist message check is loosened, because the audit now reports every missing patch.
+
+**Deviations and why:**
+- **Beyond the plan:**
+  - Patch 6 needed the hoisted-`var` form. The audit found the recovery bundle kept the 120 s idle limit.
+  - 6c and 6d no longer declare `RMP_OPENAI_*` constants.
+- **The live 2026.9.1 dist** keeps the named-constant form that the old patcher wrote. It behaves the same, and it passes the audit: its markers are there and none of the rewritten code remains.
+- **I built the fixtures with a deterministic script** rather than through a subagent, because the anchor list lives in this step's own research.
+
+**Verification:**
+- Tests: 20 patcher and pre-flight tests passed; full suite 827 passed, 4 skipped (448 s).
+- Patching full copies of the pristine packages:
+  - 2026.9.1: 14 files patched, all 15 patches in place, and a second run changed nothing.
+  - 2026.9.7: 15 files patched, including 12 patches in the recovery bundle. All 15 patches are in place, and a second run changed nothing.
+- `node --check` passes on every patched file of both versions, as on their pristine originals.
+- The pre-flight on `openclaw@2026.9.7` reports only "needs Node >=24.16.0 <25 || >=26.1.0; this host runs v22.23.2". `openclaw@2026.9.1` passes.
+- The live verifier passes: the audit is clean on the installed dist, the MoltMarket skill is present, and the model policy holds.

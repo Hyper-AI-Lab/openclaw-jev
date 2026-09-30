@@ -26,20 +26,21 @@ if [ ! -d "$DIST_DIR" ]; then
     exit 1
 fi
 
-# Narrow file set via ripgrep when available (full-tree sed is very slow).
+# Narrow file set via ripgrep when available (full-tree sed is very slow). 2026.9.7 ships most of
+# its dist as .mjs, and repeats many targets in package-update-activation-recovery.mjs.
 mapfile -t CANDIDATES < <(
   if command -v rg >/dev/null 2>&1; then
-    rg -l --glob '*.js' \
-      'hasHooks\("before_message_write"\)|filterBootstrapFilesForSession|runSubagentAnnounceFlow|async function deliverReplies|fallbackConfigured = false && hasConfiguredModelFallbacks|function normalizeAgentPayload|allowUnsafeExternalContent: value\.allowUnsafeExternalContent|DEFAULT_LLM_IDLE_TIMEOUT_MS|scanCanonicalSqliteSessionEntries|function parseSqliteSessionEntryRecord|status === 410|cleanedWorkspaceRoots|function buildOpenAIThinkingProfile|function createOpenAIResponsesContextManagementWrapper' \
+    rg -l --glob '*.js' --glob '*.mjs' \
+      'hasHooks\("before_message_write"\)|filterBootstrapFilesForSession|runSubagentAnnounceFlow|async function deliverReplies|fallbackConfigured = false && hasConfiguredModelFallbacks|function normalizeAgentPayload|allowUnsafeExternalContent: value\.allowUnsafeExternalContent|DEFAULT_LLM_IDLE_TIMEOUT_MS|scanCanonicalSqliteSessionEntries|validateCanonicalSessionRow|existing\.entry_valid !== 1|function parseSqliteSessionEntryRecord|status === 410|cleanedWorkspaceRoots|function buildOpenAIThinkingProfile|function createOpenAIResponsesContextManagementWrapper' \
       "$DIST_DIR" 2>/dev/null || true
   else
-    find "$DIST_DIR" -name '*.js'
+    find "$DIST_DIR" \( -name '*.js' -o -name '*.mjs' \)
   fi
 )
 
 if [ "${#CANDIDATES[@]}" -eq 0 ]; then
   echo "WARN: no candidate files matched; falling back to full dist scan"
-  mapfile -t CANDIDATES < <(find "$DIST_DIR" -name '*.js')
+  mapfile -t CANDIDATES < <(find "$DIST_DIR" \( -name '*.js' -o -name '*.mjs' \))
 fi
 
 echo "Scanning ${#CANDIDATES[@]} candidate file(s)"
@@ -179,8 +180,9 @@ PY
     fi
 
     # Patch 6: Fast LLM idle silence (5s) then rotate NVIDIA keys — do not sit 120s.
-    if grep -q 'const DEFAULT_LLM_IDLE_TIMEOUT_MS = 12e4;' "$f" 2>/dev/null; then
-        sed -i 's/const DEFAULT_LLM_IDLE_TIMEOUT_MS = 12e4;/const DEFAULT_LLM_IDLE_TIMEOUT_MS = 5e3; \/* RMP_LLM_IDLE_5S *\//' "$f"
+    # A `const` in most chunks; an assignment to a hoisted `var` in 2026.9.7's recovery bundle.
+    if grep -q 'DEFAULT_LLM_IDLE_TIMEOUT_MS = 12e4;' "$f" 2>/dev/null; then
+        sed -i -E 's/((const )?DEFAULT_LLM_IDLE_TIMEOUT_MS = )12e4;/\15e3; \/* RMP_LLM_IDLE_5S *\//' "$f"
         applied="${applied} llm-idle-5s"
     fi
 
@@ -218,7 +220,9 @@ PY
     # Patch 6c: OpenAI gets 20s for the first byte (stream creation, first chunk, and
     # the provider's first-event guard). gpt-5-nano's first byte takes about 4s at the
     # median and up to 5s, so a 5s cut re-billed the prompt on roughly half the calls.
-    # Gaps between chunks, and every other provider, keep the 5s rule.
+    # Gaps between chunks, and every other provider, keep the 5s rule. The 20s is written inline:
+    # 2026.9.7's recovery bundle assigns these module constants to hoisted vars inside an init
+    # function, where a new const would be out of scope for streamWithIdleTimeout.
     if grep -q 'function streamWithIdleTimeout(baseFn, timeoutMs, onIdleTimeout, opts) {' "$f" 2>/dev/null \
        && ! grep -q 'RMP_OPENAI_FIRST_BYTE_20S' "$f" 2>/dev/null; then
         python3 - "$f" <<'PY'
@@ -229,19 +233,14 @@ if "RMP_OPENAI_FIRST_BYTE_20S" in text:
     raise SystemExit(0)
 edits = [
     (
-        "const CLOUD_LLM_FIRST_EVENT_TIMEOUT_MS = DEFAULT_LLM_IDLE_TIMEOUT_MS;",
-        "const CLOUD_LLM_FIRST_EVENT_TIMEOUT_MS = DEFAULT_LLM_IDLE_TIMEOUT_MS;\n"
-        "const RMP_OPENAI_FIRST_BYTE_MS = 2e4; /* RMP_OPENAI_FIRST_BYTE_20S */",
-    ),
-    (
         "isSelfHostedRuntimeModel ? LOCAL_LLM_FIRST_EVENT_TIMEOUT_MS : CLOUD_LLM_FIRST_EVENT_TIMEOUT_MS, ...timeoutBounds));",
-        "isSelfHostedRuntimeModel ? LOCAL_LLM_FIRST_EVENT_TIMEOUT_MS : params?.model?.provider === \"openai\" ? RMP_OPENAI_FIRST_BYTE_MS : CLOUD_LLM_FIRST_EVENT_TIMEOUT_MS, ...timeoutBounds));",
+        "isSelfHostedRuntimeModel ? LOCAL_LLM_FIRST_EVENT_TIMEOUT_MS : params?.model?.provider === \"openai\" ? 2e4 /* RMP_OPENAI_FIRST_BYTE_20S */ : CLOUD_LLM_FIRST_EVENT_TIMEOUT_MS, ...timeoutBounds));",
     ),
     (
-        "\treturn (model, context, options) => {\n"
+        # Inside the returned (model, context, options) closure; 2026.9.7 opens it with a
+        # trackCleanup line, so the anchor is this line alone.
         "\t\tconst createIdleTimeoutError = () => /* @__PURE__ */ new Error(`LLM idle timeout (${Math.floor(timeoutMs / 1e3)}s): no response from model`);",
-        "\treturn (model, context, options) => {\n"
-        "\t\tconst firstByteMs = model?.provider === \"openai\" ? Math.max(timeoutMs, RMP_OPENAI_FIRST_BYTE_MS) : timeoutMs;\n"
+        "\t\tconst firstByteMs = model?.provider === \"openai\" ? Math.max(timeoutMs, 2e4) : timeoutMs; /* RMP_OPENAI_FIRST_BYTE_20S */\n"
         "\t\tconst createIdleTimeoutError = (windowMs = timeoutMs) => /* @__PURE__ */ new Error(`LLM idle timeout (${Math.floor(windowMs / 1e3)}s): no response from model`);",
     ),
     (
@@ -305,15 +304,10 @@ if "RMP_OPENAI_MAX_EFFORT_120S" in text:
     raise SystemExit(0)
 edits = [
     (
-        "const RMP_OPENAI_FIRST_BYTE_MS = 2e4; /* RMP_OPENAI_FIRST_BYTE_20S */",
-        "const RMP_OPENAI_FIRST_BYTE_MS = 2e4; /* RMP_OPENAI_FIRST_BYTE_20S */\n"
-        "const RMP_OPENAI_MAX_FIRST_BYTE_MS = 12e4, RMP_OPENAI_MAX_GAP_MS = 3e4; /* RMP_OPENAI_MAX_EFFORT_120S */",
-    ),
-    (
-        "\t\tconst firstByteMs = model?.provider === \"openai\" ? Math.max(timeoutMs, RMP_OPENAI_FIRST_BYTE_MS) : timeoutMs;\n",
-        "\t\tconst rmpMaxEffort = model?.provider === \"openai\" && options?.reasoning === \"max\";\n"
-        "\t\tconst firstByteMs = rmpMaxEffort ? Math.max(timeoutMs, RMP_OPENAI_MAX_FIRST_BYTE_MS) : model?.provider === \"openai\" ? Math.max(timeoutMs, RMP_OPENAI_FIRST_BYTE_MS) : timeoutMs;\n"
-        "\t\tconst gapMs = rmpMaxEffort ? Math.max(timeoutMs, RMP_OPENAI_MAX_GAP_MS) : timeoutMs;\n",
+        "\t\tconst firstByteMs = model?.provider === \"openai\" ? Math.max(timeoutMs, 2e4) : timeoutMs; /* RMP_OPENAI_FIRST_BYTE_20S */\n",
+        "\t\tconst rmpMaxEffort = model?.provider === \"openai\" && options?.reasoning === \"max\"; /* RMP_OPENAI_MAX_EFFORT_120S */\n"
+        "\t\tconst firstByteMs = rmpMaxEffort ? Math.max(timeoutMs, 12e4) : model?.provider === \"openai\" ? Math.max(timeoutMs, 2e4) : timeoutMs; /* RMP_OPENAI_FIRST_BYTE_20S */\n"
+        "\t\tconst gapMs = rmpMaxEffort ? Math.max(timeoutMs, 3e4) : timeoutMs;\n",
     ),
     (
         "\t\t\t\t\tconst armMs = isFirstStreamArm ? firstByteMs : timeoutMs;\n",
@@ -321,7 +315,7 @@ edits = [
     ),
     (
         "\t\t\t\tfirstEventTimeoutMs: optionsWithFirstEvent?.firstEventTimeoutMs ?? firstEventTimeoutMs,\n",
-        "\t\t\t\tfirstEventTimeoutMs: optionsWithFirstEvent?.firstEventTimeoutMs ?? (model?.provider === \"openai\" && options?.reasoning === \"max\" ? Math.max(firstEventTimeoutMs, RMP_OPENAI_MAX_FIRST_BYTE_MS) : firstEventTimeoutMs),\n",
+        "\t\t\t\tfirstEventTimeoutMs: optionsWithFirstEvent?.firstEventTimeoutMs ?? (model?.provider === \"openai\" && options?.reasoning === \"max\" ? Math.max(firstEventTimeoutMs, 12e4) : firstEventTimeoutMs),\n",
     ),
 ]
 missing = [old[:60] for old, _ in edits if text.count(old) != 1]
@@ -409,45 +403,60 @@ PY
         fi
     fi
 
-    # Patch 7: 2026.9 session_nodes.entry_valid=0/-1 rows fail-closed the entire
-    # store (every /hooks/agent). Keep placeholders skippable and allow parseable
-    # pending rows through the canonical scan.
-    if grep -q 'function scanCanonicalSqliteSessionEntries' "$f" 2>/dev/null \
-       && ! grep -q 'RMP_SESSION_PLACEHOLDER_SKIP' "$f" 2>/dev/null; then
-        python3 - "$f" <<'PY'
+    # Patch 7: a session_nodes row whose entry_valid is not 1 fails the canonical checks
+    # closed, and with them every /hooks/agent: in-flight {} placeholders, and parseable
+    # rows that the entry_valid triggers reset to 0 whenever an entry is updated (RMP's
+    # session writes included). Keep placeholders skippable and let parseable pending rows
+    # through. 2026.9.1 applies the rule in the scan and the write-path check; 2026.9.7
+    # moved the scan's rule into validateCanonicalSessionRow and ...RowEntry, which still
+    # refuse entry_valid 0 when admitting a row.
+    if grep -qE 'scanCanonicalSqliteSessionEntries|validateCanonicalSessionRow|existing\.entry_valid !== 1' "$f" 2>/dev/null; then
+        out7="$(python3 - "$f" <<'PY'
 import pathlib, sys
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
-old_scan = (
-    '\t\tif (row.entry_json === "{}" && row.entry_valid === -1 && row.retained_window_id === row.current_session_id) continue;\n'
-    '\t\tif (row.entry_valid !== 1) throw canonicalSessionKeyMigrationRequiredError(`invalid persisted session row requires repair for ${row.session_key}`);\n'
-)
-new_scan = (
-    '\t\tif (row.entry_json === "{}" && row.entry_valid !== 1 && row.retained_window_id === row.current_session_id) continue; /* RMP_SESSION_PLACEHOLDER_SKIP */\n'
-)
-old_existing = (
-    '\t\tif (existing && existing.entry_valid !== 1) {\n'
-    '\t\t\tif (!(existing.entry_json === "{}" ? executeSqliteQueryTakeFirstSync(database.db, db.selectFrom("session_windows").select("session_id").where("session_id", "=", existing.current_session_id).where("session_key", "=", scope.sessionKey)) : void 0)) throw canonicalSessionKeyMigrationRequiredError(`invalid persisted session row requires repair for ${scope.sessionKey}`);\n'
-    '\t\t}\n'
-)
-new_existing = (
-    '\t\tif (existing && existing.entry_valid !== 1) {\n'
-    '\t\t\tif (existing.entry_json !== "{}" && parseSessionEntryJson(existing)) { /* RMP_SESSION_PENDING_OK */ }\n'
-    '\t\t\telse if (!(existing.entry_json === "{}" ? executeSqliteQueryTakeFirstSync(database.db, db.selectFrom("session_windows").select("session_id").where("session_id", "=", existing.current_session_id).where("session_key", "=", scope.sessionKey)) : void 0)) throw canonicalSessionKeyMigrationRequiredError(`invalid persisted session row requires repair for ${scope.sessionKey}`);\n'
-    '\t\t}\n'
-)
-changed = False
-if old_scan in text:
-    text = text.replace(old_scan, new_scan, 1)
-    changed = True
-if old_existing in text:
-    text = text.replace(old_existing, new_existing, 1)
-    changed = True
-if changed:
+edits = [
+    # 2026.9.1: the scan
+    (
+        '\t\tif (row.entry_json === "{}" && row.entry_valid === -1 && row.retained_window_id === row.current_session_id) continue;\n'
+        '\t\tif (row.entry_valid !== 1) throw canonicalSessionKeyMigrationRequiredError(`invalid persisted session row requires repair for ${row.session_key}`);\n',
+        '\t\tif (row.entry_json === "{}" && row.entry_valid !== 1 && row.retained_window_id === row.current_session_id) continue; /* RMP_SESSION_PLACEHOLDER_SKIP */\n',
+    ),
+    # 2026.9.1 and 2026.9.7: the write-path check
+    (
+        '\t\tif (existing && existing.entry_valid !== 1) {\n'
+        '\t\t\tif (!(existing.entry_json === "{}" ? executeSqliteQueryTakeFirstSync(database.db, db.selectFrom("session_windows").select("session_id").where("session_id", "=", existing.current_session_id).where("session_key", "=", scope.sessionKey)) : void 0)) throw canonicalSessionKeyMigrationRequiredError(`invalid persisted session row requires repair for ${scope.sessionKey}`);\n'
+        '\t\t}\n',
+        '\t\tif (existing && existing.entry_valid !== 1) {\n'
+        '\t\t\tif (existing.entry_json !== "{}" && parseSessionEntryJson(existing)) { /* RMP_SESSION_PENDING_OK */ }\n'
+        '\t\t\telse if (!(existing.entry_json === "{}" ? executeSqliteQueryTakeFirstSync(database.db, db.selectFrom("session_windows").select("session_id").where("session_id", "=", existing.current_session_id).where("session_key", "=", scope.sessionKey)) : void 0)) throw canonicalSessionKeyMigrationRequiredError(`invalid persisted session row requires repair for ${scope.sessionKey}`);\n'
+        '\t\t}\n',
+    ),
+    # 2026.9.7: row validation
+    (
+        '\tconst record = row.entry_valid === 1 || mode === "read" && row.entry_valid === 0 ? parseSqliteSessionEntryRecord({\n',
+        '\tconst record = row.entry_valid === 1 || row.entry_valid === 0 ? parseSqliteSessionEntryRecord({ /* RMP_SESSION_PENDING_OK */\n',
+    ),
+    (
+        '\tif (row.entry_json === "{}" && row.entry_valid === -1 && row.retained_window_id === row.current_session_id) return;\n',
+        '\tif (row.entry_json === "{}" && row.entry_valid !== 1 && row.retained_window_id === row.current_session_id) return; /* RMP_SESSION_PLACEHOLDER_SKIP */\n',
+    ),
+    (
+        '\tif (!entry || row.entry_valid !== 1 && (mode !== "read" || row.entry_valid !== 0)) throw canonicalSessionKeyMigrationRequiredError(',
+        '\tif (!entry || row.entry_valid !== 1 && row.entry_valid !== 0) throw canonicalSessionKeyMigrationRequiredError(',
+    ),
+]
+applied = 0
+for old, new in edits:
+    if text.count(old) == 1:
+        text = text.replace(old, new, 1)
+        applied += 1
+if applied:
     path.write_text(text)
     print("patched-session-canonical")
 PY
-        if grep -q 'RMP_SESSION_PLACEHOLDER_SKIP' "$f" 2>/dev/null; then
+)"
+        if [[ "${out7}" == *patched-session-canonical* ]]; then
             applied="${applied} session-canonical-lenient"
         fi
     fi
@@ -526,32 +535,10 @@ echo ""
 echo "Done. Patched/restored $PATCHED files."
 echo "Note: model fallbacks left ENABLED (gpt-6-luna → gpt-oss-20b on NVIDIA)."
 
-require_marker() {
-    local pattern="$1"
-    local label="$2"
-    if ! grep -rqE "$pattern" "$DIST_DIR" --include='*.js' 2>/dev/null; then
-        echo "ERROR: required patch missing after apply: $label"
-        echo "  Dist symbols may have moved. Search $DIST_DIR and update this patcher."
-        echo "  Do not start an unpatched gateway."
-        exit 1
-    fi
-}
-
-require_marker 'RMP_HOOK_PERSISTENCE' 'hook-persistence'
-require_marker 'RMP_ANNOUNCE_SUPPRESS' 'announce-suppress'
-require_marker 'RMP_MINIMAL_BOOTSTRAP' 'rmp-minimal-bootstrap'
-require_marker '__RMP_SUPPRESS_NATIVE_SLACK' 'slack-rmp-suppress'
-require_marker 'RMP_ALLOW_UNSAFE_EXTERNAL' 'allow-unsafe-passthrough'
-require_marker 'RMP_FORCE_ALLOW_UNSAFE' 'allow-unsafe-rmp-force'
-require_marker 'RMP_LLM_IDLE_5S' 'llm-idle-5s'
-require_marker 'RMP_OPENAI_FIRST_BYTE_20S' 'openai-first-byte-20s'
-require_marker 'RMP_OPENAI_MAX_EFFORT_120S' 'openai-max-effort-120s'
-require_marker 'RMP_GPT6_THINKING_BACKPORT|OPENAI_GPT_6_MODEL_IDS' 'gpt6-thinking-levels'
-require_marker 'RMP_OPENAI_NO_STORE' 'openai-no-store'
-require_marker 'RMP_410_SKIP' '410-skip-model-not-found'
-require_marker 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
-require_marker 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'
-require_marker 'RMP_SKIP_LOCAL_PLACEMENT_CLEANUP' 'skip-local-placement-cleanup'
+# Every patch in place, and none of the code they rewrite left in any copy of it.
+if ! python3 "$(dirname "${BASH_SOURCE[0]}")/ops/openclaw_patch_audit.py" "$DIST_DIR"; then
+    exit 1
+fi
 
 if [ "$PATCHED" -eq 0 ]; then
     echo "Already patched (idempotent re-run)."

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Verify RMP OpenClaw patches are applied after npm update.
+# Verify RMP OpenClaw patches are applied after npm update, and the model policy holds.
+# The patch list is ops/openclaw_patch_audit.py, which patch_openclaw.sh uses too.
+#   OPENCLAW_DIST_DIR: another dist to verify (default: the installed one).
 set -euo pipefail
 
-DIST_DIR="/usr/lib/node_modules/openclaw/dist"
+RMP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIST_DIR="${OPENCLAW_DIST_DIR:-/usr/lib/node_modules/openclaw/dist}"
 FAIL=0
 
 echo "=== RMP OpenClaw Patch Verification ==="
@@ -12,59 +15,16 @@ if [[ ! -d "$DIST_DIR" ]]; then
   exit 1
 fi
 
-check_absent() {
-  local pattern="$1"
-  local label="$2"
-  if grep -rqE "$pattern" "$DIST_DIR" --include='*.js' 2>/dev/null; then
-    echo "FAIL: $label still present (patch not applied)"
-    FAIL=1
-  else
-    echo "OK: $label absent"
-  fi
-}
-
-check_present() {
-  local pattern="$1"
-  local label="$2"
-  local count
-  count=$(grep -rE "$pattern" "$DIST_DIR" --include='*.js' 2>/dev/null | wc -l || true)
-  if [[ "$count" -gt 0 ]]; then
-    echo "OK: $label present ($count matches)"
-  else
-    echo "FAIL: $label not found in dist"
-    FAIL=1
-  fi
-}
-
-check_absent 'hookRunner\?\.hasHooks\("before_message_write"\)' 'hasHooks before_message_write guards'
-# Architecture uses intentional model fallbacks — legacy disable must stay gone.
-check_absent 'fallbackConfigured = false && hasConfiguredModelFallbacks' 'legacy no-fallback disable'
-check_absent 'const DEFAULT_LLM_IDLE_TIMEOUT_MS = 12e4' '120s LLM idle timeout'
-check_present 'RMP_HOOK_PERSISTENCE' 'hook-persistence runner-only guards'
-check_present 'RMP_ANNOUNCE_SUPPRESS' 'announce-suppress for rmp_* sessions'
-check_present 'RMP_MINIMAL_BOOTSTRAP' 'rmp-minimal-bootstrap TOOLS.md only'
-check_present '__RMP_SUPPRESS_NATIVE_SLACK' 'slack-rmp-suppress patch'
-check_present 'RMP_ALLOW_UNSAFE_EXTERNAL|RMP_FORCE_ALLOW_UNSAFE' 'allowUnsafeExternalContent RMP passthrough'
-check_present 'RMP_LLM_IDLE_5S' 'llm-idle-5s'
-check_present 'RMP_OPENAI_FIRST_BYTE_20S' 'openai-first-byte-20s'
-check_present 'RMP_OPENAI_MAX_EFFORT_120S' 'openai-max-effort-120s'
-check_present 'RMP_GPT6_THINKING_BACKPORT|OPENAI_GPT_6_MODEL_IDS' 'gpt6-thinking-levels'
-check_present 'RMP_OPENAI_NO_STORE' 'openai-no-store'
-check_present 'RMP_410_SKIP' '410-skip-model-not-found'
-check_present 'RMP_SESSION_PLACEHOLDER_SKIP' 'session-canonical-placeholder-skip'
-check_present 'RMP_SESSION_TS_DRIFT' 'session-updatedAt-drift'
-check_present 'RMP_SKIP_LOCAL_PLACEMENT_CLEANUP' 'skip-local-placement-cleanup'
-
-if [[ "$FAIL" -ne 0 ]]; then
+if ! python3 "${RMP_ROOT}/ops/openclaw_patch_audit.py" "$DIST_DIR"; then
   echo ""
-  echo "Run: bash /root/.openclaw/rmp/patch_openclaw.sh"
+  echo "Run: bash ${RMP_ROOT}/patch_openclaw.sh"
   exit 1
 fi
 
 echo ""
 echo "Patch verification passed."
 
-MOLTMARKET_SKILL="/usr/lib/node_modules/openclaw/skills/moltmarket/SKILL.md"
+MOLTMARKET_SKILL="$(dirname "$DIST_DIR")/skills/moltmarket/SKILL.md"
 if [[ -f "$MOLTMARKET_SKILL" ]]; then
   echo "OK: MoltMarket SKILL.md at ${MOLTMARKET_SKILL}"
 else

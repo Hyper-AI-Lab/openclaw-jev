@@ -57,7 +57,7 @@ def test_the_patcher_rehearses_on_the_dist_it_is_given(tmp_path):
     (tmp_path / "dist").mkdir()
     applied, detail = pf.patches_apply(tmp_path / "dist")
     assert not applied
-    assert detail == "ERROR: required patch missing after apply: hook-persistence"
+    assert detail.startswith("ERROR: required patch missing after apply: hook-persistence")
 
 
 def package(tmp_path, node_range, table):
