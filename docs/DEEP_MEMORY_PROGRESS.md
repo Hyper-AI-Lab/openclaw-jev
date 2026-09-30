@@ -709,3 +709,48 @@ So the fast path's floor applies to dense similarity, at 0.30 (`fast_context_fac
 - No live run of a follow-up yet. A scratch user task would be ingested into Kirill's memory, so the first live follow-up is part of Step 15's acceptance with him.
 
 ---
+
+## Step 14 — Observability, invariants, docs
+
+**Date:** 2026-09-30, deployed 18:31 JST (`5706091`).
+
+**What changed:**
+- `app/deep_memory/health.py` (new):
+  - **Readiness checks**, in `run_all_checks`:
+    - `deep_memory_ingest`: a due job waiting 15 min warns and 60 min fails; so does a job with 3+ failed attempts.
+    - `deep_memory_enrichment`: a document raw for over 30 min, or an enrichment still failing, warns. Budget-deferred jobs are named.
+    - `deep_memory_index`: a missing collection fails; points and objects apart by more than the queued outbox warns.
+    - `memory_lane`: at 80% of the daily token budget warns, at 100% fails.
+    - `deep_recall`: report p95 over 90 s, a quarter of recalls failed, or follow-ups after more than half of the ready reports warn (at least 4 samples). It passes with "Recall off" while the switch is off.
+  - **Invariants**, in `invariants.CHECKS` and so paged by the sentinel:
+    - `task_documents`: every user task finished since go-live (the first queued ingest job) has an enriched task document 30 minutes after it ended. "User task" follows `ingestible()`, the rule ingestion itself uses.
+    - `deep_index_internal`: no live deep-memory document belongs to a task `ingestible()` refuses (canary, heartbeat, cron, internal intent, intake placeholder).
+    - `judged_followups`: every `followup` message has an `evaluator.accept` for the same attempt, recorded before it.
+  - **Views** `deep_memory_status()` and `deep_memory_reports(task_id)`. Each status part (ingest, index, lane, recall) reports its own error instead of failing the whole view.
+- `GET /api/deep_memory/status` and `GET /api/deep_memory/reports/{task_id}`, behind the API key.
+- `ops/healthcheck.sh` prints a line per deep-memory check.
+- `index.count_points()` (exact count).
+- **Docs:**
+  - CONCEPT_TREE: the IA as an actor, the deep-memory stores, `DeepRecallWorkflow`, the fast-context and two-phase invariants, turn path step 10, the memory doctrine, the IA's model law, a contradiction-register row for Kirill's direct-call decision, and the pointer map.
+  - ARCHITECTURE: flow steps 5, 6 and 9; recall in both workflows; the recall child; readiness and the ingest loop; the endpoints; new §6.3 on deep memory and the IA; the file index.
+  - README: the flow and diagram, guarantees, memory layers, Jev's new question, testing and layout.
+- **Rule 2**, in `/root/.cursor/rules/rmp-architecture.mdc` and the repository copy, now reads: "…`rmp_intake_*`); the IA's background memory work calls OpenAI directly (gpt-6-luna, medium, store false)." `tests/test_rule_copies.py` compares the copies wherever the host rule exists.
+- `tests/test_fast_context.py`: the deadline test gets headroom (0.8 s deadline, 2 s slow leg). It failed once in a full run under measured disk pressure, with the dialogue and run legs over its 0.2 s deadline. It passed 5 of 5 alone before the change and 3 of 3 after.
+
+**Verification:**
+- New `tests/test_deep_memory_health.py` (14):
+  - each readiness check's pass, warn and fail;
+  - the invariants: tasks before go-live, still inside 30 minutes, or internal are ignored; the other attempt and an accept after the follow-up count as failures;
+  - the endpoints, and a part that cannot be read.
+- The whole-path follow-up scenario now also passes `judged_followups` on its real data.
+- Full suite: 769 passed, 4 skipped.
+- The rule copies are byte-identical (SHA-256 `530d7643…`), including the `main` checkout after the merge.
+- **Live** after the watcher's restart at 18:31 JST:
+  - Readiness: 38 pass, 1 warn (telemetry, by design), 0 fail. The healthcheck's new lines: ingest drains (0 pending), documents enriched on time, 51 points for 51 objects, memory lane at 4% of its budget, recall off, 0 finished user tasks to check, no internal content, 0 follow-ups.
+  - `/api/deep_memory/status` answered with the switches (recall and follow-ups off), queue, index (51 = 51), lane (151,007 of 4,000,000 tokens) and recall (none in 24 h). `/reports/88035ce7…` returned the two Step 11 probe reports. Without the key: 401.
+
+**Step 13 addendum, live:** the 18:07 JST canary ran on the two-phase code and completed in 13 s, with no recall (internal task).
+
+**Deviation:** the plan gave readiness, invariants and docs to Grok 4.7 extra-high subagents. Kirill's rule names Grok 4.5 High, which is not among the available models, and the Grok 4.7 subagents had stalled on a provider limit earlier today (Step 4). I wrote these modules myself, as in Steps 4–5.
+
+---
