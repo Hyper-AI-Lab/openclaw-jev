@@ -652,3 +652,60 @@ So the fast path's floor applies to dense similarity, at 0.30 (`fast_context_fac
 - A Japanese conversation at the builder's limits can exceed Jev's 24 KB. This is left to the analyst as designed, not trimmed.
 
 ---
+
+## Step 13 — Two-phase answering
+
+**Date:** 2026-09-30, deployed 17:53 JST (`a28492c`). Recall and follow-ups stay off until Step 15.
+
+**What changed:**
+- **Starting recall.** When a task's run starts, `start_task_workflow` has already decided whether it recalls (`deep_recall` in the payload): the `recall_enabled` switch is on, intake did not say `recall_depth: none`, and the task is not internal. The workflow checks the internal part again.
+  - It starts the `{task_id}-recall` child with a report id it chose. The child's runtime is capped at `recall_deadline_sec` (180 s), and nothing waits for it.
+  - The new behaviour is behind one `workflow.patched("deep-memory-two-phase")` marker, so runs started before this deploy never recall.
+- **Report ready in time** (`app/workflows/recall_phase.py`, a mixin like the evaluator and attached-message ones). It is checked, without waiting, before each plan step, each judgment and each rework brief.
+  - A relevant report joins the one memory block Aura and the evaluator read, and stays in every memory block rebuilt after it.
+  - The row records the consumer: `steps` or `evaluator`. No follow-up follows.
+- **Report after the reply** (generic tasks, only with `followups_enabled`):
+  - The task stays running and refreshes its liveness. It waits up to `followup_wait_sec` (300 s) for the recall, a stop, or a new message.
+  - A stop ends the task as stopped.
+  - A new message lets the recall go. The task completes, and the message starts over at intake as its own task, since intake would otherwise attach it to the waiting task again.
+  - A relevant report goes to the IA novelty judge (`judge_recall_novelty`, gpt-6-luna): none, adds or corrects, with points. Adds or corrects without points count as none.
+  - For adds or corrects, RMP sends a notice in the words of your request: "I recalled some more information from our earlier conversations. I need a little time to work it into a more accurate answer, and I'll get back to you."
+  - Aura then refines in a fresh `__recall` session. Her brief holds the request, the reply as sent, what memory adds or corrects, the memory block with the report, and the actions digest. She gives the whole answer if her reply was short, or only what changes if it was long.
+  - The evaluator judges the refinement as a follow-up: its brief carries the reply as sent. Verdict sessions continue the task's attempt count (`__v<n>`), with up to three judged attempts and reworks in fresh `__r<n>` sessions. Attached messages are folded in as usual.
+  - Only an accepted refinement is sent, as kind `followup`, with the verdict's attempt in its metadata. Otherwise Kirill hears "I couldn't confirm the refined answer, so my earlier reply stands."
+  - The task completes after the follow-up, so its document and facts include it.
+- **Catalog tasks** check for a finished report only at step boundaries (before each step attempt), with no follow-up. The recall is let go when a leg finishes, including before a durable task waits for its next leg.
+- **Every exit settles the report row** (`settle_recall_report`): consumed by `steps`, `evaluator`, `followup` or `none`. A report still running when the task lets it go is closed as `cancelled`, and a failed or timed-out recall as `failed`.
+- `start_recall_report` takes the task's report id, and a retried start finds the row it wrote.
+
+**Verification:**
+- **New `tests/test_two_phase_answering.py`**: 16 scenarios on Temporal's test server, with the recall child replaced by a scripted workflow.
+  - A report ready before judgment joins the evaluator's brief, and no follow-up follows.
+  - Adds: notice, `__recall` refinement, judged as a follow-up at attempt 2, delivered as `followup`.
+  - Corrects.
+  - Nothing new.
+  - An irrelevant report.
+  - A failed recall; a recall past its deadline; a recall slower than the follow-up wait.
+  - A stop during the wait; a message during the wait (resubmitted, recall let go).
+  - A follow-up never accepted (the stands notice).
+  - An internal task; recall off; follow-ups off.
+  - Catalog: the report appears from the next step boundary, and a late report is let go.
+- **Ordering in the harness.** Timer-based ordering was flaky: the test server skips time whenever all workflows are idle, so a scripted recall could land early. Each scenario now releases the recall on an explicit event (after the reply, at once, or never), and waits until the parent's history holds the child's completion when a report must arrive first. 10 of 10 repeated runs passed afterwards. One earlier failure was my sequencing: a test run started in parallel with the edit it needed.
+- **Whole-path scenario** (real API, intake, workflow and database; the recall row written by the real activities):
+  - Slack received the reply, the notice and the follow-up.
+  - The log reads request, verdict, reply, notice, verdict, follow-up.
+  - The report ended `ready`, consumed by the follow-up, with novelty `adds`.
+  - Two evaluator accepts; the judged-delivery, attached-message and Slack invariants pass.
+- **Replay:** four histories recorded by the code before this step (accept, rework, a message after the reply, a stop while judging) replay on the new code (`tests/test_workflow_replay.py`, fixture committed). A variant with one extra timer fails that replay with a nondeterminism error, so the check does catch it.
+- Unit tests: the novelty judge's points rule and reply cap; the report row's id, novelty and settling; the recall settings the workflow receives.
+- Full suite: 754 passed, 4 skipped.
+- **Live:**
+  - The watcher restarted both services at 17:53 JST. Readiness: 30 pass, 1 warn, 0 fail. `recall_enabled` and `followups_enabled` are off.
+  - The novelty judge on gpt-6-luna, against the Step 11 etcd report: a reply that lacks it gave adds (2.8 s), one that contradicts it corrects (3.6 s), and one that covers it none (1.9 s). The points carried the value from memory.
+
+**Deviations:**
+- Not in the plan: a new message during the wait lets the recall go, instead of feeding the refinement. This keeps Kirill's new message from waiting behind a recall, and avoids intake attaching it to the waiting task again.
+- A refinement the evaluator does not accept within three attempts is not escalated like a first answer. The reply already stands, so Kirill hears that it does.
+- No live run of a follow-up yet. A scratch user task would be ingested into Kirill's memory, so the first live follow-up is part of Step 15's acceptance with him.
+
+---
