@@ -243,6 +243,23 @@ def task_run_session_keys(task_id: str) -> List[str]:
     return sorted(set(keys))
 
 
+def session_statuses(keys: List[str]) -> Dict[str, Optional[str]]:
+    """Each session's run status in the gateway's store (done, failed, killed, running); {} without it."""
+    if not keys or SESSIONS_JSON_PATH.is_file() or not _sqlite_sessions_available():
+        return {}
+    try:
+        con = _connect(AGENT_DB_PATH, readonly=True)
+        try:
+            marks = ",".join("?" * len(keys))
+            return dict(con.execute(
+                f"SELECT session_key, status FROM session_nodes WHERE session_key IN ({marks})", keys
+            ).fetchall())
+        finally:
+            con.close()
+    except Exception:
+        return {}
+
+
 def _task_session_rows(main: str) -> List[Tuple[str, Optional[int]]]:
     path = SESSIONS_JSON_PATH
     if path.is_file():

@@ -3,26 +3,32 @@
 OpenClaw 2026.9.1 stops a run started through ``/hooks/agent`` by its session key; the run id
 the hook returns is not in the gateway's abort registry (probed live 2026-09-30). The tool call
 already in flight finishes, then the run ends with stop reason "aborted". ``clearQueued``
-drops any turn queued behind it. Every session of the task is aborted: Aura's first session,
-reworks, refinement and planner, and the evaluator's.
+drops any turn queued behind it. Every session of the task that may still run is aborted:
+Aura's first session, reworks, refinement and planner, and the evaluator's; sessions the
+gateway's store shows as finished are skipped.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import shutil
+import signal
 from typing import Any, Dict, List, Set
 
 from app.db.database import AsyncSessionLocal
 from app.db.models import Event
-from app.openclaw_sessions import task_run_session_keys
+from app.openclaw_sessions import session_statuses, task_run_session_keys
 
 logger = logging.getLogger("rmp.openclaw_control")
 
 ABORT_TIMEOUT_MS = 15000
-CLI_TIMEOUT_SEC = 30
+# The CLI starts node and connects to the gateway; on a loaded host that took 52 s (Sep 30).
+CLI_TIMEOUT_SEC = 120
 CONCURRENT_ABORTS = 6
+# A session in one of these states has no run left to stop.
+FINISHED = frozenset({"done", "failed", "killed"})
 _background: Set[asyncio.Task] = set()
 
 
@@ -34,13 +40,19 @@ async def abort_session(session_key: str) -> Dict[str, Any]:
         proc = await asyncio.create_subprocess_exec(
             cli, "gateway", "call", "sessions.abort", "--json", "--timeout", str(ABORT_TIMEOUT_MS),
             "--params", params, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
     except OSError as exc:
         return {"key": session_key, "status": "error", "error": str(exc)[:300]}
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=CLI_TIMEOUT_SEC)
     except asyncio.TimeoutError:
-        proc.kill()
+        # The CLI's node child would otherwise live on and send the abort later, unrecorded.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await proc.wait()
         return {"key": session_key, "status": "timeout"}
     if proc.returncode != 0:
         return {"key": session_key, "status": "error", "error": err.decode(errors="replace")[-300:]}
@@ -52,17 +64,19 @@ async def abort_session(session_key: str) -> Dict[str, Any]:
 
 
 async def abort_task_runs(task_id: str, *, reason: str) -> List[Dict[str, Any]]:
-    """Abort every session of the task and record what the gateway answered."""
+    """Abort every session of the task that may still run, and record what the gateway answered."""
     keys = await asyncio.to_thread(task_run_session_keys, task_id)
     if not keys:
         return []
+    statuses = await asyncio.to_thread(session_statuses, keys)
+    finished = [k for k in keys if statuses.get(k) in FINISHED]
     limit = asyncio.Semaphore(CONCURRENT_ABORTS)
 
     async def one(key: str) -> Dict[str, Any]:
         async with limit:
             return await abort_session(key)
 
-    results = list(await asyncio.gather(*(one(k) for k in keys)))
+    results = list(await asyncio.gather(*(one(k) for k in keys if k not in finished)))
     aborted = [r["key"] for r in results if r["status"] == "aborted"]
     failed = [r for r in results if r["status"] in ("error", "timeout")]
     if failed:
@@ -73,7 +87,7 @@ async def abort_task_runs(task_id: str, *, reason: str) -> List[Dict[str, Any]]:
             db.add(Event(correlation_id=task_id, entity_type="task", entity_id=task_id,
                          event_type="openclaw.aborted",
                          event_payload={"reason": reason, "sessions": len(keys), "aborted": aborted,
-                                        "unconfirmed": [r["key"] for r in failed]}))
+                                        "unconfirmed": [r["key"] for r in failed], "finished": finished}))
             await db.commit()
     except Exception as exc:
         logger.warning("Abort event not recorded for %s: %s", task_id[:8], exc)

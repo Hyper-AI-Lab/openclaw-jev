@@ -56,6 +56,7 @@ async def test_every_session_of_the_task_is_aborted_and_queued_turns_cleared(fak
     keys = [f"agent:main:rmp_task_{TID}", f"agent:main:rmp_task_{TID}__r2",
             f"agent:main:rmp_verify_{TID}__v1", f"agent:main:rmp_verify_{TID}__v2"]
     monkeypatch.setattr(openclaw_control, "task_run_session_keys", lambda task_id: keys)
+    monkeypatch.setattr(openclaw_control, "session_statuses", lambda keys: {})
     results = {r["key"]: r["status"] for r in await openclaw_control.abort_task_runs(TID, reason="stop")}
     assert results == {keys[0]: "aborted", keys[1]: "timeout", keys[2]: "error", keys[3]: "no-active-run"}
     calls = [json.loads(line) for line in fake_cli.read_text().splitlines()]
@@ -65,7 +66,54 @@ async def test_every_session_of_the_task_is_aborted_and_queued_turns_cleared(fak
         [event] = (await db.execute(select(Event))).scalars().all()
     assert event.event_type == "openclaw.aborted" and event.entity_id == TID
     assert event.event_payload == {"reason": "stop", "sessions": 4, "aborted": [keys[0]],
-                                   "unconfirmed": [keys[1], keys[2]]}
+                                   "unconfirmed": [keys[1], keys[2]], "finished": []}
+
+
+async def test_sessions_the_gateway_shows_finished_are_not_called(fake_cli, sessions, monkeypatch):
+    live, planner, verdict = (f"agent:main:rmp_task_{TID}", f"agent:main:rmp_task_{TID}__plan",
+                              f"agent:main:rmp_verify_{TID}__v2")
+    monkeypatch.setattr(openclaw_control, "task_run_session_keys", lambda task_id: [live, planner, verdict])
+    monkeypatch.setattr(openclaw_control, "session_statuses",
+                        lambda keys: {live: "running", planner: "done", verdict: "killed"})
+    results = await openclaw_control.abort_task_runs(TID, reason="stop")
+    assert [(r["key"], r["status"]) for r in results] == [(live, "aborted")]
+    assert len(fake_cli.read_text().splitlines()) == 1
+    async with sessions() as db:
+        [event] = (await db.execute(select(Event))).scalars().all()
+    assert event.event_payload["finished"] == [planner, verdict] and event.event_payload["sessions"] == 3
+
+
+async def test_a_cli_past_its_timeout_is_killed_with_its_children(tmp_path, monkeypatch):
+    marker = tmp_path / "late-abort"
+    script = tmp_path / "openclaw"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', \"import time; time.sleep(2); open({str(marker)!r}, 'w')\"])\n"
+        "time.sleep(10)\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setattr(openclaw_control.shutil, "which", lambda name: str(script))
+    monkeypatch.setattr(openclaw_control, "CLI_TIMEOUT_SEC", 1)
+    result = await REAL_ABORT(f"agent:main:rmp_task_{TID}")
+    await asyncio.sleep(2.5)
+    assert result["status"] == "timeout" and not marker.exists()
+
+
+def test_session_statuses_read_the_gateway_store(tmp_path, monkeypatch):
+    import sqlite3
+
+    db = tmp_path / "openclaw-agent.sqlite"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE session_nodes (session_key TEXT, status TEXT)")
+    con.executemany("INSERT INTO session_nodes VALUES (?, ?)", [("a", "running"), ("b", "done"), ("c", None)])
+    con.commit()
+    con.close()
+    monkeypatch.setattr(openclaw_sessions, "AGENT_DB_PATH", db)
+    monkeypatch.setattr(openclaw_sessions, "SESSIONS_JSON_PATH", tmp_path / "missing.json")
+    monkeypatch.setattr(openclaw_sessions, "_sqlite_sessions_available", lambda db=None: True)
+    assert openclaw_sessions.session_statuses(["a", "b", "c", "d"]) == {"a": "running", "b": "done", "c": None}
+    assert openclaw_sessions.session_statuses([]) == {}
 
 
 async def test_a_task_without_sessions_calls_nothing(fake_cli, sessions, monkeypatch):
