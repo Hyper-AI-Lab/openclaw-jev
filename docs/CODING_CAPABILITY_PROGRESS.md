@@ -111,3 +111,74 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
 **Verification:**
 - The worktree `/root/.openclaw/rmp-coding` was created on branch `coding-capability` from `main` (`e479f72`). Its `venv` is a link to the main checkout's venv, as in `rmp-deep`.
 - Full suite: 795 passed, 4 skipped, in 814 s. That is slower than the 463 s this morning, because of host load (load average 3.5 on 4 cores, I/O pressure about 15%).
+
+---
+
+## Step 2 — Claude Code on the host
+
+**Date:** 2026-09-30.
+
+**What changed:**
+- `app/coding/` (new package):
+  - `units.py`: the hardening every coding unit shares.
+    - Sandboxing: `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`, `PrivateDevices`, `NoNewPrivileges`, an empty capability set, the kernel and cgroup protections, `UMask=0077`.
+    - Hidden (`InaccessiblePaths`): `/root`, `/etc/aura-coder`, `/etc/rmp`, `/etc/openclaw`, Postgres' data directory and socket, the D-Bus system bus, the Docker, containerd, snapd and lxd sockets, and `/run/user`.
+    - Writable (`ReadWritePaths`): only what the caller names.
+    - Limits: memory, no swap, tasks, CPU, `RuntimeMaxSec`, and lower CPU and I/O weight than the production services.
+    - The token arrives through `EnvironmentFile`, which systemd reads as root.
+    - `systemd_run_argv` builds a collected transient service that runs as `aura-coder`.
+  - `firewall.py`: the nftables table `inet aura_coder`, replaced atomically on each apply. `active()` requires all four user rules, and `uncovered_listeners()` lists loopback listeners below the ephemeral range that the rules leave open (DNS is open by design). For `aura-coder` it rejects:
+    - loopback TCP and UDP to `coding.blocked_tcp_ports`;
+    - all traffic to 10/8, 100.64/10, 169.254/16, 172.16/12, 192.168/16, fc00::/7 and fe80::/10.
+  - `credentials.py`: finds the `setup-token` token in a terminal transcript, including a wrapped one, and validates it. It writes `/etc/aura-coder/claude.env` (0600) and a metadata file (issue date, expiry, length, fingerprint) atomically. `python -m app.coding.credentials extract|store` gives the login script both steps.
+- `app/config.py`: a `coding` settings section with the pinned version, models, limits and the blocked ports.
+- Setup and login:
+  - `ops/setup_aura_coder.sh` (idempotent): the user, `/srv/aura-code/{jobs,venvs,cache}`, `/etc/aura-coder`, Claude Code 2.1.280 installed with the native installer, `/etc/claude-code/managed-settings.json` from `ops/aura_coder/managed-settings.json`, git identity "Aura (Claude Code)", and the firewall unit.
+  - `ops/claude_code_login.sh`: runs `setup-token` as `aura-coder` in a throwaway home inside a 400-column terminal, then extracts, stores and smoke-tests the token. The `--paste` mode also accepts a token pasted across two lines.
+- Firewall wiring: `ops/aura_coder_firewall.sh`, and `systemd/aura-coder-firewall.service` (oneshot, enabled, ordered before the RMP services).
+- `ops/claude_code_smoke.py`:
+  - preconditions: user, pinned version, managed settings identical to the repo copy, firewall active;
+  - 32 isolation probes in a hardened unit;
+  - a real `claude -p` call, trying the configured model and then the fallback;
+  - the result recorded at `data/coding/claude_smoke.json`.
+- The managed settings are:
+  - `DISABLE_UPDATES` and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`;
+  - deny rules for `git push`, `gh`, `sudo`, `su`, `systemctl`, `ssh`, `scp`, `nft` and `iptables`;
+  - `allowManagedPermissionRulesOnly`, `allowManagedHooksOnly`, and `allowManagedMcpServersOnly` with an empty `allowedMcpServers`;
+  - `disableClaudeAiConnectors`, `disableSideloadFlags`, `disableSkillShellExecution`, an empty `strictKnownMarketplaces`, and `cleanupPeriodDays` 30.
+- Tests: `tests/test_coding_host.py` (17): unit hardening and the `systemd-run` argv, port validation, the ruleset, `active()`, uncovered listeners, token extraction (plain, with escapes, wrapped, absent), token storage modes and metadata, the login commands as the script calls them, settings defaults, script syntax.
+
+**Host changes:**
+- System user `aura-coder` (uid 997, password locked, no sudo).
+- `/srv/aura-code` and `/etc/aura-coder`.
+- Claude Code 2.1.280 at `/home/aura-coder/.local/bin/claude`.
+- `/etc/claude-code/managed-settings.json`.
+- `aura-coder-firewall.service`, enabled and active.
+
+**Deviations and why:**
+- **Install before managed settings.** The installer refuses to run while the managed settings set `DISABLE_UPDATES` ("Updates are disabled by your administrator"). The setup therefore installs the pinned version first, and removes the managed file for the duration of any later version change.
+- **nft lists the user by uid** once it resolves the name (`meta skuid 997`), so `active()` accepts either form.
+- **The probes found Postgres' Unix socket connectable.** Authentication would still refuse `aura-coder`, which has no role, but the units now hide every sensitive socket by its `/run` path. `/var/run` is a symlink, and the probe covers both paths.
+- **Beyond the plan's loopback ports:** the firewall also rejects private, link-local and carrier-grade ranges. These cover the Docker bridge, since containers are reachable there, and the cloud metadata address.
+- **DNS is open by design** (systemd-resolved on 127.0.0.53), so the uncovered-listener report excludes port 53.
+- **Login bug.** The first login captured the token, but its inline Python quoting broke storing it. `store` and `extract` became module commands with tests, and the second run stored the token. The first token Kirill created stays valid and unused.
+- **Findings for the runner (step 7):**
+  - `--max-turns` is accepted although `--help` no longer lists it.
+  - `--max-budget-usd` exists.
+  - `claude -p` exits 0 even on an API error (`terminal_reason: api_error`), so success must come from the result fields.
+
+**Verification:**
+- Tests: 17 passed.
+- The setup ran twice. The second run changed nothing and finished with the firewall active and no uncovered listeners.
+- Isolation, as `aura-coder` in a hardened unit, 32 probes as intended:
+  - Refused or unreadable:
+    - reading `/etc/rmp/rmp.env`, `/etc/openclaw/openclaw.env`, `/etc/aura-coder/claude.env`, `/root/.config/github_pat`, `openclaw.json` and `settings.json`;
+    - listing `/root`;
+    - connecting to 22, 5432, 6333, 7233, 8000, 8791, 9222 and 18789 (IPv4 and IPv6);
+    - connecting to 172.17.0.1:6333 and 169.254.169.254;
+    - the Docker, Postgres (both paths), D-Bus, snapd and containerd sockets;
+    - writing to `/srv/aura-code/venvs`, `/etc`, `/usr/local/bin` and `/root/.openclaw`.
+  - Allowed: the job directory, its home, its own ephemeral test server, and api.anthropic.com:443.
+- Claude Code: `opus` answered as `claude-opus-5-5` in 7.1 s, over 2 turns, using the Read tool, in `bypassPermissions` mode with no MCP servers. So Kirill's plan allows Opus, and `opus` stays the default model.
+- The token is 108 characters, root-only, and expires 2027-09-30.
+- The version is still 2.1.280, with one version installed.
