@@ -6,7 +6,9 @@ by a loop in the API process:
 - ``turn``: one of Kirill's or Aura's messages, searchable within seconds;
 - ``task``: a finished task's document (Conversation, Path history, Deliverables, Actions),
   plus the pages and files Aura read while doing it;
-- ``attachment``: the plain-text files Kirill sent with a message.
+- ``attachment``: the plain-text files Kirill sent with a message;
+- ``enrich``: stage 2 for one document (``app.deep_memory.enrich``), queued when a task
+  ends and when an attachment is read.
 
 Ids are derived from their sources, so ingesting again overwrites instead of duplicating.
 Canary, cron and heartbeat runs never enter.
@@ -54,7 +56,7 @@ logger = logging.getLogger("rmp.deep_memory.ingest")
 NAMESPACE = uuid.UUID("0c1e5b8e-6d8a-4f5b-9a47-3d2f6b1c9e21")
 TURN_KINDS = frozenset({"request", "attached", "clarify_answer", "reply", "followup"})
 INTERNAL_TASK_TYPES = frozenset({"canary", "heartbeat", "cron"})
-PRIORITY = {"turn": 1, "attachment": 2, "task": 3}
+PRIORITY = {"turn": 1, "attachment": 2, "task": 3, "enrich": 4}
 # Tools whose results are text Aura read: pages, crawls, extractions and files.
 CONTENT_TOOLS = (
     "web_fetch", "read", "jina_reader", "scrapling", "crawlee_crawl",
@@ -574,6 +576,7 @@ async def ingest_task(db: AsyncSession, task_id: str) -> str:
         for s in sorted(present, key=lambda s: s.ordinal)
     ]
     doc.meta = {
+        **(doc.meta or {}),
         "status": task.status,
         "closed_reason": (task.supplementary_context or {}).get("closed_reason"),
         "task_type": task.task_type,
@@ -581,6 +584,11 @@ async def ingest_task(db: AsyncSession, task_id: str) -> str:
         "ended_at": task.updated_at.isoformat() if task.updated_at else None,
     }
     await w.finish()
+    children = (
+        await db.execute(select(DeepDocument.id).where(DeepDocument.task_id == task.id, DeepDocument.id != doc.id))
+    ).scalars().all()
+    for doc_id in [*children, doc.id]:
+        await enqueue(db, "enrich", doc_id)
     return "done"
 
 
@@ -632,12 +640,23 @@ async def ingest_attachments(db: AsyncSession, message_id: str) -> str:
                           "meta": {"kind": "attachment", "name": name}},
         )
         await w.link(doc.id, task_doc.id, "part_of", message_id=message.id)
+        await enqueue(db, "enrich", doc.id)
         ingested += 1
     await w.finish()
     return "done" if ingested else "no text attachments"
 
 
-_HANDLERS = {"turn": ingest_turn, "task": ingest_task, "attachment": ingest_attachments}
+async def _enrich(db: AsyncSession, document_id: str) -> str:
+    from app.deep_memory.enrich import enrich_document
+
+    return await enrich_document(db, document_id)
+
+
+_HANDLERS = {"turn": ingest_turn, "task": ingest_task, "attachment": ingest_attachments, "enrich": _enrich}
+
+
+def _next_utc_day(now: datetime) -> datetime:
+    return datetime(now.year, now.month, now.day) + timedelta(days=1, minutes=5)
 
 
 async def _claim(limit: int) -> List[Tuple[str, str, str]]:
@@ -671,13 +690,20 @@ async def ingest_once(limit: int = DRAIN_BATCH) -> Dict[str, int]:
                 job.last_error = None if outcome == "done" else outcome
                 await db.commit()
         except Exception as exc:
+            from app.llm.openai_direct import DirectBudgetExceeded
+
             async with AsyncSessionLocal() as db:
                 job = await db.get(DeepIngestJob, job_id)
-                job.attempts = (job.attempts or 0) + 1
-                job.last_error = (str(exc) or type(exc).__name__)[:500]
-                job.next_attempt_at = datetime.utcnow() + timedelta(
-                    seconds=min(MAX_BACKOFF_SEC, 30 * 2 ** min(job.attempts, 7))
-                )
+                if isinstance(exc, DirectBudgetExceeded):
+                    # Not a failure: the day's model budget is spent, so the job waits for the next day.
+                    job.last_error = f"deferred: {exc}"[:500]
+                    job.next_attempt_at = _next_utc_day(datetime.utcnow())
+                else:
+                    job.attempts = (job.attempts or 0) + 1
+                    job.last_error = (str(exc) or type(exc).__name__)[:500]
+                    job.next_attempt_at = datetime.utcnow() + timedelta(
+                        seconds=min(MAX_BACKOFF_SEC, 30 * 2 ** min(job.attempts, 7))
+                    )
                 await db.commit()
             stats["failed"] += 1
             logger.warning("Deep ingest %s %s failed (attempt %s): %s", kind, ref_id, job.attempts, exc)

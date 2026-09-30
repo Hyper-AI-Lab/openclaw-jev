@@ -290,3 +290,50 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 - Live: the watcher restarted both services at 12:47:56 JST, health is OK, and the ingest loop is claiming every 10 s. The queue stays empty until the next real message, because there is no backfill.
 
 ---
+
+## Step 6 — Ingestion stage 2: summaries, contextual headers, task summaries, registry fixes
+
+**Date:** 2026-09-30 (12:50–13:35 JST)
+
+**Research before coding:**
+- Anthropic's contextual-retrieval recipe (cookbook prompt: "a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval"). It uses one call per chunk with the document cached, costing about $1.02 per million document tokens.
+- Ours batches all chunks of a section into one structured call, with the document's outline as the shared context. This gives the same kind of header with far fewer calls and a section summary at no extra cost. Summaries are hierarchical: the document summary is built from its section summaries.
+
+**What changed:**
+- `app/deep_memory/enrich.py` (new), `enrich_document(db, document_id)`:
+  - **Input:** the document's kind, title, source (URL, path or file), trust ("external web content" for pages), the task it was read or written during, and the JST date, plus the outline with the current section marked.
+  - **Per section:** one call through `openai_direct.structured_call` (gpt-6-luna, medium, `priority="enrich"`) returns a summary of 2–4 sentences with names, numbers and dates, and a 50–100-token context header for every numbered chunk. Batches hold at most 24 chunks. An answer missing any chunk is rejected, so nothing is written and the job retries.
+  - **Per document:** the summary comes from the section summaries; a single-section document reuses its section summary without another call. A task document gets `TaskEnrichment`: summary, **outcome** and **answer** (the substance of what Aura said, 120 words at most), from the goal, the section summaries and Aura's final reply.
+  - **Model calls run outside any database transaction.** Headers are written only to chunks whose text is unchanged since they were read. A rewritten chunk loses its header during stage 1, and its section, document and registry entry are enriched again.
+  - **Writing:** section summaries, chunk headers, the document summary, TOC summaries, `status=enriched`, and `meta.outcome`/`meta.answer`. It queues index rows for the changed chunks (re-embedded with header plus text for dense and BM25), the sections and the document (their own index levels), and, for a task, the registry entry.
+  - Enriching again is a no-op: no model call, nothing queued.
+- `app/deep_memory/ingest.py`: new job kind `enrich` (priority 4), queued for a task's document and its deliverables, pages and attachments when the task ends, and for an attachment once it is read. A job that hits the daily token budget is **deferred to the next UTC day** without counting as a failure.
+- Registry:
+  - `summary.build_task_summary` leads `outcome_summary` with the enriched task's outcome and answer, then the status tokens (cap 1,200 characters). Intake's finished-task evidence and `create_guided`'s SIMILAR COMPLETED TASKS now carry the answer, not just "status=completed; evaluator=accept".
+  - `indexer.index_terminal_task` writes the Postgres entry **before** the vector. A failed vector write still raises so the outbox retries, but the entry already exists.
+  - `retriever.fetch_recent_registry` counts "recent" from `task_ended_at` (not `indexed_at`, which every re-index refreshed) and excludes canary, heartbeat and cron.
+
+**Verification:**
+- `tests/test_deep_enrich.py` (11, model mocked at `structured_call`) covers:
+  - a task document: every schema, headers, summaries, outcome and answer, TOC summaries, index and registry rows;
+  - idempotent re-enrichment;
+  - a rewritten chunk re-enriched with its section;
+  - an incomplete answer writes nothing;
+  - a chunk rewritten during the call keeps no stale header;
+  - a single-section page (trust and source in the prompt);
+  - 24-chunk batching;
+  - budget deferral;
+  - the registry leading with outcome and answer;
+  - a final reply from before message kinds;
+  - recent-registry semantics.
+- The registry indexing test was updated for Postgres-first.
+- Full suite: 670 passed, 4 skipped.
+- **Live enrichment** against production Postgres, rolled back, with real gpt-6-luna calls (43,709 `memory_llm` tokens, about a cent). All 51 chunks of four documents got headers.
+  - "What's my test code word?": summary "…Answer: PELICAN-47"; chunk header: "Kirill's question in the Conversation section of the task record titled 'What's my test code word?', dated September 30, 2026…".
+  - The Kubernetes task record: summary with the outcome (guide delivered, 17 sections, 06:26 JST).
+  - The 27,854-character guide (31 chunks, 37 s): a summary with the substance (K3s, three embedded-etcd servers tolerate one outage, 8–16 GB RAM per node).
+  - The fetched releases page (9 chunks, 14 s): "…branches 1.37, 1.36, 1.35… 1.34.12 released 2026-09-15, end of life 2026-10-27".
+  - The registry text for the code-word task: "Outcome: … PELICAN-47 identified as the test code word. Answer: PELICAN-47 [status=completed; slack.delivered; evaluator=accept; …]".
+  - The run showed one bug, fixed and tested: a final reply logged before message kinds existed was read as "(none)".
+
+---

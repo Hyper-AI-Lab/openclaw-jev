@@ -34,9 +34,12 @@ async def index_terminal_task(task_id: str, *, require_vector: bool = False) -> 
     if is_internal_task(summary.get("intent_snippet") or "", summary.get("process_type") or "", []):
         logger.debug("Skip registry index for internal task %s", task_id)
         return None
+    # Postgres is the record: the entry exists even while the vector write keeps failing.
+    entry_id = await upsert_registry_entry(task_id)
     point_id = await asyncio.to_thread(upsert_task_vector, task_id, summary)
+    if point_id:
+        await upsert_registry_entry(task_id, vector_point_id=point_id)
     if require_vector and point_id is None and is_vector_memory_enabled():
         raise RuntimeError(f"registry vector write failed for {task_id}")
-    entry_id = await upsert_registry_entry(task_id, vector_point_id=point_id)
     logger.info("Indexed task %s into registry (entry=%s)", task_id[:8], entry_id)
     return entry_id

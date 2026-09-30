@@ -313,5 +313,11 @@ async def test_registry_indexing_through_the_outbox_retries_a_failed_vector_writ
          patch.object(indexer, "upsert_registry_entry", AsyncMock(return_value="e1")) as entry:
         with pytest.raises(RuntimeError):
             await indexer.index_terminal_task("t1", require_vector=True)
-        entry.assert_not_awaited()
+        # The Postgres entry is written even though the vector write failed and will be retried.
+        entry.assert_awaited_once_with("t1")
         assert await indexer.index_terminal_task("t1") == "e1"
+    with patch("app.task_registry.summary.build_task_summary", AsyncMock(return_value=summary)), \
+         patch.object(indexer, "upsert_task_vector", return_value="p1"), \
+         patch.object(indexer, "upsert_registry_entry", AsyncMock(return_value="e1")) as entry:
+        assert await indexer.index_terminal_task("t1", require_vector=True) == "e1"
+        assert [c.kwargs for c in entry.await_args_list] == [{}, {"vector_point_id": "p1"}]

@@ -88,6 +88,18 @@ async def build_task_summary(
         )
         events = ev_result.scalars().all()
         outcome_parts = outcome_parts_from_events(task.status, events)
+        from app.db.models import DeepDocument
+        from app.deep_memory.ingest import document_id, task_source_key
+
+        record = await session.get(DeepDocument, document_id(task_source_key(task_id)))
+        meta = (record.meta or {}) if record is not None else {}
+        # What happened and what Aura answered come first, so intake reads them before any cut.
+        told = [
+            f"Outcome: {meta['outcome']}" if meta.get("outcome") else "",
+            f"Answer: {meta['answer']}" if meta.get("answer") else "",
+        ]
+        outcome_summary = " ".join(t for t in told if t)
+        outcome_summary = f"{outcome_summary} [{'; '.join(outcome_parts)}]" if outcome_summary else "; ".join(outcome_parts)
 
         artifact_refs: List[str] = []
         if runs:
@@ -102,7 +114,7 @@ async def build_task_summary(
         return {
             "task_id": task.id,
             "intent_snippet": _snippet(task.goal or ""),
-            "outcome_summary": "; ".join(outcome_parts)[:800],
+            "outcome_summary": outcome_summary[:1200],
             "process_type": process_type,
             "terminal_status": task.status,
             "task_kind": task.task_kind or "one_shot",

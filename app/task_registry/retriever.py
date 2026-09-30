@@ -8,7 +8,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_task_registry_config
@@ -126,8 +126,13 @@ async def fetch_recent_registry(
     cutoff = datetime.utcnow() - timedelta(days=days)
 
     async def _query(session: AsyncSession) -> List[Dict[str, Any]]:
+        # Recent means recently finished; re-indexing an old entry does not make it recent.
         q = select(TaskRegistryEntry).where(
-            TaskRegistryEntry.indexed_at >= cutoff
+            TaskRegistryEntry.task_ended_at >= cutoff,
+            or_(
+                TaskRegistryEntry.process_type.is_(None),
+                TaskRegistryEntry.process_type.not_in(("canary", "heartbeat", "cron")),
+            ),
         )
         if recurrence_key:
             q = q.where(TaskRegistryEntry.recurrence_key == recurrence_key)
