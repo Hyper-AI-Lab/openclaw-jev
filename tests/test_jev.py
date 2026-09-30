@@ -231,18 +231,6 @@ async def test_promotion_holds_uncertain_facts(clients,monkeypatch,fault):
     await c.aclose()
 
 
-async def test_actual_promotion_callsite_holds_before_write(monkeypatch):
-    from app.memory.promotion import promote_completion_memory
-    from app.memory.router import MemoryRouter
-    writer=AsyncMock()
-    monkeypatch.setattr(MemoryRouter,'write',writer)
-    monkeypatch.setattr(memory,'review_promotions',AsyncMock(return_value={'mode':'enforce','allowed_indices':[],'held_indices':[0]}))
-    stats=await promote_completion_memory(process_run_id='p',process_type='',task_id='t',
-        episodic_content='The task inspected https://example.org/pricing for available options.')
-    assert stats['jev_held']==1 and stats['promoted_semantic']==0 and stats['promoted_pinned']==0
-    writer.assert_not_awaited()
-
-
 async def test_eval_metrics_include_false_holds(monkeypatch):
     from ops import jev_eval
     cases=jev_eval.load_cases(Path('tests/fixtures/jev_memory_eval.jsonl'),20)

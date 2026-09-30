@@ -454,6 +454,7 @@ def _fact_payload(item: MemoryItem) -> Dict[str, Any]:
             "valid": True,
             "text": redact_secrets(item.content or "")[:PAYLOAD_TEXT_CHARS],
             "confidence": item.confidence,
+            "subject": (item.provenance_ref or {}).get("subject"),
         }
     )
 

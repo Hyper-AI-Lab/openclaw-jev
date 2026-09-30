@@ -859,16 +859,18 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 },
                 start_to_close_timeout=timedelta(seconds=10),
             )
-            await workflow.execute_activity(
-                promote_completion_memory,
-                {
-                    "process_run_id": self.process_run_id,
-                    "process_type": template.process_type,
-                    "task_id": task_id,
-                    "content": clean_result[:3000],
-                },
-                start_to_close_timeout=timedelta(seconds=30),
-            )
+            promotion = {
+                "process_run_id": self.process_run_id,
+                "process_type": template.process_type,
+                "task_id": task_id,
+                "content": clean_result[:3000],
+            }
+            # Memory is promoted only from a reply that reached Kirill; histories from before promoted here.
+            promote_after_delivery = workflow.patched("deep-memory-promote-after-delivery")
+            if not promote_after_delivery:
+                await workflow.execute_activity(
+                    promote_completion_memory, promotion, start_to_close_timeout=timedelta(seconds=30)
+                )
             await workflow.execute_activity(
                 update_task_status,
                 {"task_id": task_id, "status": "completed"},
@@ -918,6 +920,10 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
             )
             if not delivered:
                 return {"status": "failed", "task_id": task_id, "reason": SLACK_DELIVERY_FAILED}
+            if promote_after_delivery:
+                await workflow.execute_activity(
+                    promote_completion_memory, promotion, start_to_close_timeout=timedelta(seconds=30)
+                )
             return await self._finish_durable_catalog(
                 payload,
                 user_intent,

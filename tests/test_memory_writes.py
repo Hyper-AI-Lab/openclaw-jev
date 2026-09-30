@@ -32,15 +32,13 @@ async def test_write_episodic_uses_provenance_kwarg(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_promotion_uses_provenance_kwarg(monkeypatch):
-    calls = []
+    from types import SimpleNamespace
+
+    calls, queued = [], []
 
     async def fake_write(*args, **kwargs):
         calls.append(kwargs)
         return f"mem-{len(calls)}"
-
-    class FakeResult:
-        def scalar_one_or_none(self):
-            return None
 
     class FakeDb:
         async def __aenter__(self):
@@ -49,29 +47,28 @@ async def test_promotion_uses_provenance_kwarg(monkeypatch):
         async def __aexit__(self, *args):
             pass
 
-        async def execute(self, query):
-            return FakeResult()
+        async def get(self, model, key):
+            if model.__name__ == "Task":
+                return SimpleNamespace(goal="Register the account on example.com", task_type="user")
+            return SimpleNamespace(plan_json={"steps": [{"name": "open_site"}, {"name": "register"}]})
 
-    monkeypatch.setattr(
-        "app.memory.router.MemoryRouter.write",
-        staticmethod(fake_write),
-    )
-    monkeypatch.setattr(
-        "app.db.database.AsyncSessionLocal",
-        lambda: FakeDb(),
-    )
+    async def enqueue_facts(task_id):
+        queued.append(task_id)
+
+    monkeypatch.setattr("app.memory.router.MemoryRouter.write", staticmethod(fake_write))
+    monkeypatch.setattr("app.db.database.AsyncSessionLocal", lambda: FakeDb())
+    monkeypatch.setattr("app.deep_memory.ingest.enqueue_facts", enqueue_facts)
+    monkeypatch.setattr("app.openclaw_sessions.task_action_trace", lambda task_id: [{"tool": "browser_use", "ok": True}])
     from app.memory.promotion import promote_completion_memory
 
     stats = await promote_completion_memory(
         process_run_id="pr-1",
         process_type="account_registration",
         task_id="t-1",
-        episodic_content=(
-            "Registration complete at https://example.com/register. "
-            "Account created and verified successfully."
-        ),
+        episodic_content="Registration complete at https://example.com/register.",
     )
-    assert stats["promoted_semantic"] >= 1
+    assert stats == {"facts_queued": 1, "promoted_procedural": 1, "rejected": 0} and queued == ["t-1"]
+    assert [c["scope_type"] for c in calls] == ["procedural"]
     assert all("provenance" in c for c in calls)
     assert all("provenance_ref" not in c for c in calls)
 

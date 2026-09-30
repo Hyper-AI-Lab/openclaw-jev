@@ -578,5 +578,4 @@ async def promote_completion_memory(payload: Dict[str, Any]) -> Dict[str, Any]:
         process_type=payload.get("process_type", ""),
         task_id=payload.get("task_id", ""),
         episodic_content=payload.get("content", ""),
-        user_scope_id=payload.get("user_scope_id", "default"),
     )

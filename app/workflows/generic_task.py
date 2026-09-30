@@ -660,16 +660,18 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                 {"task_id": task_id, "status": "completed"},
                 start_to_close_timeout=timedelta(seconds=10),
             )
-        await workflow.execute_activity(
-            promote_completion_memory,
-            {
-                "process_run_id": self.process_run_id,
-                "process_type": task_type,
-                "task_id": task_id,
-                "content": clean_result[:3000],
-            },
-            start_to_close_timeout=timedelta(seconds=30),
-        )
+        # Memory is promoted only from a reply that reached Kirill; histories from before kept the old call.
+        if delivered or not workflow.patched("deep-memory-promote-after-delivery"):
+            await workflow.execute_activity(
+                promote_completion_memory,
+                {
+                    "process_run_id": self.process_run_id,
+                    "process_type": task_type,
+                    "task_id": task_id,
+                    "content": clean_result[:3000],
+                },
+                start_to_close_timeout=timedelta(seconds=30),
+            )
         await self._resubmit_leftovers(task_id, session_key)
         if not delivered:
             return {"status": "failed", "task_id": task_id, "final_result": clean_result, "reason": SLACK_DELIVERY_FAILED}

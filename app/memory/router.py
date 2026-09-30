@@ -167,7 +167,12 @@ class MemoryRouter:
         content: str,
         provenance: Optional[Dict[str, Any]] = None,
         confidence: int = 100,
+        *,
+        db=None,
+        valid_from: Optional[datetime] = None,
+        supersedes_memory_id: Optional[str] = None,
     ) -> str:
+        """The single memory writer. With ``db``, the row joins the caller's transaction."""
         import uuid
 
         allowed, reason, redacted = apply_write_policy(
@@ -183,8 +188,9 @@ class MemoryRouter:
             raise ValueError(f"Memory write rejected: {reason}")
 
         mem_id = str(uuid.uuid4())
-        async with AsyncSessionLocal() as db:
-            db.add(
+
+        def _add(session) -> None:
+            session.add(
                 MemoryItem(
                     id=mem_id,
                     scope_type=scope_type,
@@ -193,17 +199,25 @@ class MemoryRouter:
                     content=redacted,
                     provenance_ref=provenance,
                     confidence=confidence,
-                    valid_from=datetime.utcnow(),
+                    valid_from=valid_from or datetime.utcnow(),
+                    supersedes_memory_id=supersedes_memory_id,
                 )
             )
             if is_vector_memory_enabled() and memory_type in INDEXABLE_TYPES:
                 if scope_type == "user":
                     from app.deep_memory.index import point_ref
 
-                    db.add(VectorOutbox(kind="deep", ref_id=point_ref("fact", mem_id)))
+                    session.add(VectorOutbox(kind="deep", ref_id=point_ref("fact", mem_id)))
                 else:
-                    db.add(VectorOutbox(kind="memory", ref_id=mem_id))
-            await db.commit()
+                    session.add(VectorOutbox(kind="memory", ref_id=mem_id))
+
+        if db is not None:
+            _add(db)
+            await db.flush()
+            return mem_id
+        async with AsyncSessionLocal() as session:
+            _add(session)
+            await session.commit()
         return mem_id
 
     @staticmethod

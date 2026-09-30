@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from app.activities import intake_activities
-from app.decisions import intake, memory
+from app.decisions import intake
 from app.decisions.jev import MODEL, JevClient, Policy
 
 NOW = datetime(2026, 9, 28, 5, 0, tzinfo=timezone.utc)
@@ -321,16 +321,3 @@ async def test_intake_eval_flags_harmful_attach_and_fails_the_gate(monkeypatch):
     assert report["intake"]["abstain_expected"] == 1 and report["intake"]["abstained_when_expected"] == 0
     assert report["gate"]["passed"] is False
 
-
-async def test_promotion_review_sees_only_facts_that_pass_validation(monkeypatch):
-    from app.memory import promotion
-
-    good = {"content": "Always use metric units in all my future tasks.", "confidence": 85, "kind": "constraint_fact"}
-    weak = {"content": "A weakly supported guess about the user", "confidence": 50, "kind": "constraint_fact"}
-    monkeypatch.setattr(promotion, "extract_semantic_facts", lambda content, process_type: [good, weak])
-    review = AsyncMock(return_value={"mode": "enforce", "allowed_indices": [], "held_indices": [0]})
-    monkeypatch.setattr(memory, "review_promotions", review)
-    stats = await promotion.promote_completion_memory(process_run_id="p", process_type="", task_id="t",
-        episodic_content="Kirill asked Aura to always use metric units in all future tasks.")
-    assert review.await_args.args[1] == [good]
-    assert stats["rejected"] == 1 and stats["jev_held"] == 1 and stats["promoted_semantic"] == 0

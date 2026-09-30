@@ -8,7 +8,9 @@ by a loop in the API process:
   plus the pages and files Aura read while doing it;
 - ``attachment``: the plain-text files Kirill sent with a message;
 - ``enrich``: stage 2 for one document (``app.deep_memory.enrich``), queued when a task
-  ends and when an attachment is read.
+  ends and when an attachment is read;
+- ``facts``: stage 3 for one task (``app.deep_memory.facts``), queued by promotion once
+  the task's reply has reached Kirill.
 
 Ids are derived from their sources, so ingesting again overwrites instead of duplicating.
 Canary, cron and heartbeat runs never enter.
@@ -56,7 +58,7 @@ logger = logging.getLogger("rmp.deep_memory.ingest")
 NAMESPACE = uuid.UUID("0c1e5b8e-6d8a-4f5b-9a47-3d2f6b1c9e21")
 TURN_KINDS = frozenset({"request", "attached", "clarify_answer", "reply", "followup"})
 INTERNAL_TASK_TYPES = frozenset({"canary", "heartbeat", "cron"})
-PRIORITY = {"turn": 1, "attachment": 2, "task": 3, "enrich": 4}
+PRIORITY = {"turn": 1, "attachment": 2, "task": 3, "facts": 3, "enrich": 4}
 # Tools whose results are text Aura read: pages, crawls, extractions and files.
 CONTENT_TOOLS = (
     "web_fetch", "read", "jina_reader", "scrapling", "crawlee_crawl",
@@ -117,6 +119,12 @@ async def enqueue(db: AsyncSession, kind: str, ref_id: str) -> None:
 async def enqueue_task(task_id: str) -> None:
     async with AsyncSessionLocal() as db:
         await enqueue(db, "task", task_id)
+        await db.commit()
+
+
+async def enqueue_facts(task_id: str) -> None:
+    async with AsyncSessionLocal() as db:
+        await enqueue(db, "facts", task_id)
         await db.commit()
 
 
@@ -652,7 +660,15 @@ async def _enrich(db: AsyncSession, document_id: str) -> str:
     return await enrich_document(db, document_id)
 
 
-_HANDLERS = {"turn": ingest_turn, "task": ingest_task, "attachment": ingest_attachments, "enrich": _enrich}
+async def _facts(db: AsyncSession, task_id: str) -> str:
+    from app.deep_memory.facts import extract_task_facts
+
+    return await extract_task_facts(db, task_id)
+
+
+_HANDLERS = {
+    "turn": ingest_turn, "task": ingest_task, "attachment": ingest_attachments, "enrich": _enrich, "facts": _facts,
+}
 
 
 def _next_utc_day(now: datetime) -> datetime:

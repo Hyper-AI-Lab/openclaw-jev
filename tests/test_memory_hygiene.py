@@ -35,44 +35,45 @@ def _db(task, run):
     return lambda: session
 
 
-async def _promote(task, run, trace, review_mode="shadow"):
-    writes = []
+async def _promote(task, run, trace):
+    writes, queued = [], []
 
     async def write(**kwargs):
         writes.append(kwargs)
         return "m1"
 
-    review = {"mode": review_mode, "allowed_indices": list(range(8)), "held_indices": []}
+    async def enqueue_facts(task_id):
+        queued.append(task_id)
+
     with patch("app.db.database.AsyncSessionLocal", _db(task, run)), \
          patch("app.memory.router.MemoryRouter.write", side_effect=write), \
-         patch("app.decisions.memory.review_promotions", AsyncMock(return_value=review)), \
+         patch("app.deep_memory.ingest.enqueue_facts", side_effect=enqueue_facts), \
          patch("app.openclaw_sessions.task_action_trace", return_value=trace):
         stats = await promote_completion_memory(process_run_id="pr", process_type=task.task_type,
                                                 task_id="t1", episodic_content=REPLY)
-    return stats, writes
+    return stats, writes, queued
 
 
 async def test_canary_work_never_becomes_shared_memory():
     canary = SimpleNamespace(goal="RMP MEMORY CANARY: Reply with one sentence", task_type="canary")
-    stats, writes = await _promote(canary, None, [{"tool": "read", "ok": True}])
-    assert stats["skipped"] == "internal_task" and writes == []
+    stats, writes, queued = await _promote(canary, None, [{"tool": "read", "ok": True}])
+    assert stats["skipped"] == "internal_task" and writes == [] and queued == []
 
 
-async def test_user_work_stores_facts_and_the_procedure_not_the_reply():
+async def test_user_work_queues_its_facts_and_stores_the_procedure_not_the_reply():
     task = SimpleNamespace(goal="Check visa rules for Japan", task_type="user")
     run = SimpleNamespace(plan_json={"steps": [{"name": "gather_facts"}, {"name": "deliver"}]})
-    stats, writes = await _promote(task, run, [{"tool": "web_search", "ok": True}])
+    stats, writes, queued = await _promote(task, run, [{"tool": "web_search", "ok": True}])
     procedural = [w for w in writes if w["scope_type"] == "procedural"]
     assert len(procedural) == 1 and procedural[0]["content"].startswith("Task: Check visa rules for Japan")
     assert "Tools used: web_search" in procedural[0]["content"]
-    assert not any(w["memory_type"] == "pinned" for w in writes)
-    assert stats["promoted_semantic"] >= 1
+    assert queued == ["t1"] and stats["facts_queued"] == 1
 
 
-async def test_facts_are_pinned_only_when_jev_enforces_and_accepts_them():
-    task = SimpleNamespace(goal="Check visa rules for Japan", task_type="user")
-    _, writes = await _promote(task, None, [], review_mode="enforce")
-    assert any(w["memory_type"] == "pinned" for w in writes)
+async def test_promotion_never_writes_user_memory_itself():
+    task = SimpleNamespace(goal="Remember that I prefer window seats", task_type="user")
+    stats, writes, queued = await _promote(task, None, [])
+    assert writes == [] and queued == ["t1"] and stats["promoted_procedural"] == 0
 
 
 async def test_internal_tasks_are_not_indexed_into_the_registry():
