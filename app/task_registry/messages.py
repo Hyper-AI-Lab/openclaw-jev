@@ -126,10 +126,11 @@ async def recent_session_dialogue_block(
         lookup = dialogue_lookup_keys(session_key)
         if not lookup:
             return ""
+        # User work of every kind, catalog-typed tasks included; never canaries, heartbeats or cron.
         q = (
             select(Task)
             .where(Task.openclaw_session_key.in_(lookup))
-            .where(Task.task_type == "user")
+            .where(Task.task_type.not_in(("canary", "heartbeat", "cron")))
             .order_by(Task.created_at.desc())
             .limit(max(limit_tasks + 2, 6))
         )

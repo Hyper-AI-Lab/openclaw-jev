@@ -80,6 +80,8 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
         self._spawn_leg_requested: bool = False
         self._spawn_leg_payload: Dict[str, Any] = {}
         self._catchup_chunks: List[str] = []
+        # The brief plus the fast context Aura last worked from; the evaluator judges against it.
+        self._memory_block: str = ""
 
     @workflow.signal
     def user_input(self, message: str) -> None:
@@ -373,6 +375,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
             ensure_brief_header(initial_memory_block or ""),
             memory_fetched,
         )
+        self._memory_block = memory_block
 
         for plan_step in steps:
             step_name = plan_step.get("name", "execute")
@@ -442,6 +445,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                             ensure_brief_header(initial_memory_block or ""),
                             memory_fetched,
                         )
+                        self._memory_block = memory_block
                     break
                 if status in ("failed", "blocked"):
                     if attempt >= 3 and step_context.strip():
@@ -525,6 +529,15 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
         else:
             max_rework = int(policy["max_attempts"])
         internal = is_internal_task(user_intent, task_type, tags)
+        # A recovered draft skips the plan loop, so the evaluator's memory is assembled here.
+        if not self._memory_block and not internal and workflow.patched("deep-memory-judge-with-fast-context"):
+            fetched = await workflow.execute_activity(
+                build_process_memory_context,
+                {"process_run_id": self.process_run_id, "task_id": task_id, "process_type": task_type,
+                 "semantic_query": user_intent[:300]},
+                start_to_close_timeout=timedelta(seconds=120),
+            )
+            self._memory_block = compose_executor_memory(ensure_brief_header(initial_memory_block or ""), fetched)
         attempt = 1
         while True:
             if self._stop_pending():
@@ -544,7 +557,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry):
                         "agent_response": clean_result,
                         "process_run_id": self.process_run_id,
                         "attempt": attempt,
-                        "process_brief": initial_memory_block or "",
+                        "process_brief": self._memory_block or initial_memory_block or "",
                     },
                     session_key=session_key,
                     user_intent=user_intent,

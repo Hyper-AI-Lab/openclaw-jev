@@ -302,12 +302,10 @@ class MemoryRouter:
         limit: int = 20,
         skip_vector: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Report §6.2 read order: process → working → procedural → semantic → graph.
+        """Report §6.2 read order: process → working → procedural → semantic.
 
         Scope reads run concurrently (capped) but merge order is preserved.
         """
-        from app.memory.graph import query_links
-
         merged: List[Dict[str, Any]] = []
         seen: set = set()
         proc_scope = (process_type or "generic").strip() or "generic"
@@ -333,10 +331,6 @@ class MemoryRouter:
             (("process", process_run_id, "working"), {"limit": 8, "query": query}),
             (("process", process_run_id, "episodic"), {"limit": 5, "query": query}),
         ]
-        if task_id:
-            specs.append(
-                (("task", task_id, None), {"limit": 5, "query": query}),
-            )
         specs.extend(
             [
                 (("procedural", proc_scope, "procedural"), {"limit": 5, "query": query}),
@@ -360,27 +354,6 @@ class MemoryRouter:
                 logger.warning("Memory parallel read failed: %s", result)
                 continue
             _add(result)
-
-        if merged:
-            try:
-                anchor_id = merged[0].get("id")
-                if anchor_id:
-                    links = await query_links(anchor_id, direction="both")
-                    for link in links[:5]:
-                        if link.get("peer_content"):
-                            _add(
-                                [
-                                    {
-                                        "id": link.get("peer_id"),
-                                        "memory_type": link.get("peer_type") or "graph",
-                                        "content": redact_secrets(link["peer_content"]),
-                                        "source": "graph",
-                                        "confidence": 100,
-                                    }
-                                ]
-                            )
-            except Exception as e:
-                logger.debug("Graph neighborhood read skipped: %s", e)
 
         return merged[:limit]
 
@@ -481,7 +454,5 @@ class MemoryRouter:
             tag = item.get("memory_type", "working")
             if src == "vector":
                 tag = f"{tag}/vector"
-            elif src == "graph":
-                tag = f"{tag}/graph"
             lines.append(f"- [{tag}] {item['content'][:500]}")
         return "\n".join(lines) + "\n"

@@ -158,10 +158,19 @@ def ensure_collection() -> None:
         _ensured.add(name)
 
 
+_openai_clients: Dict[str, Any] = {}
+_openai_lock = threading.Lock()
+
+
 def _openai_client(key: str):
+    """One client per key, so embeddings reuse its connection instead of a new TLS handshake."""
     from openai import OpenAI
 
-    return OpenAI(api_key=key, timeout=30.0, max_retries=2)
+    with _openai_lock:
+        client = _openai_clients.get(key)
+        if client is None:
+            client = _openai_clients[key] = OpenAI(api_key=key, timeout=30.0, max_retries=2)
+        return client
 
 
 def _normalize(text: str) -> str:
@@ -341,8 +350,13 @@ def search(
     prefetch_limit: int = 40,
     weights: Tuple[float, float] = (1.0, 1.0),
     timeout_sec: Optional[int] = None,
+    dense_floor: Optional[float] = None,
 ) -> List[Hit]:
-    """Dense and BM25 candidates under the same filter, fused by weighted reciprocal rank."""
+    """Dense and BM25 candidates under the same filter, fused by weighted reciprocal rank.
+
+    With ``dense_floor``, only points at least that similar to the query in meaning are
+    ranked: BM25 alone matches on shared words, which is not relevance.
+    """
     from qdrant_client import models
 
     query = (query or "").strip()
@@ -352,10 +366,20 @@ def search(
     if not client.collection_exists(name):
         return []
     flt = _filter(levels, match, match_any, since, until, valid_only)
+    timeout = timeout_sec or int(get_task_registry_config().get("qdrant_query_timeout_sec", 8))
+    vector = embed_query(query)
+    if dense_floor is not None:
+        close = client.query_points(
+            name, query=vector, using=DENSE, query_filter=flt, limit=prefetch_limit,
+            score_threshold=dense_floor, with_payload=False, timeout=timeout,
+        ).points
+        if not close:
+            return []
+        flt = models.Filter(must=[*flt.must, models.HasIdCondition(has_id=[p.id for p in close])])
     response = client.query_points(
         name,
         prefetch=[
-            models.Prefetch(query=embed_query(query), using=DENSE, filter=flt, limit=prefetch_limit),
+            models.Prefetch(query=vector, using=DENSE, filter=flt, limit=prefetch_limit),
             models.Prefetch(
                 query=models.Document(text=bm25_text(query), model=BM25_MODEL, options=BM25_OPTIONS),
                 using=SPARSE,
@@ -366,7 +390,7 @@ def search(
         query=models.RrfQuery(rrf=models.Rrf(k=RRF_K, weights=list(weights))),
         limit=limit,
         with_payload=True,
-        timeout=timeout_sec or int(get_task_registry_config().get("qdrant_query_timeout_sec", 8)),
+        timeout=timeout,
     )
     return [Hit(id=str(p.id), score=float(p.score), payload=dict(p.payload or {})) for p in response.points]
 

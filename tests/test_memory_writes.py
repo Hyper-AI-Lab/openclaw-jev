@@ -78,10 +78,7 @@ async def test_build_context_fail_soft(monkeypatch):
     async def boom(**kwargs):
         raise RuntimeError("db down")
 
-    monkeypatch.setattr(
-        "app.memory.router.MemoryRouter.build_context_block",
-        staticmethod(boom),
-    )
+    monkeypatch.setattr("app.deep_memory.curator.assemble_fast_context", boom)
     from app.activities.db_activities import build_process_memory_context
 
     block = await build_process_memory_context({"process_run_id": "pr-1"})

@@ -100,6 +100,7 @@
     "tool_document_min_chars": 2000,
     "fast_context_deadline_sec": 3.0,
     "fast_context_max_chars": 6000,
+    "fast_context_fact_floor": 0.3,
     "recall_deadline_sec": 180,
     "followup_wait_sec": 300
   }

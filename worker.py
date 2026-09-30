@@ -98,9 +98,13 @@ async def main():
             resubmit_user_messages,
         ],
     )
+    from app.deep_memory.curator import warm_up
+
+    warming = asyncio.create_task(warm_up())
     try:
         await worker.run()
     finally:
+        warming.cancel()
         from app.decisions.jev import close_jev_client
         from app.llm.openai_direct import close_direct_clients
 

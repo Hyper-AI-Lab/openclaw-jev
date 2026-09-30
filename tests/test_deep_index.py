@@ -125,6 +125,23 @@ def test_search_filters_both_prefetches_and_fuses_by_weighted_rank(fake, monkeyp
     assert kwargs["limit"] == 5 and kwargs["with_payload"] is True
 
 
+def test_a_dense_floor_ranks_only_points_close_in_meaning(fake, monkeypatch):
+    fake.exists = True
+    monkeypatch.setattr(index, "embed_query", lambda text: [0.2] * 4)
+    replies = [SimpleNamespace(points=[SimpleNamespace(id="c1", score=0.62, payload={})]),
+               SimpleNamespace(points=[SimpleNamespace(id="c1", score=0.5, payload={"text": "hit"})])]
+    fake.query_points = lambda name, **kw: (fake.calls.append(("query", kw)), replies.pop(0))[1]
+    assert [h.id for h in index.search("code word", levels=("fact",), dense_floor=0.3)] == ["c1"]
+    (_, close), (_, fused) = [c for c in fake.calls if c[0] == "query"]
+    assert close["score_threshold"] == 0.3 and close["using"] == "dense"
+    has_id = [c for c in fused["prefetch"][1].filter.must if isinstance(c, models.HasIdCondition)]
+    assert has_id and has_id[0].has_id == ["c1"]
+    fake.calls.clear()
+    fake.query_points = lambda name, **kw: (fake.calls.append(("query", kw)), SimpleNamespace(points=[]))[1]
+    assert index.search("unrelated", levels=("fact",), dense_floor=0.3) == []
+    assert len(fake.calls) == 1, "nothing close enough: no fused query at all"
+
+
 def test_a_missing_collection_answers_empty_not_error(fake):
     assert index.search("anything", levels=("chunk",)) == []
     assert index.delete_points(["a", "b"]) == 0 and index.scroll_point_ids() == []
@@ -160,6 +177,12 @@ def test_embed_texts_batches_in_order_with_dimensions_and_records_usage(monkeypa
     monkeypatch.setattr(index, "_read_openai_key", lambda: "")
     with pytest.raises(RuntimeError):
         index.embed_texts(["a"])
+
+
+def test_the_embedding_client_is_reused_per_key(monkeypatch):
+    monkeypatch.setattr(index, "_openai_clients", {})
+    first = index._openai_client("sk-one")
+    assert index._openai_client("sk-one") is first and index._openai_client("sk-two") is not first
 
 
 def test_a_query_is_embedded_once_for_concurrent_searches_and_again_after_the_ttl(monkeypatch):

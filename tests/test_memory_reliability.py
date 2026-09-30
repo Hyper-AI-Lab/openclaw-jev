@@ -40,12 +40,12 @@ async def test_write_process_memory_provenance_kwarg():
 @pytest.mark.asyncio
 async def test_build_context_skip_vector():
     with patch(
-        "app.memory.router.MemoryRouter.build_context_block", new_callable=AsyncMock
+        "app.deep_memory.curator.assemble_fast_context", new_callable=AsyncMock
     ) as mock_build:
         mock_build.return_value = "BLOCK"
-        await build_process_memory_context(
+        assert await build_process_memory_context(
             {"process_run_id": "run-1", "skip_vector": True, "semantic_query": "x"}
-        )
+        ) == "BLOCK"
         mock_build.assert_awaited_once()
         kwargs = mock_build.call_args.kwargs
         assert kwargs["skip_vector"] is True

@@ -34,7 +34,7 @@ from app.db import database
 from app.db.models import (
     Base, Event, MemoryItem, ProcessRun, SideEffectReceipt, Task, TaskIntakeDecision, TaskMessage,
 )
-from app.deep_memory import index as deep_index
+from app.deep_memory import curator, index as deep_index
 from app.memory import router
 from app.orchestrator import web_capability
 from app.production import invariants
@@ -315,6 +315,25 @@ async def test_the_conversation_log_records_each_messages_kind_session_and_place
     run = (await h.rows(ProcessRun, ProcessRun.task_id == tid))[0]
     assert (verdict.meta["verdict"], verdict.meta["process_run_id"]) == ("accept", run.id)
     assert (reply.content, reply.meta["process_run_id"], reply.meta["parts"]) == (folded, run.id, 1)
+
+
+async def test_aura_and_the_evaluator_see_one_memory_block_with_the_dialogue(h):
+    first_ask, first_reply = "Remember: my test code word is ORCA-19.", "Noted: your test code word is ORCA-19."
+    second_ask, second_reply = "What's my test code word?", "Your test code word is ORCA-19."
+    h.intake, h.drafts = [{"decision": "create_fresh"}], [first_reply]
+    await h.finish((await h.send(first_ask, "1790000012.000100"))["task_id"])
+    h.intake, h.drafts = [{"decision": "create_fresh"}], [second_reply]
+    tid = (await h.send(second_ask, "1790000012.000200"))["task_id"]
+    await h.finish(tid)
+
+    prompt = h.prompts[-1]
+    # One memory block (the prompt policy also names it once in its instructions).
+    assert prompt.count(curator.HEADER) == 1 and prompt.count("RECENT DIALOGUE (") == 1
+    assert f"Kirill: {first_ask}" in prompt and f"Aura: {first_reply}" in prompt
+    assert f"Kirill: {first_ask}" in h.judged[-1], "the evaluator judges against the same dialogue"
+    assert h.slack[-1] == second_reply
+    fast = await h.rows(Event, Event.entity_id == tid, Event.event_type == "memory.fast_context")
+    assert fast and "dialogue" in fast[0].event_payload["sections"]
 
 
 async def test_the_same_dm_delivered_twice_runs_once(h):

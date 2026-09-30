@@ -723,56 +723,9 @@ async def create_task(
     except Exception as exc:
         logger.warning("Eager process run creation skipped: %s", exc)
 
-    session_dialogue = ""
-    inject_dialogue = (
-        not is_canary
-        and not is_heartbeat
-        and not is_cron
-        and task_type not in ("canary", "heartbeat")
-    )
-    if inject_dialogue:
-        try:
-            from app.task_registry.messages import recent_session_dialogue_block
-
-            session_dialogue = await recent_session_dialogue_block(
-                request.session_key or "",
-                exclude_task_id=task_id,
-                db=db,
-            )
-        except Exception as exc:
-            logger.warning("Session dialogue prefetch skipped: %s", exc)
-
-    initial_memory_block = guided_memory
-    if process_run_id:
-        try:
-            tag_set = {t.lower() for t in (request.tags or [])}
-            skip_vector = is_canary or "memory-canary" in tag_set
-            prefetched = await MemoryRouter.build_context_block(
-                process_run_id=process_run_id,
-                task_id=task_id,
-                process_type=catalog_type or task_type,
-                query=None if skip_vector else intent[:300],
-                skip_vector=skip_vector,
-            )
-            initial_memory_block = "\n\n".join(
-                p
-                for p in (
-                    guided_memory,
-                    session_dialogue,
-                    web_capability_block,
-                    prefetched,
-                )
-                if p
-            ).strip()
-        except Exception as exc:
-            logger.warning("Memory prefetch skipped: %s", exc)
-            initial_memory_block = "\n\n".join(
-                p for p in (guided_memory, session_dialogue, web_capability_block) if p
-            ).strip()
-    elif session_dialogue or web_capability_block:
-        initial_memory_block = "\n\n".join(
-            p for p in (guided_memory, session_dialogue, web_capability_block) if p
-        ).strip()
+    # The workflow assembles Aura's memory once (dialogue, facts, linked tasks, run, procedures);
+    # the brief carries only what intake decided and the web capabilities.
+    initial_memory_block = "\n\n".join(p for p in (guided_memory, web_capability_block) if p).strip()
 
     try:
         with trace_span(

@@ -37,12 +37,10 @@ async def test_read_ordered_preserves_merge_priority(monkeypatch):
         limit=10,
     )
     contents = [i["content"] for i in items]
-    assert contents[0] == "process:working"
-    assert contents[1] == "process:episodic"
-    assert contents[2] == "task:any"
-    assert "procedural:procedural" in contents
-    assert "user:semantic" in contents
-    assert "user:pinned" in contents
+    # Task-scope memory has no writer, so it is no longer read.
+    assert contents == [
+        "process:working", "process:episodic", "procedural:procedural", "user:semantic", "user:pinned",
+    ]
 
 
 @pytest.mark.asyncio

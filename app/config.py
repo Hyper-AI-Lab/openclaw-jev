@@ -232,6 +232,8 @@ DEFAULT_DEEP_MEMORY = {
     # Aura's fast context, and the deep recall that may follow up on her reply.
     "fast_context_deadline_sec": 3.0,
     "fast_context_max_chars": 6000,
+    # Dense similarity a fact needs to reach Aura's fast context (text-embedding-3-large, 1536 dims).
+    "fast_context_fact_floor": 0.30,
     "recall_deadline_sec": 180,
     "followup_wait_sec": 300,
 }

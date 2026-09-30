@@ -454,18 +454,18 @@ async def write_process_memory(payload: Dict[str, Any]) -> str:
 
 @traced_activity("memory.build_context")
 async def build_process_memory_context(payload: Dict[str, Any]) -> str:
+    """Aura's memory block: the Internal Agent's fast context (app/deep_memory/curator.py)."""
     import asyncio
 
-    from app.memory.router import MemoryRouter
+    from app.deep_memory.curator import assemble_fast_context
 
     try:
         skip_vector = bool(payload.get("skip_vector"))
-        return await MemoryRouter.build_context_block(
-            process_run_id=payload.get("process_run_id", ""),
-            query=None if skip_vector else (payload.get("semantic_query") or payload.get("query")),
+        return await assemble_fast_context(
             task_id=payload.get("task_id"),
+            process_run_id=payload.get("process_run_id", ""),
             process_type=payload.get("process_type", "generic"),
-            user_scope_id=payload.get("user_scope_id", "default"),
+            query=None if skip_vector else (payload.get("semantic_query") or payload.get("query")),
             skip_vector=skip_vector,
         )
     except (asyncio.CancelledError, Exception) as exc:

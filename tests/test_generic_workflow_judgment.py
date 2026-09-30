@@ -28,6 +28,8 @@ class Recorder:
         self.prompts: List[str] = []
         self.resubmitted: List[List[str]] = []
         self.failed = 0
+        self.memory_builds = 0
+        self.briefs: List[str] = []
         self.signals_during_judging = list(signals_during_judging)
         self.signal_on_completed = signal_on_completed
         self.signals_during_rework = list(signals_during_rework)
@@ -72,9 +74,17 @@ class Recorder:
         async def execute_compensation(payload: Dict[str, Any]) -> bool:
             return True
 
+        @activity.defn(name="build_process_memory_context")
+        async def build_process_memory_context(payload: Dict[str, Any]) -> str:
+            rec.memory_builds += 1
+            return ("PROCESS-SCOPED MEMORY (use this before workspace files when answering):\n\n"
+                    "RECENT DIALOGUE (same Slack session — continue this conversation):\n"
+                    "[05:08] Kirill: I'm off to Osaka in October.")
+
         @activity.defn(name="verify_response_quality")
         async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
             rec.judged.append(payload["agent_response"])
+            rec.briefs.append(payload.get("process_brief") or "")
             if rec.signals_during_judging:
                 await _signal_own_workflow(rec.signals_during_judging.pop(0))
             verdict = rec.verdicts.pop(0) if rec.verdicts else "rework"
@@ -102,7 +112,8 @@ class Recorder:
 
         return [ensure_process_run, record_event, update_task_status, update_process_state,
                 promote_completion_memory, finalize_task_failure, execute_compensation,
-                verify_response_quality, send_to_openclaw, notify_slack_user, resubmit_user_messages]
+                verify_response_quality, send_to_openclaw, notify_slack_user, resubmit_user_messages,
+                build_process_memory_context]
 
 
 async def _run(recorder: Recorder, **overrides) -> Dict[str, Any]:
@@ -124,6 +135,8 @@ async def test_a_recovered_draft_is_judged_before_it_is_delivered():
     assert result["status"] == "completed"
     assert rec.judged == ["Pack layers and a light rain jacket."]
     assert rec.slack == ["Pack layers and a light rain jacket."]
+    # The recovered draft skipped the plan loop, so its memory was assembled once for the evaluator.
+    assert rec.memory_builds == 1 and "Kirill: I'm off to Osaka in October." in rec.briefs[0]
 
 
 async def test_a_delivery_result_recorded_as_a_boolean_before_sep_30_still_decodes():

@@ -70,6 +70,8 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
         self._spawn_leg_payload: Dict[str, Any] = {}
         self._catchup_chunks: List[str] = []
         self._initial_memory_block: str = ""
+        # The brief plus the fast context of the latest attempt; the evaluator judges against it.
+        self._memory_block: str = ""
 
     @workflow.signal
     def spawn_leg(self, payload: Dict[str, Any]) -> None:
@@ -466,6 +468,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                         ensure_brief_header(self._initial_memory_block),
                         memory_fetched,
                     )
+                    self._memory_block = memory_block
 
                     if self._catchup_chunks:
                         step_context += "\n" + format_user_catchup(self._catchup_chunks)
@@ -722,7 +725,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                     "agent_response": clean_result,
                     "process_run_id": self.process_run_id,
                     "attempt": 1,
-                    "process_brief": self._initial_memory_block or "",
+                    "process_brief": self._memory_block or self._initial_memory_block or "",
                 },
                 session_key=session_key,
                 user_intent=user_intent,
@@ -798,7 +801,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry):
                             "agent_response": clean_result,
                             "process_run_id": self.process_run_id,
                             "attempt": judged,
-                            "process_brief": self._initial_memory_block or "",
+                            "process_brief": self._memory_block or self._initial_memory_block or "",
                         },
                         session_key=session_key,
                         user_intent=user_intent,
