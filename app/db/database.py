@@ -105,6 +105,15 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS ix_vector_outbox_pending ON vector_outbox (next_attempt_at) WHERE done_at IS NULL",
     "CREATE INDEX IF NOT EXISTS ix_events_type_time ON events (event_type, occurred_at)",
     "CREATE INDEX IF NOT EXISTS ix_events_entity_id ON events (entity_id)",
+    "ALTER TABLE task_messages ADD COLUMN IF NOT EXISTS kind VARCHAR",
+    "ALTER TABLE task_messages ADD COLUMN IF NOT EXISTS session_key VARCHAR",
+    "ALTER TABLE task_messages ADD COLUMN IF NOT EXISTS meta JSON",
+    "CREATE INDEX IF NOT EXISTS ix_task_messages_kind ON task_messages (kind)",
+    "CREATE INDEX IF NOT EXISTS ix_task_messages_session_key ON task_messages (session_key)",
+    # Deep-memory tables come from create_all; their text search needs Postgres DDL.
+    "CREATE INDEX IF NOT EXISTS ix_dm_chunks_fts ON dm_chunks USING gin (to_tsvector('english', coalesce(context_header, '') || ' ' || coalesce(text, '')))",
+    "CREATE INDEX IF NOT EXISTS ix_dm_sections_fts ON dm_sections USING gin (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(summary, '')))",
+    "CREATE INDEX IF NOT EXISTS ix_dm_documents_fts ON dm_documents USING gin (to_tsvector('english', coalesce(title, '') || ' ' || coalesce(summary, '')))",
 ]
 
 

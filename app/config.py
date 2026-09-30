@@ -211,6 +211,36 @@ DEFAULT_TASK_REGISTRY = {
 }
 
 
+DEFAULT_DEEP_MEMORY = {
+    # Ingestion, the hybrid index and the fast context.
+    "enabled": True,
+    # The IA's deep recall during user tasks, and the judged follow-up it can trigger.
+    "recall_enabled": False,
+    "followups_enabled": False,
+    "collection_name": "rmp_deep_memory_v1",
+    "embedder_model": "text-embedding-3-large",
+    "embedding_dims": 1536,
+    # Direct model calls (app/llm/openai_direct.py).
+    "lane_concurrency": 3,
+    "lane_requests_per_minute": 60,
+    "lane_busy_enrich_slots": 1,
+    "llm_daily_token_budget": 4_000_000,
+    "llm_call_deadline_sec": 120,
+    # Ingestion.
+    "ingest_concurrency": 2,
+    "tool_document_min_chars": 2000,
+    # Aura's fast context, and the deep recall that may follow up on her reply.
+    "fast_context_deadline_sec": 3.0,
+    "fast_context_max_chars": 6000,
+    "recall_deadline_sec": 180,
+    "followup_wait_sec": 300,
+}
+
+
+def get_deep_memory_config() -> dict:
+    return dict(load_settings().get("deep_memory") or DEFAULT_DEEP_MEMORY)
+
+
 def get_intake_models() -> list[str]:
     """Ordered intake LLM models: primary then fallbacks (OpenClaw provider/model refs)."""
     cfg = get_task_registry_config()
@@ -316,6 +346,8 @@ def load_settings() -> dict:
     settings["llm_quota"] = {**DEFAULT_LLM_QUOTA, **llm_q}
     tr = settings.get("task_registry") or {}
     settings["task_registry"] = {**DEFAULT_TASK_REGISTRY, **tr}
+    dm = settings.get("deep_memory") or {}
+    settings["deep_memory"] = {**DEFAULT_DEEP_MEMORY, **dm}
     return settings
 
 

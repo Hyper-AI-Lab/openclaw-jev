@@ -32,7 +32,9 @@ class EvaluatorRetry:
     async def _deliver_final(self, notify_payload: Dict[str, Any]) -> bool:
         """Post the accepted reply. False when Slack refused it for good; the task has then failed."""
         outcome = await workflow.execute_activity(
-            notify_slack_user, notify_payload, start_to_close_timeout=timedelta(seconds=30)
+            notify_slack_user,
+            {"message_kind": "reply", "process_run_id": self.process_run_id, **notify_payload},
+            start_to_close_timeout=timedelta(seconds=30),
         )
         if outcome != SLACK_REFUSED:
             return True

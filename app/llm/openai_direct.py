@@ -63,7 +63,21 @@ class LanePolicy:
 
 
 def lane_policy() -> LanePolicy:
-    return LanePolicy()
+    from app.config import get_deep_memory_config
+
+    cfg = get_deep_memory_config()
+    defaults = LanePolicy()
+    try:
+        return LanePolicy(
+            concurrency=max(1, int(cfg.get("lane_concurrency", defaults.concurrency))),
+            requests_per_minute=max(1, int(cfg.get("lane_requests_per_minute", defaults.requests_per_minute))),
+            busy_enrich_slots=max(1, int(cfg.get("lane_busy_enrich_slots", defaults.busy_enrich_slots))),
+            daily_token_budget=max(0, int(cfg.get("llm_daily_token_budget", defaults.daily_token_budget))),
+            call_deadline_sec=max(5.0, float(cfg.get("llm_call_deadline_sec", defaults.call_deadline_sec))),
+        )
+    except (TypeError, ValueError):
+        logger.warning("deep_memory lane settings invalid; using defaults")
+        return defaults
 
 
 class DirectModelError(RuntimeError):

@@ -24,6 +24,9 @@ async def add_task_message(
     source: str = "api",
     db: Optional[AsyncSession] = None,
     slack_ts: Optional[str] = None,
+    kind: str = "request",
+    session_key: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> str:
     text = (content or "").strip()
     if not text:
@@ -36,6 +39,9 @@ async def add_task_message(
         content=text[:8000],
         source=source,
         slack_ts=slack_ts or None,
+        kind=kind,
+        session_key=session_key or None,
+        meta={k: v for k, v in (meta or {}).items() if v not in (None, "", [], {})} or None,
     )
 
     async def _commit(session: AsyncSession) -> None:

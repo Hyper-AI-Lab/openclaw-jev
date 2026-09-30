@@ -689,6 +689,13 @@ async def create_task(
         source=msg_source,
         db=db,
         slack_ts=request.slack_message_id,
+        kind="request",
+        session_key=request.session_key,
+        meta={
+            "slack": _slack_context(request) if request.slack_message_id or request.attachments else None,
+            "intake_decision_id": intake_decision_id,
+            "task_type": task_type,
+        },
     )
     if msg_id:
         task.supplementary_context = {
@@ -1095,12 +1102,16 @@ async def signal_task(
     from app.task_registry.messages import add_task_message
 
     if signal.message:
+        target = await db.get(Task, task_id)
         await add_task_message(
             task_id,
             signal.message,
             role="user",
             source="signal",
             db=db,
+            kind="attached",
+            session_key=getattr(target, "openclaw_session_key", None),
+            meta={"signal_type": signal.signal_type.lower()},
         )
         await db.commit()
     try:

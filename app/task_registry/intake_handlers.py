@@ -75,6 +75,20 @@ def _requester(request) -> str:
     return getattr(request, "user_id", None) or "slack_user"
 
 
+def _slack_meta(request) -> Optional[dict]:
+    """Where the message sits in Slack: its thread, the message it replies to, its files."""
+    message_id = getattr(request, "slack_message_id", None)
+    attachments = getattr(request, "attachments", None) or []
+    if not message_id and not attachments:
+        return None
+    return {
+        "message_id": message_id,
+        "thread_id": getattr(request, "thread_id", None),
+        "reply_to_id": (getattr(request, "reply_to", None) or {}).get("id"),
+        "attachments": attachments,
+    }
+
+
 async def build_catchup_block(task_id: str, db: AsyncSession) -> str:
     """Process memory + last steps for attach/rebuild. Fail-soft."""
     lines = [f"PROCESS BRIEF: continue task {task_id}"]
@@ -245,6 +259,13 @@ async def handle_intake_outcome(
                 await add_task_message(
                     target, intent, role="user", source="slack", db=db,
                     slack_ts=getattr(request, "slack_message_id", None),
+                    kind="clarify_answer" if intake_clarify else "attached",
+                    session_key=session_key,
+                    meta={
+                        "slack": _slack_meta(request),
+                        "intake_decision_id": decision_id,
+                        "targets": targets if len(targets) > 1 else None,
+                    },
                 )
                 metrics_inc("intake_attached")
                 db.add(
@@ -341,6 +362,9 @@ async def handle_intake_outcome(
         await add_task_message(
             task_id, intent, role="user", source="slack", db=db,
             slack_ts=getattr(request, "slack_message_id", None),
+            kind="request",
+            session_key=session_key,
+            meta={"slack": _slack_meta(request), "intake_decision_id": decision_id, "clarify": True},
         )
         await _intake_notify_slack(
             session_key=session_key,
@@ -394,6 +418,9 @@ async def handle_intake_outcome(
         await add_task_message(
             ack_id, intent, role="user", source="slack", db=db,
             slack_ts=getattr(request, "slack_message_id", None),
+            kind="request",
+            session_key=session_key,
+            meta={"slack": _slack_meta(request), "intake_decision_id": decision_id, "skip_kind": effective},
         )
         await _intake_notify_slack(
             session_key=session_key,

@@ -729,6 +729,9 @@ async def notify_slack_user(payload: Dict[str, Any]) -> Union[bool, str]:
         user_id=user_id,
         message=clean,
         bot_token=bot_token,
+        kind=str(payload.get("message_kind") or "notice"),
+        session_key=session_key,
+        meta={k: payload[k] for k in ("attempt", "process_run_id") if payload.get(k) is not None},
     )
     return SLACK_DELIVERED if delivered else SLACK_REFUSED
 

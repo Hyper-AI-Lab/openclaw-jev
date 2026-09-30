@@ -130,3 +130,56 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
 **Deployment note:** `rmp-code-watch` restarts `rmp-api` and `rmp-worker` when `app/**/*.py` changes and no user task is active. It restarted them at 11:25 and 11:28 JST on these edits, which are backward compatible (new functions; the budget adds zero until the IA calls). From Step 3 on, development moves to a git worktree, and each step reaches the live tree only after its tests pass.
 
 ---
+
+## Step 3 — Conversation-log metadata, deep-memory tables, settings
+
+**Date:** 2026-09-30 (12:05–12:45 JST). Developed in the worktree `/root/.openclaw/rmp-deep` (branch `deep-memory`).
+
+**What changed:**
+- **`task_messages`** gains three columns:
+  - `kind`: `request`, `attached`, `clarify_answer`, `reply`, `followup`, `notice` or `verdict`;
+  - `session_key`;
+  - `meta`: Slack message, thread, reply-to and attachments, intake decision, process run, attempt.
+
+  Every writer sets them:
+
+  | Writer | Kind | Meta |
+  |---|---|---|
+  | `create_task` | `request` | Slack context, intake decision, task type |
+  | The signal endpoint | `attached` | signal type (session taken from the task row) |
+  | Intake attach | `attached`, or `clarify_answer` when it answers a clarify question | Slack, decision, targets |
+  | Intake clarify and skip | `request` | Slack, decision, clarify or skip kind |
+  | `send_slack_message_idempotent(kind, session_key, meta)` | `reply` from `EvaluatorRetry._deliver_final` (generic and catalog); every other `notify_slack_user` call is RMP's own text and stays `notice` | process run, parts |
+  | Evaluator rows | `verdict` | verdict, attempt, process run |
+
+  Empty metadata values are dropped.
+- **New tables** in `app/db/models.py`:
+  - `dm_documents`: kind, a unique `source_key`, summary, TOC, status, `source_at`, `valid_to`;
+  - `dm_sections`: TOC entries with path, level, summary;
+  - `dm_chunks`: text, `context_header`, TOC pointer (`section_id`), task, session, process run, message, role, `source_at`, `meta`, `valid_to`;
+  - `dm_links`: typed edges, unique per source, target and relation;
+  - `dm_ingest_queue`: a partial unique index deduplicates pending work per source, and a partial due-index serves the drain;
+  - `dm_context_reports`.
+
+  Section and chunk ids are assigned by the ingester (deterministic in Step 5), so facts can cite chunks that survive re-ingestion.
+- **`app/db/database.py`:** idempotent DDL for the three `task_messages` columns and their indexes, plus English full-text GIN indexes on chunks (header + text), sections (title + summary) and documents (title + summary). The new tables come from `create_all`.
+- **`app/config.py`:** `DEFAULT_DEEP_MEMORY`, merged in `load_settings()`, with `get_deep_memory_config()`. The section holds:
+  - kill switches `enabled` (ingestion, index, fast context), `recall_enabled` and `followups_enabled`;
+  - the collection name, `text-embedding-3-large` at 1536 dimensions;
+  - lane concurrency, per-minute cap and busy-enrich slots;
+  - the daily token budget and call deadline;
+  - ingest concurrency and the tool-document threshold;
+  - fast-context deadline and size;
+  - recall deadline and follow-up wait.
+
+  `openai_direct.lane_policy()` now reads these settings, falling back to its defaults on invalid values. `settings.example.json` carries the section.
+
+**Deviation:** the plan names two kill switches, `enabled` and `followups_enabled`. A third, `recall_enabled`, separates recall, whose report the evaluator and later steps can use, from the follow-up message. Both default to off until Step 15's live acceptance turns them on, so no step before that changes what Kirill sees.
+
+**Verification:**
+- 75 related tests pass, and the full suite has 617 passed, 3 skipped (7 new).
+- New whole-path scenario: an ask and an attached follow-up log `request`, `attached`, `notice` (the attach note), `verdict` and `reply`, all on the Slack session. The Slack ids, intake decision, process run and verdict are in the metadata.
+- Unit tests cover: the pending-job index rejects a duplicate and accepts the same source once the first is done; empty metadata is dropped; the migrations list; settings merge and example parity; `lane_policy` reads settings and falls back on invalid values.
+- Live Postgres, in one transaction that was rolled back: two full rounds of `create_all` plus all 52 migrations succeeded, and created the 3 columns, the 6 tables and all indexes. Afterwards 0 `dm_*` tables existed.
+
+---

@@ -211,10 +211,11 @@ async def persist_evaluator_verdict(payload: Dict[str, Any], result: Dict[str, s
                     )
                 )
             if task_id and task_id != "unknown":
-                from app.db.models import TaskMessage
+                from app.db.models import Task, TaskMessage
                 import uuid as _uuid
 
                 cmd = result.get("command_to_aura") or result.get("reason") or verdict
+                task = await db.get(Task, task_id)
                 db.add(
                     TaskMessage(
                         id=str(_uuid.uuid4()),
@@ -222,6 +223,13 @@ async def persist_evaluator_verdict(payload: Dict[str, Any], result: Dict[str, s
                         role="evaluator",
                         content=(cmd or "verdict")[:4000],
                         source="process_evaluator",
+                        kind="verdict",
+                        session_key=getattr(task, "openclaw_session_key", None),
+                        meta={
+                            "verdict": verdict or None,
+                            "attempt": payload.get("attempt"),
+                            "process_run_id": process_run_id or None,
+                        },
                     )
                 )
             await db.commit()

@@ -153,11 +153,17 @@ async def send_slack_message_idempotent(
     user_id: str,
     message: str,
     bot_token: str,
+    *,
+    kind: str = "notice",
+    session_key: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Send a Slack DM once per (task_id, message), in ordered parts when it is long.
 
-    Returns False on a permanent Slack error (recorded and alerted); raises
-    SlackTransientError when delivery may still succeed later.
+    ``kind`` is how the conversation log records it: ``reply`` (Aura's judged answer),
+    ``followup`` or ``notice`` (RMP's own text). Returns False on a permanent Slack
+    error (recorded and alerted); raises SlackTransientError when delivery may still
+    succeed later.
     """
     if not message or not user_id or not bot_token:
         return False
@@ -211,6 +217,9 @@ async def send_slack_message_idempotent(
                     content=message,
                     source="slack",
                     slack_ts=first_ts,
+                    kind=kind,
+                    session_key=session_key or None,
+                    meta={**(meta or {}), "parts": len(parts)},
                 )
             )
             await db.commit()

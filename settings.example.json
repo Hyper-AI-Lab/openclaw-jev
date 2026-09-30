@@ -83,5 +83,24 @@
       "memory_canary": 360,
       "cron_default": 55
     }
+  },
+  "deep_memory": {
+    "enabled": true,
+    "recall_enabled": false,
+    "followups_enabled": false,
+    "collection_name": "rmp_deep_memory_v1",
+    "embedder_model": "text-embedding-3-large",
+    "embedding_dims": 1536,
+    "lane_concurrency": 3,
+    "lane_requests_per_minute": 60,
+    "lane_busy_enrich_slots": 1,
+    "llm_daily_token_budget": 4000000,
+    "llm_call_deadline_sec": 120,
+    "ingest_concurrency": 2,
+    "tool_document_min_chars": 2000,
+    "fast_context_deadline_sec": 3.0,
+    "fast_context_max_chars": 6000,
+    "recall_deadline_sec": 180,
+    "followup_wait_sec": 300
   }
 }

@@ -288,6 +288,32 @@ async def test_a_follow_up_sent_while_aura_works_is_folded_into_the_one_judged_r
     assert {name: c.status for name, c in checks.items()} == dict.fromkeys(checks, "pass")
 
 
+async def test_the_conversation_log_records_each_messages_kind_session_and_place(h):
+    ask, follow_up = "Plan a day in Kobe.", "Add a place for Kobe beef at lunch."
+    first, folded = "Harborland in the morning, Kitano in the afternoon.", "Harborland, Kobe beef at Mouriya, Kitano."
+
+    async def follow_up_arrives(payload):
+        h.intake.append({"decision": "attach_active", "target_task_id": payload["task_id"]})
+        await h.send(follow_up, "1790000011.000200")
+
+    h.intake, h.drafts, h.during = [{"decision": "create_fresh"}], [first, folded], {1: follow_up_arrives}
+    tid = (await h.send(ask, "1790000011.000100"))["task_id"]
+    await h.finish(tid)
+
+    log = await h.rows(TaskMessage, TaskMessage.task_id == tid, order=TaskMessage.created_at)
+    assert [(m.role, m.kind) for m in log] == [
+        ("user", "request"), ("user", "attached"), ("assistant", "notice"),
+        ("evaluator", "verdict"), ("assistant", "reply"),
+    ]
+    assert {m.session_key for m in log} == {SESSION}
+    request, attached, _notice, verdict, reply = log
+    assert request.meta["slack"]["message_id"] == "1790000011.000100" and request.meta["task_type"] == "user"
+    assert attached.meta["slack"]["message_id"] == "1790000011.000200" and attached.meta["intake_decision_id"]
+    run = (await h.rows(ProcessRun, ProcessRun.task_id == tid))[0]
+    assert (verdict.meta["verdict"], verdict.meta["process_run_id"]) == ("accept", run.id)
+    assert (reply.content, reply.meta["process_run_id"], reply.meta["parts"]) == (folded, run.id, 1)
+
+
 async def test_the_same_dm_delivered_twice_runs_once(h):
     ask = "Compare the JR Pass with regional passes for Kansai."
     reply = "For Kansai alone the Kansai Area Pass costs far less than the nationwide JR Pass."
