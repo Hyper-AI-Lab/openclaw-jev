@@ -394,3 +394,54 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
   - Afterwards: legacy 2,509 rows = 2,509 points, registry 214 = 214, deep 51 = 51.
 
 ---
+
+## Step 8 — One fast context, assembled once
+
+**Date:** 2026-09-30, deployed 14:40 JST (`b7c1625`).
+
+**Calibration first (live, read-only):** dense cosine of `text-embedding-3-large` at 1536 dimensions, for the top facts of five real questions.
+- Relevant: 0.49–0.58 (the Kubernetes pages for a Kubernetes question).
+- Borderline: 0.31–0.33 (USER.md for "who am I").
+- Noise: 0.15–0.30 (heartbeat notes, 0.299, for "test code word", which has no matching fact).
+- BM25 raw scores are no relevance signal on their own: an irrelevant note scored 8.94 on shared words.
+
+So the fast path's floor applies to dense similarity, at 0.30 (`fast_context_fact_floor`). BM25 then only reorders what clears it.
+
+**What changed:**
+- `app/deep_memory/curator.py` (new), `assemble_fast_context`: one block, headed `PROCESS-SCOPED MEMORY` as the prompt policy, plugin and canary expect. Sections in priority order:
+  1. **RECENT DIALOGUE** of this Slack conversation, which now includes catalog-typed user tasks; it keeps its newest turns when cut.
+  2. **Facts** from the deep index above the floor (`index.search(dense_floor=…)`: a dense query with `score_threshold` picks the candidates, then the fused dense+BM25 query ranks only those), plus pinned facts. Superseded facts never appear. If the index cannot answer, Postgres text search is used.
+  3. **Earlier tasks intake linked** (the decision's `similar_task_ids`): their enriched summary with outcome and answer, else their registry entry. Internal tasks never appear.
+  4. **This run so far**: working and episodic memory, by recency.
+  5. **Up to 3 procedures** above a similarity floor.
+  - Budget and deadline: shares of 2,600, 1,400, 1,200, 1,200 and 600 characters within `fast_context_max_chars` (6,000), and a 3 s deadline (`fast_context_deadline_sec`). Legs run concurrently, and a leg that misses the deadline is left out; the lowest-priority sections go first when space runs out.
+  - Canaries, heartbeats and cron get only their own run's memory.
+  - Every assembly records `memory.fast_context` (ms, sections, characters), which makes the p95 measurable.
+  - `warm_up()` opens the index, embedder and Mem0 clients in the worker at startup, and embeddings reuse one OpenAI client per key.
+- The activity `build_process_memory_context` (same name, so replays are unaffected) now returns this block. It serves the generic plan loop, catalog attempts and `resume_clarify`, which previously started with no dialogue or memory.
+- `create_task` no longer prefetches memory or dialogue. Its brief is intake's brief plus the web-capability brief. This removes the duplicate memory block found in Step 1.
+- The evaluator judges against the same composed block: `process_brief` is now the latest memory block, not the creation-time brief, in both generic and catalog workflows.
+  - A draft recovered by the reconciler skips the plan loop, so its block is assembled before judging, behind `workflow.patched("deep-memory-judge-with-fast-context")`.
+- `MemoryRouter.read_ordered` no longer reads task-scope memory, which has no writer, or the per-item graph links, which never existed.
+
+**Verification:**
+- New `tests/test_fast_context.py` (7) covers:
+  - one block in priority order with the right fact-search arguments, and the timing event;
+  - text search when the index is down, and no facts section when nothing is close;
+  - linked tasks from their summary or their registry entry, never canaries;
+  - canaries get only their run;
+  - budgets cut low-priority sections, and the dialogue keeps its newest turns;
+  - a leg over the deadline is left out while the others arrive;
+  - line-safe cutting.
+- New whole-path scenario: in two DMs in a row, the second prompt has the memory block once and RECENT DIALOGUE once, with the first exchange, and the evaluator's prompt carries the same dialogue. The prompt policy's own "Use PROCESS-SCOPED MEMORY" instruction is the only other mention.
+- The judgment harness registers the memory activity, and its recovered-draft scenario now proves the evaluator sees the dialogue.
+- Updated tests: `read_ordered` order without task scope, and the activity-level tests.
+- New index tests: the dense floor ranks only close points; the embedding client is reused per key.
+- Full suite: 686 passed, 4 skipped.
+- **Live**, real tasks on production data, rolled back:
+  - For the code-word question: the dialogue with the PELICAN-47 exchange and the run's memory, and correctly no facts section, since nothing is close enough.
+  - For the Kubernetes question: dialogue, the relevant documentation facts (0.49–0.57), the run and procedures.
+  - Latency: a fresh process without warm-up took 3.0 s and dropped facts at the deadline. After `warm_up()` the first assembly took 307 ms and later ones 197–329 ms.
+  - After the deploy, the worker logged "Fast-context clients warm in 4.7s".
+
+---
