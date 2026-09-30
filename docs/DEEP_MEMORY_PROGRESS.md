@@ -337,3 +337,60 @@ Append-only. One entry per plan step, newest at the bottom. Each entry states wh
   - The run showed one bug, fixed and tested: a final reply logged before message kinds existed was read as "(none)".
 
 ---
+
+## Step 7 — Facts, consolidation, promotion rework, legacy procedural delete
+
+**Date:** 2026-09-30, deployed 13:27 JST (`6cf8d85`). **Correction:** Step 6 was deployed at 13:03 JST. Its "12:50–13:35" range was an estimate.
+
+**Research before coding:**
+- Mem0's extraction prompt ([prompts.py](https://github.com/mem0ai/mem0/blob/4debc58a/mem0/configs/prompts.py)):
+  - categories: preferences, personal details (names, relationships, dates), plans and intentions, activity preferences, health, professional details, and facts from content the user shares;
+  - it extracts from both user and assistant messages and returns an empty list when nothing qualifies.
+- Consolidation follows the Step 1 brief: Mem0's per-candidate ADD/UPDATE/DELETE/NOOP against the nearest memories, Graphiti's invalidation instead of deletion, and Mem0 v3's transition capture.
+
+**What changed:**
+- `app/deep_memory/facts.py` (new), job kind `facts` (priority 3):
+  - It runs only when the task has a delivered reply, and never for internal runs.
+  - **Extraction:** one gpt-6-luna call over the numbered turns, both Kirill's and Aura's, returns standalone third-person statements. Each carries a subject, kind, speaker, source turns, `valid_from` and confidence.
+  - **Filtered before review:** confidence below 0.6; anything the redactor would change; natural-language credentials (password, passcode, API or access key, auth token, OTP and 2FA codes, card or account number, IBAN, CVV, seed or recovery phrase, and a capitalised PIN). A test code word to remember is not a credential.
+  - **Citations:** facts cite the deterministic id of stage 1's first turn chunk, so they can be written before or after ingestion.
+  - **Consolidation:** the nearest active facts come from the hybrid index, or Postgres text search when Qdrant cannot answer. One call judges every candidate against them:
+    - `same`: nothing is written;
+    - `update`: a new fact with `supersedes_memory_id`, the old one retired (`valid_to`, its index point queued for deletion), and a `supersedes` link;
+    - `contradicts`: both kept, plus a `contradicts` link;
+    - `new`.
+  - A decision naming a nonexistent fact counts as `new`.
+  - **Review:** Jev reviews everything to be written in its configured promotion mode (currently shadow).
+- `MemoryRouter.write` takes an optional `db`, so facts join the job's transaction, plus `valid_from` and `supersedes_memory_id`.
+- `app/memory/promotion.py`:
+  - The heuristic `extract_semantic_facts` is removed. It produced "Site referenced: …" rows.
+  - Promotion queues fact extraction, never writes user or pinned memory itself, and records a procedure only when more than one plan step ran **and** tools were used.
+  - `validate_fact` stays for `ops/jev_eval.py`.
+- `app/workflows/generic_task.py` and `catalog_task.py`: promotion runs only after the reply was delivered. Catalog workflows used to promote before posting. The change is behind `workflow.patched("deep-memory-promote-after-delivery")`, so histories recorded before it replay unchanged.
+- `ops/purge_legacy_procedures.py` (new): dry run by default; `--apply` backs up, then removes the rows' vectors, including points that name their row only in the payload, and the rows.
+- Tests:
+  - `tests/test_deep_facts.py` (8) covers:
+    - a changed code word leaves exactly one active fact (supersede, retire, link, index rows, consolidation input);
+    - citations equal stage 1's chunk ids;
+    - `same` writes nothing, and a contradiction keeps both;
+    - credentials and weak facts never reach review or memory;
+    - Jev enforce holds before any write;
+    - nothing without a delivered reply or from internal runs;
+    - a decision pointing nowhere counts as new;
+    - credential detection spares ordinary facts.
+  - Tests of the removed heuristic path were rewritten for the new behaviour, and Jev's hold-before-write contract moved to the facts tests.
+
+**Verification:**
+- Full suite: 676 passed, 4 skipped. One earlier run had a teardown error in the whole-path reconciler-nudge scenario that did not reproduce in four later runs (three harness runs, one full suite). Future full runs capture tracebacks to diagnose it if it returns.
+- Live, with real gpt-6-luna calls and Jev's shadow review, on production Postgres, rolled back:
+  - a task saying "Remember this for later: my test code word is ORCA-19." became the fact "Kirill's test code word is ORCA-19.";
+  - a later task, "Update: my test code word is now LYNX-44.", was judged an update: "Kirill's test code word is LYNX-44 (changed from ORCA-19).", with `supersedes`, the old fact retired and a `supersedes` link;
+  - **exactly one active code-word fact.**
+- **Approved deletion applied** at 13:27 JST:
+  - 43 legacy procedural rows, all old reply text in the `user` pool, deleted with 82 vector ids;
+  - backup `data/backups/purge-legacy-procedures-20260930T042732Z.json` (0600, 43 rows);
+  - one procedural row remains, the only real procedure summary;
+  - 25 more legacy points named deleted rows only in their payload (confirmed by scan, all procedural). `ops/reconcile_vectors --apply` removed them, and the script now finds such points itself.
+  - Afterwards: legacy 2,509 rows = 2,509 points, registry 214 = 214, deep 51 = 51.
+
+---

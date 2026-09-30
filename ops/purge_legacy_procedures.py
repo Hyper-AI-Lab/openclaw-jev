@@ -27,6 +27,21 @@ def _row(obj) -> dict:
     return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
 
 
+def _points_naming(row_ids: set) -> list:
+    """Older points carry their row id only in the payload, not as point id or vector_ref."""
+    from app.memory.vector_sync import _client, memory_collection
+
+    client, name = _client(), memory_collection()
+    if not client.collection_exists(name):
+        return []
+    found, offset = [], None
+    while True:
+        points, offset = client.scroll(name, limit=1024, offset=offset, with_payload=["provenance"], with_vectors=False)
+        found += [str(p.id) for p in points if ((p.payload or {}).get("provenance") or {}).get("memory_id") in row_ids]
+        if offset is None:
+            return found
+
+
 async def legacy_procedures() -> list:
     async with AsyncSessionLocal() as db:
         rows = (
@@ -56,8 +71,9 @@ async def main(apply: bool) -> None:
     os.chmod(path, 0o600)
     print(f"backup: {path}")
     ids = [m.id for m in doomed]
+    named = await asyncio.to_thread(_points_naming, set(ids))
     vectors = await asyncio.to_thread(
-        delete_memory_points, ids + [(m.provenance_ref or {}).get("vector_ref") for m in doomed]
+        delete_memory_points, ids + [(m.provenance_ref or {}).get("vector_ref") for m in doomed] + named
     )
     async with AsyncSessionLocal() as db:
         await db.execute(delete(MemoryLink).where(or_(MemoryLink.source_id.in_(ids), MemoryLink.target_id.in_(ids))))
