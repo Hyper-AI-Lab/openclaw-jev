@@ -15,7 +15,7 @@ Evidence from live code plus [Audit SoT vs live path](9d363fde-4b3d-4075-88f9-f3
 |-----------|-------|----------------|
 | 1 SoT `CONCEPT_TREE.md` complete, no TBD | **MATCH** | `/root/.openclaw/rmp/docs/CONCEPT_TREE.md`; `rg TBD\|TODO\|placeholder` on that file → no unfinished sections |
 | 2 Thin Cursor binding; nested copy identical | **MATCH** | `/root/.cursor/rules/rmp-architecture.mdc` = `/root/.openclaw/rmp/.cursor/rules/rmp-architecture.mdc` (md5 `4e6bcb24…`) |
-| 3 ARCHITECTURE points at SoT; no MiniMax-primary / live `auth-profiles.json` as store | **MATCH** live config / **MISMATCH** leftover ARCHITECTURE/README claims below | `openclaw.json` primary `openai/gpt-5-nano`; no live `auth-profiles.json` |
+| 3 ARCHITECTURE points at SoT; no MiniMax-primary / live `auth-profiles.json` as store | **MATCH** live config / **MISMATCH** leftover ARCHITECTURE/README claims below | `openclaw.json` primary `openai/gpt-6-luna`; no live `auth-profiles.json` |
 | 4 Slack session key on user DMs | **MATCH** | Plugin `pickSlackSessionKey` `plugins/rmp_adapter/index.js`; API `persist_user_session_key` `app/task_registry/session_identity.py` |
 | 5 Classifiers advisory; catalog only from intake | **MATCH** | `catalog_assignment_from_intake` `app/api/server.py` + `app/workflows/catalog.py`; `resolve_generic_profile` → `None` `app/orchestrator/prompt_policy.py` |
 | 6 Embedder probe; honest not-ready if 410 | **MATCH** | `settings.json` `enabled: false`, `ready` false, model `nvidia/llama-nemotron-embed-1b-v2`, reason HTTP 410. Conversational path = RECENT DIALOGUE + process memory |
@@ -51,7 +51,7 @@ Evidence from live code plus [Audit SoT vs live path](9d363fde-4b3d-4075-88f9-f3
 | Keywords / `GENERIC_PROFILES` assign catalogs | **SUPERSEDED** | Intake LLM assigns; plugin sends no `process_type_hint` |
 | `create_fresh` = empty mind | **SUPERSEDED** | New Task row + RECENT DIALOGUE |
 | Ask user at attempt 10 | **SUPERSEDED** | Strategy change at 10; diagnosis at 20 |
-| MiniMax/GLM as primary; no OpenAI | **SUPERSEDED** | `openai/gpt-5-nano` → MiniMax; no GLM, no DeepSeek |
+| MiniMax/GLM as primary; no OpenAI | **SUPERSEDED** | `openai/gpt-6-luna` → `nvidia/openai/gpt-oss-20b`; no GLM, no DeepSeek, no MiniMax |
 | `nv-embed-v1` working | **SUPERSEDED** | Honest vector not-ready (HTTP 410) |
 | `auth-profiles.json` is the store | **SUPERSEDED** | SQLite `authProfiles.store`; live JSON file absent |
 
@@ -68,7 +68,7 @@ Evidence from live code plus [Audit SoT vs live path](9d363fde-4b3d-4075-88f9-f3
 | Conversational gated | **MATCH** | `tests/test_process_evaluator.py`; `generic_task.py` |
 | `skip_quality` = `is_internal_task` only | **MATCH** (live) | `generic_task.py`; catalog never skips |
 | Intake LLM/workflow fail → Generic + RMP Slack | **MATCH** | `intake_activities.py`; `execution_mode.py` |
-| Primary `openai/gpt-5-nano`; idle ~5s; no GLM | **MATCH** | `openclaw.json`; dist `DEFAULT_LLM_IDLE_TIMEOUT_MS = 5e3` |
+| Primary `openai/gpt-6-luna`; idle ~5s; no GLM | **MATCH** | `openclaw.json`; dist `DEFAULT_LLM_IDLE_TIMEOUT_MS = 5e3` |
 | Vector `/health` not claiming ready | **MATCH** | `server.py` + `memory/router.py` `ready: false` |
 | Whole-message stop only | **MATCH** | Plugin `isStopCommand` + Temporal `is_whole_message_stop` |
 | User DMs do not `wait_active` onto canaries | **MATCH** | `intake_decision_engine.py` `user_visible_active_tasks` |
@@ -79,7 +79,7 @@ Evidence from live code plus [Audit SoT vs live path](9d363fde-4b3d-4075-88f9-f3
 | ARCHITECTURE plugin still sends `process_type_hint` | **MISMATCH** (doc-only) | `ARCHITECTURE.md` Layer C |
 | ARCHITECTURE intent profiles as live assignment | **MISMATCH** (doc-only) | `ARCHITECTURE.md` §5.4 / Layer B vs `resolve_generic_profile` → `None` |
 | ARCHITECTURE “106 pytest”; workspace MEMORY as authoritative recall | **MISMATCH** (doc-only) | `ARCHITECTURE.md` vs 324 pytest / process-scoped inject |
-| README MiniMax primary / GLM fallback | **MISMATCH** (doc-only) | `README.md` vs live `openclaw.json` |
+| README model claims | **MATCH** | `README.md` names `openai/gpt-6-luna` with the `nvidia/openai/gpt-oss-20b` fallback, as live `openclaw.json` does |
 | AGENTS.md MAIN SESSION must read `MEMORY.md`; TOOLS.md `tasks.md` ledgers | **MISMATCH** (executor leftover) | Workspace vs constitution §6 |
 | Dead `catalog_type_for_workflow` regex helper | **SUPERSEDED** | `catalog.py` — not called on live `/tasks` |
 | API still *accepts* `process_type_hint` as advisory | **SUPERSEDED** | `server.py` TaskRequest; plugin does not send it |
