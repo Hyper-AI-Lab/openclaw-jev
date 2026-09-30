@@ -754,3 +754,42 @@ So the fast path's floor applies to dense similarity, at 0.30 (`fast_context_fac
 **Deviation:** the plan gave readiness, invariants and docs to Grok 4.7 extra-high subagents. Kirill's rule names Grok 4.5 High, which is not among the available models, and the Grok 4.7 subagents had stalled on a provider limit earlier today (Step 4). I wrote these modules myself, as in Steps 4–5.
 
 ---
+
+## Step 15 — End-to-end proof and close
+
+**Date:** 2026-09-30 (18:40–19:05 JST so far).
+
+**Retrieval eval:**
+- `ops/deep_memory_eval.py` and the labelled fixture `tests/fixtures/deep_memory_eval.json`.
+  - 50 items: facts, conversation turns, guide sections, fetched pages, task records and incidents, with near-miss distractors (another code word, a neighbouring SKU, other Kubernetes versions).
+  - 32 queries, exact and paraphrased.
+- Offline it validates the fixture. `--live` indexes the corpus into a throwaway collection, runs each query four ways, and deletes the collection. `tests/test_deep_memory_eval.py` (3) checks the fixture and the metrics.
+- Live, with `text-embedding-3-large`, k = 8 (the throwaway collection was deleted after the run):
+
+  | Mode | recall@8 | MRR |
+  |---|---|---|
+  | Hybrid RRF (what the index uses) | 1.000 | 1.000 |
+  | Hybrid DBSF | 1.000 | 0.984 |
+  | Dense only | 1.000 | 0.958 |
+  | BM25 only | 0.938 | 0.930 |
+
+  - Gate passed: hybrid ≥ 0.9 and not below dense.
+  - Recall@8 saturates on a set this size, so the ranking difference shows in MRR: hybrid RRF ranked a relevant item first for every query. RRF stays; DBSF brings nothing on this set.
+  - BM25 alone missed "Which timezone am I in?" (no shared words with "Japan Standard Time").
+- Before the push, an invented health fact in the fixture was replaced with a neutral preference, and the eval was re-run with the same numbers.
+
+**Deploy:**
+- The code is live through the watcher: the last application change was Step 14's, and Step 15 changed only `ops/`, `tests/` and docs.
+- The collection, the user-memory migration and the procedural delete were done in Steps 4 and 7. Checked again: 51 user facts = 51 points, and the one remaining procedural row is the real procedure summary Step 7 kept.
+- **Recall and follow-ups on** at 18:54 JST: `deep_memory.recall_enabled` and `followups_enabled` set through the locked settings writer. The API's status view shows both on; the next user task recalls.
+
+**Proof:**
+- Full suite: 772 passed, 4 skipped. It includes the whole-path harness (14 scenarios, the two-phase follow-up among them), the judgment harness (11), the two-phase harness (16) and the replay of recorded histories.
+- **Pushed** to `Hyper-AI-Lab/openclaw-jev`: `371c87d..216d31e`.
+  - The first CI run failed at collection: the rule-copy test stat-ed `/root/.cursor/rules/…`, which the runner cannot read. The test now skips when the host rule cannot be read.
+  - CI run [36698805338](https://github.com/Hyper-AI-Lab/openclaw-jev/actions/runs/36698805338): success, 771 passed, 5 skipped.
+- Before the push, the outgoing diff was scanned for credentials. The only match is the fake key the facts tests use to prove credentials are never stored.
+
+**Live acceptance with Kirill:** pending: a fact then a question about it, a long document then a question about one section, a past task's outcome, a stop, and a rework.
+
+---
