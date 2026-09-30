@@ -790,6 +790,31 @@ So the fast path's floor applies to dense similarity, at 0.30 (`fast_context_fac
   - CI run [36698805338](https://github.com/Hyper-AI-Lab/openclaw-jev/actions/runs/36698805338): success, 771 passed, 5 skipped.
 - Before the push, the outgoing diff was scanned for credentials. The only match is the fake key the facts tests use to prove credentials are never stored.
 
-**Live acceptance with Kirill:** pending: a fact then a question about it, a long document then a question about one section, a past task's outcome, a stop, and a rework.
+**Live acceptance with Kirill** (19:01–19:13 JST, his DMs to Aura, recall and follow-ups on):
+
+| Check | Task | What happened |
+|---|---|---|
+| A fact, then asked later | `2120d2bd`, `4cadfe37` | "My acceptance code word is KESTREL-58", then, four tasks later, "What's my acceptance code word?": recall ready in 10.0 s, merged before judgment, answered KESTREL-58 in 27 s |
+| A long document, then one section | `df3d14e2`, `f7c8b7f1` | Aura read kubernetes.io/releases. Asked later when the 1.34 branch reaches end of life: recall (11.2 s) found the page's section and merged at a step boundary; answered October 27, 2026 |
+| A past task's outcome | `384fb4c8` | Reply at +27 s; the report came after it, so the novelty judge ran: adds (3 points), notice, `__recall` refinement, accepted at attempt 2, follow-up at +52 s |
+| A rework | `df3d14e2` | Two reworks, accepted at attempt 3. Prompt tokens per attempt: 28,647, then 24,740 and 24,999 (fresh sessions): flat |
+| A stop | `cabfadb4` | Kirill heard "stopped as requested" within 3 s and nothing else was sent. But the OpenClaw run was aborted only 52 s later (below) |
+
+Against the targets:
+- **Fast path:** fast context 336–1,755 ms over 14 assemblies, so p95 under 3 s. One memory block in each task prompt.
+- **Deep path:** reports took 10.0–18.2 s (p95 under 90 s). Intake's `recall_depth` skipped recall for the page read, the NAS guide and the bullets request.
+- **Follow-ups:** one, judged (`judged_followups` passes).
+- **Reworks:** flat.
+- **Regressions:** none. Readiness afterwards: 38 pass, 1 warn, 0 fail. Deep index 139 points = 139 objects; `task_documents` found enriched documents for both tasks past 30 minutes.
+
+**Two findings, two fixes** (`c8ee0e0`, deployed 19:31 JST, CI [36702938542](https://github.com/Hyper-AI-Lab/openclaw-jev/actions/runs/36702938542) green, 774 passed):
+- **The follow-up was not worth an interruption.** Its three points were how the work was processed: the evaluator accepted, one Slack message was sent, about a minute. The novelty judge now asks whether Kirill would be misinformed or miss something without the follow-up; processing details and minor background are none. Rechecked live on gpt-6-luna: that case is now none; the etcd cases stay adds, corrects and none.
+- **The stop aborted late.** Two CLI calls ran, one for the planner session that had already finished. Each exceeded the 30 s wrapper. The wrapper killed only the CLI's parent, and its node child sent the abort at +52 s, unrecorded. Now finished sessions (gateway store `done`, `failed`, `killed`) are skipped, the CLI gets 120 s in its own process group, and a timeout kills the whole group (tests +3).
+
+**Residual: stop latency on this host.**
+- A live re-measure with a scratch run after the fix: the abort reached the gateway at +44.6 s. The run had meanwhile made three tool calls and finished on its own at +16.8 s, so the gateway answered `no-active-run`.
+- A trace shows why. The time is in the `openclaw gateway call` CLI before it connects: it re-launches node after 17 s and connects 41 s later (under strace; 7.8 s for an idle `health` call without it). The gateway answers within about 1 s of the connection. At Step 10 this morning the same path took 4.5 s.
+- Kirill sees the stop at once and nothing is delivered after it. But a run can go on for up to about 45 s on this host now; for catalog work with side effects, that matters.
+- The durable fix is a direct gateway client. The gateway's connection is device-authenticated (the client signs the challenge nonce with a device key pair and applies OpenClaw's token rules), so that touches authentication and needs Kirill's approval. Not done.
 
 ---
