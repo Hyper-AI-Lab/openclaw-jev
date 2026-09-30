@@ -102,8 +102,10 @@ async def main():
         await worker.run()
     finally:
         from app.decisions.jev import close_jev_client
+        from app.llm.openai_direct import close_direct_clients
 
         await close_jev_client()
+        await close_direct_clients()
 
 
 if __name__ == "__main__":

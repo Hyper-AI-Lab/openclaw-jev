@@ -44,6 +44,7 @@ _RMP_RUN_RE = re.compile(
 #   openclaw_hook      — RMP /hooks/agent dispatch (triggers gateway work)
 #   rate_limit_429     — NVIDIA 429 observed (RMP path)
 #   probe              — manual health probes
+#   memory_llm         — the IA's direct model calls (app/llm/openai_direct.py)
 
 _SOURCES = (
     "embed",
@@ -51,7 +52,9 @@ _SOURCES = (
     "openclaw_hook",
     "rate_limit_429",
     "probe",
+    "memory_llm",
 )
+DIRECT_SOURCES = ("memory_llm",)
 
 _UNSET_PROFILE_IDS = frozenset({"nvidia:unknown", "unknown", ""})
 
@@ -577,6 +580,7 @@ def transcript_usage(hours: float = 24, *, now_ms: Optional[int] = None) -> Dict
         "totals": _zero_attribution(),
         "abort_rate": 0.0,
         "max_live_context": {"session_key": None, "tokens": 0},
+        "direct": {},
     }
     if not AGENT_DB_PATH.is_file():
         return report
@@ -602,6 +606,7 @@ def transcript_usage(hours: float = 24, *, now_ms: Optional[int] = None) -> Dict
         logger.debug("transcript usage query failed: %s", exc)
         return report
     report["available"] = True
+    report["direct"] = _direct_usage(since_ms, now_ms)
 
     turns: List[Dict[str, Any]] = []
     for session_id, _seq, event_json, created_at, session_key in rows:
@@ -691,6 +696,36 @@ def transcript_usage(hours: float = 24, *, now_ms: Optional[int] = None) -> Dict
     return report
 
 
+def source_tokens_today(source: str) -> int:
+    """Today's (UTC) input plus output tokens recorded under ``source``, all profiles."""
+    day = (_read_store().get("days") or {}).get(_utc_day()) or {}
+    total = 0
+    for bucket in (day.get("profiles") or {}).values():
+        counts = (bucket.get("by_source") or {}).get(source) or {}
+        total += int(counts.get("input_tokens") or 0) + int(counts.get("output_tokens") or 0)
+    return total
+
+
+def _direct_usage(since_ms: int, now_ms: int) -> Dict[str, Dict[str, int]]:
+    """Ledger totals of direct (non-OpenClaw) model calls in a window, per source."""
+    out: Dict[str, Dict[str, int]] = {}
+    for entry in _read_store().get("rolling_24h") or []:
+        source = entry.get("source")
+        ts = int(entry.get("ts_ms") or 0)
+        if source not in DIRECT_SOURCES or not since_ms <= ts <= now_ms:
+            continue
+        bucket = out.setdefault(source, {"requests": 0, "input_tokens": 0, "output_tokens": 0})
+        if not entry.get("is_rate_limit"):
+            bucket["requests"] += 1
+        bucket["input_tokens"] += int(entry.get("input_tokens") or 0)
+        bucket["output_tokens"] += int(entry.get("output_tokens") or 0)
+    return out
+
+
+def _direct_prompt_tokens(report: Optional[Dict[str, Any]]) -> int:
+    return sum(int(v.get("input_tokens") or 0) for v in ((report or {}).get("direct") or {}).values())
+
+
 def _input_budget_24h() -> int:
     try:
         from app.config import load_settings
@@ -724,8 +759,9 @@ def usage_alerts(
     recent_hours = float((recent or {}).get("window_hours") or 24)
     alerts: List[str] = []
 
-    prompt = _prompt_tokens(totals)
-    still_burning = recent is None or _prompt_tokens(recent_totals) * 24 / recent_hours > budget
+    prompt = _prompt_tokens(totals) + _direct_prompt_tokens(report)
+    recent_prompt = _prompt_tokens(recent_totals) + _direct_prompt_tokens(recent)
+    still_burning = recent is None or recent_prompt * 24 / recent_hours > budget
     if prompt > budget and still_burning:
         alerts.append(f"24 h prompt tokens {prompt:,} over budget {budget:,}")
 

@@ -121,8 +121,10 @@ async def lifespan(app: FastAPI):
     if _vector_task:
         await _vector_task
     from app.decisions.jev import close_jev_client
+    from app.llm.openai_direct import close_direct_clients
 
     await close_jev_client()
+    await close_direct_clients()
 
 
 app = FastAPI(lifespan=lifespan)

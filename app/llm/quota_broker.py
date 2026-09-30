@@ -51,6 +51,10 @@ TERMINAL_TASK_STATUSES = frozenset(
 DEFAULT_STALE_SLOT_MS = 90 * 60 * 1000
 # Canary/system/intake sessions must not pin LLM slots for long — they starve user work.
 CANARY_STALE_SLOT_MS = 6 * 60 * 1000
+# Direct memory-model calls last at most minutes; an older slot belongs to a dead process.
+MEMORY_LANE_STALE_MS = 10 * 60 * 1000
+# A recall waiter that stopped polling this long ago no longer holds enrichment back.
+MEMORY_RECALL_WAIT_MS = 30 * 1000
 
 _lock = asyncio.Lock()
 _state_lock = threading.Lock()
@@ -887,12 +891,80 @@ def _task_looks_like_canary_sync(task_id: str) -> bool:
         return False
 
 
+def reserve_memory_lane_slot(
+    priority: str,
+    *,
+    concurrency: int,
+    per_minute: int,
+    busy_enrich_slots: int,
+    waiter_id: Optional[str] = None,
+) -> Optional[str]:
+    """One direct memory-model call slot, shared by every RMP process, or None to wait.
+
+    Recall (a user is waiting) goes first: enrichment is not admitted while a recall
+    waits, and holds at most ``busy_enrich_slots`` while user runs hold broker slots.
+    """
+
+    def _mutate(state: Dict[str, Any]) -> Optional[str]:
+        lane = state.setdefault("memory_lane", {})
+        slots = lane.setdefault("slots", {})
+        waiting = lane.setdefault("recall_waiting", {})
+        now = _now_ms()
+        for sid in [s for s, v in slots.items() if now - float(v.get("started_ms") or 0) > MEMORY_LANE_STALE_MS]:
+            slots.pop(sid, None)
+        for wid in [w for w, ts in waiting.items() if now - float(ts or 0) > MEMORY_RECALL_WAIT_MS]:
+            waiting.pop(wid, None)
+        calls = [t for t in lane.get("calls_ms") or [] if now - float(t) < 60_000]
+        lane["calls_ms"] = calls
+        admit = len(slots) < max(1, concurrency) and len(calls) < max(1, per_minute)
+        if admit and priority != "recall":
+            enrich_active = sum(1 for v in slots.values() if v.get("priority") != "recall")
+            user_busy = _count_kind_slots(state)[0] > 0
+            admit = not waiting and not (user_busy and enrich_active >= max(1, busy_enrich_slots))
+        if not admit:
+            if priority == "recall" and waiter_id:
+                waiting[waiter_id] = now
+            return None
+        if waiter_id:
+            waiting.pop(waiter_id, None)
+        slot_id = uuid.uuid4().hex
+        slots[slot_id] = {"priority": priority, "started_ms": now, "pid": os.getpid()}
+        calls.append(now)
+        return slot_id
+
+    return _mutate_state(_mutate)
+
+
+def release_memory_lane_slot(slot_id: str, *, waiter_id: Optional[str] = None) -> None:
+    def _mutate(state: Dict[str, Any]) -> None:
+        lane = state.setdefault("memory_lane", {})
+        (lane.setdefault("slots", {})).pop(slot_id, None)
+        if waiter_id:
+            (lane.setdefault("recall_waiting", {})).pop(waiter_id, None)
+
+    _mutate_state(_mutate)
+
+
+def _memory_lane_status(state: Dict[str, Any]) -> Dict[str, Any]:
+    lane = state.get("memory_lane") or {}
+    slots = lane.get("slots") or {}
+    now = _now_ms()
+    return {
+        "active": len(slots),
+        "recall_active": sum(1 for v in slots.values() if v.get("priority") == "recall"),
+        "enrich_active": sum(1 for v in slots.values() if v.get("priority") != "recall"),
+        "recall_waiting": len(lane.get("recall_waiting") or {}),
+        "calls_last_minute": sum(1 for t in lane.get("calls_ms") or [] if now - float(t) < 60_000),
+    }
+
+
 def get_orchestration_status(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     cfg = QuotaConfig.from_settings(settings)
     state = _read_state()
     g = state.get("global") or {}
     slots = g.get("active_slots") or {}
     return {
+        "memory_lane": _memory_lane_status(state),
         "max_concurrent": cfg.max_concurrent,
         "user_slots": _pool_caps(cfg.max_concurrent)[0],
         "canary_slots": _pool_caps(cfg.max_concurrent)[1],
@@ -1058,20 +1130,27 @@ async def acquire(
     return profile_id
 
 
-def wait_for_dispatch_sync(settings: Optional[Dict[str, Any]] = None) -> str:
-    """Blocking quota gate for sync embedders and other non-async callers."""
+def wait_for_dispatch_sync(
+    settings: Optional[Dict[str, Any]] = None, *, deadline: Optional[float] = None
+) -> str:
+    """Blocking quota gate for sync embedders and other non-async callers.
+
+    ``deadline`` (epoch seconds) caps the wait below ``max_wait_sec``.
+    """
     cfg = QuotaConfig.from_settings(settings)
     profiles = [p for p, _ in _load_env_keys()]
     if not profiles:
         profiles = ["nvidia:default"]
 
-    deadline = time.time() + cfg.max_wait_sec
-    while time.time() < deadline:
+    give_up_at = time.time() + cfg.max_wait_sec
+    if deadline is not None:
+        give_up_at = min(give_up_at, deadline)
+    while time.time() < give_up_at:
         state = _read_state()
         now_ms = _now_ms()
         wait_ms = _soonest_ready_ms(state, profiles, now_ms, cfg.min_interval_sec)
         if wait_ms > 0:
-            time.sleep(min(wait_ms / 1000.0, 30.0))
+            time.sleep(max(0.0, min(wait_ms / 1000.0, 30.0, give_up_at - time.time())))
             continue
 
         pid = _pick_key(state, profiles, now_ms, rotation_mode=cfg.rotation_mode)
@@ -1089,10 +1168,12 @@ def wait_for_dispatch_sync(settings: Optional[Dict[str, Any]] = None) -> str:
             _patch_auth_last_good(chosen)
             return chosen
 
-        time.sleep(1.0)
+        time.sleep(max(0.0, min(1.0, give_up_at - time.time())))
 
     raise TimeoutError(
-        f"LLM quota: no NVIDIA key available within {cfg.max_wait_sec:.0f}s"
+        "LLM quota: no NVIDIA key available before the caller's deadline"
+        if deadline is not None
+        else f"LLM quota: no NVIDIA key available within {cfg.max_wait_sec:.0f}s"
     )
 
 
