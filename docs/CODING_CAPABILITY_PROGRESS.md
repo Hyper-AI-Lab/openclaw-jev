@@ -533,3 +533,43 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
   - After the fix: 881 passed, 5 skipped, exit 0 (276 s). Node 21/22 passed, with the live-plugin drift check skipped because `/root` is hidden.
 - **Live collection:** a change made as `aura-coder` became one commit by "Aura (Claude Code)" (`docs/CODING_CAPABILITY_PROGRESS.md` M, `leaked.py` A, 2 insertions). The secret scan flagged the planted `ghp_…` string in `leaked.py`. The head was read from the review repository.
 - **Cleanup:** the scratch job, review repository and run records were removed afterwards.
+
+---
+
+## Step 9 — Approval and evidence hardening
+
+**Date:** 2026-10-01.
+
+**What changed:**
+- `app/workflows/approval.py` (new): `gate_decision(signalled)` reads only Kirill's words (`user_words`), never the catch-up brief before them.
+  - **Approves:** a whole message `approve`, `approved` or `deploy`.
+  - **Stops:** a whole-message stop (the existing `is_whole_message_stop`: stop, cancel, abort, halt, "please stop"), or `reject` or `deny`.
+  - **Anything else** is "other". That includes "yes", "ok", "go ahead" and "approve, but…".
+  - It also defines `REMINDER_AFTER` (12 h) and `CLOSE_AFTER` (7 days).
+- **The catalog gate** (`app/workflows/catalog_task.py`) decides with `gate_decision`. It sends one reminder after 12 hours, and closes the task as `cancelled` (terminal) after 7 days with "nothing was done". `_stop_task` takes a status. The coding gate (step 10) uses the same function.
+- **Provenance:**
+  - The plugin's inbound record keeps the Slack `senderId` and `timestamp` (from the 2026.9.7 SDK's inbound facts), and `POST /tasks` sends them as `slack_user_id` and `slack_event_ts`.
+  - `TaskRequest` takes both. `_slack_context` (new tasks) and `_slack_meta` (attached messages) store them as `meta.slack.user_id` and `event_ts`.
+  - The new activity `confirm_approval_provenance` (registered in `worker.py`) accepts only a Slack message from the configured owner, recorded after the gate opened, whose own words approve. An API signal, another sender, an earlier message or a conditional "approve, but…" is refused, and an `approval.refused` event is recorded.
+- **The evaluator:**
+  - `format_external_evidence` writes up a Claude Code run's outcome, commands and edits, RMP's own test run, the commits, the diffstat and secret findings.
+  - `verify_response_quality` passes `external_evidence` into a new prompt section, `EXTERNAL EVIDENCE (recorded by RMP, not by Aura)`. The prompt rule: code work is done only as far as that evidence shows it, and tests pass only when RMP's own run passed.
+  - The OpenClaw transcript trace stays as it was. Tasks without evidence show "(none)".
+- Tests:
+  - `tests/test_approval_gate.py` (21): an 18-case decision table, including briefs that mention "stop" and "ok", plus procurement on the time-skipping server:
+    - a brief doesn't decide, an unclear reply gets "not recognised", and "approve" lets the purchase run;
+    - a whole-message stop stops at the gate;
+    - no reminder at 11 h, exactly one at 13 h, and `cancelled` at 7 days.
+  - `tests/test_approval_provenance.py` (6): the owner's approval after the gate opened is confirmed; another sender, before the gate, an API signal and a conditional approval are refused and recorded; the attach path keeps the sender.
+  - `tests/test_process_evaluator.py` (+2): with and without evidence.
+  - Node: the sender and event time reach `POST /tasks`.
+  - `tests/test_ingress_identity.py`: the Slack context carries the sender.
+
+**Deviations:**
+- **A narrower API approve signal in the catalog gate:** it still works for the existing non-deploy catalog flows (procurement, browser automation). The provenance check applies before deploys, as the plan says, so the coding gate (step 10) requires it.
+- **Deploy:** the plugin change needed a gateway restart, taken at an idle moment. There were no open process runs, so no in-flight catalog workflow could replay into the changed gate.
+
+**Verification:**
+- **Tests:** full suite 911 passed, 4 skipped. The one failure, an exact-dict test, was then updated to cover the sender, and its module passes. 79 gate, evaluator and catalog tests; node 23/23.
+- **Deploy:** the plugin was synced (live == repo), and the gateway was ready 108 s after the restart. The plugin probe shows all six runtime plugins loaded with no load failures. The API and worker reloaded without errors.
+- **Live provenance:** Kirill sent a DM ("Quick check, please reply OK"), and its task message records `user_id=U0AELFYTLKS` (the configured owner) and `event_ts=1790818985363`. The message before the deploy had neither.
