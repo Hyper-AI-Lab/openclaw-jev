@@ -487,3 +487,49 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
   - **Reattach:** the script that started the run died. A new `start()` returned the finished run rather than launching another, and tailing from offset 0 read all 7 events.
 - **Live stop:** a running Bash loop was stopped by SIGINT in 0.3 s. The unit went inactive, no `aura-coder` process was left (3 before the stop), and the outcome was `stopped`.
   - Hardening on the live unit: `User=aura-coder`, `ProtectSystem=strict`, `ProtectHome=read-only`, `ProtectProc=invisible`, `NoNewPrivileges`, a 1 h 30 min runtime cap, a 15 s stop timeout, 3 GiB of memory and 1,024 tasks.
+
+---
+
+## Step 8 — Workspaces, repositories, independent verification
+
+**Date:** 2026-10-01.
+
+**What changed:**
+- **Registry** (`coding.repositories` in `app/config.py`):
+  - `rmp` is cloned from the live repo at `/root/.openclaw/rmp`. It is tested with the full suite (through the shared venv) and `node --test tests/node/*.test.js`, and deploys to `self`.
+  - `agentic-design` (`npm ci`, `npm test`), `cursor-dual-agent-loop` (a job venv, `pip install -e .`, pytest) and `cyber-ai-team` (a job venv, the backend requirements, `pytest backend/tests`) deploy as a PR.
+  - Also new: `verify_timeout_sec` 1800, `job_retention_days` 14 and `diff_limit_chars` 200,000.
+- `app/coding/workspace.py` (new):
+  - **Preparing a job:** root clones the trusted source with `--no-hardlinks` into `/srv/aura-code/jobs/<task>`. A hardlinked object would change owner in the live repo too. The source is the live repo, or a root-only mirror under `/srv/aura-code/repos` fetched through a temporary `GIT_ASKPASS` that reads the token file at use, so the token never appears in a URL or config.
+  - The checkout gets the branch `aura/<task8>-<slug>`, the identity "Aura (Claude Code)" and excludes for `.aura/`, `.venv/`, `node_modules/` and caches. It is then handed to `aura-coder` with mode 0700. A bare review repository at the same base goes to `/srv/aura-code/review/<task>.git` (root-only), and `job.json` goes to the root-only runs directory. Preparing is idempotent.
+  - **Collecting:** root runs no git in the checkout, because a planted `.git/config` (fsmonitor, textconv or filter driver) or hook would run as root or misreport the diff.
+    - Inside a hardened unit, `aura-coder` commits leftovers with the Aura identity, with hooks and fsmonitor off, and exports `HEAD ^base` as a bundle.
+    - Root copies the bundle into the runs directory, then runs `bundle verify` and fetches it into the review repository.
+    - Root refuses work that no longer builds on its base.
+    - It reads commits, the diffstat, the bounded diff (`--no-textconv --no-ext-diff`), changed paths, changed tests and dependency files there.
+  - **The secret scan** reads added lines for key and token patterns and for this host's own secret values, from the env files, the GitHub token and the secrets inside `openclaw.json` and `settings.json`. Findings block a deploy (step 11).
+  - **Retention:** `prune(days)` removes checkouts and review repositories past retention unless one of their runs is live. The reconciler loop calls it hourly.
+- `app/coding/verify.py` (new):
+  - **The run:** the repository's setup and test commands, each as `aura-coder` in its own hardened unit (writable: the checkout, its home and the cache). Output goes to root-owned files, and the exit codes recorded by systemd are the evidence. Counts are parsed from pytest and node, but only for information, because the job can change its own tests.
+  - **Shared venv:** `ensure_shared_venv` builds `/srv/aura-code/venvs/<repo>` from the trusted source's requirements only. A job whose `requirements.txt` differs builds its own venv in the sandbox.
+  - **Test cache:** `seed_test_cache` places Temporal's 84 MB test server in `aura-coder`'s `TMPDIR` (`/srv/aura-code/cache/tmp`), since units have a private `/tmp`.
+- `app/llm/quota_broker.py`: an unreadable OpenClaw env file now reads as "no keys". The sandbox hides `/etc/openclaw`, and `Path.is_file()` raises `PermissionError` on a hidden path. This fixed 10 failures in the first live run.
+- Tests:
+  - `tests/test_coding_workspace.py` (8): branch, base and identity on prepare, and idempotence; an empty collection; Claude's commit plus leftovers collected from the review repository, with changed tests and dependencies; a planted fsmonitor and textconv neither run nor fake the diff; work rewritten off its base is refused; the secret scan; retention keeps a job with a live run; the GitHub mirror is fetched without storing the token.
+  - `tests/test_coding_verify.py` (7): a passing suite; a failing suite that prints a fake "2 passed"; a failed setup stops the run; the shared venv is used only for matching requirements; it is rebuilt when they change; the Temporal seed; summary parsing.
+  - `test_quota_broker.py` gains the unreadable-env case.
+  - The fake `systemd-run` gains `--wait` and `StandardError=inherit`.
+
+**Deviations and why:**
+- **The review-repository design is stricter than the plan's "collects commits, a diffstat, a bounded diff".** Reading the diff in Claude's own checkout would let its git config misreport the diff, or run code as root. Step 11's deploy takes its commit from the review repository too.
+- **I wrote the workspace and verification code myself**, not through a subagent, after step 7's subagent started 20 minutes late.
+- **The per-repository commands for the three PR repositories** are declared from their manifests and not yet run here. Step 14's PR acceptance runs one of them.
+
+**Verification:**
+- **Tests:** 66 coding tests, plus the affected modules (56).
+- **Shared venv:** built from the live `requirements.txt` in 62 s. It is root-owned and read-only for `aura-coder`, which can import pytest 8.3.5 and temporalio 1.23.0 from it. The test server is seeded.
+- **Live: the RMP suite as `aura-coder` from a job checkout** of this branch, in hardened units:
+  - First run: 870 passed, 10 failed, all of them the `PermissionError` above.
+  - After the fix: 881 passed, 5 skipped, exit 0 (276 s). Node 21/22 passed, with the live-plugin drift check skipped because `/root` is hidden.
+- **Live collection:** a change made as `aura-coder` became one commit by "Aura (Claude Code)" (`docs/CODING_CAPABILITY_PROGRESS.md` M, `leaked.py` A, 2 insertions). The secret scan flagged the planted `ghp_…` string in `leaked.py`. The head was read from the review repository.
+- **Cleanup:** the scratch job, review repository and run records were removed afterwards.
