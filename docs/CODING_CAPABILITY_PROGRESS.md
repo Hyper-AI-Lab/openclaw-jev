@@ -427,3 +427,63 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
   - Health canary `ops/canary.sh` CANARY OK in 15 s.
 - **Real DM round trip:** Kirill DMed Aura and she answered normally. Task `e31c6311`: created at 23:14:10Z, the evaluator accepted it, and `slack.delivered` followed at 23:14:47Z, 37 s end to end.
 - **Tests:** full suite 832 passed, 4 skipped (284 s); node 22/22.
+
+---
+
+## Step 7 — Claude Code runner
+
+**Date:** 2026-10-01.
+
+**Research:**
+- `code.claude.com/docs/en/headless`:
+  - SIGTERM exits 143 and records no result. SIGINT ends the turn.
+  - `--permission-prompts none` (2.1.259 and later) removes the tools that need a person.
+  - `system/api_retry` fields: `attempt`, `max_retries`, `retry_delay_ms`, `error_status`, `error` (12 categories).
+  - `system/init` metadata; `--resume <session_id>` works from any directory; `--json-schema` yields `structured_output`.
+- `code.claude.com/docs/en/agent-sdk/typescript`:
+  - the result's two variants: success, and `error_max_turns`, `error_during_execution`, `error_max_budget_usd`, `error_max_structured_output_retries`;
+  - `rate_limit_event`, `permission_denied`, `compact_boundary` and `ModelUsage`.
+
+**Recorded fixtures:** `tests/fixtures/claude_streams/record.py` runs the pinned CLI as `aura-coder` in hardened units, the way the runner does, and keeps each stream with its systemd exit line. Scenarios: `success_readonly`, `edit_and_test`, `max_turns`, `auth_failure`, `unknown_model`, `interrupted`, `resume_first` and `resumed`, plus `synthetic_usage_limit`, which can't be recorded on demand. What the recordings showed:
+- **API failures report "success":** an auth failure (401) and an unknown model (404) both end in a result with subtype `success` and `is_error` true (`terminal_reason: api_error`), with exit code 1.
+- **A stop leaves no result:** SIGINT ends the run with exit 0 and no result event.
+- **Edits through Bash:** Claude fixed the bug with `sed -i` in Bash, not the Edit tool. So changed files come from git (step 8), not from tool uses.
+- **Structured report:** it arrives as a `StructuredOutput` tool call.
+- **Rate limits:** `rate_limit_event` carries `rateLimitType`, `resetsAt` and `unifiedWindows`.
+- **Resumed sessions:** `modelUsage` and `total_cost_usd` cover the whole session, while `usage` covers only the latest run.
+
+**What changed:**
+- `app/coding/stream.py` (new) parses the stream incrementally into a `StreamState`:
+  - session, model and version;
+  - commands, files edited and read, and tool counts (the report tool excluded);
+  - tool errors, assistant errors and API retries;
+  - the latest rate limit, normalised to epoch seconds;
+  - permission denials, compactions, background tasks, the result, and milestones for notices.
+
+  `outcome()` classifies a run as `success`, `max_turns`, `usage_limit`, `auth_failed`, `api_error`, `error`, `stopped`, `timeout`, `no_result` or `running`. Usage limits and auth failures are told apart by error fields, never by `subtype`. `usage_summary()` gives tokens and cost.
+- `app/coding/runner.py` (new):
+  - `claude_argv`: `-p`, stream-json, `--model`/`--fallback-model`/`--max-turns` from settings, `bypassPermissions`, `--permission-prompts none`, `--append-system-prompt`, `--json-schema` and `--resume`.
+  - `start`: unit `aura-claude-<task>-<n>`, step 2's hardening plus `TimeoutStopSec=15`. Stdout goes through `StandardOutput=file:` into the root-only `/srv/aura-code/runs/<task>/<n>/`, and the exit is recorded by a root `ExecStopPost` (`$SERVICE_RESULT $EXIT_CODE $EXIT_STATUS`), so the run can write neither. `meta.json` stores the prompt's hash and length, not its text. It is idempotent: while the unit runs, or once it has ended, it returns the existing run, so an activity retry reattaches.
+  - `read_events(run, offset)`: complete lines only.
+  - `stop`: records the stop first, sends SIGINT, waits 10 s, then `systemctl stop`, which kills the cgroup.
+  - `finish`: the outcome.
+  - `record_usage`: books the run's tokens once, from `usage` only, under source `claude_code` and profile `claude_code:subscription`. That source is not in `DIRECT_SOURCES`, so it stays outside the OpenClaw prompt budget.
+  - `resume_at`: the usage limit's reset time plus 60 s.
+- Supporting changes: `app/coding/units.py` gains `RUNS_DIR`, `ops/setup_aura_coder.sh` creates `/srv/aura-code/runs` (root, 700), and `app/llm/usage_monitor.py` gains the `claude_code` source.
+- Tests:
+  - `tests/test_coding_stream.py` (19): every recording ends as it did.
+  - `tests/test_coding_runner.py` (15), with fake `systemd-run`, `systemctl` and `claude` in `tests/fakes/coding`. The fakes enforce `RuntimeMaxSec`, run `ExecStopPost` with systemd's variables, and replay recordings. Covered: argv, a full run, reattaching by offset with no lost or repeated line, a half-written line, idempotent start, stop within seconds, stop escalation when SIGINT is ignored, timeout, every recorded ending, usage booked once, a resumed run booking only its own tokens, and the usage-limit resume time.
+
+**Deviations and why:**
+- **The parser subagent started late.** It was launched on Grok 4.7 extra high, as the plan says, but didn't start for about 20 minutes. I wrote my own parser meanwhile. When its version landed, I kept it, after review, as the plan intends. I stopped it before it wrote tests, and kept my tests, which pass against its parser. It found that resumed runs report cumulative `modelUsage`, so `record_usage` now books `usage` only, and a test covers it.
+- **Pausing at the usage limit lands in step 10.** The plan describes pausing until `resetsAt`, telling Kirill and resuming the same session. The runner provides the pieces (the `usage_limit` outcome, `resume_at`, `--resume`). The timer and the notice belong to the coding workflow, and its harness test covers them there.
+
+**Verification:**
+- **Tests:** 65 coding and usage tests, then the full suite: 866 passed, 4 skipped (262 s). Node 22/22.
+- **Live read-only run through the real runner:** the unit `aura-claude-live-check-read-1` ended `success exited 0`.
+  - The report was `{phrase: KESTREL-9}`, in 3 turns, at an estimated $0.128.
+  - 30,512 tokens were booked once; the second call was a no-op.
+  - The stream and exit files are root-owned with mode 0600.
+  - **Reattach:** the script that started the run died. A new `start()` returned the finished run rather than launching another, and tailing from offset 0 read all 7 events.
+- **Live stop:** a running Bash loop was stopped by SIGINT in 0.3 s. The unit went inactive, no `aura-coder` process was left (3 before the stop), and the outcome was `stopped`.
+  - Hardening on the live unit: `User=aura-coder`, `ProtectSystem=strict`, `ProtectHome=read-only`, `ProtectProc=invisible`, `NoNewPrivileges`, a 1 h 30 min runtime cap, a 15 s stop timeout, 3 GiB of memory and 1,024 tasks.

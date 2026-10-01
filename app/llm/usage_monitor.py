@@ -54,6 +54,8 @@ _SOURCES = (
     "rate_limit_429",
     "probe",
     "memory_llm",
+    # Claude Code on Kirill's subscription: reported, never part of the OpenClaw prompt budget.
+    "claude_code",
 )
 DIRECT_SOURCES = ("memory_llm",)
 

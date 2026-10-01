@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Fake systemd-run for runner tests: a detached supervisor stands in for the transient unit.
+
+It runs the command with the unit's StandardOutput/StandardError files, enforces RuntimeMaxSec,
+and after the command ends runs ExecStopPost with SERVICE_RESULT, EXIT_CODE and EXIT_STATUS set
+the way systemd sets them. Unit state lives in $FAKE_UNITS_DIR.
+"""
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE = Path(os.environ["FAKE_UNITS_DIR"])
+
+
+def parse(args):
+    unit, props, env, workdir = None, {}, {}, None
+    for i, arg in enumerate(args):
+        if arg == "--":
+            return unit, props, env, workdir, args[i + 1:]
+        if arg.startswith("--unit="):
+            unit = arg.split("=", 1)[1]
+        elif arg.startswith("--property="):
+            key, value = arg[len("--property="):].split("=", 1)
+            props[key] = value
+        elif arg.startswith("--setenv="):
+            key, value = arg[len("--setenv="):].split("=", 1)
+            env[key] = value
+        elif arg.startswith("--working-directory="):
+            workdir = arg.split("=", 1)[1]
+    raise SystemExit("fake systemd-run: no command")
+
+
+def supervise(spec_path):
+    spec = json.loads(Path(spec_path).read_text())
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_IGN)
+    props = spec["props"]
+    stdout = open(props["StandardOutput"].split(":", 1)[1], "wb")
+    stderr = open(props.get("StandardError", "file:/dev/null").split(":", 1)[1], "wb")
+    child = subprocess.Popen(spec["command"], stdout=stdout, stderr=stderr, cwd=spec["workdir"],
+                             env={**os.environ, **spec["env"]},
+                             preexec_fn=lambda: [signal.signal(s, signal.SIG_DFL) for s in (signal.SIGINT, signal.SIGTERM)])
+    limit = float(props.get("RuntimeMaxSec", "0") or 0)
+    started, timed_out = time.monotonic(), False
+    while child.poll() is None:
+        if limit and time.monotonic() - started > limit and not timed_out:
+            timed_out = True
+            child.terminate()
+        time.sleep(0.05)
+    code = child.returncode
+    if timed_out:
+        result, exit_code, status = "timeout", "killed", "TERM"
+    elif code < 0:
+        result, exit_code, status = "signal", "killed", signal.Signals(-code).name[3:]
+    else:
+        result, exit_code, status = ("success" if code == 0 else "exit-code"), "exited", str(code)
+    post = props.get("ExecStopPost", "")
+    if post:
+        subprocess.run(shlex.split(post.lstrip("+")),
+                       env={**os.environ, "SERVICE_RESULT": result, "EXIT_CODE": exit_code, "EXIT_STATUS": status})
+    (STATE / f"{spec['unit']}.pid").unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--supervise"]:
+        supervise(sys.argv[2])
+        sys.exit(0)
+    unit, props, env, workdir, command = parse(sys.argv[1:])
+    STATE.mkdir(parents=True, exist_ok=True)
+    spec = STATE / f"{unit}.json"
+    spec.write_text(json.dumps({"unit": unit, "props": props, "env": env, "workdir": workdir, "command": command}))
+    proc = subprocess.Popen([sys.executable, __file__, "--supervise", str(spec)], start_new_session=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    (STATE / f"{unit}.pid").write_text(str(proc.pid))

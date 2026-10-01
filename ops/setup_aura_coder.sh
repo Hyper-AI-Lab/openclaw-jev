@@ -36,6 +36,8 @@ install -d -o root -g root -m 755 /srv/aura-code
 install -d -o root -g "${CODER}" -m 750 /srv/aura-code/jobs
 install -d -o root -g root -m 755 /srv/aura-code/venvs
 install -d -o "${CODER}" -g "${CODER}" -m 700 /srv/aura-code/cache
+# Run streams and exit records: written by systemd as root, never by aura-coder.
+install -d -o root -g root -m 700 /srv/aura-code/runs
 install -d -o root -g root -m 700 /etc/aura-coder
 log "directories ready under /srv/aura-code and /etc/aura-coder"
 

@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Fake systemctl for runner tests: is-active, kill --signal and stop on fake units."""
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+STATE = Path(os.environ["FAKE_UNITS_DIR"])
+
+
+def pid(unit):
+    try:
+        value = int((STATE / f"{unit}.pid").read_text())
+        os.kill(value, 0)
+        return value
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        return None
+
+
+def signal_unit(unit, sig):
+    value = pid(unit)
+    if value:
+        try:
+            os.killpg(value, sig)
+        except ProcessLookupError:
+            pass
+
+
+def main(args):
+    action, unit = args[0], args[-1]
+    if action == "is-active":
+        return 0 if pid(unit) else 3
+    if action == "kill":
+        name = next(a.split("=", 1)[1] for a in args if a.startswith("--signal="))
+        signal_unit(unit, getattr(signal, name))
+        return 0
+    if action == "stop":
+        props = json.loads((STATE / f"{unit}.json").read_text())["props"] if (STATE / f"{unit}.json").exists() else {}
+        signal_unit(unit, signal.SIGTERM)
+        deadline = time.monotonic() + float(props.get("TimeoutStopSec", "15"))
+        while pid(unit) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        signal_unit(unit, signal.SIGKILL)
+        while pid(unit):
+            time.sleep(0.05)
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

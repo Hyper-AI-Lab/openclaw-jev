@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Fake claude for runner tests: replays a recorded stream named in the prompt ("fixture:<name>").
+
+$FAKE_CLAUDE_DELAY seconds between lines; $FAKE_CLAUDE_ARGV records the argv. It exits with the
+recorded exit code, ends at SIGINT with code 0 as the real CLI did, and ignores SIGINT when the
+prompt also says "stubborn".
+"""
+import json
+import os
+import re
+import signal
+import sys
+import time
+from pathlib import Path
+
+FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "claude_streams"
+
+prompt = sys.argv[sys.argv.index("-p") + 1]
+if os.environ.get("FAKE_CLAUDE_ARGV"):
+    Path(os.environ["FAKE_CLAUDE_ARGV"]).write_text(json.dumps(sys.argv[1:]))
+name = re.search(r"fixture:(\w+)", prompt).group(1)
+signal.signal(signal.SIGINT, signal.SIG_IGN if "stubborn" in prompt else lambda *_: sys.exit(0))
+delay = float(os.environ.get("FAKE_CLAUDE_DELAY", "0"))
+for line in (FIXTURES / f"{name}.jsonl").read_text().rstrip("\n").split("\n"):
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+    time.sleep(delay)
+exit_line = (FIXTURES / f"{name}.exit").read_text().split()
+sys.exit(int(exit_line[2]) if exit_line[1] == "exited" else 1)

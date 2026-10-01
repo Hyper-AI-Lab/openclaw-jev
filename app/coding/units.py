@@ -14,6 +14,7 @@ CODER_USER = "aura-coder"
 CODER_HOME = Path("/home/aura-coder")
 CODE_ROOT = Path("/srv/aura-code")
 JOBS_DIR = CODE_ROOT / "jobs"
+RUNS_DIR = CODE_ROOT / "runs"
 CACHE_DIR = CODE_ROOT / "cache"
 VENVS_DIR = CODE_ROOT / "venvs"
 CLAUDE_BIN = CODER_HOME / ".local" / "bin" / "claude"
