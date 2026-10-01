@@ -838,6 +838,7 @@ async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
         build_evaluator_prompt,
         format_action_trace,
         format_artifacts,
+        format_external_evidence,
         parse_evaluator_response,
         persist_evaluator_verdict,
     )
@@ -845,6 +846,7 @@ async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     task_id = payload.get("task_id", "unknown")
     enriched = dict(payload)
+    enriched["external_evidence_text"] = format_external_evidence(payload.get("external_evidence"))
     try:
         enriched["situational_tools"] = await collect_situational_context(payload)
     except Exception:

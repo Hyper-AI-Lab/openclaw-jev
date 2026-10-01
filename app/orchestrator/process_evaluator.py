@@ -112,6 +112,32 @@ def format_action_trace(trace: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_external_evidence(evidence: Optional[Dict[str, Any]]) -> str:
+    """Work RMP recorded outside OpenClaw: a Claude Code run, RMP's own test run, the commits."""
+    if not evidence:
+        return ""
+    lines: List[str] = []
+    run = evidence.get("claude") or {}
+    if run:
+        lines.append(f"Claude Code run: {run.get('outcome')}, {run.get('num_turns')} turns")
+        lines += [f"- ran: {c[:200]}" for c in (run.get("commands") or [])[:30]]
+        lines += [f"- edited: {p}" for p in (run.get("files_edited") or [])[:30]]
+    tests = evidence.get("tests")
+    if tests:
+        lines.append(f"RMP's own test run: {'passed' if tests.get('ok') else 'FAILED'}")
+        for command in tests.get("commands") or []:
+            lines.append(f"- {' '.join(command.get('command') or [])[-120:]}: {command.get('exit')} {command.get('counts') or ''}")
+    commits = evidence.get("commits") or []
+    if commits:
+        lines.append("Commits:")
+        lines += [f"- {c.get('sha', '')[:10]} {c.get('subject')} ({c.get('author')})" for c in commits[:20]]
+    if evidence.get("diffstat"):
+        lines.append("Diffstat:\n" + str(evidence["diffstat"]).strip()[-2000:])
+    if evidence.get("secrets"):
+        lines.append(f"Secret scan: {len(evidence['secrets'])} finding(s); nothing deploys until they are removed")
+    return "\n".join(lines)
+
+
 def format_artifacts(artifacts: List[Dict[str, Any]]) -> str:
     if not artifacts:
         return "(none recorded)"
@@ -125,6 +151,7 @@ def build_evaluator_prompt(payload: Dict[str, Any]) -> str:
     brief = (payload.get("process_brief") or payload.get("initial_memory_block") or "").strip()
     tools = payload.get("tools_taken") or payload.get("actions_taken") or ""
     artifacts = payload.get("artifacts") or ""
+    external = (payload.get("external_evidence_text") or "").strip()
     situational = (payload.get("situational_tools") or "").strip()
     return f"""You are the RMP PROCESS EVALUATOR (not Aura). Aura's reply must NOT reach Slack until you accept it.
 
@@ -143,13 +170,17 @@ TOOLS/ACTIONS TAKEN:
 ARTIFACTS:
 {artifacts or "(not provided)"}
 
+EXTERNAL EVIDENCE (recorded by RMP, not by Aura):
+{external or "(none)"}
+
 SITUATIONAL TOOLS (local health/readiness/web only; privileged ops are denied):
 {situational or "(not fetched)"}
 
 ATTEMPT: {attempt}
 
 Greetings/social chat: accept a short matching reply. Do not skip this judgment.
-Check every claim of work done in AURA OUTPUT (read, searched, checked, ran, sent, created, updated, fixed) against TOOLS/ACTIONS TAKEN and ARTIFACTS. A claim with no matching successful action is not done: verdict=rework and name the claim in command_to_aura. Answers that need only knowledge or the conversation need no tools.
+Check every claim of work done in AURA OUTPUT (read, searched, checked, ran, sent, created, updated, fixed) against TOOLS/ACTIONS TAKEN, EXTERNAL EVIDENCE and ARTIFACTS. A claim with no matching successful action is not done: verdict=rework and name the claim in command_to_aura. Answers that need only knowledge or the conversation need no tools.
+Code work (files changed, commits, tests run or passing) is done only as far as EXTERNAL EVIDENCE shows it: tests pass only when RMP's own test run passed.
 Insufficient work: verdict=rework with a concrete command_to_aura.
 Around attempt 10 you may verdict=strategy_change. Around attempt 20, verdict=escalate_user.
 

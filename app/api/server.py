@@ -161,6 +161,9 @@ class TaskRequest(BaseModel):
     process_type_hint: Optional[str] = None
     task_kind_hint: Optional[str] = None
     slack_message_id: Optional[str] = None
+    # Who sent it and when, as Slack reported them; a deploy's approval is checked against these.
+    slack_user_id: Optional[str] = None
+    slack_event_ts: Optional[float] = None
     thread_id: Optional[str] = None
     reply_to: Optional[Dict[str, Any]] = None
     attachments: Optional[List[Dict[str, Any]]] = None
@@ -299,6 +302,8 @@ async def _cancel_intake_reservation(task: Task, db: AsyncSession) -> None:
 def _slack_context(request: TaskRequest) -> Dict[str, Any]:
     return {
         "message_id": request.slack_message_id,
+        "user_id": request.slack_user_id,
+        "event_ts": request.slack_event_ts,
         "thread_id": request.thread_id,
         "reply_to_id": (request.reply_to or {}).get("id"),
         "attachments": request.attachments or [],

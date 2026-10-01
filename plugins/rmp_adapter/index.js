@@ -146,6 +146,8 @@ function inboundFromEvent(event) {
   return {
     content: String(event?.content || event?.body || '').trim(),
     messageId: String(event?.messageId || '') || null,
+    senderId: String(event?.senderId || '') || null,
+    timestamp: Number.isFinite(event?.timestamp) ? event.timestamp : null,
     threadId: String(event?.threadId || '') || null,
     replyTo: replyToId
       ? { id: replyToId, body: String(event?.replyToBody || '').slice(0, 2000), sender: String(event?.replyToSender || '') }
@@ -335,6 +337,8 @@ async function createRmpTaskFromInbound({ sessionKey, intent, tags, rawText, hea
     // No process_type_hint: intake LLM + memory/registry decide routing.
     idempotency_key: idemKey,
     slack_message_id: inbound?.messageId || null,
+    slack_user_id: inbound?.senderId || null,
+    slack_event_ts: inbound?.timestamp ?? null,
     thread_id: inbound?.threadId || null,
     reply_to: inbound?.replyTo || null,
     attachments: inbound?.attachments?.length ? inbound.attachments : null,

@@ -19,6 +19,7 @@ from app.db.models import (
     ProcessRun,
     Step,
     Task,
+    TaskMessage,
 )
 
 
@@ -109,6 +110,41 @@ async def record_event(payload: Dict[str, Any]) -> str:
         )
         await db.commit()
     return event_id
+
+
+@traced_activity("approval.confirm_provenance")
+async def confirm_approval_provenance(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Whether an approval came from Kirill's Slack user, in a message recorded after the gate opened.
+
+    Only messages that arrived through Slack carry a sender; an API signal or a message without one is
+    refused, and the refusal is recorded. ``gate_opened_at`` is UTC (ISO 8601).
+    """
+    from app.config import get_slack_owner_user_id
+    from app.workflows.approval import gate_decision
+
+    task_id = payload["task_id"]
+    opened = datetime.fromisoformat(payload["gate_opened_at"]).replace(tzinfo=None)
+    owner = get_slack_owner_user_id()
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            select(TaskMessage)
+            .where(TaskMessage.task_id == task_id, TaskMessage.role == "user", TaskMessage.source == "slack",
+                   TaskMessage.created_at >= opened)
+            .order_by(TaskMessage.created_at.desc())
+        )).scalars().all()
+        for row in rows:
+            slack = (row.meta or {}).get("slack") or {}
+            if owner and slack.get("user_id") == owner and gate_decision(row.content) == "approve":
+                return {"ok": True, "message_id": row.id, "slack_ts": row.slack_ts, "slack_user_id": owner,
+                        "event_ts": slack.get("event_ts")}
+        senders = sorted({str(((r.meta or {}).get("slack") or {}).get("user_id")) for r in rows})
+        reason = (f"no Slack approval from {owner or 'the owner (unset)'} after {opened.isoformat()}"
+                  f" ({len(rows)} Slack message(s) since, senders {senders})")
+        db.add(Event(correlation_id=task_id, entity_type="task", entity_id=task_id, event_type="approval.refused",
+                     event_payload={"gate_opened_at": payload["gate_opened_at"], "reason": reason}))
+        await db.commit()
+    logger.warning("Approval refused for task %s: %s", task_id[:8], reason)
+    return {"ok": False, "reason": reason}
 
 
 @traced_activity("process.ensure_run")

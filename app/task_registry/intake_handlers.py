@@ -83,6 +83,8 @@ def _slack_meta(request) -> Optional[dict]:
         return None
     return {
         "message_id": message_id,
+        "user_id": getattr(request, "slack_user_id", None),
+        "event_ts": getattr(request, "slack_event_ts", None),
         "thread_id": getattr(request, "thread_id", None),
         "reply_to_id": (getattr(request, "reply_to", None) or {}).get("id"),
         "attachments": attachments,

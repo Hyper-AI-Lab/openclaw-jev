@@ -1,5 +1,5 @@
 """Step-driven workflow using catalog templates."""
-import re
+import asyncio
 from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +14,7 @@ with workflow.unsafe.imports_passed_through():
         validate_openclaw_output,
     )
     from app.task_registry.stop_command import is_whole_message_stop
+    from app.workflows.approval import CLOSE_AFTER, REMINDER_AFTER, gate_decision
     from app.activities.db_activities import (
         acquire_process_run_lease,
         build_process_memory_context,
@@ -106,18 +107,18 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
             self.user_inputs.append(message)
 
     async def _stop_task(
-        self, task_id: str, session_key: str, stop_message: str
+        self, task_id: str, session_key: str, stop_message: str, status: str = "stopped_by_user"
     ) -> Dict[str, Any]:
         await workflow.execute_activity(
             update_task_status,
-            {"task_id": task_id, "status": "stopped_by_user"},
+            {"task_id": task_id, "status": status},
             start_to_close_timeout=timedelta(seconds=10),
         )
         await workflow.execute_activity(
             update_process_state,
             {
                 "process_run_id": self.process_run_id,
-                "state": "stopped_by_user",
+                "state": status,
                 "ended": True,
             },
             start_to_close_timeout=timedelta(seconds=10),
@@ -127,7 +128,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
             {"session_key": session_key, "task_id": task_id, "message": stop_message},
             start_to_close_timeout=timedelta(seconds=30),
         )
-        return {"status": "stopped_by_user", "task_id": task_id}
+        return {"status": status, "task_id": task_id}
 
     async def _consume_stop(self, task_id: str, session_key: str) -> Optional[Dict[str, Any]]:
         if self._cancel_requested:
@@ -365,28 +366,44 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                             "approval_gate notified despite intermediate_updates=off task=%s",
                             task_id,
                         )
+                    gate_opened = workflow.now()
+                    reminded = False
                     approved = False
                     while not approved:
-                        await workflow.wait_condition(
-                            lambda: len(self.user_inputs) > 0 or self._approved
-                        )
+                        wait_until = gate_opened + (CLOSE_AFTER if reminded else REMINDER_AFTER)
+                        try:
+                            await workflow.wait_condition(
+                                lambda: len(self.user_inputs) > 0 or self._approved,
+                                timeout=max(wait_until - workflow.now(), timedelta(seconds=1)),
+                            )
+                        except asyncio.TimeoutError:
+                            if reminded:
+                                return await self._stop_task(
+                                    task_id,
+                                    session_key,
+                                    f"Task {task_id[:8]} closed: no approval within 7 days, so nothing was done.",
+                                    status="cancelled",
+                                )
+                            reminded = True
+                            await workflow.execute_activity(
+                                notify_slack_user,
+                                {"session_key": session_key, "task_id": task_id,
+                                 "message": f"Reminder, still waiting for your approval:\n{approval_msg}"},
+                                start_to_close_timeout=timedelta(seconds=30),
+                            )
+                            continue
                         if self._approved:
                             self._approved = False
                             approved = True
                             break
-                        reply = self.user_inputs.pop(0).strip()
-                        if re.search(
-                            r"\b(stop|abort|cancel|halt|reject|deny)\b", reply.lower()
-                        ):
+                        decision = gate_decision(self.user_inputs.pop(0))
+                        if decision == "stop":
                             return await self._stop_task(
                                 task_id,
                                 session_key,
                                 f"Task {task_id[:8]} stopped at approval gate.",
                             )
-                        if re.search(
-                            r"\b(approve|approved|yes|go\s+ahead|proceed|ok)\b",
-                            reply.lower(),
-                        ):
+                        if decision == "approve":
                             approved = True
                             break
                         await workflow.execute_activity(
@@ -395,7 +412,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                                 "session_key": session_key,
                                 "task_id": task_id,
                                 "message": (
-                                    "Approval not recognized. Reply 'approve' to continue "
+                                    "Approval not recognised. Reply 'approve' to continue "
                                     "or 'stop' to cancel."
                                 ),
                             },

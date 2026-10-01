@@ -54,6 +54,40 @@ def test_evaluator_prompt_is_not_aura():
     assert "hello" in prompt
 
 
+EVIDENCE = {
+    "claude": {"outcome": "success", "num_turns": 7, "commands": ["python3 -m pytest -q tests/test_app.py"],
+               "files_edited": ["app/coding/runner.py"]},
+    "tests": {"ok": False, "commands": [{"command": ["python", "-m", "pytest", "-q"], "exit": "exit-code exited 1",
+                                         "counts": {"failed": 2, "passed": 879}}]},
+    "commits": [{"sha": "5e11a266b598aa", "subject": "Fix the runner", "author": "Aura (Claude Code)"}],
+    "diffstat": " app/coding/runner.py | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)",
+    "secrets": [{"path": "leaked.py", "kind": "GitHub token"}],
+}
+
+
+def test_code_claims_are_judged_against_the_evidence_rmp_recorded():
+    from app.orchestrator.process_evaluator import format_external_evidence
+
+    text = format_external_evidence(EVIDENCE)
+    assert "Claude Code run: success, 7 turns" in text and "- ran: python3 -m pytest -q tests/test_app.py" in text
+    assert "- edited: app/coding/runner.py" in text and "RMP's own test run: FAILED" in text
+    assert "exit-code exited 1 {'failed': 2, 'passed': 879}" in text
+    assert "5e11a266b5 Fix the runner (Aura (Claude Code))" in text and "1 file changed" in text
+    assert "Secret scan: 1 finding(s)" in text
+    prompt = build_evaluator_prompt({"user_intent": "fix the runner", "agent_response": "Fixed; all tests pass.",
+                                     "attempt": 1, "external_evidence_text": text})
+    assert "EXTERNAL EVIDENCE (recorded by RMP, not by Aura):\nClaude Code run" in prompt
+    assert "tests pass only when RMP's own test run passed" in prompt
+
+
+def test_without_evidence_the_section_says_none():
+    from app.orchestrator.process_evaluator import format_external_evidence
+
+    assert format_external_evidence(None) == "" and format_external_evidence({}) == ""
+    prompt = build_evaluator_prompt({"user_intent": "hello", "agent_response": "Hi Kirill", "attempt": 1})
+    assert "EXTERNAL EVIDENCE (recorded by RMP, not by Aura):\n(none)" in prompt
+
+
 def test_missing_quality_without_skip_retries():
     d = decide_completion_gate(
         evidence_passed=True,

@@ -16,9 +16,11 @@ def test_tasks_keep_the_slack_message_identity():
     from app.api.server import TaskRequest, _slack_context
 
     req = TaskRequest(intent="yes", session_key=SLACK, slack_message_id="1790.0001", thread_id="1789.0009",
-                      reply_to={"id": "1789.0009", "body": "Book it?"},
+                      reply_to={"id": "1789.0009", "body": "Book it?"}, slack_user_id="U0AELFYTLKS",
+                      slack_event_ts=1790000100123,
                       attachments=[{"path": "/m/a.pdf", "type": "application/pdf", "name": "a.pdf"}])
-    assert _slack_context(req) == {"message_id": "1790.0001", "thread_id": "1789.0009", "reply_to_id": "1789.0009",
+    assert _slack_context(req) == {"message_id": "1790.0001", "user_id": "U0AELFYTLKS", "event_ts": 1790000100123,
+                                   "thread_id": "1789.0009", "reply_to_id": "1789.0009",
                                    "attachments": [{"path": "/m/a.pdf", "type": "application/pdf", "name": "a.pdf"}]}
 
 

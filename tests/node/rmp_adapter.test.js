@@ -410,6 +410,23 @@ test('reply-to and thread ids travel with the message', async () => {
   assert.deepEqual(calls[0].body.reply_to, { id: '1790000150.000350', body: 'Shall I book the 10:05 train?', sender: '' });
 });
 
+test('the Slack sender and event time travel with the message, for approval checks', async () => {
+  const calls = installFetch([['POST /tasks', () => ({ task_id: 't-sender', status: 'created' })]]);
+  const { hooks } = loadPlugin();
+  const event = {
+    content: 'approve',
+    messageId: '1790000300.000500',
+    senderId: 'U0AELFYTLKS',
+    timestamp: 1790000300123,
+    metadata: { provider: 'slack' },
+  };
+  hooks.message_received(event, { channelId: 'slack', sessionKey: SLACK_KEY });
+  await waitFor(() => calls.length === 1, 'POST /tasks');
+  assert.equal(calls[0].body.slack_user_id, 'U0AELFYTLKS');
+  assert.equal(calls[0].body.slack_event_ts, 1790000300123);
+  assert.equal(calls[0].body.slack_message_id, '1790000300.000500');
+});
+
 test('a structured API error is logged readably, not as [object Object]', async () => {
   installFetch([
     ['POST /tasks', () => json({ detail: { intake_action: 'attach_active', error: 'workflow not found' } }, 502)],
