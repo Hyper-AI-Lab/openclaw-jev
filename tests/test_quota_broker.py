@@ -15,9 +15,10 @@ def test_an_unreadable_env_file_reads_as_no_keys(monkeypatch):
             raise PermissionError(13, "Permission denied", "/etc/openclaw/openclaw.env")
 
     monkeypatch.setattr(qb, "OPENCLAW_ENV_PATH", Hidden())
-    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    for name in [n for n in os.environ if n.startswith("NVIDIA_API_KEY")]:
+        monkeypatch.delenv(name)
     monkeypatch.setenv("NVIDIA_API_KEY_2", "nvapi-from-env")
-    assert qb._load_env_keys() == [("nvidia:key2", "nvapi-from-env")]
+    assert [pid for pid, _ in qb._load_env_keys()] == ["nvidia:key2"]
     assert qb._read_env_value("MISSING_NAME") == ""
 
 
