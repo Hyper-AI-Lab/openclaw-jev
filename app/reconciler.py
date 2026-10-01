@@ -18,6 +18,7 @@ from app.production.alerting import send_alert
 logger = logging.getLogger("rmp.reconciler")
 
 RECONCILE_INTERVAL_SEC = 60
+CODING_PRUNE_INTERVAL_SEC = 3600
 STALE_TASK_MINUTES = 20
 STUCK_REPAIR_MINUTES = 45
 # Recover completed OpenClaw replies quickly after worker crashes mid-notify.
@@ -640,9 +641,27 @@ async def close_runs_of_ended_tasks(db, now: datetime) -> int:
     return closed
 
 
+def prune_coding_jobs() -> list:
+    """Coding job checkouts past their retention, unless a run of theirs is still live."""
+    from app.coding.workspace import prune
+    from app.config import get_coding_config
+
+    return prune(int(get_coding_config()["job_retention_days"]))
+
+
 async def reconciler_loop(stop_event: asyncio.Event):
     logger.info("Reconciler started (interval=%ss)", RECONCILE_INTERVAL_SEC)
+    last_prune = 0.0
     while not stop_event.is_set():
+        loop_time = asyncio.get_running_loop().time()
+        if loop_time - last_prune >= CODING_PRUNE_INTERVAL_SEC:
+            last_prune = loop_time
+            try:
+                removed = await asyncio.to_thread(prune_coding_jobs)
+                if removed:
+                    logger.info("Pruned coding job checkouts: %s", removed)
+            except Exception as e:
+                logger.warning("Coding job prune failed: %s", e)
         try:
             stats = await reconcile_once()
             if stats.get("skipped"):

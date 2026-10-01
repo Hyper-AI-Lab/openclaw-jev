@@ -258,6 +258,28 @@ DEFAULT_CODING = {
     # This host's services on loopback; aura-coder may not connect to them.
     "blocked_tcp_ports": [22, "4317-4318", 5432, 6006, "6333-6334", "6933-6939", "7233-7243",
                           8000, 8791, 9222, "18789-18899"],
+    "verify_timeout_sec": 1800,
+    "job_retention_days": 14,
+    "diff_limit_chars": 200_000,
+    # The repositories coding tasks may change. "self" deploys to this host after Kirill's approval;
+    # "pr" pushes a branch and opens a pull request. {venv} is the shared read-only test venv.
+    "repositories": {
+        "rmp": {"remote": "Hyper-AI-Lab/openclaw-jev", "source": "/root/.openclaw/rmp", "branch": "main",
+                "deploy": "self", "setup": [],
+                "tests": [["{venv}/bin/python", "-m", "pytest", "-q", "-p", "no:warnings"],
+                          ["node", "--test", "tests/node/*.test.js"]]},
+        "agentic-design": {"remote": "Hyper-AI-Lab/agentic-design", "branch": "main", "deploy": "pr",
+                           "setup": [["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]],
+                           "tests": [["npm", "test"]]},
+        "cursor-dual-agent-loop": {"remote": "Hyper-AI-Lab/cursor-dual-agent-loop", "branch": "main", "deploy": "pr",
+                                   "setup": [["python3", "-m", "venv", ".aura/venv"],
+                                             [".aura/venv/bin/pip", "install", "-q", "-e", ".", "pytest"]],
+                                   "tests": [[".aura/venv/bin/python", "-m", "pytest", "-q"]]},
+        "cyber-ai-team": {"remote": "Hyper-AI-Lab/cyber-ai-team", "branch": "main", "deploy": "pr",
+                          "setup": [["python3", "-m", "venv", ".aura/venv"],
+                                    [".aura/venv/bin/pip", "install", "-q", "-r", "backend/requirements.txt", "pytest"]],
+                          "tests": [[".aura/venv/bin/python", "-m", "pytest", "-q", "backend/tests"]]},
+    },
 }
 
 

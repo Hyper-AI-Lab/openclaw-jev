@@ -21,7 +21,7 @@ def parse(args):
     unit, props, env, workdir = None, {}, {}, None
     for i, arg in enumerate(args):
         if arg == "--":
-            return unit, props, env, workdir, args[i + 1:]
+            return unit, props, env, workdir, args[i + 1:], "--wait" in args[:i]
         if arg.startswith("--unit="):
             unit = arg.split("=", 1)[1]
         elif arg.startswith("--property="):
@@ -41,7 +41,8 @@ def supervise(spec_path):
         signal.signal(sig, signal.SIG_IGN)
     props = spec["props"]
     stdout = open(props["StandardOutput"].split(":", 1)[1], "wb")
-    stderr = open(props.get("StandardError", "file:/dev/null").split(":", 1)[1], "wb")
+    error = props.get("StandardError", "file:/dev/null")
+    stderr = stdout if error == "inherit" else open(error.split(":", 1)[1], "wb")
     child = subprocess.Popen(spec["command"], stdout=stdout, stderr=stderr, cwd=spec["workdir"],
                              env={**os.environ, **spec["env"]},
                              preexec_fn=lambda: [signal.signal(s, signal.SIG_DFL) for s in (signal.SIGINT, signal.SIGTERM)])
@@ -64,16 +65,19 @@ def supervise(spec_path):
         subprocess.run(shlex.split(post.lstrip("+")),
                        env={**os.environ, "SERVICE_RESULT": result, "EXIT_CODE": exit_code, "EXIT_STATUS": status})
     (STATE / f"{spec['unit']}.pid").unlink(missing_ok=True)
+    return 0 if result == "success" else (code if code > 0 else 1)
 
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--supervise"]:
-        supervise(sys.argv[2])
-        sys.exit(0)
-    unit, props, env, workdir, command = parse(sys.argv[1:])
+        sys.exit(supervise(sys.argv[2]))
+    unit, props, env, workdir, command, wait = parse(sys.argv[1:])
     STATE.mkdir(parents=True, exist_ok=True)
     spec = STATE / f"{unit}.json"
+    props.setdefault("StandardOutput", "file:/dev/null")
     spec.write_text(json.dumps({"unit": unit, "props": props, "env": env, "workdir": workdir, "command": command}))
     proc = subprocess.Popen([sys.executable, __file__, "--supervise", str(spec)], start_new_session=True,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     (STATE / f"{unit}.pid").write_text(str(proc.pid))
+    if wait:
+        sys.exit(proc.wait())
