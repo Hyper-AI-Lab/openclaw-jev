@@ -266,16 +266,23 @@ class QuotaConfig:
         )
 
 
+def _env_file_lines() -> List[str]:
+    """The OpenClaw env file's lines; none when it is missing or unreadable (coding units cannot see it)."""
+    try:
+        return OPENCLAW_ENV_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+
 def _load_env_keys() -> List[tuple[str, str]]:
     """Return (profile_id, api_key) for NVIDIA_API_KEY, NVIDIA_API_KEY_2, ..."""
     values: Dict[str, str] = {}
-    if OPENCLAW_ENV_PATH.is_file():
-        for line in OPENCLAW_ENV_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, val = line.split("=", 1)
-            values[key.strip()] = val.strip()
+    for line in _env_file_lines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        values[key.strip()] = val.strip()
     for env_name, val in os.environ.items():
         if env_name.startswith("NVIDIA_API_KEY") and val.strip():
             values.setdefault(env_name, val.strip())
@@ -307,11 +314,10 @@ def _read_env_value(name: str) -> str:
     val = os.environ.get(name, "").strip()
     if val:
         return val
-    if OPENCLAW_ENV_PATH.is_file():
-        for line in OPENCLAW_ENV_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line.startswith(f"{name}="):
-                return line.split("=", 1)[1].strip()
+    for line in _env_file_lines():
+        line = line.strip()
+        if line.startswith(f"{name}="):
+            return line.split("=", 1)[1].strip()
     return ""
 
 

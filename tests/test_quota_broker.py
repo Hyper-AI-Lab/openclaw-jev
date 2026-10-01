@@ -8,6 +8,19 @@ import pytest
 from app.llm import quota_broker as qb
 
 
+def test_an_unreadable_env_file_reads_as_no_keys(monkeypatch):
+    """Coding units hide /etc/openclaw; Path.is_file() raises PermissionError on a hidden path."""
+    class Hidden:
+        def read_text(self, encoding=None):
+            raise PermissionError(13, "Permission denied", "/etc/openclaw/openclaw.env")
+
+    monkeypatch.setattr(qb, "OPENCLAW_ENV_PATH", Hidden())
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setenv("NVIDIA_API_KEY_2", "nvapi-from-env")
+    assert qb._load_env_keys() == [("nvidia:key2", "nvapi-from-env")]
+    assert qb._read_env_value("MISSING_NAME") == ""
+
+
 def test_is_rate_limit_message():
     assert qb.is_rate_limit_message("429 status code (no body)")
     assert qb.is_rate_limit_message("Rate limit exceeded")
