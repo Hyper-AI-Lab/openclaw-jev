@@ -159,14 +159,26 @@ async def test_the_coding_api_shows_a_job_and_refuses_a_path_outside_the_runs_di
     assert outside.status_code == 404 and missing.status_code == 404
 
 
-async def test_the_coding_status_names_the_short_rmp_commit_alongside_the_existing_fields(host, monkeypatch):
+async def test_the_coding_status_names_the_short_rmp_commit_and_open_direct_sessions_alongside_the_existing_fields(
+        host, monkeypatch):
     import subprocess
     from pathlib import Path
 
     from app.activities import coding_activities
+    from app.coding import direct
 
     monkeypatch.setattr(cr, "live_units", lambda: [])
     monkeypatch.setattr(coding_activities, "slot_holder", lambda: None)
+    monkeypatch.setattr(direct, "DIRECT_DIR", host.tmp / "direct")
+    records = [("task-a", "open", 0), ("task-a", "ended", 1), ("task-b", "open", 2), ("task-c", "ended", 0)]
+    for n, (task_id, state, turns) in enumerate(records):
+        home = host.tmp / "direct" / task_id / f"0000000{n}-0000-4000-8000-000000000000"
+        home.mkdir(parents=True)
+        (home / "session.json").write_text(json.dumps({"id": home.name, "task_id": task_id, "status": state,
+                                                       "created_at": f"2026-10-02T10:0{n}:00+00:00", "turns": turns}))
+    # Only the ended session's turn is running: the count is of open sessions, not of running turns.
+    monkeypatch.setattr(direct.runner, "unit_active", lambda unit: unit.endswith("-00000001-1"))
+    assert [s["running"] for s in direct.sessions()] == [False, True, False, False]
     monkeypatch.setenv("RMP_API_KEY", "k")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://rmp",
                                  headers={"X-RMP-API-Key": "k"}) as api:
@@ -176,8 +188,9 @@ async def test_the_coding_status_names_the_short_rmp_commit_alongside_the_existi
     status = response.json()
     assert response.status_code == 200 and status["rmp_commit"] == head and len(head) >= 7
     assert {"enabled", "claude_version", "pinned", "token_days_left", "slot_holder", "live_units", "repositories",
-            "jobs"} <= status.keys()
+            "jobs", "direct_sessions_open"} <= status.keys()
     assert status["enabled"] is True and status["pinned"] == "2.1.280" and status["repositories"] == {}
+    assert status["direct_sessions_open"] == 2
 
 
 def merge_event(tid, minutes, check="success"):

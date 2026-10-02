@@ -153,7 +153,7 @@ def check_claude_direct() -> CheckResult:
     if not warnings and not deploy._is_ancestor_on_github(live, repo):
         problems.append(f"the live main ({live[:12]}) has commits GitHub's main lacks, so no merged pull request can deploy")
     details = {"running_turns": len(direct.running_units()),
-               "open_sessions": sum(1 for s in direct.sessions() if s["status"] == "open")}
+               "open_sessions": open_direct_sessions()}
     status = "fail" if problems else "warn" if warnings else "pass"
     message = "; ".join(problems + warnings) or (
         f"Host policy and aura-github as in the repo; main protected; the live main is on GitHub's; "
@@ -188,7 +188,15 @@ def coding_status() -> Dict[str, Any]:
     return {"enabled": bool(cfg.get("enabled")), "claude_version": installed_version(), "pinned": cfg["claude_version"],
             "token_days_left": token_days_left(), "slot_holder": slot_holder(), "live_units": live_units(),
             "repositories": {name: {"remote": e["remote"], "deploy": e.get("deploy")} for name, e in cfg["repositories"].items()},
-            "jobs": sorted((p.parent.name for p in RUNS_DIR.glob("*/job.json")), reverse=True)[:50]}
+            "jobs": sorted((p.parent.name for p in RUNS_DIR.glob("*/job.json")), reverse=True)[:50],
+            "direct_sessions_open": open_direct_sessions()}
+
+
+def open_direct_sessions() -> int:
+    """How many of Aura's direct sessions, across all tasks, are open (not ended), whether or not a turn is running."""
+    from app.coding import direct
+
+    return sum(1 for s in direct.sessions() if s["status"] == "open")
 
 
 def coding_job(task_id: str) -> Optional[Dict[str, Any]]:
