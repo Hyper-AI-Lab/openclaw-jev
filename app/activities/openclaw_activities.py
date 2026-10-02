@@ -198,10 +198,10 @@ def _jsonl_hard_failure(lines: list, start_time: float) -> Optional[str]:
 
 
 def _reply_deadline(poll_deadline: float, task_id: Optional[str], deadline: Optional[float]) -> float:
-    """Aura's reply deadline, moved on while one of her Claude turns in the task works; a hard ``deadline`` stays."""
-    from app.coding.direct import task_turn_running
+    """Aura's reply deadline, moved on while she works with Claude in the task; a hard ``deadline`` stays."""
+    from app.coding.direct import task_working
 
-    if task_id and deadline is None and task_turn_running(task_id):
+    if task_id and deadline is None and task_working(task_id):
         return max(poll_deadline, time.time() + 120)
     return poll_deadline
 
@@ -841,39 +841,31 @@ async def check_intermediate_updates_enabled(payload: Dict[str, Any]) -> bool:
     return should_send_intermediate_updates()
 
 
-PR_EVENTS = ("coding.pr_merged", "coding.pr_not_merged")
-
-
 async def _direct_claude_evidence(task_id: str) -> str:
-    """Aura's direct Claude sessions in the task and the pull requests RMP merged for her, from RMP's records.
+    """Aura's direct Claude sessions in the task, from RMP's records, and what GitHub says of their pull requests.
 
     A reviewed coding job brings its own evidence; this is what Aura did with Claude herself.
     """
-    from sqlalchemy import select
-
+    from app.coding import github
     from app.coding.records import section_text, task_records
-    from app.db.database import AsyncSessionLocal
-    from app.db.models import Event
+    from app.config import get_coding_config
     from app.memory.policy import redact_secrets
 
     sessions = [r for r in await asyncio.to_thread(task_records, task_id) if r["kind"] == "session"]
-    async with AsyncSessionLocal() as db:
-        events = (await db.execute(
-            select(Event).where(Event.entity_id == task_id, Event.event_type.in_((*PR_EVENTS, "coding.deploy")))
-            .order_by(Event.occurred_at)
-        )).scalars().all()
-    if not any(e.event_type in PR_EVENTS for e in events):
-        events = []
-    lines = ["Aura's Claude sessions (what she asked, what Claude did and answered):\n"
-             + section_text(sessions, reply_chars=1500)] if sessions else []
-    for event in events:
-        p = event.event_payload or {}
-        if event.event_type == "coding.pr_merged":
-            lines.append(f"RMP merged PR #{p.get('pr')} ({p.get('url')}) after CI's test check passed, as {str(p.get('merge'))[:12]}.")
-        elif event.event_type == "coding.pr_not_merged":
-            lines.append(f"RMP did not merge PR #{p.get('pr')}: {p.get('summary')}")
-        else:
-            lines.append(f"Deploy {p.get('status')}: {p.get('summary')}")
+    if not sessions:
+        return ""
+    lines = ["Aura's Claude sessions (what she asked, what Claude did and answered):\n" + section_text(sessions, reply_chars=1500)]
+    repo = get_coding_config()["repositories"]["rmp"]["remote"]
+    links = sorted({link for r in sessions for turn in r["turns"] for link in turn["prs"] if f"/{repo}/pull/" in link})
+    for link in links:
+        number = int(link.rsplit("/", 1)[1])
+        try:
+            pr = await asyncio.to_thread(github.pull, number, repo)
+            ci = await asyncio.to_thread(github.check, pr["head"]["sha"], repo)
+            state = "merged" if pr.get("merged") else pr.get("state")
+            lines.append(f"GitHub: PR #{number} ({link}) is {state}; CI's test check on it: {ci}.")
+        except github.GitHubError as exc:
+            lines.append(f"GitHub: PR #{number} could not be checked ({str(exc)[:120]}).")
     return redact_secrets("\n".join(lines))
 
 

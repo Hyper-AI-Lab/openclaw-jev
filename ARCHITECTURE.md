@@ -471,7 +471,6 @@ Key endpoints:
 | `GET /api/claude/sessions/{id}/turns/{n}?wait=` | A turn's progress or Claude's answer (long poll up to 55 s) |
 | `POST /api/claude/sessions/{id}/end` | End a session, stopping a running turn |
 | `GET /api/claude/sessions[/{id}]` | Sessions, by task |
-| `POST /api/claude/deploy` | `deploy_pr`: merge one of Aura's pull requests once CI passed, then deploy GitHub's main when she is idle |
 | `GET /api/production/readiness` | Go-live readiness score |
 | `GET /api/deep_memory/status` | Switches, ingest queue, documents, index points vs objects, memory lane, recall outcomes of the last 24 h |
 | `GET /api/deep_memory/reports/{task_id}` | A task's deep recall reports: plan, candidates, report, latency, use, novelty |
@@ -580,8 +579,9 @@ Claude Code is Aura's tool in any task (direct sessions, the default). When Kiri
 **Shipping** (`app/coding/github.py`, `app/coding/deploy.py`, `ops/coding_deploy.py`):
 
 - **Protection.** GitHub's `main` is protected for everyone: a pull request is required, the `test` check is required, and admins are not exempt.
-- **Pull requests.** Claude pushes a branch and opens a pull request with `aura-github`, never `main` and never a merge.
-- **Merge.** Aura's `deploy_pr` has RMP squash-merge it once the check passed (`merge_pull_request`), then start the task's deploy unit `aura-deploy-<task>`.
+- **Pull requests.** Claude pushes a branch and opens a pull request with `aura-github`, never `main`. Aura reviews what it reports and approves.
+- **Merge.** Claude merges it with `aura-github gh pr merge --squash` once Aura approves; the protection makes GitHub take it only after the `test` check passed.
+- **Watcher.** Every minute the reconciler loop's `watch_main` looks at GitHub's `main`. Once it moved past the live `main` and CI's `test` check passed on that commit, it starts the deploy unit `aura-deploy-main` for exactly that commit. A commit whose deploy was blocked or rolled back is not tried again; a later one is.
 - **Deploy.** The unit waits until no user task is active, then:
   - fast-forwards the live `main` to GitHub's;
   - syncs `plugins/`, `web-stack/`, `systemd/` and `.cursor/rules/`;
@@ -606,7 +606,7 @@ Claude Code is Aura's tool in any task (direct sessions, the default). When Kiri
   - `approved_deploys` (reviewed jobs only);
   - `deploy_verification` (RMP's suite, or CI's check at the merge, plus the canary);
   - `coding_units` and `direct_units`;
-  - `merged_deploys` (every merge passed CI and deployed within 3 hours);
+  - `main_deployed` (GitHub's `main` goes live within 3 hours);
   - `claude_records`.
 - **API:** the coding and Claude endpoints above.
 

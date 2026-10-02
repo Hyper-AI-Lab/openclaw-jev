@@ -31,6 +31,8 @@ CONFIG_DIR = Path("/root/.claude")
 WORKSPACES = {"repo": "repo", "scratch": "work"}
 PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 MAX_WAIT_SEC = 55
+# After a turn ends Aura reads the answer and writes the next message; her reply is due after that.
+BETWEEN_TURNS_SEC = 600
 # A message travels as one argument of claude -p; Linux caps one argument at 128 KiB.
 MAX_MESSAGE_BYTES = 120_000
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -44,8 +46,10 @@ You run as root on Kirill's production server, in Claude Code's auto permission 
 - Never edit {live}: it is Aura's live code, and a change there goes live at once.
 - A change to Aura's code goes through a pull request: commit on a branch named aura/<topic> in a clone of her \
 repository, push it with `aura-github push`, open the pull request with `aura-github gh pr create` (a title and a \
-body that says what changed and how you tested it), and tell Aura its URL. Never merge: once CI's test check \
-passes, Aura merges and deploys it. When Aura asks you to wait for CI, run `aura-github gh pr checks <number> --watch`.
+body that says what changed and how you tested it), and tell Aura its URL. To wait for CI, run \
+`aura-github gh pr checks <number> --watch`. Merge only when Aura approves, with `aura-github gh pr merge <number> \
+--squash`; main only takes it once CI's test check passed. RMP then deploys main when Aura is idle.
+- Run focused tests for what you changed; CI runs the full suite on the pull request.
 - For GitHub use only `aura-github`. Never push to main. Other repositories are off limits unless Aura tells you \
 Kirill asked for it.
 - Never print, log or commit a secret; read a token only inside the command that needs it.
@@ -236,8 +240,21 @@ def running_units() -> List[str]:
     return [line.split()[0] for line in listed.stdout.splitlines() if line.strip()]
 
 
-def task_turn_running(task_id: str) -> bool:
-    return any(unit.startswith(f"{UNIT_PREFIX}{task_id}-") for unit in running_units())
+def task_working(task_id: str) -> bool:
+    """Whether Aura is working with Claude in the task: a turn is running, or an open session's last turn ended,
+    or the session started, less than ``BETWEEN_TURNS_SEC`` ago."""
+    now = time.time()
+    for session in sessions(task_id):
+        if session["running"]:
+            return True
+        if session["status"] != "open":
+            continue
+        last = _turn(session, session["turns"]) if session["turns"] else None
+        since = (last.exit_file.stat().st_mtime if last and last.exit_file.exists()
+                 else datetime.fromisoformat(session["created_at"]).timestamp())
+        if now - since < BETWEEN_TURNS_SEC:
+            return True
+    return False
 
 
 def prune(days: int, *, now: Optional[datetime] = None) -> List[str]:

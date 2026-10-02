@@ -213,8 +213,8 @@ async def check_vector_sync() -> CheckResult:
 
 
 SHIPPED = ("deployed", "rolled_back", "pr_opened")
-# A merged pull request deploys once Aura is idle; the deploy waits for that up to 2 hours.
-MERGE_DEPLOY_HOURS = 3
+# GitHub's main deploys once CI passed and Aura is idle; the deploy waits up to 2 hours for that.
+MAIN_DEPLOY_HOURS = 3
 
 
 async def _deploy_events() -> List[Event]:
@@ -227,7 +227,7 @@ async def _deploy_events() -> List[Event]:
 async def check_approved_deploys() -> CheckResult:
     """Nothing from a reviewed coding job ships without Kirill's own Slack approval, confirmed before the deploy.
 
-    Aura's own pull requests need none: they merge once CI passed (``merged_deploys``).
+    Aura's own pull requests need none: Claude merges them once she approves and CI passed (``main_deployed``).
     """
     shipped = [e for e in await _deploy_events() if (e.event_payload or {}).get("status") in SHIPPED
                and (e.event_payload or {}).get("source") != "github"]
@@ -249,13 +249,12 @@ async def check_approved_deploys() -> CheckResult:
 
 async def check_deploy_verification() -> CheckResult:
     """Every deploy records its tests and the checks after the restart: RMP's exact-commit suite for a reviewed
-    job, CI's passed test check on the merged pull request for Aura's own."""
+    job, CI's passed test check on the deployed commit for GitHub's main."""
     deployed = [e for e in await _deploy_events() if (e.event_payload or {}).get("status") == "deployed"]
-    merged_ok = await _merged_with_ci({e.entity_id for e in deployed if e.event_payload.get("source") == "github"})
 
     def tested(e: Event) -> bool:
         if e.event_payload.get("source") == "github":
-            return any(at <= e.occurred_at for at in merged_ok.get(e.entity_id, []))
+            return e.event_payload.get("ci") == "success"
         return (e.event_payload.get("suite") or {}).get("ok") is True
 
     unverified = sorted({e.entity_id for e in deployed
@@ -264,22 +263,6 @@ async def check_deploy_verification() -> CheckResult:
         return CheckResult("deploy_verification", "fail", f"{len(unverified)} self-deploy(s) without a verification record",
                            {"task_ids": unverified[:20]})
     return CheckResult("deploy_verification", "pass", f"Every self-deploy ({len(deployed)}) recorded its suite and checks", {})
-
-
-async def _merged_with_ci(task_ids) -> dict:
-    """When RMP merged each task's pull requests after CI's test check passed."""
-    if not task_ids:
-        return {}
-    async with AsyncSessionLocal() as db:
-        rows = (await db.execute(
-            select(Event.entity_id, Event.occurred_at, Event.event_payload).where(
-                Event.event_type == "coding.pr_merged", Event.entity_id.in_(set(task_ids)))
-        )).all()
-    merged: dict = {}
-    for task_id, at, payload in rows:
-        if (payload or {}).get("check") == "success":
-            merged.setdefault(task_id, []).append(at)
-    return merged
 
 
 async def check_direct_units() -> CheckResult:
@@ -300,25 +283,23 @@ async def check_direct_units() -> CheckResult:
     return CheckResult("direct_units", "pass", f"{len(units)} direct Claude turn(s), each with a live task", {})
 
 
-async def check_merged_deploys() -> CheckResult:
-    """Every pull request RMP merged for Aura had CI's test check passed, and was deployed within 3 hours."""
-    async with AsyncSessionLocal() as db:
-        merges = list((await db.execute(
-            select(Event).where(Event.event_type == "coding.pr_merged", Event.occurred_at >= _since())
-        )).scalars())
-        deploys = (await db.execute(
-            select(Event.entity_id, Event.occurred_at).where(
-                Event.event_type == "coding.deploy", Event.entity_id.in_({m.entity_id for m in merges}))
-        )).all() if merges else []
-    cutoff = datetime.utcnow() - timedelta(hours=MERGE_DEPLOY_HOURS)
-    unchecked = sorted({m.entity_id for m in merges if (m.event_payload or {}).get("check") != "success"})
-    undeployed = sorted({m.entity_id for m in merges if m.occurred_at < cutoff
-                         and not any(t == m.entity_id and at >= m.occurred_at for t, at in deploys)})
-    problems = ([f"{len(unchecked)} merge(s) without a passed CI check"] if unchecked else []) + \
-               ([f"{len(undeployed)} merge(s) not deployed after {MERGE_DEPLOY_HOURS} h"] if undeployed else [])
-    if problems:
-        return CheckResult("merged_deploys", "fail", "; ".join(problems), {"task_ids": sorted({*unchecked, *undeployed})[:20]})
-    return CheckResult("merged_deploys", "pass", f"Every pull request RMP merged ({len(merges)}) passed CI and was deployed", {})
+async def check_main_deployed() -> CheckResult:
+    """GitHub's main goes live within 3 hours: the watcher deploys it once CI passed and Aura is idle."""
+    from app.coding import deploy
+    from app.config import get_coding_config
+
+    repo = get_coding_config()["repositories"]["rmp"]["remote"]
+    try:
+        pending = await asyncio.to_thread(deploy.pending_main, repo)
+    except Exception as exc:
+        return CheckResult("main_deployed", "warn", f"GitHub could not be checked ({str(exc)[:150]})", {})
+    if pending is None:
+        return CheckResult("main_deployed", "pass", "GitHub's main is live", {})
+    if pending["age_hours"] > MAIN_DEPLOY_HOURS:
+        return CheckResult("main_deployed", "fail", f"GitHub's main ({pending['head'][:12]}) has waited "
+                           f"{pending['age_hours']} h to go live", pending)
+    return CheckResult("main_deployed", "pass", f"GitHub's main ({pending['head'][:12]}) goes live once CI passed "
+                       "and Aura is idle", pending)
 
 
 async def check_coding_units() -> CheckResult:
@@ -351,7 +332,7 @@ CHECKS = (
     check_deploy_verification,
     check_coding_units,
     check_direct_units,
-    check_merged_deploys,
+    check_main_deployed,
     *DEEP_MEMORY_INVARIANTS,
 )
 

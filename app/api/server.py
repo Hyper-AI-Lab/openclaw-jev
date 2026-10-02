@@ -1594,12 +1594,6 @@ class ClaudeMessageRequest(BaseModel):
     message: str
 
 
-class ClaudeDeployRequest(BaseModel):
-    pr: int
-    session_key: str = ""
-    task_id: str = ""
-
-
 async def _claude_event(db: AsyncSession, task_id: str, event_type: str, payload: Dict[str, Any]) -> None:
     db.add(Event(correlation_id=task_id, entity_type="task", entity_id=task_id, event_type=event_type,
                  event_payload=payload))
@@ -1687,21 +1681,6 @@ async def claude_session_end(session_id: str, db: AsyncSession = Depends(get_db)
     await _claude_event(db, session["task_id"], "claude.session_ended",
                         {"session": session_id, "turns": session["turns"], "stopped": session["stopped"]})
     return session
-
-
-@app.post("/api/claude/deploy")
-async def claude_deploy(req: ClaudeDeployRequest, db: AsyncSession = Depends(get_db)):
-    from app.coding import deploy, direct, github
-    from app.config import get_coding_config
-
-    task = await _live_task(db, req.task_id or direct.task_of(req.session_key))
-    try:
-        result = await asyncio.to_thread(deploy.merge_pull_request, task.id, req.pr, get_coding_config())
-    except github.GitHubError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
-    await _claude_event(db, task.id, "coding.pr_merged" if result["status"] == "merged" else "coding.pr_not_merged",
-                        {**result, "pr": req.pr})
-    return result
 
 
 @app.get("/api/deep_memory/status")

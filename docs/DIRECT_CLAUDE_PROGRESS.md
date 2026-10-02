@@ -310,3 +310,54 @@ Deploy records now carry `source` (`github` or `reviewed`), and each invariant a
 - **Rule item 6** in `.cursor/rules/rmp-architecture.mdc`, rewritten for both modes; the host copy is updated once this lands.
 
 **Note:** for the second time today, an edit I could not see applied before my visible attempt (two ARCHITECTURE bullets, worded slightly differently). Their content is what I intended. I checked the section for duplicates, and the diff, before committing.
+
+---
+
+## Step 9 (in progress) — Acceptance
+
+**Date:** 2026-10-02.
+
+**Test 1, Aura talks to Claude (task `42e49f62`): passed.**
+- Intake made it a normal task (`create_fresh`, no catalog type).
+- Aura opened a `repo` session and sent one turn; Claude answered in about 40 s.
+- Her reply matched Claude's findings and the evaluator accepted it.
+- The reconciler ended the session 31 s after the task finished.
+- The task document has its "Claude sessions" section, and the conversation is its own document.
+
+**Test 2, a change through a pull request (task `68806177`): failed, then shipped another way.**
+- Claude's turns 1 and 2 were stopped after about 5.5 minutes each, while their session stayed open.
+  - Claude was running RMP's full test suite in its clone. `test_reconciler_janitor` runs the real `reconcile_once()`, which includes the step 3 sweep that ends sessions of finished tasks.
+  - The sweep read the real session directory, found Claude's own open session, did not find its task in the test's database, treated it as finished, and stopped the running turn.
+  - The SIGINT reached the whole unit, the test process included, so the test died before marking the session ended.
+  - Evidence: systemd logged SIGINT "on client request" to `claude`, `bash`, `python`, `tail` and a `systemctl` inside the turn's own unit.
+- At 13:20:47 RMP gave up waiting for Aura's turn ("Timed out waiting for agent reply"). The step 3 extension of her reply deadline only applied while a Claude turn ran, and she was between turns.
+  - RMP retried while her original run still held the session.
+  - The gateway answered 503 for three minutes; its docs list single-run admission timing out among the causes.
+  - The task was compensated at 13:23:38, and its session ended with it.
+- Her context reached 82,307 tokens, past the 60,000 limit of the `llm_usage` canary. She had run about 70 commands of her own through the code harness (308,000 characters of output), starting in the live checkout. She changed nothing there: the checkout was clean.
+- Before the compensation, she had scheduled a cron follow-up. At 13:31 it called `deploy_pr` for PR #6, RMP merged it (CI passed), and the deploy unit shipped it at 13:34: `rmp-api` and `rmp-worker` restarted, and health, readiness and the canary passed. Kirill's note was sent.
+- `deploy_pr` returned "internal_error" to Aura anyway. OpenClaw's code harness reads a tool's result as an object (`'details' in result`), and the plugin's tools returned bare strings.
+
+**Kirill's decision:** Claude does the coding, merging included; Aura manages it. RMP records, and puts GitHub's `main` live once Aura is idle.
+
+**What changed:**
+- **Merging.** Claude merges with `aura-github gh pr merge --squash` once Aura approves; the wrapper no longer refuses merges, and the protected `main` still demands the `test` check. `deploy_pr`, its API endpoint and `merge_pull_request` are gone.
+- **Going live.**
+  - The watcher, `watch_main`, runs in the reconciler loop every minute and is skipped in development mode.
+  - Once GitHub's `main` has moved past the live `main` and CI's `test` check passed on that exact commit, it starts `aura-deploy-main` for that commit.
+  - The unit waits until no user task is active, then deploys as before, records a `coding.deploy` event on entity `deploy/main` with the CI result, writes `result.json`, and sends Kirill the note.
+  - A commit whose deploy was blocked, failed or rolled back is not retried; a later commit is.
+- **The sweep** ends only sessions whose task the database knows to be finished.
+- **The test suite** gets its own empty session directory in every test (autouse fixture in `tests/conftest.py`).
+- **The reply deadline** stays open while Aura works with Claude: a turn running, or an open session whose last turn ended (or which started) less than 10 minutes ago (`task_working`).
+- **The tools** return OpenClaw's result object (`content` plus a small `details`). Claude's answer is cut at 12,000 characters instead of 30,000; the whole answer stays in the record.
+- **The evaluator** sees Aura's sessions and, for each pull request linked in them, GitHub's word: merged or not, and CI's check on it. The rule: tests pass when RMP's own run passed, "or GitHub reports CI's test check passed on the pull request".
+- **Invariants:**
+  - `main_deployed` replaces `merged_deploys`: GitHub's `main` goes live within 3 hours;
+  - `deploy_verification` takes the CI result recorded on a deploy of GitHub's `main`.
+- **Notes and docs:**
+  - Aura's notes: leave the work to Claude; she reviews, approves, and has Claude merge.
+  - `CLAUDE.md` and the direct sessions' system prompt: run focused tests, since CI runs the full suite; merge only on Aura's approval.
+  - `ARCHITECTURE`, `README`, `CONCEPT_TREE` and rule item 6, both copies.
+
+**Verification:** full suite 1063 passed, 4 skipped; node 25 of 27 before the plugin deploy (the 2 live-copy checks).

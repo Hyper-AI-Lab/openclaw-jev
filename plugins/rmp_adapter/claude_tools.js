@@ -4,12 +4,18 @@
 // these tools only call RMP's API, so a turn outlives an RMP restart and a stop reaches it.
 
 const POLL_SEC = 50;
-const REPLY_CHARS = 30000;
+// Aura's whole context is bounded; the full answer stays in the session's record.
+const REPLY_CHARS = 12000;
 // RMP may be restarting (its code reloads); the turn runs on, so the wait does too, this long.
 const OUTAGE_SEC = 300;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// OpenClaw's tool result: the text Aura reads, and a few facts a script can use.
+function result(text, details) {
+  return { content: [{ type: 'text', text }], details: details || {} };
 }
 
 function format(state) {
@@ -35,6 +41,10 @@ function format(state) {
   return lines.join('\n');
 }
 
+function turnResult(state) {
+  return result(format(state), { session: state.session, turn: state.turn, done: state.done, outcome: state.outcome });
+}
+
 function register(api, { rmpFetch, pause = sleep }) {
   const turnPath = (session, turn) => `/api/claude/sessions/${encodeURIComponent(session)}/turns/${Number(turn)}`;
 
@@ -53,7 +63,7 @@ function register(api, { rmpFetch, pause = sleep }) {
         await pause(5000);
         continue;
       }
-      if (state.done || signal?.aborted || Date.now() >= until) return format(state);
+      if (state.done || signal?.aborted || Date.now() >= until) return turnResult(state);
     }
   }
 
@@ -78,9 +88,10 @@ function register(api, { rmpFetch, pause = sleep }) {
           workspace: params.workspace || 'repo',
           title: params.title || '',
         }, { maxTimeSec: 330 });
-        return `Claude session ${s.id} is ready (${s.workspace}: ${s.path}). Send it a message with claude_send.`;
+        return result(`Claude session ${s.id} is ready (${s.workspace}: ${s.path}). Send it a message with claude_send.`,
+          { session: s.id, workspace: s.workspace, path: s.path });
       } catch (err) {
-        return `Claude session not started: ${err.message}`;
+        return result(`Claude session not started: ${err.message}`, { error: err.message });
       }
     },
   }), { name: 'claude_start' });
@@ -107,7 +118,7 @@ function register(api, { rmpFetch, pause = sleep }) {
           { message: params.message }, { maxTimeSec: 60 });
         return await waitFor(params.session, started.turn, params.wait_minutes ? params.wait_minutes * 60 : 0, signal);
       } catch (err) {
-        return `Claude message failed: ${err.message}`;
+        return result(`Claude message failed: ${err.message}`, { error: err.message });
       }
     },
   });
@@ -128,35 +139,13 @@ function register(api, { rmpFetch, pause = sleep }) {
     execute: async (_id, params, signal) => {
       try {
         const s = await rmpFetch('GET', `/api/claude/sessions/${encodeURIComponent(params.session)}`);
-        if (!s.turns) return `Claude session ${s.id} (${s.status}) has no turns yet.`;
+        if (!s.turns) return result(`Claude session ${s.id} (${s.status}) has no turns yet.`, { session: s.id, turn: 0 });
         return await waitFor(s.id, s.turns, Math.min(Number(params.wait_seconds) || 1, 55), signal);
       } catch (err) {
-        return `Claude status failed: ${err.message}`;
+        return result(`Claude status failed: ${err.message}`, { error: err.message });
       }
     },
   });
-
-  api.registerTool((context) => ({
-    name: 'deploy_pr',
-    description:
-      'Merge one of your pull requests on Hyper-AI-Lab/openclaw-jev and deploy it. RMP merges it once CI\'s test check has '
-      + 'passed, then deploys GitHub\'s main when you are idle (restarting what changed, checking health, readiness and the '
-      + 'canary, and reverting on failure) and sends Kirill a note with the link. Only for your own repository.',
-    parameters: {
-      type: 'object',
-      properties: { pr: { type: 'number', description: 'The pull request number' } },
-      required: ['pr'],
-    },
-    execute: async (_id, params) => {
-      try {
-        const r = await rmpFetch('POST', '/api/claude/deploy',
-          { pr: Number(params.pr), session_key: context?.sessionKey || '' }, { maxTimeSec: 120 });
-        return r.summary;
-      } catch (err) {
-        return `deploy_pr failed: ${err.message}`;
-      }
-    },
-  }), { name: 'deploy_pr' });
 
   api.registerTool({
     name: 'claude_end',
@@ -170,9 +159,10 @@ function register(api, { rmpFetch, pause = sleep }) {
       try {
         const s = await rmpFetch('POST', `/api/claude/sessions/${encodeURIComponent(params.session)}/end`, undefined,
           { maxTimeSec: 60 });
-        return `Claude session ${s.id} ended after ${s.turns} turn(s)${s.stopped.length ? '; its running turn was stopped' : ''}.`;
+        return result(`Claude session ${s.id} ended after ${s.turns} turn(s)${s.stopped.length ? '; its running turn was stopped' : ''}.`,
+          { session: s.id, turns: s.turns });
       } catch (err) {
-        return `Claude session not ended: ${err.message}`;
+        return result(`Claude session not ended: ${err.message}`, { error: err.message });
       }
     },
   });

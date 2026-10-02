@@ -1,9 +1,9 @@
 """Shipping Aura's code: GitHub's main is protected, so every change lands there through a pull request first.
 
-Two changes ship this way. Aura's own pull requests: ``merge_pull_request`` merges one once its test check
-passed, and the task's deploy unit later deploys GitHub's main as it then is. A reviewed coding job's
-approved commit: the worker fetches it into the live repo, checks it fast-forwards ``main`` and runs the
-full suite on that exact commit as aura-coder, then hands off; the unit lands it through a pull request.
+Two changes ship this way. Aura's own pull requests: Claude merges one once she approves and CI passed, and
+``watch_main`` starts the deploy of GitHub's main once CI passed on that commit too. A reviewed coding
+job's approved commit: the worker fetches it into the live repo, checks it fast-forwards ``main`` and runs
+the full suite on that exact commit as aura-coder, then hands off; the unit lands it through a pull request.
 
 The detached root unit (``ops/coding_deploy.py``) holds the code-reload lock, waits until no user task is
 active, refuses mirrors that drifted, fast-forwards the live ``main`` to GitHub's, syncs the mirrors,
@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -168,12 +169,12 @@ def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
     """Start the detached deploy unit; it outlives worker restarts, including its own.
 
     The spec stays on disk only once the unit started, so a retried activity finding it does not deploy twice.
-    A deploy of GitHub's main that is still waiting ships whatever main is when it runs, a later merge included.
+    While a deploy of GitHub's main runs, a later commit waits for the next one.
     """
     path = spec_file(spec["task_id"])
     unit = f"aura-deploy-{spec['task_id']}"
     if spec.get("source") == "github":
-        if subprocess.run(["systemctl", "is-active", "--quiet", unit], capture_output=True).returncode == 0:
+        if _unit_active(unit):
             return unit
     elif path.exists() and json.loads(path.read_text()).get("head") == spec["head"]:
         return unit
@@ -193,34 +194,48 @@ def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
     return unit
 
 
-def merge_pull_request(task_id: str, number: int, cfg: Dict[str, Any], *, live: Path = LIVE_REPO) -> Dict[str, Any]:
-    """Aura's deploy_pr: merge her pull request once its test check passed; the task's deploy unit then deploys
-    GitHub's main when she is idle and tells Kirill."""
-    repo = cfg["repositories"]["rmp"]["remote"]
-    pr = github.pull(number, repo)
-    if pr.get("merged"):
-        return {"status": "refused", "url": pr.get("html_url"), "summary": f"PR #{number} is already merged."}
-    head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
-    if pr.get("state") != "open" or pr["base"]["ref"] != "main" or head_repo != repo or pr["head"]["ref"] == "main":
-        return {"status": "refused", "url": pr.get("html_url"),
-                "summary": f"PR #{number} is not an open pull request into main from a branch of {repo}."}
-    sha = pr["head"]["sha"]
-    state = github.check(sha, repo)
-    if state != "success":
-        waiting = state in ("pending", "missing")
-        then = (f" Have Claude wait for it with `aura-github gh pr checks {number} --watch`, then call deploy_pr again."
-                if waiting else " Have Claude fix the branch, then call deploy_pr again once CI has passed.")
-        return {"status": "waiting" if waiting else "refused", "check": state, "url": pr["html_url"],
-                "summary": f"CI's test check on PR #{number} is {state}; it merges once that has passed.{then}"}
-    old = _git(live, "rev-parse", "refs/heads/main").strip()
-    if not _is_ancestor_on_github(old, repo):
-        return {"status": "refused", "url": pr["html_url"],
-                "summary": f"The live main ({old[:12]}) has commits GitHub's main lacks, so nothing was merged."}
-    merged = github.merge(number, sha, "squash", repo)
-    unit = hand_off({"task_id": task_id, "source": "github", "pr": {"number": number, "url": pr["html_url"]}}, live=live)
-    return {"status": "merged", "merge": merged, "check": state, "url": pr["html_url"], "title": pr["title"], "unit": unit,
-            "summary": f"Merged PR #{number} ({pr['html_url']}) as {merged[:12]}. RMP deploys GitHub's main once you are "
-                       "idle and tells Kirill how it went."}
+MAIN = "main"
+# A head whose deploy ended this way waits for a later commit instead of being tried again.
+NOT_RETRIED = ("blocked", "failed", "rolled_back")
+
+
+def watch_main(host: Optional["Host"] = None) -> Optional[str]:
+    """Start the deploy of GitHub's main once it moved past the live main and CI's test check passed on that commit;
+    the unit then waits until Aura is idle. The unit started, or None."""
+    host = host or Host()
+    if _unit_active(f"aura-deploy-{MAIN}"):
+        return None
+    head = host.fetch_main()
+    old = _git(host.live, "rev-parse", "refs/heads/main").strip()
+    if head == old or not _is_ancestor(host.live, old, head):
+        return None
+    last = _read_json(spec_file(MAIN).with_name("result.json"))
+    if last and last.get("head") == head and last.get("status") in NOT_RETRIED:
+        return None
+    if github.check(head, host.repo) != "success":
+        return None
+    return hand_off({"task_id": MAIN, "source": "github", "head": head, "ci": "success"}, live=host.live)
+
+
+def pending_main(repo: str, *, live: Path = LIVE_REPO) -> Optional[Dict[str, Any]]:
+    """GitHub's main when it is not live yet: its commit and how many hours ago it was committed."""
+    head = github.main_sha(repo)
+    if head == _git(live, "rev-parse", "refs/heads/main").strip():
+        return None
+    committed = github.api("GET", f"repos/{repo}/commits/{head}")["commit"]["committer"]["date"]
+    age = datetime.now(timezone.utc) - datetime.fromisoformat(committed.replace("Z", "+00:00"))
+    return {"head": head, "age_hours": round(age.total_seconds() / 3600, 1)}
+
+
+def _unit_active(unit: str) -> bool:
+    return subprocess.run(["systemctl", "is-active", "--quiet", unit], capture_output=True).returncode == 0
+
+
+def _read_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        return None
 
 
 def _is_ancestor_on_github(commit: str, repo: str) -> bool:
@@ -328,7 +343,8 @@ def _apply(host: Host, old: str, new: str, changed: List[Tuple[str, str]]) -> Li
 def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] = print) -> Dict[str, Any]:
     """The deploy unit's work, once it holds the code-reload lock. Returns the result to record.
 
-    ``source`` "github" deploys GitHub's main as it is now; otherwise the spec's approved ``head`` lands first.
+    ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
+    approved ``head`` lands through a pull request first.
     """
     live = host.live
     waited = 0
@@ -340,7 +356,8 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     old = _git(live, "rev-parse", "refs/heads/main").strip()
     landed = None
     if spec.get("source") == "github":
-        head = host.fetch_main()
+        host.fetch_main()
+        head = spec["head"]
         if head == old:
             return {"status": "unchanged", "old": old, "head": head, "restarted": [], "commits": [],
                     "summary": f"GitHub's main ({head[:12]}) was already live, so nothing changed."}

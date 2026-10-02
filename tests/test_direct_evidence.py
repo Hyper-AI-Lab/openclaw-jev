@@ -1,56 +1,49 @@
-"""What the evaluator sees of Aura's own work with Claude: her sessions and the pull requests RMP merged."""
-from datetime import datetime, timedelta
-
+"""What the evaluator sees of Aura's own work with Claude: her sessions, and what GitHub says of their pull requests."""
 import pytest
 
 from app.activities import openclaw_activities as oa
-from app.db.models import Event
-from tests.test_invariants import seed, session, task  # noqa: F401  (session is a fixture)
+from app.coding import github
 
 TASK = "11111111-2222-4333-8444-555555555555"
 TOKEN = "sk-ant-oat01-" + "Ab3_-" * 19
-T0 = datetime(2026, 10, 2, 12, 0)
+PR = "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/12"
 
 
-def record(kind, title):
+def record(kind, title, prs=(PR,)):
     return {"kind": kind, "id": title, "title": title, "where": "Direct session in a clone of her repository",
             "status": "ended: task finished", "started_at": "2026-10-02T12:00:00+00:00",
             "turns": [{"number": 1, "message": "Fix the greeting", "outcome": "success",
                        "reply": f"Fixed it; tests pass. The env had {TOKEN}.", "files_edited": ["app/greet.py"],
-                       "commands": ["pytest -q"], "prs": ["https://github.com/Hyper-AI-Lab/openclaw-jev/pull/12"],
-                       "tokens": 100}]}
-
-
-def event(event_type, minutes, **payload):
-    return Event(correlation_id=TASK, entity_type="task", entity_id=TASK, event_type=event_type,
-                 event_payload=payload, occurred_at=T0 + timedelta(minutes=minutes))
+                       "commands": ["pytest -q"], "prs": list(prs), "tokens": 100}]}
 
 
 @pytest.fixture
 def records(monkeypatch):
     found = []
     monkeypatch.setattr("app.coding.records.task_records", lambda task_id: list(found))
+    monkeypatch.setattr("app.config.get_coding_config", lambda: {"repositories": {"rmp": {"remote": "Hyper-AI-Lab/openclaw-jev"}}})
     return found
 
 
-async def test_the_evaluator_sees_her_sessions_the_merge_and_the_deploy_redacted(session, records, monkeypatch):  # noqa: F811
-    monkeypatch.setattr("app.db.database.AsyncSessionLocal", session)
-    records += [record("session", "Greeting fix"), record("coding_job", "A reviewed job")]
-    await seed(session, task(TASK, status="running"),
-               event("coding.pr_merged", 1, pr=12, url="https://github.com/Hyper-AI-Lab/openclaw-jev/pull/12", merge="m" * 40),
-               event("coding.deploy", 2, status="deployed", summary="Deployed mmmmmmmmmmmm to main."))
+async def test_the_evaluator_sees_her_sessions_and_githubs_word_on_their_pull_requests(records, monkeypatch):
+    records += [record("session", "Greeting fix", prs=(PR, "https://github.com/someone/else/pull/3")),
+                record("coding_job", "A reviewed job")]
+    monkeypatch.setattr(github, "pull", lambda number, repo: {"merged": True, "state": "closed", "head": {"sha": "h" * 40}})
+    monkeypatch.setattr(github, "check", lambda sha, repo: "success")
     text = await oa._direct_claude_evidence(TASK)
     assert text.startswith("Aura's Claude sessions (what she asked, what Claude did and answered):\nGreeting fix")
     assert "A reviewed job" not in text and "Aura asked: Fix the greeting" in text and "Files edited: app/greet.py" in text
-    assert "RMP merged PR #12 (https://github.com/Hyper-AI-Lab/openclaw-jev/pull/12) after CI's test check passed, as mmmmmmmmmmmm." in text
-    assert "Deploy deployed: Deployed mmmmmmmmmmmm to main." in text
+    assert f"GitHub: PR #12 ({PR}) is merged; CI's test check on it: success." in text
+    assert "someone/else" not in text.split("GitHub:", 1)[1]
     assert TOKEN[:12] not in text and "[REDACTED:api_key]" in text
 
 
-async def test_a_reviewed_jobs_deploys_are_its_own_evidence_and_nothing_means_nothing(session, records, monkeypatch):  # noqa: F811
-    monkeypatch.setattr("app.db.database.AsyncSessionLocal", session)
-    await seed(session, task(TASK, status="running"), event("coding.deploy", 2, status="deployed", summary="Deployed."))
+async def test_github_out_of_reach_is_said_and_no_session_means_no_evidence(records, monkeypatch):
     assert await oa._direct_claude_evidence(TASK) == ""
-    await seed(session, event("coding.pr_not_merged", 3, pr=13, summary="CI's test check on PR #13 is failure; ..."))
-    assert await oa._direct_claude_evidence(TASK) == (
-        "Deploy deployed: Deployed.\nRMP did not merge PR #13: CI's test check on PR #13 is failure; ...")
+
+    def down(number, repo):
+        raise github.GitHubError("GET pulls/12: connection refused")
+
+    records.append(record("session", "Greeting fix"))
+    monkeypatch.setattr(github, "pull", down)
+    assert "GitHub: PR #12 could not be checked (GET pulls/12: connection refused)." in await oa._direct_claude_evidence(TASK)

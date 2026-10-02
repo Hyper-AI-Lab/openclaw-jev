@@ -2,10 +2,10 @@
 """The detached deploy of Aura's code (unit ``aura-deploy-<task>``, as root).
 
 Started with a spec in the task's runs directory: by the coding workflow's deploy activity for a reviewed
-job's approved commit, or by ``deploy_pr`` for GitHub's main once Aura merged a pull request. It holds the
-code-reload lock for the whole deploy, runs ``app.coding.deploy.self_deploy`` and records the result. Then
-a reviewed job gets a fresh run of its workflow, which sends Aura's judged reply on the new code; a deploy
-of Aura's own pull requests sends Kirill a note with their links.
+job's approved commit, or by RMP's watcher (``aura-deploy-main``) for a commit of GitHub's main that CI
+passed. It holds the code-reload lock for the whole deploy, runs ``app.coding.deploy.self_deploy`` and
+records the result. Then a reviewed job gets a fresh run of its workflow, which sends Aura's judged reply on
+the new code; a deploy of GitHub's main sends Kirill a note with its pull requests' links.
 """
 import asyncio
 import fcntl
@@ -38,8 +38,8 @@ async def finish(spec: dict, result: dict) -> None:
     task_id = spec["task_id"]
     try:
         async with AsyncSessionLocal() as db:
-            db.add(Event(correlation_id=task_id, entity_type="task", entity_id=task_id, event_type="coding.deploy",
-                         event_payload=result))
+            db.add(Event(correlation_id=task_id, entity_type="deploy" if spec.get("source") == "github" else "task",
+                         entity_id=task_id, event_type="coding.deploy", event_payload=result))
             task = await db.get(Task, task_id)
             if task is not None:
                 task.supplementary_context = {**(task.supplementary_context or {}), "coding_deploy": result}
@@ -70,8 +70,10 @@ def main(spec_path: str) -> int:
             result = {"status": "failed", "error": str(exc)[:500],
                       "summary": f"The deploy stopped with an error ({str(exc)[:300]}); main is at {main_now[:12]}, "
                                  "please check it."}
-    result = {**result, "suite": spec.get("suite"), "source": spec.get("source") or "reviewed"}
+    result = {**result, "suite": spec.get("suite"), "source": spec.get("source") or "reviewed",
+              "head": result.get("head") or spec.get("head"), "ci": spec.get("ci")}
     log(f"result: {json.dumps(result)}")
+    Path(spec_path).with_name("result.json").write_text(json.dumps(result, indent=2) + "\n")
     asyncio.run(finish(spec, result))
     return 0 if result["status"] == "deployed" else 1
 
