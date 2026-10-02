@@ -80,6 +80,14 @@ def test_code_claims_are_judged_against_the_evidence_rmp_recorded():
     assert "tests pass only when RMP's own test run passed" in prompt
 
 
+def test_a_final_coding_reply_is_judged_against_what_shipped():
+    from app.orchestrator.process_evaluator import format_external_evidence
+
+    text = format_external_evidence({**EVIDENCE, "deploy": {"status": "deployed",
+                                                            "summary": "Deployed 5e11a266b598 to main; canary passed."}})
+    assert text.endswith("After Kirill's approval: deployed. Deployed 5e11a266b598 to main; canary passed.")
+
+
 def test_without_evidence_the_section_says_none():
     from app.orchestrator.process_evaluator import format_external_evidence
 

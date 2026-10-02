@@ -135,6 +135,9 @@ def format_external_evidence(evidence: Optional[Dict[str, Any]]) -> str:
         lines.append("Diffstat:\n" + str(evidence["diffstat"]).strip()[-2000:])
     if evidence.get("secrets"):
         lines.append(f"Secret scan: {len(evidence['secrets'])} finding(s); nothing deploys until they are removed")
+    deploy = evidence.get("deploy")
+    if deploy:
+        lines.append(f"After Kirill's approval: {deploy.get('status')}. {str(deploy.get('summary') or '')[:1000]}")
     return "\n".join(lines)
 
 

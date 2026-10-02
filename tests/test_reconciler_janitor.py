@@ -115,6 +115,38 @@ async def test_the_janitor_reads_the_task_of_a_deep_recall(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_the_janitor_keeps_a_coding_task_waiting_days_for_approval():
+    import importlib.util
+    from datetime import timezone
+
+    from app.config import RMP_ROOT
+
+    spec = importlib.util.spec_from_file_location("workflow_janitor", os.path.join(RMP_ROOT, "ops", "workflow_janitor.py"))
+    janitor_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(janitor_mod)
+    gate = MagicMock(id="workflow-t-gate", start_time=datetime.now(timezone.utc) - timedelta(days=3))
+
+    async def fake_list(*args, **kwargs):
+        yield gate
+
+    client = MagicMock()
+    client.list_workflows = fake_list
+    client.get_workflow_handle.return_value.terminate = AsyncMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = MagicMock(status="pending_user_input")
+
+    with patch.object(janitor_mod, "Client") as mock_client_cls:
+        mock_client_cls.connect = AsyncMock(return_value=client)
+        with patch.object(janitor_mod, "AsyncSessionLocal") as mock_session:
+            db = AsyncMock()
+            db.execute = AsyncMock(return_value=result)
+            mock_session.return_value.__aenter__.return_value = db
+            stats = await janitor_mod.janitor_once(max_age_hours=24)
+    assert stats == {"scanned": 1, "terminated": 0, "errors": 0}
+    client.get_workflow_handle.return_value.terminate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_count_stuck_created_task_workflows():
     wf = MagicMock()
     wf.id = "workflow-stuck-created"
@@ -270,6 +302,7 @@ async def test_reconciler_indexes_the_tasks_it_completes_after_commit():
     db.add = MagicMock()
     db.execute = AsyncMock(
         side_effect=[
+            _rows([]),  # coding tasks whose workflow may be gone
             _rows([orphan]),  # orphaned-reply candidates
             _rows([]),  # stuck running workflows
             _rows([stale_done]),  # stale tasks

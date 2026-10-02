@@ -39,10 +39,15 @@ async def connect_temporal_with_retry(
 
 
 async def terminate_task_workflow(task_id: str, reason: str = "superseded") -> bool:
-    """End a task's workflow and Aura's runs for it (rebuild_stale and supersede)."""
+    """End a task's workflow, Aura's runs for it and its coding units (rebuild_stale and supersede)."""
+    from app.activities.coding_activities import stop_task_units
     from app.openclaw_control import schedule_abort
 
     schedule_abort(task_id, reason=reason)
+    try:
+        await asyncio.to_thread(stop_task_units, task_id)
+    except Exception as exc:
+        logger.warning("Stopping coding units of %s: %s", task_id[:8], exc)
     try:
         client = await connect_temporal()
         handle = client.get_workflow_handle(f"workflow-{task_id}")
@@ -95,6 +100,8 @@ async def start_task_workflow(
         if catalog_type and not get_template(catalog_type):
             catalog_type = None
 
+    if workflow_name is None and "coding_task" in (process_type, task_type, catalog_type):
+        workflow_name = "CodingTaskWorkflow"
     if workflow_name is None:
         workflow_name = "CatalogTaskWorkflow" if catalog_type else "GenericTaskWorkflow"
 

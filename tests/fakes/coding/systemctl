@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fake systemctl for runner tests: is-active, kill --signal and stop on fake units."""
+"""Fake systemctl for runner tests: is-active, list-units, kill --signal and stop on fake units."""
+import fnmatch
 import json
 import os
 import signal
@@ -29,9 +30,14 @@ def signal_unit(unit, sig):
 
 
 def main(args):
-    action, unit = args[0], args[-1]
+    action, unit = args[0], args[-1].removesuffix(".service")
     if action == "is-active":
         return 0 if pid(unit) else 3
+    if action == "list-units":
+        for path in sorted(STATE.glob("*.pid")):
+            if fnmatch.fnmatch(path.stem, unit) and pid(path.stem):
+                print(f"{path.stem}.service loaded active running fake unit")
+        return 0
     if action == "kill":
         name = next(a.split("=", 1)[1] for a in args if a.startswith("--signal="))
         signal_unit(unit, getattr(signal, name))

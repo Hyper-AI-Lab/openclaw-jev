@@ -87,6 +87,53 @@ async def test_the_workflow_learns_whether_to_recall_and_follow_up(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_coding_task_starts_the_coding_workflow(monkeypatch):
+    from app import temporal_control
+
+    started = []
+
+    class FakeClient:
+        async def start_workflow(self, name, payload, **kwargs):
+            started.append((name, kwargs["id"]))
+
+    async def fake_connect():
+        return FakeClient()
+
+    monkeypatch.setattr(temporal_control, "connect_temporal", fake_connect)
+    await temporal_control.start_task_workflow("t1", "Fix the greeting in Aura's code.", "s1", "user", process_type="coding_task")
+    await temporal_control.start_task_workflow("t2", "Good morning!", "s1", "user")
+    assert started == [("CodingTaskWorkflow", "workflow-t1"), ("GenericTaskWorkflow", "workflow-t2")]
+
+
+@pytest.mark.asyncio
+async def test_terminating_a_task_also_stops_its_coding_units(monkeypatch):
+    from app import openclaw_control, temporal_control
+    from app.activities import coding_activities
+
+    stopped, terminated = [], []
+
+    class FakeHandle:
+        async def signal(self, *args):
+            pass
+
+        async def terminate(self, reason):
+            terminated.append(reason)
+
+    class FakeClient:
+        def get_workflow_handle(self, workflow_id):
+            return FakeHandle()
+
+    async def fake_connect():
+        return FakeClient()
+
+    monkeypatch.setattr(openclaw_control, "schedule_abort", lambda task_id, reason: None)
+    monkeypatch.setattr(coding_activities, "stop_task_units", lambda task_id: stopped.append(task_id) or [])
+    monkeypatch.setattr(temporal_control, "connect_temporal", fake_connect)
+    assert await temporal_control.terminate_task_workflow("t1", "superseded by intake")
+    assert stopped == ["t1"] and terminated == ["superseded by intake"]
+
+
+@pytest.mark.asyncio
 async def test_reconciler_reconnects_after_dead_client(monkeypatch):
     from app import reconciler
 

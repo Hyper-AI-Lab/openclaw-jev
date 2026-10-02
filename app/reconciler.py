@@ -72,6 +72,62 @@ ORPHAN_EVENTS = (
     "reconciler.orphan_reply_rejudged",
     "reconciler.orphan_run_failed",
 )
+CODING_PROCESS = "coding_task"
+
+
+async def _is_coding_task(db, task: Task) -> bool:
+    if task.task_type == CODING_PROCESS:
+        return True
+    found = await db.execute(
+        select(ProcessRun.id).where(ProcessRun.task_id == task.id, ProcessRun.process_type == CODING_PROCESS).limit(1)
+    )
+    return found.scalars().first() is not None
+
+
+async def _close_orphaned_coding_tasks(client: Client, db, now: datetime, stats: dict) -> list:
+    """A coding task whose workflow is gone gets its units stopped and a notice; it is never re-judged."""
+    from app.activities.coding_activities import stop_task_units
+    from app.activities.db_activities import finalize_task_failure
+
+    coding_runs = select(ProcessRun.task_id).where(ProcessRun.process_type == CODING_PROCESS)
+    rows = await db.execute(
+        select(Task).where(Task.id.in_(coding_runs), Task.status.notin_(TERMINAL_STATUSES))
+    )
+    closed = []
+    for task in rows.scalars().all():
+        if task.updated_at and now - task.updated_at < timedelta(seconds=ORPHAN_REPLY_MIN_AGE_SEC):
+            continue
+        try:
+            desc = await client.get_workflow_handle(f"workflow-{task.id}").describe()
+        except RPCError as exc:
+            if exc.status != RPCStatusCode.NOT_FOUND:
+                continue
+            desc = None
+        if desc is not None and desc.status == WorkflowExecutionStatus.RUNNING:
+            continue
+        stopped = await asyncio.to_thread(stop_task_units, task.id)
+        await finalize_task_failure({"task_id": task.id, "task_status": "failed", "process_state": "failed_terminal"})
+        task.status = "failed"
+        task.next_check_at = None
+        db.add(
+            Event(
+                correlation_id=task.correlation_id or task.id,
+                entity_type="task",
+                entity_id=task.id,
+                event_type="reconciler.coding_orphan_closed",
+                event_payload={"workflow_status": desc.status.name if desc else "NOT_FOUND", "stopped_units": stopped},
+            )
+        )
+        stats["events"] += 1
+        metrics_inc("reconciler_coding_orphan_closed")
+        stopped_note = " and stopped its Claude Code run" if stopped else ""
+        await _notify_repair(
+            task,
+            f"Coding task {task.id[:8]} lost its workflow, so I closed it{stopped_note}. "
+            "Nothing shipped; the work so far is kept in its checkout.",
+        )
+        closed.append(task.id)
+    return closed
 
 
 async def _started_payload(client: Client, handle) -> dict | None:
@@ -130,6 +186,8 @@ async def _recover_orphaned_session_reply(
         select(Event).where(Event.entity_id == task.id, Event.event_type.in_(ORPHAN_EVENTS))
     )
     if prior.scalars().first():
+        return None
+    if await _is_coding_task(db, task):
         return None
 
     wf_id = f"workflow-{task.id}"
@@ -282,7 +340,17 @@ async def _repair_stuck_running_task(
     if desc.status != WorkflowExecutionStatus.RUNNING:
         return False
 
+    coding = await _is_coding_task(db, task)
+    if coding:
+        from app.activities.coding_activities import live_task_units, stop_task_units
+
+        # A live unit means the worker is down, not the run: the restarted worker reattaches to it.
+        if await asyncio.to_thread(live_task_units, task.id):
+            return False
+
     await _terminate_workflow(client, wf_id, f"Reconciler stuck repair (>={STUCK_REPAIR_MINUTES}m)")
+    if coding:
+        await asyncio.to_thread(stop_task_units, task.id)
     stats["terminated"] = stats.get("terminated", 0) + 1
 
     from app.activities.db_activities import execute_compensation, finalize_task_failure
@@ -412,6 +480,7 @@ async def reconcile_once() -> dict:
     client = await _get_temporal()
 
     async with AsyncSessionLocal() as db:
+        stats["coding_orphans_closed"] = len(await _close_orphaned_coding_tasks(client, db, now, stats))
         # Fast path: OpenClaw finished but worker died before Slack notify.
         orphan_candidates = await db.execute(
             select(Task).where(Task.status.in_(["running", "created"]))

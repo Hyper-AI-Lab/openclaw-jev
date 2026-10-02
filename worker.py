@@ -38,11 +38,13 @@ from app.activities.intake_activities import (
     resubmit_user_messages,
 )
 from app.activities.plan_activities import generate_process_plan, save_process_plan
+from app.activities.coding_activities import CODING_ACTIVITIES
 from app.activities.deep_memory_activities import RECALL_ACTIVITIES
 from app.telemetry import init_telemetry
 from app.temporal_control import connect_temporal_with_retry
 from app.workflows.catalog_step_child import CatalogStepChildWorkflow
 from app.workflows.catalog_task import CatalogTaskWorkflow
+from app.workflows.coding_task import CodingTaskWorkflow
 from app.workflows.deep_recall import DeepRecallWorkflow
 from app.workflows.generic_execute_child import GenericExecuteChildWorkflow
 from app.workflows.generic_task import GenericTaskWorkflow
@@ -71,6 +73,7 @@ async def main():
             GenericExecuteChildWorkflow,
             IntakeWorkflow,
             DeepRecallWorkflow,
+            CodingTaskWorkflow,
         ],
         activities=[
             send_to_openclaw,
@@ -104,6 +107,7 @@ async def main():
             classify_task_intake_activity,
             resubmit_user_messages,
             *RECALL_ACTIVITIES,
+            *CODING_ACTIVITIES,
         ],
     )
     from app.deep_memory.curator import warm_up
