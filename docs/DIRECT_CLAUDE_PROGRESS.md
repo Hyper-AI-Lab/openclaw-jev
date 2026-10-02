@@ -84,3 +84,57 @@ No coding job was running.
 - **Readiness:** 44 pass, 1 warn (telemetry), 0 fail; `claude_code`, `coding_isolation` and `coding_jobs` pass.
 
 **Deviation:** the plan's per-run flags were replaced by the bind (see step 1).
+
+---
+
+## Step 3 — RMP direct sessions
+
+**Date:** 2026-10-02.
+
+**What changed:**
+- **Sessions (`app/coding/direct.py`).** A session belongs to a task. Its `session.json` and workspace live under `/srv/aura-code/direct/<task>/<session>/`, root-only, so coding units can't see them. The workspace is either:
+  - `repo`: a clone of `openclaw-jev` from GitHub, borrowing the live checkout's objects (`--reference-if-able ... --dissociate`) and then standing alone, with the commit identity "Aura (Claude Code)";
+  - `scratch`: an empty folder.
+
+  Never the live checkout.
+- **Turns.** Each turn is `claude -p` as root, in auto mode, in its own transient unit `aura-direct-<task>-<session>-<n>`:
+  - `--session-id` the first time, `--resume` once Claude Code has the conversation;
+  - `CLAUDE_CONFIG_DIR=/root/.claude`, the login token from `/etc/aura-coder/claude.env`;
+  - resource limits as for coding jobs, and a 60-minute turn limit (`direct_turn_timeout_sec`);
+  - a short system prompt: work in the workspace, never edit the live checkout, never push to `main`, other repositories only on Kirill's word, no secrets in output, ask when unclear.
+
+  `Turn` subclasses the runner's `Run`, so stream reading, stop and usage booking are the same code as for coding runs.
+- **Limits.** One turn at a time per session, two at once on the host (`direct_max_running`), messages up to 120 KB.
+- **API** (behind the RMP key):
+  - `POST /api/claude/sessions`, only for a task that is still running, found from Aura's session key;
+  - `POST .../messages`;
+  - `GET .../turns/{n}?wait=` (a long poll of up to 55 s);
+  - `POST .../end`;
+  - `GET /api/claude/sessions[/{id}]`.
+
+  The task's timeline gets `claude.session_started`, `claude.turn_started` and `claude.session_ended` events.
+- **Stop.**
+  - `abort_task_runs`, which Kirill's stop, a cancel and a supersede all go through, ends the task's Claude sessions first, since their turns are Aura's tool calls.
+  - `stop_task_units` does the same for the coding and reconciler paths.
+  - The reconciler ends sessions whose task has finished, and prunes ended sessions' workspaces after the job retention (14 days); their records stay.
+- **Aura's turn time.**
+  - In `_dispatch_openclaw_session`, the 10-minute reply deadline moves on while one of the task's Claude turns runs (`_reply_deadline`); a hard deadline, as in intake's quick turns, never moves.
+  - The seven 45-minute activity limits on Aura's turns are now one `AURA_TURN` of 4 hours (`app/workflows/timeouts.py`). Turns without Claude are still bounded by the 10-minute reply deadline.
+
+**Files:**
+- **New:** `app/coding/direct.py`, `app/workflows/timeouts.py`, `tests/test_direct_sessions.py`.
+- **Changed:** `app/api/server.py`, `app/openclaw_control.py`, `app/activities/coding_activities.py`, `app/activities/openclaw_activities.py`, `app/reconciler.py`, `app/config.py`, and the seven workflows.
+
+**Verification:**
+- **Tests:**
+  - `test_direct_sessions.py`, 15 passed: the root profile and auto mode in the unit, resume on the second turn, one turn at a time, the host limit, end and stop, a stop or an abort ends only the task's sessions, usage booked once, a lost unit, refused input, a real-git clone, prune, the reply deadline, the reconciler, and the API end to end with events.
+  - Full suite: 1025 passed, 4 skipped.
+- **Live, as root with real Claude:**
+  - the clone took 3.9 s from GitHub, standing alone afterwards;
+  - turn 1 succeeded in 17 s; turn 2 resumed and remembered the first;
+  - ending the session mid-command (`sleep 120`) took 0.4 s and the turn reads as stopped; no unit was left.
+- **Readiness:** 44 pass, 1 warn (telemetry), 0 fail; the reconciler sweep runs without errors.
+
+**Found and fixed live:** the clone flag is `--dissociate`; I had written `--dissolve`, which git rejects. The faked-git test could not see it, so `_clone` now takes its URL and a real-git test covers it.
+
+**Noted:** the clone is GitHub's `main`, which is behind the local `main` until this work is pushed.
