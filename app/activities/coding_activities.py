@@ -322,7 +322,9 @@ async def deploy_coding_change(payload: Dict[str, Any]) -> Dict[str, Any]:
     entry = cfg["repositories"][job.repo]
     if payload["target"] != "self":
         body = prompts.pr_body(payload["summary"], (payload.get("report") or {}).get("evidence", {}).get("tests"))
-        return await asyncio.to_thread(deploy.open_pull_request, job, head, entry, payload["title"], body)
+        result = await asyncio.to_thread(deploy.open_pull_request, job, head, entry, payload["title"], body)
+        await _record_deploy(job.task_id, result)
+        return result
     ready = await asyncio.to_thread(deploy.fetch_approved, job, head)
     if ready["status"] != "ready":
         return ready
@@ -331,9 +333,21 @@ async def deploy_coding_change(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "failed", "tests": suite,
                 "summary": f"RMP's full suite failed on the approved commit {head[:12]} ({prompts.tests_line(suite)}), "
                            "so nothing was deployed; main is unchanged."}
-    spec = {"task_id": job.task_id, "old": ready["old"], "head": head, "context": _context(payload), "report": payload["report"]}
+    spec = {"task_id": job.task_id, "old": ready["old"], "head": head, "context": _context(payload), "report": payload["report"],
+            "suite": {"ok": True, "summary": prompts.tests_line(suite)}}
     unit = await asyncio.to_thread(deploy.hand_off, spec)
     return {"status": "handed_off", "unit": unit, "summary": f"RMP's full suite passed on {head[:12]}; {unit} deploys it."}
+
+
+async def _record_deploy(task_id: str, result: Dict[str, Any]) -> None:
+    """The same record a self-deploy's unit writes, for the deploy invariants."""
+    from app.db.database import AsyncSessionLocal
+    from app.db.models import Event
+
+    async with AsyncSessionLocal() as db:
+        db.add(Event(correlation_id=task_id, entity_type="task", entity_id=task_id, event_type="coding.deploy",
+                     event_payload=result))
+        await db.commit()
 
 
 @traced_activity("coding.refresh_base")

@@ -1538,6 +1538,33 @@ async def production_readiness():
     return await run_all_checks()
 
 
+CODING_EVENTS = ("approval.confirmed", "approval.refused", "coding.deploy", "coding.reported_by_rmp",
+                 "reconciler.coding_orphan_closed")
+
+
+@app.get("/api/coding/status")
+async def coding_status_view():
+    from app.production.coding_readiness import coding_status
+
+    return await asyncio.to_thread(coding_status)
+
+
+@app.get("/api/coding/jobs/{task_id}")
+async def coding_job_view(task_id: str, db: AsyncSession = Depends(get_db)):
+    import re
+
+    from app.production.coding_readiness import coding_job
+
+    job = await asyncio.to_thread(coding_job, task_id) if re.fullmatch(r"[0-9A-Za-z_-]{1,64}", task_id) else None
+    if job is None:
+        raise HTTPException(status_code=404, detail="No coding job for this task")
+    events = (await db.execute(
+        select(Event).where(Event.entity_id == task_id, Event.event_type.in_(CODING_EVENTS)).order_by(Event.occurred_at)
+    )).scalars().all()
+    return {**job, "events": [{"type": e.event_type, "at": e.occurred_at.isoformat() if e.occurred_at else None,
+                               "payload": e.event_payload} for e in events]}
+
+
 @app.get("/api/deep_memory/status")
 async def deep_memory_status():
     from app.deep_memory.health import deep_memory_status as status

@@ -135,8 +135,12 @@ async def confirm_approval_provenance(payload: Dict[str, Any]) -> Dict[str, Any]
         for row in rows:
             slack = (row.meta or {}).get("slack") or {}
             if owner and slack.get("user_id") == owner and gate_decision(row.content) == "approve":
-                return {"ok": True, "message_id": row.id, "slack_ts": row.slack_ts, "slack_user_id": owner,
-                        "event_ts": slack.get("event_ts")}
+                confirmed = {"ok": True, "message_id": row.id, "slack_ts": row.slack_ts, "slack_user_id": owner,
+                             "event_ts": slack.get("event_ts")}
+                db.add(Event(correlation_id=task_id, entity_type="task", entity_id=task_id, event_type="approval.confirmed",
+                             event_payload={"gate_opened_at": payload["gate_opened_at"], **confirmed}))
+                await db.commit()
+                return confirmed
         senders = sorted({str(((r.meta or {}).get("slack") or {}).get("user_id")) for r in rows})
         reason = (f"no Slack approval from {owner or 'the owner (unset)'} after {opened.isoformat()}"
                   f" ({len(rows)} Slack message(s) since, senders {senders})")

@@ -825,6 +825,9 @@ async def run_all_checks() -> Dict[str, Any]:
         check_openai_key(),
         check_safe_harbor_peripheral(),
     ]
+    from app.production.coding_readiness import run_coding_checks
+
+    sync_checks += run_coding_checks()
     async_checks = await asyncio.gather(
         check_systemd_services(),
         check_rmp_health(),

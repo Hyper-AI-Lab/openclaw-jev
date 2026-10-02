@@ -464,6 +464,8 @@ Key endpoints:
 | `GET /tasks/{id}` | Status |
 | `POST /tasks/{id}/signal` | `user_input`, `cancel`, `approve`, `retry` |
 | `POST /tasks/{id}/cancel` | Cancel workflow |
+| `GET /api/coding/status` | Coding: Claude Code version, token expiry, the coding slot, live units, repositories |
+| `GET /api/coding/jobs/{task_id}` | One coding task: its job, each Claude Code run, each verification, the deploy and its events |
 | `GET /api/production/readiness` | Go-live readiness score |
 | `GET /api/deep_memory/status` | Switches, ingest queue, documents, index points vs objects, memory lane, recall outcomes of the last 24 h |
 | `GET /api/deep_memory/reports/{task_id}` | A task's deep recall reports: plan, candidates, report, latency, use, novelty |
@@ -554,6 +556,16 @@ Tracks **requests + tokens** per key per day, by source:
 - **Honesty:** `nvidia:unknown` is treated as unset when a model id is present (`openai/` → `openai:default`, `nvidia/` → `nvidia:default`). Only `rolling_24h` events with a model are rewritten. Day-bucket `nvidia:unknown` totals stay; summary annotates those UTC days. Never invent `nvidia:keyN`.
 
 **Design choice:** Chat and embeddings share one key pool — avoids total quota overrun; bulk vector seeding may pace Slack turns slightly. Balanced rotation **aims for equal load** but instant parity is not guaranteed under burst traffic.
+
+### 5.11 Coding tasks (Claude Code)
+
+Kirill's requests for code changes are catalog type `coding_task`, run by **`CodingTaskWorkflow`** (`app/workflows/coding_task.py`, activities in `app/activities/coding_activities.py`).
+
+- **Isolation:** Claude Code (`claude -p`, stream-json, pinned version) runs as the unprivileged user `aura-coder` in a transient systemd unit per run (`aura-claude-<task>-<n>`): read-only system, writes only to its job checkout and home, secrets and RMP's sockets hidden, and an nftables table that keeps it off this host's services (`app/coding/units.py`, `firewall.py`). Aura never runs `claude` herself.
+- **Flow:** one coding job at a time (the coding slot). Aura writes the brief, RMP prepares a job checkout (`app/coding/workspace.py`), then rounds: Claude Code (a rework resumes its session), RMP collects the work into a root-owned review repository through a bundle and runs the repository's tests itself as `aura-coder` (`app/coding/verify.py`), Aura reviews, and the Process Evaluator judges her reply against that external evidence. Then the approval card; only Kirill's own Slack *approve*, recorded after the card, ships (`confirm_approval_provenance`).
+- **Shipping** (`app/coding/deploy.py`): other repositories get a branch and a pull request. Aura's own code must fast-forward `main` (else a rebase round), passes the full suite on the exact commit, and is handed to the detached root unit `aura-deploy-<task>` (`ops/coding_deploy.py`). That unit holds the code-reload lock, waits for idle, refuses hand-edited mirrors, fast-forwards and pushes `main`, syncs `plugins/`, `web-stack/`, `systemd/` and `.cursor/rules/`, restarts only what changed, checks health, readiness and a canary, and reverts on failure. A fresh run of `workflow-<task>` then sends the judged reply on the new code.
+- **Durability:** long runs heartbeat and reattach to their unit after a worker restart; a stop stops the unit within seconds and keeps the checkout; the reconciler closes a coding task whose workflow is gone and stops its units, and never re-judges it.
+- **Observability:** readiness checks `claude_code`, `coding_isolation` and `coding_jobs`; invariants `approved_deploys`, `deploy_verification` and `coding_units`; the coding API above.
 
 ---
 

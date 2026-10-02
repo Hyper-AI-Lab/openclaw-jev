@@ -35,8 +35,11 @@ def _since() -> datetime:
 
 
 async def check_judged_deliveries() -> CheckResult:
-    """A user task completes only after the evaluator accepted its reply."""
-    accepted = exists().where(Event.entity_id == Task.id, Event.event_type == "evaluator.accept")
+    """A user task completes only after the evaluator accepted its reply.
+
+    A coding task whose replies the evaluator never accepted completes with RMP's own record of what shipped.
+    """
+    accepted = exists().where(Event.entity_id == Task.id, Event.event_type.in_(("evaluator.accept", "coding.reported_by_rmp")))
     async with AsyncSessionLocal() as db:
         rows = (
             await db.execute(
@@ -207,6 +210,66 @@ async def check_vector_sync() -> CheckResult:
     return CheckResult("vector_sync", "pass", "Postgres and Qdrant agree; outbox drains", details)
 
 
+SHIPPED = ("deployed", "rolled_back", "pr_opened")
+
+
+async def _deploy_events() -> List[Event]:
+    async with AsyncSessionLocal() as db:
+        return list((await db.execute(
+            select(Event).where(Event.event_type == "coding.deploy", Event.occurred_at >= _since())
+        )).scalars())
+
+
+async def check_approved_deploys() -> CheckResult:
+    """Nothing ships without Kirill's own Slack approval, confirmed before the deploy."""
+    shipped = [e for e in await _deploy_events() if (e.event_payload or {}).get("status") in SHIPPED]
+    confirmed = {}
+    if shipped:
+        async with AsyncSessionLocal() as db:
+            confirmed = dict((await db.execute(
+                select(Event.entity_id, func.min(Event.occurred_at)).where(
+                    Event.event_type == "approval.confirmed", Event.entity_id.in_({e.entity_id for e in shipped})
+                ).group_by(Event.entity_id)
+            )).all())
+    unapproved = sorted({e.entity_id for e in shipped
+                         if confirmed.get(e.entity_id) is None or confirmed[e.entity_id] > e.occurred_at})
+    if unapproved:
+        return CheckResult("approved_deploys", "fail", f"{len(unapproved)} coding task(s) shipped without a confirmed approval",
+                           {"task_ids": unapproved[:20]})
+    return CheckResult("approved_deploys", "pass", f"Every shipped coding change ({len(shipped)}) had Kirill's approval", {})
+
+
+async def check_deploy_verification() -> CheckResult:
+    """Every self-deploy records the exact-commit suite and the checks after the restart."""
+    deployed = [e for e in await _deploy_events() if (e.event_payload or {}).get("status") == "deployed"]
+    unverified = sorted({e.entity_id for e in deployed
+                         if not ((e.event_payload.get("suite") or {}).get("ok") is True
+                                 and e.event_payload.get("canary") in ("ok", "skipped"))})
+    if unverified:
+        return CheckResult("deploy_verification", "fail", f"{len(unverified)} self-deploy(s) without a verification record",
+                           {"task_ids": unverified[:20]})
+    return CheckResult("deploy_verification", "pass", f"Every self-deploy ({len(deployed)}) recorded its suite and checks", {})
+
+
+async def check_coding_units() -> CheckResult:
+    """No Claude Code unit runs without a live coding task."""
+    from app.activities.coding_activities import ACTIVE_TASK_STATUSES
+    from app.production.coding_readiness import live_units
+
+    units = [u for u in await asyncio.to_thread(live_units) if u["kind"] == "claude"]
+    statuses = {}
+    if units:
+        async with AsyncSessionLocal() as db:
+            statuses = dict((await db.execute(
+                select(Task.id, Task.status).where(Task.id.in_({u["task_id"] for u in units}))
+            )).all())
+    orphaned = [u["unit"] for u in units if statuses.get(u["task_id"]) not in ACTIVE_TASK_STATUSES]
+    if orphaned:
+        return CheckResult("coding_units", "fail", f"Claude Code unit(s) without a live task: {', '.join(orphaned)}",
+                           {"units": orphaned})
+    return CheckResult("coding_units", "pass", f"{len(units)} Claude Code unit(s), each with a live task", {})
+
+
 CHECKS = (
     check_judged_deliveries,
     check_attached_messages,
@@ -214,6 +277,9 @@ CHECKS = (
     check_orphan_recoveries,
     check_memory_hygiene,
     check_vector_sync,
+    check_approved_deploys,
+    check_deploy_verification,
+    check_coding_units,
     *DEEP_MEMORY_INVARIANTS,
 )
 

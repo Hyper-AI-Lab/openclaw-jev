@@ -60,6 +60,7 @@ def main(spec_path: str) -> int:
             result = {"status": "failed", "error": str(exc)[:500],
                       "summary": f"The deploy stopped with an error ({str(exc)[:300]}); main is at {main_now[:12]}, "
                                  "please check it."}
+    result = {**result, "suite": spec.get("suite")}
     log(f"result: {json.dumps(result)}")
     asyncio.run(finish(spec, result))
     return 0 if result["status"] == "deployed" else 1

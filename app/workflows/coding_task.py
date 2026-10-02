@@ -32,6 +32,7 @@ with workflow.unsafe.imports_passed_through():
         confirm_approval_provenance,
         ensure_process_run,
         finalize_task_failure,
+        record_event,
         update_process_state,
         update_task_status,
     )
@@ -455,6 +456,11 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                 break
             prompt = f"{prompts.final_prompt(review['reply'], shipped)}\n\nYour last draft was not accepted: {judged['issues']}"
         ok = shipped.get("status") in ("deployed", "pr_opened")
+        if not message:
+            await workflow.execute_activity(
+                record_event, {"correlation_id": self._ctx["task_id"], "entity_type": "task", "entity_id": self._ctx["task_id"],
+                               "event_type": "coding.reported_by_rmp", "event_payload": {"status": shipped.get("status")}},
+                start_to_close_timeout=QUICK)
         delivered = await self._deliver_final({**self._ctx, "message": message or shipped.get("summary") or str(shipped)})
         if delivered:
             await self._close("completed" if ok else "failed", "completed" if ok else "failed_terminal")

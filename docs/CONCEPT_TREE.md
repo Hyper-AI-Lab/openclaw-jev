@@ -99,7 +99,8 @@ RMP chat.postMessage (idempotent)
 ### 3.4 Workflow kinds
 
 - **GenericTaskWorkflow** — default for user DMs and most work. Plan-driven steps.
-- **CatalogTaskWorkflow** — named templates (registration, login, email verify, procurement, outreach, browser automation, tool self-upgrade). **Assigned by Intake Analyst `catalog_hint`**, never by keyword alone.
+- **CatalogTaskWorkflow** — named templates (registration, login, email verify, procurement, outreach, browser automation). **Assigned by Intake Analyst `catalog_hint`**, never by keyword alone.
+- **CodingTaskWorkflow** — catalog `coding_task` (aliases `tool_self_upgrade`, `self_upgrade`, `capability_upgrade`): Claude Code changes code as `aura-coder` in its own checkout, RMP tests it, Aura and the evaluator review, and Kirill approves before anything ships.
 - **IntakeWorkflow** — classify. If it fails, still create an RMP user task (`create_fresh` + Generic). Never native Slack.
 - **DeepRecallWorkflow** — the IA's deep recall, a bounded child `{task_id}-recall` of a user task: plan, hybrid retrieval with expansion, and a cited context report.
 
@@ -133,6 +134,8 @@ RMP chat.postMessage (idempotent)
 - Canaries are health checks: green → silent; failure → fix if possible else alert Kirill. They are not user work (`wait_active` / `attach_active` must ignore them). `CANARY_OK` must not appear in user Slack.
 - One user-visible Slack reply per turn (no native + RMP double post).
 - Secrets stay out of git and chat.
+
+- Coding jobs: Claude Code runs only as `aura-coder` in transient units, never as Aura or root. Nothing ships without Kirill's own Slack *approve*, confirmed after the approval card. Aura's own code deploys only through the deploy unit: the full suite on the exact commit, restarts of what changed, health, readiness and a canary, and an automatic revert.
 
 ### MUST NOT
 
