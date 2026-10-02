@@ -138,3 +138,34 @@ No coding job was running.
 **Found and fixed live:** the clone flag is `--dissociate`; I had written `--dissolve`, which git rejects. The faked-git test could not see it, so `_clone` now takes its URL and a real-git test covers it.
 
 **Noted:** the clone is GitHub's `main`, which is behind the local `main` until this work is pushed.
+
+---
+
+## Step 4 — Claude's work in memory
+
+**Date:** 2026-10-02.
+
+**Why:** Kirill's addition to the plan. Aura's other tools leave their trace through her OpenClaw transcript, which RMP already reads: the evaluator sees her actions, and the task document lists every tool call and keeps the pages and files she read. Claude is the one path outside that transcript: RMP runs it, so what it did is only in RMP's records. The structured coding jobs had the same gap.
+
+**What changed:**
+- **One reader (`app/coding/records.py`).** `task_records(task_id)` reads RMP's own records into conversations of turns: each direct session, and the coding job's runs (the brief's goal as the first ask, plus RMP's test result per round). Each turn has what Aura asked, Claude's reply (its report's summary for coding runs), commands, files edited, pull-request links and tokens. `section_text` and `conversation_text` render them. The evaluator's evidence will use the same reader in step 7.
+- **The task document (`app/deep_memory/ingest.py`).**
+  - A fifth section, "Claude sessions", holds a digest of every conversation.
+  - Each conversation is also its own `claude_session` document, with a heading per turn and a `part_of` link to the task.
+  - Both are redacted, chunked, enriched and indexed like the rest. Enrichment gets a label for the new kind.
+- **Redaction (`app/memory/policy.py`).** `sk-` keys may now contain `-` and `_`, which covers OpenAI's `sk-proj-` keys and Claude Code's `sk-ant-oat01-` token, and fine-grained GitHub tokens (`github_pat_`) are covered. Before this, neither the Claude token nor the GitHub token on this host would have been redacted, and root Claude can read both.
+- **Invariant `claude_records` (`app/deep_memory/health.py`).** It fails when a finished user task with Claude work lacks the "Claude sessions" section in its document 30 minutes after it ended.
+
+**Files:**
+- **New:** `app/coding/records.py`, `tests/test_claude_records.py`.
+- **Changed:** `app/deep_memory/ingest.py`, `app/deep_memory/enrich.py`, `app/deep_memory/health.py`, `app/memory/policy.py`, `tests/test_deep_ingest.py`, `tests/test_deep_memory_health.py`, `tests/test_memory_policy.py`.
+
+**Verification:**
+- **Tests:**
+  - records from a real direct session (through the fakes) and from a coding job with a brief, a pull request and RMP's tests;
+  - the task document's new section and the linked conversation document, with a Claude token redacted;
+  - the invariant on missing, fresh, internal and plain tasks;
+  - the token shapes on this host.
+  - Full suite: 1031 passed, 4 skipped.
+- **Backfill (live).** The one finished task with Claude records, the coding task `bd56025f` from the earlier acceptance, was re-queued. Its document now has sections Conversation, Path history, Actions and Claude sessions, enriched. Its conversation is an enriched `claude_session` document (5 chunks, a section for the turn).
+- **Invariants:** `claude_records` passes (1 of 1), `task_documents` passes (7 of 7).
