@@ -169,3 +169,39 @@ No coding job was running.
   - Full suite: 1031 passed, 4 skipped.
 - **Backfill (live).** The one finished task with Claude records, the coding task `bd56025f` from the earlier acceptance, was re-queued. Its document now has sections Conversation, Path history, Actions and Claude sessions, enriched. Its conversation is an enriched `claude_session` document (5 chunks, a section for the turn).
 - **Invariants:** `claude_records` passes (1 of 1), `task_documents` passes (7 of 7).
+
+---
+
+## Step 5 — Aura's Claude tools
+
+**Date:** 2026-10-02.
+
+**What changed:**
+- **The tools (`plugins/rmp_adapter/claude_tools.js`).** Four tools for Aura, registered by `rmp_adapter`:
+  - `claude_start` starts a session in `repo` (a GitHub clone of her repository) or `scratch`, tied to the task through the tool's `context.sessionKey`;
+  - `claude_send` sends a message and waits for Claude's answer: its text, the files it edited, the commands it ran, what auto mode blocked, and a usage limit with its reset time;
+  - `claude_status` reports where a session stands, optionally waiting up to 55 s;
+  - `claude_end` ends a session.
+
+  All four only call RMP's session API, through the plugin's existing `rmpFetch`, which carries the RMP key and redacts it in logs.
+- **Waiting.** `claude_send` long-polls RMP in steps of at most 50 s until the turn is done. It rides out up to 5 minutes of RMP being unreachable, as during a code reload, because the turn runs on in its own unit. It gives up at once on a refused request (HTTP 4xx), and stops when Aura's run is aborted.
+- **Manifest.** `openclaw.plugin.json` declares the four tools under `contracts.tools`. `index.js` exports `rmpFetch` for the tests.
+
+**Deviation:** the plan named a new plugin `plugins/aura_claude/`. The tools live in `rmp_adapter` instead: it is already registered and allowed in `openclaw.json`, and it already holds the RMP client and key handling. So nothing in OpenClaw's configuration changed and there is no second RMP client.
+
+**Found live:** OpenClaw 2026.9.7 drops plugin tools that the manifest does not declare. The first gateway restart logged "plugin must declare contracts.tools" for all four. A node test now ties the registered tools to the manifest, and compares the live copies with the repo.
+
+**Deploy:**
+- **First (12:52 local):** the files were copied to `/root/.openclaw/plugins/rmp_adapter/` with no user task active, and the gateway restarted.
+- **Second (12:55):** the manifest, again with no task active. After it the gateway came up in 45 s with no warnings.
+
+**Incident, investigated at Kirill's request:**
+- **What was seen.** The commit `12e42de`, the fast-forward of `main`, the manifest copy and the second restart (12:55:55 to 12:55:57) did not come from a command whose result I saw. My visible command found nothing to commit.
+- **What I found.** The journal and both reflogs show the same chain as my command, two seconds from commit to restart, gated on no active task. Today's only gateway stops are this one and my first. No other process, terminal or agent transcript was active. Every other commit and fast-forward today is mine.
+- **Conclusion:** an earlier attempt of my own command ran in full and its result never reached me (inferred). Its outcome was the intended state.
+- **From now on,** deploy commands check the live state first, so a repeated run changes nothing.
+
+**Verification:**
+- **Node:** 26/26, including the claude tools end to end against a fake RMP (start, a send across three polls, end), an RMP outage ridden out, a refused message, a usage limit, progress while working, the manifest check, and the live copies.
+- **Gateway:** active; `http server listening (6 plugins ...)` with no `contracts.tools` warnings.
+- **Not yet:** Aura using the tools in a real task, which comes with step 7's notes and the acceptance.
