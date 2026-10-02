@@ -193,27 +193,30 @@ async def test_the_coding_status_names_the_short_rmp_commit_and_open_direct_sess
     assert status["direct_sessions_open"] == 2
 
 
-def merge_event(tid, minutes, check="success"):
-    return Event(correlation_id=tid, entity_type="task", entity_id=tid, event_type="coding.pr_merged",
-                 event_payload={"pr": 12, "check": check, "url": "https://github.com/x/pull/12"}, occurred_at=ago(minutes=minutes))
-
-
-async def test_auras_own_deploys_need_no_approval_but_ci_at_the_merge(session):  # noqa: F811
-    await seed(session, deploy_event("own", "deployed", 20, source="github", canary="ok"), merge_event("own", 30),
-               deploy_event("late-ci", "deployed", 20, source="github", canary="ok"), merge_event("late-ci", 10),
+async def test_deploys_of_githubs_main_need_no_approval_but_ci_on_the_deployed_commit(session):  # noqa: F811
+    await seed(session, deploy_event("main", "deployed", 20, source="github", canary="ok", ci="success"),
+               deploy_event("main-untested", "deployed", 20, source="github", canary="ok"),
                deploy_event("reviewed", "deployed", 20, source="reviewed", canary="ok", suite={"ok": True}))
     approved = await invariants.check_approved_deploys()
     assert approved.status == "fail" and approved.details["task_ids"] == ["reviewed"]
     verified = await invariants.check_deploy_verification()
-    assert verified.status == "fail" and verified.details["task_ids"] == ["late-ci"]
+    assert verified.status == "fail" and verified.details["task_ids"] == ["main-untested"]
 
 
-async def test_a_merged_pull_request_must_have_passed_ci_and_be_deployed_within_3_hours(session):  # noqa: F811
-    await seed(session, merge_event("deployed", 200), deploy_event("deployed", "deployed", 190, source="github"),
-               merge_event("waiting", 60), merge_event("forgotten", 200), merge_event("unchecked", 5, check="failure"))
-    result = await invariants.check_merged_deploys()
-    assert result.status == "fail" and result.details["task_ids"] == ["forgotten", "unchecked"]
-    assert "1 merge(s) without a passed CI check" in result.message and "1 merge(s) not deployed after 3 h" in result.message
+async def test_githubs_main_must_go_live_within_3_hours(monkeypatch):
+    from app.coding import deploy
+
+    monkeypatch.setattr("app.config.get_coding_config", lambda: {"repositories": {"rmp": {"remote": "x/y"}}})
+    for pending, status in ((None, "pass"), ({"head": "a" * 40, "age_hours": 1.0}, "pass"),
+                            ({"head": "b" * 40, "age_hours": 5.2}, "fail")):
+        monkeypatch.setattr(deploy, "pending_main", lambda repo, pending=pending: pending)
+        assert (await invariants.check_main_deployed()).status == status
+
+    def unreachable(repo):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(deploy, "pending_main", unreachable)
+    assert (await invariants.check_main_deployed()).status == "warn"
 
 
 async def test_no_direct_claude_turn_runs_without_a_live_task(session, monkeypatch):  # noqa: F811

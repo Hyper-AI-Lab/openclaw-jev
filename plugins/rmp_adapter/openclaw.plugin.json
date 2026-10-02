@@ -24,8 +24,7 @@
       "claude_start",
       "claude_send",
       "claude_status",
-      "claude_end",
-      "deploy_pr"
+      "claude_end"
     ]
   }
 }

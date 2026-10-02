@@ -93,7 +93,10 @@ async def _is_coding_task(db, task: Task) -> bool:
 
 
 async def _end_claude_sessions_of_finished_tasks(db) -> int:
-    """A Claude session outlives its task only when a stop went astray; it ends with the task."""
+    """A Claude session outlives its task only when a stop went astray; it ends with the task.
+
+    Only a task known to have finished ends its sessions: one the database lacks may be a test's.
+    """
     from app.coding import direct
 
     open_sessions = [s for s in await asyncio.to_thread(direct.sessions) if s["status"] == "open"]
@@ -103,7 +106,7 @@ async def _end_claude_sessions_of_finished_tasks(db) -> int:
     statuses = dict(rows.all())
     ended = 0
     for session in open_sessions:
-        if statuses.get(session["task_id"], "missing") in TERMINAL_STATUSES | {"missing"}:
+        if statuses.get(session["task_id"]) in TERMINAL_STATUSES:
             await asyncio.to_thread(direct.end, session["id"], "task finished")
             ended += 1
     return ended
@@ -743,6 +746,14 @@ async def close_runs_of_ended_tasks(db, now: datetime) -> int:
     return closed
 
 
+def watch_github_main():
+    """Start the deploy of GitHub's main once a merge moved it and CI passed on it (``app.coding.deploy``)."""
+    from app.coding.deploy import watch_main
+    from app.config import is_development_mode
+
+    return None if is_development_mode() else watch_main()
+
+
 def prune_coding_jobs() -> list:
     """Coding job checkouts past their retention, unless a run of theirs is still live, and the
     workspaces of Claude sessions that ended as long ago."""
@@ -767,6 +778,12 @@ async def reconciler_loop(stop_event: asyncio.Event):
                     logger.info("Pruned coding job checkouts: %s", removed)
             except Exception as e:
                 logger.warning("Coding job prune failed: %s", e)
+        try:
+            started = await asyncio.to_thread(watch_github_main)
+            if started:
+                logger.info("GitHub's main moved and passed CI; %s deploys it once Aura is idle", started)
+        except Exception as e:
+            logger.warning("Watching GitHub's main failed: %s", e)
         try:
             stats = await reconcile_once()
             if stats.get("skipped"):

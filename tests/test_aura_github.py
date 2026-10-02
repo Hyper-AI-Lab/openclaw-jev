@@ -46,24 +46,26 @@ def test_a_branch_is_pushed_to_auras_repository(clone):
     assert git(clone.remote, "rev-parse", "refs/heads/aura/fix") == git(clone.work, "rev-parse", "HEAD")
 
 
-def test_main_another_repository_and_a_merge_are_refused(clone):
+def test_main_and_another_repository_are_refused(clone):
     git(clone.work, "checkout", "-q", "main")
     main = run("push", cwd=clone.work, env=clone.env)
     assert main.returncode == 2 and "never push main" in main.stderr
     git(clone.work, "remote", "set-url", "origin", "https://github.com/someone/else.git")
     other = run("push", "aura/fix", cwd=clone.work, env=clone.env)
     assert other.returncode == 2 and "Kirill's go-ahead" in other.stderr
-    merge = run("gh", "pr", "merge", "12", cwd=clone.work, env=clone.env)
-    assert merge.returncode == 2 and "deploy_pr" in merge.stderr
     nothing = run(cwd=clone.work, env=clone.env)
     assert nothing.returncode == 2 and "usage" in nothing.stderr
     assert "refs/heads/main" not in git(clone.remote, "for-each-ref")
 
 
-def test_gh_gets_the_token_and_the_repository_in_its_environment_only(clone):
+def test_gh_gets_the_token_and_the_repository_in_its_environment_only_and_can_merge(clone):
     fake = clone.tmp / "bin"
     fake.mkdir()
     (fake / "gh").write_text('#!/bin/sh\necho "argv=$* token=$GH_TOKEN repo=$GH_REPO"\n')
     (fake / "gh").chmod(0o755)
-    out = run("gh", "pr", "view", "12", cwd=clone.work, env={**clone.env, "PATH": f"{fake}:{os.environ['PATH']}"})
+    env = {**clone.env, "PATH": f"{fake}:{os.environ['PATH']}"}
+    out = run("gh", "pr", "view", "12", cwd=clone.work, env=env)
     assert out.stdout.strip() == "argv=pr view 12 token=tok-123 repo=Hyper-AI-Lab/openclaw-jev"
+    # Claude merges once Aura approves; GitHub's protection on main still demands a passed test check.
+    merged = run("gh", "pr", "merge", "12", "--squash", cwd=clone.work, env=env)
+    assert merged.returncode == 0 and merged.stdout.strip().startswith("argv=pr merge 12 --squash token=tok-123")

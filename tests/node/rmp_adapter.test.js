@@ -127,6 +127,10 @@ function loadPlugin() {
   return { hooks, tools };
 }
 
+function text(result) {
+  return result.content.map((part) => part.text).join('');
+}
+
 function slackDm(content) {
   return [
     { content, metadata: { provider: 'slack' } },
@@ -361,22 +365,24 @@ test('claude tools start a session, send a message, wait across long polls and e
     ['POST /api/claude/sessions/s-1/end', () => ({ id: 's-1', turns: 2, stopped: [] })],
   ]);
   const { tools } = loadPlugin();
-  assert.match(await tools.claude_start.execute('c1', { title: 'Fix calc' }), /^Claude session s-1 is ready \(repo: /);
-  assert.equal(await tools.claude_send.execute('c2', { session: 's-1', message: 'Fix add()' }),
-    'Claude, turn 2: success\n\nFixed add().\n\nFiles edited: calc.py\nCommands (last 1): pytest -q');
+  const started = await tools.claude_start.execute('c1', { title: 'Fix calc' });
+  assert.match(text(started), /^Claude session s-1 is ready \(repo: /);
+  assert.deepEqual(started.details, { session: 's-1', workspace: 'repo', path: '/srv/aura-code/direct/t/s-1/repo' });
+  const answer = await tools.claude_send.execute('c2', { session: 's-1', message: 'Fix add()' });
+  assert.equal(text(answer), 'Claude, turn 2: success\n\nFixed add().\n\nFiles edited: calc.py\nCommands (last 1): pytest -q');
+  assert.deepEqual(answer.details, { session: undefined, turn: 2, done: true, outcome: 'success' });
   assert.equal(polls, 3);
   assert.deepEqual(calls[0].body, { session_key: SLACK_KEY, workspace: 'repo', title: 'Fix calc' });
   assert.deepEqual(calls[1].body, { message: 'Fix add()' });
-  assert.equal(await tools.claude_end.execute('c3', { session: 's-1' }), 'Claude session s-1 ended after 2 turn(s).');
+  assert.equal(text(await tools.claude_end.execute('c3', { session: 's-1' })), 'Claude session s-1 ended after 2 turn(s).');
 });
 
-test('deploy_pr asks RMP to merge one of her pull requests and deploy it', async () => {
-  const calls = installFetch([
-    ['POST /api/claude/deploy', () => ({ status: 'merged', summary: 'Merged PR #12 as abc. RMP deploys it once you are idle.' })],
-  ]);
+test('a tool result is an object OpenClaw can read in a script, never a bare string', async () => {
+  installFetch([['POST /api/claude/sessions/s-1/messages', () => json({ detail: 'the session has ended' }, 409)]]);
   const { tools } = loadPlugin();
-  assert.equal(await tools.deploy_pr.execute('c1', { pr: '12' }), 'Merged PR #12 as abc. RMP deploys it once you are idle.');
-  assert.deepEqual(calls[0].body, { pr: 12, session_key: SLACK_KEY });
+  const failed = await tools.claude_send.execute('c1', { session: 's-1', message: 'go' });
+  assert.ok('details' in failed && Array.isArray(failed.content));
+  assert.equal(text(failed), 'Claude message failed: HTTP 409: the session has ended');
 });
 
 test('a Claude wait rides out an RMP restart, and a refused message or a usage limit is reported', async () => {
@@ -398,12 +404,12 @@ test('a Claude wait rides out an RMP restart, and a refused message or a usage l
     { registerTool: (tool) => { const built = typeof tool === 'function' ? tool({}) : tool; tools[built.name] = built; } },
     { rmpFetch: require(PLUGIN).rmpFetch, pause: async () => {} },
   );
-  assert.equal(await tools.claude_send.execute('c1', { session: 's-1', message: 'go' }),
+  assert.equal(text(await tools.claude_send.execute('c1', { session: 's-1', message: 'go' })),
     "Claude, turn 1: usage_limit\n\n(no reply)\nClaude's usage limit is reached; it resets at 2026-09-21T14:13:20.000Z.");
   assert.equal(polls, 2);
-  assert.equal(await tools.claude_send.execute('c2', { session: 's-2', message: 'again' }),
+  assert.equal(text(await tools.claude_send.execute('c2', { session: 's-2', message: 'again' })),
     'Claude message failed: HTTP 409: turn 3 is still running');
-  assert.equal(await tools.claude_status.execute('c3', { session: 's-3' }),
+  assert.equal(text(await tools.claude_status.execute('c3', { session: 's-3' })),
     'Claude is still working on turn 1.\nLatest: Ran: pytest; Edited calc.py\nWait for it with claude_status, or stop it with claude_end.');
 });
 

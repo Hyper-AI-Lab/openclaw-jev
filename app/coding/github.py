@@ -1,8 +1,8 @@
 """Aura's repository on GitHub, where main is protected: every change lands through a pull request whose test check passed.
 
 The token is read only inside the command that uses it (gh gets it as GH_TOKEN, git through GIT_ASKPASS),
-as the github-access rule says. RMP merges Aura's pull requests when she asks (``deploy_pr``), lands a
-reviewed job's approved commit the same way, and turns a failed deploy's revert into a pull request.
+as the github-access rule says. Claude merges Aura's own pull requests once she approves; RMP lands a
+reviewed job's approved commit through a pull request, and turns a failed deploy's revert into one.
 """
 from __future__ import annotations
 

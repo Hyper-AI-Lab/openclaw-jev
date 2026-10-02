@@ -136,7 +136,7 @@ RMP chat.postMessage (idempotent)
 - Secrets stay out of git and chat.
 
 - **Claude Code is Aura's tool in any task.** Direct sessions run as root in Claude's auto mode in transient units. RMP records them in full, keeps them in memory, and stops them with her runs.
-- **Her code reaches GitHub's protected `main` only through pull requests whose CI `test` check passed.** She merges with `deploy_pr`. The deploy unit ships GitHub's `main` when she is idle: restarts of what changed, health, readiness and a canary, an automatic revert, and the revert landed as a pull request.
+- **Her code reaches GitHub's protected `main` only through pull requests whose CI `test` check passed.** Claude merges once she approves. The deploy unit ships GitHub's `main` once CI passed on it and she is idle: restarts of what changed, health, readiness and a canary, an automatic revert, and the revert landed as a pull request.
 - **Reviewed coding jobs** (`coding_task`, only on Kirill's explicit request) run Claude Code as `aura-coder` under the strict coding policy. Nothing of theirs ships without Kirill's own Slack *approve*, confirmed after the approval card.
 
 ### MUST NOT

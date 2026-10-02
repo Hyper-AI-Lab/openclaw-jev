@@ -40,6 +40,17 @@ def _no_live_deep_index(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_claude_sessions(monkeypatch, tmp_path_factory):
+    """Aura's live Claude sessions: a test that ends or prunes them stops real turns, as one did from a suite
+    Claude ran inside a session. Every test gets an empty directory of its own."""
+    from app.coding import direct
+
+    root = tmp_path_factory.mktemp("claude-direct")
+    monkeypatch.setattr(direct, "DIRECT_DIR", root / "direct")
+    monkeypatch.setattr(direct, "CONFIG_DIR", root / "claude-config")
+
+
+@pytest.fixture(autouse=True)
 def _no_live_gateway_abort(monkeypatch):
     """Stopping a task calls the openclaw CLI against this host's gateway; tests stub it."""
     from app import openclaw_control

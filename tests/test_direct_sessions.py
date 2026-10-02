@@ -109,7 +109,7 @@ def test_a_session_takes_one_turn_at_a_time_and_the_host_a_few(fakes, monkeypatc
         direct.send(a["id"], "fixture:success_readonly", CFG)
     with pytest.raises(direct.SessionError, match="too many"):
         direct.send(b["id"], "fixture:success_readonly", {**CFG, "direct_max_running": 1})
-    assert direct.task_turn_running(TASK) and not direct.task_turn_running(OTHER)
+    assert direct.task_working(TASK) and not direct.task_working(OTHER)
     direct.end(a["id"])
 
 
@@ -240,7 +240,7 @@ def test_prune_removes_only_the_workspaces_of_sessions_that_ended_long_ago(fakes
 
 def test_auras_reply_deadline_moves_on_only_while_her_claude_turn_works(monkeypatch):
     running = {"now": True}
-    monkeypatch.setattr(direct, "task_turn_running", lambda task_id: running["now"])
+    monkeypatch.setattr(direct, "task_working", lambda task_id: running["now"])
     soon = time.time() + 10
     assert oa._reply_deadline(soon, TASK, None) >= time.time() + 119
     assert oa._reply_deadline(soon, TASK, soon) == soon
@@ -249,13 +249,28 @@ def test_auras_reply_deadline_moves_on_only_while_her_claude_turn_works(monkeypa
     assert oa._reply_deadline(soon, TASK, None) == soon
 
 
-async def test_the_reconciler_ends_sessions_whose_task_has_finished(fakes, session):  # noqa: F811
+async def test_the_reconciler_ends_sessions_whose_task_has_finished_and_no_other(fakes, session):  # noqa: F811
     await seed(session, task(TASK, status="completed"), task(OTHER, status="running"))
     finished_task, live_task = direct.create(TASK, "scratch", "", CFG), direct.create(OTHER, "scratch", "", CFG)
+    unknown = direct.create("99999999-8888-4777-8666-555555555555", "scratch", "", CFG)
     async with session() as db:
         assert await reconciler._end_claude_sessions_of_finished_tasks(db) == 1
     assert direct.load(finished_task["id"])["end_reason"] == "task finished"
-    assert direct.load(live_task["id"])["status"] == "open"
+    # A task the database lacks may belong to someone else's database, a test's for one: its session stays.
+    assert direct.load(live_task["id"])["status"] == "open" and direct.load(unknown["id"])["status"] == "open"
+
+
+def test_aura_is_working_with_claude_while_a_turn_runs_and_for_a_while_after_it(fakes, monkeypatch):
+    s = direct.create(TASK, "scratch", "", CFG)
+    assert direct.task_working(TASK)
+    direct.send(s["id"], "fixture:success_readonly", CFG)
+    finished(s["id"], 1)
+    assert direct.task_working(TASK)
+    monkeypatch.setattr(direct, "BETWEEN_TURNS_SEC", 0)
+    assert not direct.task_working(TASK)
+    monkeypatch.setattr(direct, "BETWEEN_TURNS_SEC", 600)
+    direct.end(s["id"])
+    assert not direct.task_working(TASK) and not direct.task_working(OTHER)
 
 
 async def test_the_api_runs_a_session_for_a_live_task_and_records_it(fakes, session, monkeypatch):  # noqa: F811
