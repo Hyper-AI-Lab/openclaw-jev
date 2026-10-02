@@ -1,5 +1,6 @@
 """Coding readiness checks, the deploy and unit invariants, and the coding API."""
 import json
+import subprocess
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -177,3 +178,74 @@ async def test_the_coding_status_names_the_short_rmp_commit_alongside_the_existi
     assert {"enabled", "claude_version", "pinned", "token_days_left", "slot_holder", "live_units", "repositories",
             "jobs"} <= status.keys()
     assert status["enabled"] is True and status["pinned"] == "2.1.280" and status["repositories"] == {}
+
+
+def merge_event(tid, minutes, check="success"):
+    return Event(correlation_id=tid, entity_type="task", entity_id=tid, event_type="coding.pr_merged",
+                 event_payload={"pr": 12, "check": check, "url": "https://github.com/x/pull/12"}, occurred_at=ago(minutes=minutes))
+
+
+async def test_auras_own_deploys_need_no_approval_but_ci_at_the_merge(session):  # noqa: F811
+    await seed(session, deploy_event("own", "deployed", 20, source="github", canary="ok"), merge_event("own", 30),
+               deploy_event("late-ci", "deployed", 20, source="github", canary="ok"), merge_event("late-ci", 10),
+               deploy_event("reviewed", "deployed", 20, source="reviewed", canary="ok", suite={"ok": True}))
+    approved = await invariants.check_approved_deploys()
+    assert approved.status == "fail" and approved.details["task_ids"] == ["reviewed"]
+    verified = await invariants.check_deploy_verification()
+    assert verified.status == "fail" and verified.details["task_ids"] == ["late-ci"]
+
+
+async def test_a_merged_pull_request_must_have_passed_ci_and_be_deployed_within_3_hours(session):  # noqa: F811
+    await seed(session, merge_event("deployed", 200), deploy_event("deployed", "deployed", 190, source="github"),
+               merge_event("waiting", 60), merge_event("forgotten", 200), merge_event("unchecked", 5, check="failure"))
+    result = await invariants.check_merged_deploys()
+    assert result.status == "fail" and result.details["task_ids"] == ["forgotten", "unchecked"]
+    assert "1 merge(s) without a passed CI check" in result.message and "1 merge(s) not deployed after 3 h" in result.message
+
+
+async def test_no_direct_claude_turn_runs_without_a_live_task(session, monkeypatch):  # noqa: F811
+    await seed(session, task("live", status="pending_user_input"), task("done", status="completed"))
+    units = [{"unit": f"aura-direct-{tid}-abcd1234-1", "kind": "direct", "task_id": tid, "active_usec": 1}
+             for tid in ("live", "done", "gone")]
+    monkeypatch.setattr(cr, "live_units", lambda: units)
+    result = await invariants.check_direct_units()
+    assert result.status == "fail" and result.details["units"] == ["aura-direct-done-abcd1234-1", "aura-direct-gone-abcd1234-1"]
+    monkeypatch.setattr(cr, "live_units", lambda: units[:1])
+    assert (await invariants.check_direct_units()).status == "pass"
+
+
+def test_direct_sessions_are_ready_with_their_policy_wrapper_protection_and_a_live_main_on_github(tmp_path, monkeypatch):
+    from app.coding import deploy, direct, github
+
+    for name in ("HOST_POLICY", "HOST_POLICY_SOURCE", "GITHUB_WRAPPER", "GITHUB_WRAPPER_SOURCE"):
+        (tmp_path / name).write_text(name.removesuffix("_SOURCE"))
+        monkeypatch.setattr(cr, name, tmp_path / name)
+    live = tmp_path / "live"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(live)], check=True)
+    subprocess.run(["git", "-C", str(live), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "a"],
+                   check=True)
+    monkeypatch.setattr(deploy, "LIVE_REPO", live)
+    protection = {"enforce_admins": {"enabled": True}, "required_status_checks": {"checks": [{"context": "test"}]}}
+    monkeypatch.setattr(github, "api", lambda method, path, body=None: protection)
+    on_github = {"now": True}
+    monkeypatch.setattr(deploy, "_is_ancestor_on_github", lambda commit, repo: on_github["now"])
+    monkeypatch.setattr(direct, "running_units", lambda: [])
+    monkeypatch.setattr(direct, "sessions", lambda task_id=None: [{"status": "open"}, {"status": "ended"}])
+    monkeypatch.setattr(cr, "get_coding_config", lambda: {"repositories": {"rmp": {"remote": "Hyper-AI-Lab/openclaw-jev"}}})
+    ready = cr.check_claude_direct()
+    assert ready.status == "pass" and ready.details == {"running_turns": 0, "open_sessions": 1}
+
+    (tmp_path / "GITHUB_WRAPPER").write_text("edited by hand")
+    protection["enforce_admins"] = {"enabled": False}
+    on_github["now"] = False
+    broken = cr.check_claude_direct()
+    assert broken.status == "fail"
+    for words in ("GITHUB_WRAPPER is missing or differs", "not protected for everyone", "commits GitHub's main lacks"):
+        assert words in broken.message
+
+    def unreachable(method, path, body=None):
+        raise github.GitHubError("GET protection: connection refused")
+
+    monkeypatch.setattr(github, "api", unreachable)
+    (tmp_path / "GITHUB_WRAPPER").write_text("GITHUB_WRAPPER")
+    assert cr.check_claude_direct().status == "warn"

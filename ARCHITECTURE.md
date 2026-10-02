@@ -466,6 +466,12 @@ Key endpoints:
 | `POST /tasks/{id}/cancel` | Cancel workflow |
 | `GET /api/coding/status` | Coding: Claude Code version, token expiry, the coding slot, live units, repositories |
 | `GET /api/coding/jobs/{task_id}` | One coding task: its job, each Claude Code run, each verification, the deploy and its events |
+| `POST /api/claude/sessions` | A direct Claude session for a running task (`repo` or `scratch` workspace) |
+| `POST /api/claude/sessions/{id}/messages` | The session's next turn |
+| `GET /api/claude/sessions/{id}/turns/{n}?wait=` | A turn's progress or Claude's answer (long poll up to 55 s) |
+| `POST /api/claude/sessions/{id}/end` | End a session, stopping a running turn |
+| `GET /api/claude/sessions[/{id}]` | Sessions, by task |
+| `POST /api/claude/deploy` | `deploy_pr`: merge one of Aura's pull requests once CI passed, then deploy GitHub's main when she is idle |
 | `GET /api/production/readiness` | Go-live readiness score |
 | `GET /api/deep_memory/status` | Switches, ingest queue, documents, index points vs objects, memory lane, recall outcomes of the last 24 h |
 | `GET /api/deep_memory/reports/{task_id}` | A task's deep recall reports: plan, candidates, report, latency, use, novelty |
@@ -557,15 +563,52 @@ Tracks **requests + tokens** per key per day, by source:
 
 **Design choice:** Chat and embeddings share one key pool — avoids total quota overrun; bulk vector seeding may pace Slack turns slightly. Balanced rotation **aims for equal load** but instant parity is not guaranteed under burst traffic.
 
-### 5.11 Coding tasks (Claude Code)
+### 5.11 Claude Code
 
-Kirill's requests to change Aura's own code are catalog type `coding_task`, run by **`CodingTaskWorkflow`** (`app/workflows/coding_task.py`, activities in `app/activities/coding_activities.py`).
+Claude Code is Aura's tool in any task (direct sessions, the default). When Kirill explicitly asks for a reviewed coding job, the coding workflow runs it as before.
 
-- **Isolation:** Claude Code (`claude -p`, stream-json, pinned version) runs as the unprivileged user `aura-coder` in a transient systemd unit per run (`aura-claude-<task>-<n>`): read-only system, writes only to its job checkout and home, secrets and RMP's sockets hidden, and an nftables table that keeps it off this host's services (`app/coding/units.py`, `firewall.py`). Aura never runs `claude` herself.
+**Direct sessions** (`app/coding/direct.py`; tools `claude_start`, `claude_send`, `claude_status`, `claude_end` in `plugins/rmp_adapter/claude_tools.js`; API `/api/claude/*`):
+
+- **Turns.** Each turn is `claude -p` as root in Claude's auto permission mode, in a transient unit `aura-direct-<task>-<session>-<n>`: `--session-id` the first time, `--resume` after.
+  - **Policy and config:** the host's relaxed policy `/etc/claude-code/managed-settings.json`, and `CLAUDE_CONFIG_DIR=/root/.claude`.
+  - **Workspace:** a clone of her repository from GitHub (`repo`) or an empty folder (`scratch`), never the live checkout.
+  - **Limits:** one turn at a time per session, two on the host, 60 minutes per turn.
+- **Aura's turn time.** While one of her turns runs, Aura's reply deadline stays open (`_reply_deadline`), and her turns' activities allow 4 hours (`app/workflows/timeouts.py`).
+- **Stops.** A stop, cancel or supersede ends the task's sessions (`abort_task_runs`, `stop_task_units`). The reconciler ends the sessions of finished tasks and prunes old workspaces.
+- **Memory and evidence.** What Claude did is in memory: a "Claude sessions" section in the task document, and a `claude_session` document per conversation (`app/coding/records.py`). The evaluator gets the same records as external evidence, along with the pull requests RMP merged.
+
+**Shipping** (`app/coding/github.py`, `app/coding/deploy.py`, `ops/coding_deploy.py`):
+
+- **Protection.** GitHub's `main` is protected for everyone: a pull request is required, the `test` check is required, and admins are not exempt.
+- **Pull requests.** Claude pushes a branch and opens a pull request with `aura-github`, never `main` and never a merge.
+- **Merge.** Aura's `deploy_pr` has RMP squash-merge it once the check passed (`merge_pull_request`), then start the task's deploy unit `aura-deploy-<task>`.
+- **Deploy.** The unit waits until no user task is active, then:
+  - fast-forwards the live `main` to GitHub's;
+  - syncs `plugins/`, `web-stack/`, `systemd/` and `.cursor/rules/`;
+  - restarts only what changed, and checks health, readiness and a canary;
+  - on failure, reverts the live code at once and lands the revert as a pull request.
+
+  Then it sends Kirill a note with the links.
+
+**Reviewed coding jobs** are catalog type `coding_task`, only when Kirill explicitly asks for one, run by **`CodingTaskWorkflow`** (`app/workflows/coding_task.py`, activities in `app/activities/coding_activities.py`).
+
+- **Isolation:** Claude Code (`claude -p`, stream-json, pinned version) runs as the unprivileged user `aura-coder` in a transient systemd unit per run (`aura-claude-<task>-<n>`): read-only system, writes only to its job checkout and home, secrets and RMP's sockets hidden, the strict coding policy (`/srv/aura-code/policy`) bound over Claude Code's policy directory, and an nftables table that keeps it off this host's services (`app/coding/units.py`, `firewall.py`).
 - **Flow:** one coding job at a time (the coding slot). Aura writes the brief, RMP prepares a job checkout (`app/coding/workspace.py`), then rounds: Claude Code (a rework resumes its session), RMP collects the work into a root-owned review repository through a bundle and runs the repository's tests itself as `aura-coder` (`app/coding/verify.py`), Aura reviews, and the Process Evaluator judges her reply against that external evidence. Then the approval card; only Kirill's own Slack *approve*, recorded after the card, ships (`confirm_approval_provenance`).
-- **Shipping** (`app/coding/deploy.py`): only Aura's own repository (`rmp`, Hyper-AI-Lab/openclaw-jev) is registered; Kirill's other repositories are off limits, and the pull-request path stays unused until a repository is added with his consent. Aura's own code must fast-forward `main` (else a rebase round), passes the full suite on the exact commit, and is handed to the detached root unit `aura-deploy-<task>` (`ops/coding_deploy.py`). That unit holds the code-reload lock, waits for idle, refuses hand-edited mirrors, fast-forwards and pushes `main`, syncs `plugins/`, `web-stack/`, `systemd/` and `.cursor/rules/`, restarts only what changed, checks health, readiness and a canary, and reverts on failure. A fresh run of `workflow-<task>` then sends the judged reply on the new code.
+- **Shipping:**
+  - Only Aura's own repository (`rmp`, Hyper-AI-Lab/openclaw-jev) is registered.
+  - The approved commit must fast-forward `main` (else a rebase round) and pass the full suite on the exact commit. It is then handed to the deploy unit, which holds the code-reload lock, waits for idle, refuses hand-edited mirrors and lands the commit through its own pull request before `main` moves. It then deploys as above.
+  - A fresh run of `workflow-<task>` then sends the judged reply on the new code.
 - **Durability:** long runs heartbeat and reattach to their unit after a worker restart; a stop stops the unit within seconds and keeps the checkout; the reconciler closes a coding task whose workflow is gone and stops its units, and never re-judges it.
-- **Observability:** readiness checks `claude_code`, `coding_isolation` and `coding_jobs`; invariants `approved_deploys`, `deploy_verification` and `coding_units`; the coding API above.
+
+**Observability:**
+- **Readiness checks:** `claude_code`, `coding_isolation`, `coding_jobs` and `claude_direct` (the host policy and `aura-github` as in the repository, `main` protected, the live `main` contained in GitHub's).
+- **Invariants:**
+  - `approved_deploys` (reviewed jobs only);
+  - `deploy_verification` (RMP's suite, or CI's check at the merge, plus the canary);
+  - `coding_units` and `direct_units`;
+  - `merged_deploys` (every merge passed CI and deployed within 3 hours);
+  - `claude_records`.
+- **API:** the coding and Claude endpoints above.
 
 ---
 

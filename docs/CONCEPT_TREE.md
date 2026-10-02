@@ -100,7 +100,7 @@ RMP chat.postMessage (idempotent)
 
 - **GenericTaskWorkflow** — default for user DMs and most work. Plan-driven steps.
 - **CatalogTaskWorkflow** — named templates (registration, login, email verify, procurement, outreach, browser automation). **Assigned by Intake Analyst `catalog_hint`**, never by keyword alone.
-- **CodingTaskWorkflow** — catalog `coding_task` (aliases `tool_self_upgrade`, `self_upgrade`, `capability_upgrade`): Claude Code changes Aura's own code (only her repository is registered) as `aura-coder` in its own checkout, RMP tests it, Aura and the evaluator review, and Kirill approves before anything ships.
+- **CodingTaskWorkflow** — catalog `coding_task` (aliases `tool_self_upgrade`, `self_upgrade`, `capability_upgrade`), only when Kirill explicitly asks for a reviewed job: Claude Code changes Aura's own code (only her repository is registered) as `aura-coder` in its own checkout, RMP tests it, Aura and the evaluator review, Kirill approves, and it lands through a pull request. Otherwise Aura works with Claude Code herself in direct sessions.
 - **IntakeWorkflow** — classify. If it fails, still create an RMP user task (`create_fresh` + Generic). Never native Slack.
 - **DeepRecallWorkflow** — the IA's deep recall, a bounded child `{task_id}-recall` of a user task: plan, hybrid retrieval with expansion, and a cited context report.
 
@@ -135,7 +135,9 @@ RMP chat.postMessage (idempotent)
 - One user-visible Slack reply per turn (no native + RMP double post).
 - Secrets stay out of git and chat.
 
-- Coding jobs: Claude Code runs only as `aura-coder` in transient units, never as Aura or root. Nothing ships without Kirill's own Slack *approve*, confirmed after the approval card. Aura's own code deploys only through the deploy unit: the full suite on the exact commit, restarts of what changed, health, readiness and a canary, and an automatic revert.
+- **Claude Code is Aura's tool in any task.** Direct sessions run as root in Claude's auto mode in transient units. RMP records them in full, keeps them in memory, and stops them with her runs.
+- **Her code reaches GitHub's protected `main` only through pull requests whose CI `test` check passed.** She merges with `deploy_pr`. The deploy unit ships GitHub's `main` when she is idle: restarts of what changed, health, readiness and a canary, an automatic revert, and the revert landed as a pull request.
+- **Reviewed coding jobs** (`coding_task`, only on Kirill's explicit request) run Claude Code as `aura-coder` under the strict coding policy. Nothing of theirs ships without Kirill's own Slack *approve*, confirmed after the approval card.
 
 ### MUST NOT
 

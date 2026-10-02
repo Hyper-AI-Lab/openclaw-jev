@@ -255,3 +255,58 @@ No coding job was running.
   - `aura-github` pushing a branch, refusing `main`, another repository and a merge;
   - the deploy API.
 - **This entry** landed through a pull request with `github.land`, the reviewed-job path, under the new protection.
+
+---
+
+## Step 7 — What Aura and the other agents know
+
+**Date:** 2026-10-02.
+
+**What changed:**
+- **Aura's notes** (`/root/.openclaw/workspace/TOOLS.md` and `AGENTS.md`). The coding section is now "Working with Claude Code":
+  - Claude is her tool in any task, used when it helps;
+  - how to brief it and talk to it;
+  - her code changes go through a branch and a pull request, and `deploy_pr` once CI passed;
+  - in her reply she says "merged, deploys when I'm done", never "deployed";
+  - never live code, never `main`, other repositories only on Kirill's word, secrets.
+
+  The reviewed coding job follows as the option Kirill asks for, with her brief, review and final reply. Her workspace repository was not committed: it already held unrelated uncommitted changes.
+- **Intake** (`intake_prompt.py`). `coding_task` is only an explicitly requested reviewed job. Any other change to Aura's own code is `structured_work` with no catalog hint. The advisory keyword patterns stay: their hits are advisory, the rule defines the type, and the tests pin them.
+- **The evaluator.** Its external evidence gains `_direct_claude_evidence`: Aura's direct sessions (the records digest, redacted), the pull requests RMP merged or refused for her, and their deploys. A reviewed job's own evidence stays as it was. The rule "tests pass only when RMP's own test run passed" now adds "or CI's test check passed on a pull request RMP merged".
+- **`CLAUDE.md`.** The two ways Claude works here, the new modules, the test command for direct sessions, and how a direct session ships through a pull request.
+
+**Verification:**
+- **Tests:** the new tests and the related suites, 131 passed.
+- **Landed** as [PR #2](https://github.com/Hyper-AI-Lab/openclaw-jev/pull/2) through `github.land`, after CI's full suite passed (squash `84b8b15`).
+
+---
+
+## Step 8 — Monitoring, docs and the rule
+
+**Date:** 2026-10-02.
+
+**Found:** two invariants would have failed on every deploy of Aura's own pull requests:
+- `approved_deploys` wanted Kirill's approval, which by his decision they don't need;
+- `deploy_verification` wanted RMP's exact-commit suite, where CI is their suite.
+
+Deploy records now carry `source` (`github` or `reviewed`), and each invariant applies its rule to its own kind. A deploy of a `main` that was already live is now `unchanged`, not `deployed`.
+
+**What changed:**
+- **Readiness `claude_direct`.** It checks:
+  - the host policy and `/usr/local/bin/aura-github` match the repository's copies;
+  - GitHub's `main` is protected for everyone with the `test` check;
+  - GitHub's `main` contains the live `main`.
+
+  GitHub being unreachable is a warning. The details count open sessions and running turns. `live_units` recognises `aura-direct-*` units.
+- **Invariants:**
+  - `direct_units`: no direct turn without a live task;
+  - `merged_deploys`: every merge recorded a passed CI check and was deployed within 3 hours (the deploy waits up to 2 hours for idle);
+  - `approved_deploys`: reviewed jobs only;
+  - `deploy_verification`: for Aura's deploys, CI's check recorded at the merge, before the deploy, plus the canary.
+- **Docs:**
+  - `README.md` (Coding);
+  - `ARCHITECTURE.md` §5.11, rewritten as Claude Code: direct sessions, shipping through the protected `main`, reviewed jobs, observability, plus the `/api/claude/*` endpoints;
+  - `docs/CONCEPT_TREE.md` (the workflow list and the coding invariants).
+- **Rule item 6** in `.cursor/rules/rmp-architecture.mdc`, rewritten for both modes; the host copy is updated once this lands.
+
+**Note:** for the second time today, an edit I could not see applied before my visible attempt (two ARCHITECTURE bullets, worded slightly differently). Their content is what I intended. I checked the section for duplicates, and the diff, before committing.
