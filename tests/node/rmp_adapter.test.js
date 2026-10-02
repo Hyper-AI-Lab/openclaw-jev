@@ -370,6 +370,15 @@ test('claude tools start a session, send a message, wait across long polls and e
   assert.equal(await tools.claude_end.execute('c3', { session: 's-1' }), 'Claude session s-1 ended after 2 turn(s).');
 });
 
+test('deploy_pr asks RMP to merge one of her pull requests and deploy it', async () => {
+  const calls = installFetch([
+    ['POST /api/claude/deploy', () => ({ status: 'merged', summary: 'Merged PR #12 as abc. RMP deploys it once you are idle.' })],
+  ]);
+  const { tools } = loadPlugin();
+  assert.equal(await tools.deploy_pr.execute('c1', { pr: '12' }), 'Merged PR #12 as abc. RMP deploys it once you are idle.');
+  assert.deepEqual(calls[0].body, { pr: 12, session_key: SLACK_KEY });
+});
+
 test('a Claude wait rides out an RMP restart, and a refused message or a usage limit is reported', async () => {
   let polls = 0;
   installFetch([

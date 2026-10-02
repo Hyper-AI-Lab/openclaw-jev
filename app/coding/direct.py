@@ -42,7 +42,12 @@ You run as root on Kirill's production server, in Claude Code's auto permission 
 
 - Your workspace is {workspace}. Work there.
 - Never edit {live}: it is Aura's live code, and a change there goes live at once.
-- Never push to main. Other repositories are off limits unless Aura tells you Kirill asked for it.
+- A change to Aura's code goes through a pull request: commit on a branch named aura/<topic> in a clone of her \
+repository, push it with `aura-github push`, open the pull request with `aura-github gh pr create` (a title and a \
+body that says what changed and how you tested it), and tell Aura its URL. Never merge: once CI's test check \
+passes, Aura merges and deploys it.
+- For GitHub use only `aura-github`. Never push to main. Other repositories are off limits unless Aura tells you \
+Kirill asked for it.
 - Never print, log or commit a secret; read a token only inside the command that needs it.
 - If something is unclear, ask Aura instead of guessing.
 - End each reply with what you did, what you found and what is left."""
@@ -168,13 +173,14 @@ def status(session_id: str, number: int) -> Dict[str, Any]:
     if not 1 <= number <= session["turns"]:
         raise SessionError(f"turn {number} does not exist")
     turn = _turn(session, number)
-    lines, _ = runner.read_events(turn, 0)
-    state = stream.parse_lines(lines)
+    # The exit line first: once it is there the stream is complete, while a stream read first may miss its end.
     exit_line = runner.exit_line(turn)
     if exit_line is None and not runner.unit_active(turn.unit):
         time.sleep(1.0)
         # systemd writes the exit line just after the unit stops; a unit gone without one was lost.
         exit_line = runner.exit_line(turn) or ("lost" if not runner.unit_active(turn.unit) else None)
+    lines, _ = runner.read_events(turn, 0)
+    state = stream.parse_lines(lines)
     result = stream.outcome(state, exit_line=exit_line, stopped=turn.stop_file.exists())
     done = result.kind != "running"
     if done:

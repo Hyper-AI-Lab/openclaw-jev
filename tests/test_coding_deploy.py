@@ -75,9 +75,11 @@ def repos(tmp_path, monkeypatch):
 
 
 class FakeHost(deploy.Host):
-    def __init__(self, live, *, busy=(), checks=()):
-        super().__init__(live)
-        self.calls, self.busy, self.results = [], list(busy), list(checks)
+    """GitHub is the origin repo: a pull request that merges is pushed onto its main as it is."""
+
+    def __init__(self, live, *, busy=(), checks=(), lands=()):
+        super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
+        self.calls, self.busy, self.results, self.lands = [], list(busy), list(checks), list(lands)
 
     def active_user_tasks(self):
         return self.busy.pop(0) if self.busy else 0
@@ -88,9 +90,16 @@ class FakeHost(deploy.Host):
     def pip_install(self):
         self.calls.append(("pip",))
 
-    def push(self):
-        git(self.live, "push", "-q", "origin", "main")
-        self.calls.append(("push", git(self.live, "rev-parse", "main")))
+    def land(self, commit, branch, title, body, method):
+        self.calls.append(("land", branch, method))
+        pr = {"number": len(self.calls), "url": f"https://github.com/Hyper-AI-Lab/openclaw-jev/pull/{len(self.calls)}"}
+        outcome = self.lands.pop(0) if self.lands else "merged"
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome != "merged":
+            return {"status": "blocked", "pr": pr, "check": outcome}
+        git(self.live, "push", "-q", "origin", f"{commit}:refs/heads/main")
+        return {"status": "merged", "pr": pr, "merge": commit}
 
     def readiness_baseline(self):
         return ["telemetry"]
@@ -104,16 +113,19 @@ class FakeHost(deploy.Host):
 
 
 def spec(repos, head):
-    return {"task_id": "t1", "old": repos.old, "head": head}
+    return {"task_id": "t1", "old": repos.old, "head": head, "branch": "aura/t1-x", "title": "The approved change",
+            "body": "Body"}
 
 
-def test_a_self_deploy_fast_forwards_pushes_syncs_and_restarts_only_what_changed(repos):
+def test_a_reviewed_change_lands_through_a_pull_request_then_syncs_and_restarts_only_what_changed(repos):
     head = repos.change({"app/a.py": "A = 2\n", "plugins/p/index.js": "v2\n", "web-stack/backends/w.py": "W = 2\n",
                          ".cursor/rules/r.mdc": "rule v2\n", "docs/d.md": "more docs\n"}, deletes=["plugins/p/old.js"])
     host = FakeHost(repos.live)
     result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
 
-    assert result["status"] == "deployed" and result["pushed"] and "health and readiness passed and the canary passed" in result["summary"]
+    assert result["status"] == "deployed" and result["pr"]["url"].startswith("https://github.com/")
+    assert "health and readiness passed and the canary passed" in result["summary"]
+    assert ("land", "aura/t1-x", "squash") in host.calls and result["commits"] == ["the approved change"]
     assert git(repos.live, "rev-parse", "main") == head == git(repos.origin, "rev-parse", "main")
     plugins, web, rules = repos.mirror["plugins/"], repos.mirror["web-stack/"], repos.mirror[".cursor/rules/"]
     assert (plugins / "p" / "index.js").read_text() == "v2\n" and not (plugins / "p" / "old.js").exists()
@@ -140,7 +152,7 @@ def test_a_hand_edited_mirror_blocks_the_deploy_before_main_moves(repos):
 
     assert result["status"] == "blocked" and "plugins/p/index.js" in result["summary"]
     assert git(repos.live, "rev-parse", "main") == repos.old == git(repos.origin, "rev-parse", "main")
-    assert not [c for c in host.calls if c[0] == "systemctl"]
+    assert not [c for c in host.calls if c[0] in ("systemctl", "land")]
 
 
 def test_a_mirror_that_is_only_behind_is_updated(repos):
@@ -151,13 +163,15 @@ def test_a_mirror_that_is_only_behind_is_updated(repos):
     assert result["status"] == "deployed" and (repos.mirror["web-stack/"] / "backends" / "w.py").read_text() == "W = 3\n"
 
 
-def test_failed_checks_revert_main_restore_the_mirrors_restart_and_push_the_revert(repos):
+def test_failed_checks_revert_main_at_once_restore_the_mirrors_restart_and_land_the_revert_by_merge_commit(repos):
     head = repos.change({"app/a.py": "A = 2\n", "plugins/p/index.js": "v2\n"}, deletes=["plugins/p/old.js"])
     host = FakeHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}, {"failure": None, "canary": "ok"}])
     result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
 
     revert = git(repos.live, "rev-parse", "main")
     assert result["status"] == "rolled_back" and result["revert"] == revert and "Aura is healthy again" in result["summary"]
+    assert "GitHub's main is reverted too" in result["summary"] and result["revert_pr"]["status"] == "merged"
+    assert ("land", f"aura/revert-{head[:12]}", "merge") in host.calls
     assert git(repos.live, "rev-parse", f"{revert}^{{tree}}") == git(repos.live, "rev-parse", f"{repos.old}^{{tree}}")
     assert git(repos.origin, "rev-parse", "main") == revert
     plugins = repos.mirror["plugins/"]
@@ -185,6 +199,46 @@ def test_main_moving_while_the_deploy_waited_deploys_nothing(repos):
     moved = commit(repos.live, "another deploy")
     result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
     assert result["status"] == "failed" and "main moved" in result["summary"] and git(repos.live, "rev-parse", "main") == moved
+
+
+def test_a_deploy_of_githubs_main_ships_it_as_it_is_now_and_then_finds_nothing_new(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy({"task_id": "t1", "source": "github"}, host, log=lambda m: None)
+    assert result["status"] == "deployed" and result["commits"] == ["the approved change"] and "pr" not in result
+    assert git(repos.live, "rev-parse", "main") == head and not [c for c in host.calls if c[0] == "land"]
+    assert [c for c in host.calls if c[:2] == ("systemctl", "restart")] == [("systemctl", "restart", "rmp-api", "rmp-worker")]
+
+    again = deploy.self_deploy({"task_id": "t1", "source": "github"}, FakeHost(repos.live), log=lambda m: None)
+    assert again["status"] == "deployed" and "already live" in again["summary"] and again["restarted"] == []
+
+
+def test_a_live_main_with_commits_github_lacks_is_never_deployed_over(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
+    write(repos.live, {"docs/d.md": "edited on the server\n"})
+    local = commit(repos.live, "a commit only the live repo has")
+    result = deploy.self_deploy({"task_id": "t1", "source": "github"}, FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "blocked" and "lacks" in result["summary"] and git(repos.live, "rev-parse", "main") == local
+
+
+def test_a_reviewed_change_whose_pull_request_fails_ci_deploys_nothing(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live, lands=["failure"])
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert result["status"] == "blocked" and "is failure" in result["summary"] and result["pr"]["url"]
+    assert git(repos.live, "rev-parse", "main") == repos.old == git(repos.origin, "rev-parse", "main")
+    assert not [c for c in host.calls if c[0] == "systemctl"]
+
+
+def test_a_rollback_whose_revert_cannot_reach_github_says_so(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live, checks=[{"failure": "health failed", "canary": None}, {"failure": None, "canary": "ok"}],
+                    lands=["merged", RuntimeError("GitHub is down")])
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and "the revert is not on GitHub yet (GitHub is down)" in result["summary"]
+    assert git(repos.origin, "rev-parse", "main") == head != git(repos.live, "rev-parse", "main")
 
 
 def test_the_approved_commit_must_fast_forward_main(repos):
@@ -265,6 +319,26 @@ def test_the_hand_off_starts_one_root_unit_and_forgets_a_failed_start(repos, mon
     assert not deploy.spec_file("t1").exists()
 
 
+def test_a_deploy_of_githubs_main_starts_once_while_one_is_waiting(repos, monkeypatch):
+    monkeypatch.setattr(deploy, "RUNS_DIR", repos.tmp / "runs")
+    calls, active = [], {"now": False}
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0 if argv[:2] != ["systemctl", "is-active"] or active["now"] else 3)
+
+    monkeypatch.setattr(deploy.subprocess, "run", run)
+    github_spec = {"task_id": "t2", "source": "github", "pr": {"number": 12}}
+    assert deploy.hand_off(github_spec, live=repos.live) == "aura-deploy-t2"
+    active["now"] = True
+    assert deploy.hand_off({**github_spec, "pr": {"number": 13}}, live=repos.live) == "aura-deploy-t2"
+    assert [argv[0] for argv in calls].count("systemd-run") == 1
+    active["now"] = False
+    deploy.hand_off({**github_spec, "pr": {"number": 14}}, live=repos.live)
+    assert [argv[0] for argv in calls].count("systemd-run") == 2
+    assert json.loads(deploy.spec_file("t2").read_text())["pr"]["number"] == 14
+
+
 def test_the_exact_commit_suite_runs_on_a_clean_checkout_of_the_head(repos, monkeypatch):
     monkeypatch.setattr(deploy, "JOBS_DIR", repos.tmp / "jobs")
     (repos.tmp / "jobs").mkdir()
@@ -321,3 +395,38 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
     assert name == "CodingTaskWorkflow" and client.start_workflow.await_args.kwargs["id"] == "workflow-t1"
     assert payload["task_id"] == "t1" and payload["report"]["shipped"]["status"] == "deployed"
     assert db.get.return_value.supplementary_context == {"a": 1, "coding_deploy": payload["report"]["shipped"]}
+
+
+def test_the_deploy_unit_tells_kirill_about_auras_own_deploy_instead_of_starting_a_reply_run(tmp_path, monkeypatch):
+    module_spec = importlib.util.spec_from_file_location("coding_deploy", ROOT / "ops" / "coding_deploy.py")
+    unit = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(unit)
+    monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
+    monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
+        "status": "deployed", "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Deployed cccccccccccc."})
+    monkeypatch.setattr(unit.deploy, "Host", lambda: None)
+    added = []
+    db = SimpleNamespace(add=added.append, get=AsyncMock(return_value=None), commit=AsyncMock())
+    session = AsyncMock()
+    session.__aenter__.return_value = db
+    monkeypatch.setattr(unit, "AsyncSessionLocal", lambda: session)
+    monkeypatch.setattr(unit, "engine", SimpleNamespace(dispose=AsyncMock()))
+    monkeypatch.setattr(unit, "get_coding_config", lambda: {"repositories": {"rmp": {"remote": "Hyper-AI-Lab/openclaw-jev"}}})
+    notes = []
+
+    async def notify(message, *, incident_id):
+        notes.append((message, incident_id))
+        return True
+
+    monkeypatch.setattr(unit, "notify_ops_slack", notify)
+    client = SimpleNamespace(start_workflow=AsyncMock())
+    monkeypatch.setattr(unit, "connect_temporal", AsyncMock(return_value=client))
+    path = tmp_path / "deploy.json"
+    path.write_text(json.dumps({"task_id": "t1", "source": "github", "pr": {"number": 12}}))
+
+    assert unit.main(str(path)) == 0
+    assert added[0].event_type == "coding.deploy" and added[0].event_payload["status"] == "deployed"
+    [(note, incident)] = notes
+    assert note.startswith("Aura's change is live.") and "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/12" in note
+    assert incident == "deploy:t1:cccccccccccc"
+    client.start_workflow.assert_not_awaited()

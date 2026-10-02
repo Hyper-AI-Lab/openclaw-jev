@@ -136,6 +136,28 @@ function register(api, { rmpFetch, pause = sleep }) {
     },
   });
 
+  api.registerTool((context) => ({
+    name: 'deploy_pr',
+    description:
+      'Merge one of your pull requests on Hyper-AI-Lab/openclaw-jev and deploy it. RMP merges it once CI\'s test check has '
+      + 'passed, then deploys GitHub\'s main when you are idle (restarting what changed, checking health, readiness and the '
+      + 'canary, and reverting on failure) and sends Kirill a note with the link. Only for your own repository.',
+    parameters: {
+      type: 'object',
+      properties: { pr: { type: 'number', description: 'The pull request number' } },
+      required: ['pr'],
+    },
+    execute: async (_id, params) => {
+      try {
+        const r = await rmpFetch('POST', '/api/claude/deploy',
+          { pr: Number(params.pr), session_key: context?.sessionKey || '' }, { maxTimeSec: 120 });
+        return r.summary;
+      } catch (err) {
+        return `deploy_pr failed: ${err.message}`;
+      }
+    },
+  }), { name: 'deploy_pr' });
+
   api.registerTool({
     name: 'claude_end',
     description: "End a Claude session: a turn still running is stopped. The session's record stays in RMP's memory.",

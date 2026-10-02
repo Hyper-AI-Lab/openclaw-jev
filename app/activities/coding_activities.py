@@ -339,7 +339,8 @@ async def deploy_coding_change(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "summary": f"RMP's full suite failed on the approved commit {head[:12]} ({prompts.tests_line(suite)}), "
                            "so nothing was deployed; main is unchanged."}
     spec = {"task_id": job.task_id, "old": ready["old"], "head": head, "context": _context(payload), "report": payload["report"],
-            "suite": {"ok": True, "summary": prompts.tests_line(suite)}}
+            "suite": {"ok": True, "summary": prompts.tests_line(suite)}, "branch": job.branch, "title": payload["title"],
+            "body": prompts.pr_body(payload["summary"], (payload.get("report") or {}).get("evidence", {}).get("tests"))}
     unit = await asyncio.to_thread(deploy.hand_off, spec)
     return {"status": "handed_off", "unit": unit, "summary": f"RMP's full suite passed on {head[:12]}; {unit} deploys it."}
 

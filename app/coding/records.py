@@ -100,9 +100,10 @@ def _coding_job(task_id: str) -> List[Dict[str, Any]]:
 
 
 def _what_claude_did(run: runner.Run) -> Dict[str, Any]:
+    exit_line = runner.exit_line(run)
     lines, _ = runner.read_events(run, 0)
     state = stream.parse_lines(lines)
-    result = stream.outcome(state, exit_line=runner.exit_line(run), stopped=run.stop_file.exists())
+    result = stream.outcome(state, exit_line=exit_line, stopped=run.stop_file.exists())
     reply = (result.report or {}).get("summary") or (state.result or {}).get("result") or state.last_text or ""
     commands = [command[:COMMAND_CHARS] for command in state.commands]
     return {"outcome": result.kind, "reply": reply, "files_edited": state.files_edited, "commands": commands,

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""The detached self-deploy of an approved coding change (unit ``aura-deploy-<task>``, as root).
+"""The detached deploy of Aura's code (unit ``aura-deploy-<task>``, as root).
 
-Started by the coding workflow's deploy activity with a spec in the task's runs directory. It holds the
-code-reload lock for the whole deploy, runs ``app.coding.deploy.self_deploy``, records the result and
-starts a fresh run of the task's workflow, which sends Aura's judged reply on the new code.
+Started with a spec in the task's runs directory: by the coding workflow's deploy activity for a reviewed
+job's approved commit, or by ``deploy_pr`` for GitHub's main once Aura merged a pull request. It holds the
+code-reload lock for the whole deploy, runs ``app.coding.deploy.self_deploy`` and records the result. Then
+a reviewed job gets a fresh run of its workflow, which sends Aura's judged reply on the new code; a deploy
+of Aura's own pull requests sends Kirill a note with their links.
 """
 import asyncio
 import fcntl
@@ -18,8 +20,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app.coding.deploy_checks  # noqa: E402,F401
 import app.production.canary_sentinel  # noqa: E402,F401
 from app.coding import deploy  # noqa: E402
+from app.config import get_coding_config  # noqa: E402
 from app.db.database import AsyncSessionLocal, engine  # noqa: E402
 from app.db.models import Event, Task  # noqa: E402
+from app.production.ops_notify import notify_ops_slack  # noqa: E402
 from app.temporal_control import connect_temporal  # noqa: E402
 
 TASK_QUEUE = "openclaw-tasks"
@@ -30,7 +34,7 @@ def log(message: str) -> None:
 
 
 async def finish(spec: dict, result: dict) -> None:
-    """Record the result on the task, then start the run that replies."""
+    """Record the result on the task, then start the run that replies, or tell Kirill about Aura's own deploy."""
     task_id = spec["task_id"]
     try:
         async with AsyncSessionLocal() as db:
@@ -42,6 +46,11 @@ async def finish(spec: dict, result: dict) -> None:
             await db.commit()
     finally:
         await engine.dispose()
+    if spec.get("source") == "github":
+        note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
+        await notify_ops_slack(note, incident_id=f"deploy:{task_id}:{(result.get('head') or '')[:12]}")
+        log("told Kirill")
+        return
     client = await connect_temporal()
     await client.start_workflow("CodingTaskWorkflow", {**spec["context"], "report": {**spec["report"], "shipped": result}},
                                 id=f"workflow-{task_id}", task_queue=TASK_QUEUE)
@@ -52,7 +61,8 @@ def main(spec_path: str) -> int:
     spec = json.loads(Path(spec_path).read_text())
     with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        log(f"holding {deploy.CODE_RELOAD_LOCK}; deploying {spec['head'][:12]} over {spec['old'][:12]}")
+        what = "GitHub's main" if spec.get("source") == "github" else f"{spec['head'][:12]} over {spec['old'][:12]}"
+        log(f"holding {deploy.CODE_RELOAD_LOCK}; deploying {what}")
         try:
             result = deploy.self_deploy(spec, deploy.Host(), log=log)
         except Exception as exc:

@@ -151,6 +151,16 @@ def test_a_finished_turn_books_its_tokens_once(fakes, monkeypatch):
     assert [args[0] for args in booked] == [runner.USAGE_PROFILE]
 
 
+def test_a_turn_reads_its_exit_line_before_its_stream_so_a_finished_turn_never_looks_cut_short(fakes, monkeypatch):
+    s = direct.create(TASK, "scratch", "", CFG)
+    direct.send(s["id"], "fixture:success_readonly", CFG)
+    finished(s["id"], 1)
+    order, exit_line, read_events = [], runner.exit_line, runner.read_events
+    monkeypatch.setattr(runner, "exit_line", lambda run: order.append("exit") or exit_line(run))
+    monkeypatch.setattr(runner, "read_events", lambda run, offset: order.append("stream") or read_events(run, offset))
+    assert direct.status(s["id"], 1)["outcome"] == "success" and order[:2] == ["exit", "stream"]
+
+
 def test_a_turn_whose_unit_vanished_without_an_exit_line_is_done_with_no_result(fakes):
     s = direct.create(TASK, "scratch", "", CFG)
     turn = direct._turn(s, 1)

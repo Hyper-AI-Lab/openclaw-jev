@@ -57,6 +57,8 @@ install -d -o root -g root -m 755 /etc/claude-code
 install -o root -g root -m 644 "${RMP_ROOT}/ops/aura_coder/managed-settings.json" /srv/aura-code/policy/managed-settings.json
 install -o root -g root -m 644 "${RMP_ROOT}/ops/claude_host/managed-settings.json" "${MANAGED}"
 log "coding policy at /srv/aura-code/policy, host policy at ${MANAGED}"
+install -o root -g root -m 755 "${RMP_ROOT}/ops/aura_github.sh" /usr/local/bin/aura-github
+log "aura-github installed for Aura's direct sessions"
 [[ "${current}" == "${VERSION}" ]] || die "Claude Code is ${current:-missing}, expected ${VERSION}"
 log "Claude Code ${current} at ${CLAUDE}"
 

@@ -1,17 +1,21 @@
-"""Shipping an approved change: a pull request for Kirill's other repos, a self-deploy for Aura's own code.
+"""Shipping Aura's code: GitHub's main is protected, so every change lands there through a pull request first.
 
-A self-deploy runs in two places. The worker fetches the approved commit into the live repo, checks it
-fast-forwards ``main`` and runs the full suite on that exact commit as aura-coder, then hands off to a
-detached root unit (``ops/coding_deploy.py``). That unit holds the code-reload lock, waits until no other
-user task is active, refuses mirrors that drifted, fast-forwards and pushes ``main``, syncs the mirrors,
-restarts only what changed and checks health, readiness and a canary. On failure it reverts ``main``,
-restarts and pushes the revert. It records the result and starts a fresh run of the task's workflow,
-which replies on the new code, so nothing replays across the change.
+Two changes ship this way. Aura's own pull requests: ``merge_pull_request`` merges one once its test check
+passed, and the task's deploy unit later deploys GitHub's main as it then is. A reviewed coding job's
+approved commit: the worker fetches it into the live repo, checks it fast-forwards ``main`` and runs the
+full suite on that exact commit as aura-coder, then hands off; the unit lands it through a pull request.
+
+The detached root unit (``ops/coding_deploy.py``) holds the code-reload lock, waits until no user task is
+active, refuses mirrors that drifted, fast-forwards the live ``main`` to GitHub's, syncs the mirrors,
+restarts only what changed and checks health, readiness and a canary. On failure it reverts the live
+``main`` and restarts at once; the revert reaches GitHub as a pull request of its own. It records the
+result, then a reviewed job's workflow replies on the new code, or Kirill gets a note for Aura's own.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -19,7 +23,7 @@ from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from app.coding import verify, workspace
+from app.coding import github, verify, workspace
 from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
 
 LIVE_REPO = Path("/root/.openclaw/rmp")
@@ -164,10 +168,14 @@ def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
     """Start the detached deploy unit; it outlives worker restarts, including its own.
 
     The spec stays on disk only once the unit started, so a retried activity finding it does not deploy twice.
+    A deploy of GitHub's main that is still waiting ships whatever main is when it runs, a later merge included.
     """
     path = spec_file(spec["task_id"])
     unit = f"aura-deploy-{spec['task_id']}"
-    if path.exists() and json.loads(path.read_text()).get("head") == spec["head"]:
+    if spec.get("source") == "github":
+        if subprocess.run(["systemctl", "is-active", "--quiet", unit], capture_output=True).returncode == 0:
+            return unit
+    elif path.exists() and json.loads(path.read_text()).get("head") == spec["head"]:
         return unit
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_text(json.dumps(spec, indent=2) + "\n")
@@ -183,6 +191,55 @@ def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
         path.unlink(missing_ok=True)
         raise
     return unit
+
+
+def merge_pull_request(task_id: str, number: int, cfg: Dict[str, Any], *, live: Path = LIVE_REPO) -> Dict[str, Any]:
+    """Aura's deploy_pr: merge her pull request once its test check passed; the task's deploy unit then deploys
+    GitHub's main when she is idle and tells Kirill."""
+    repo = cfg["repositories"]["rmp"]["remote"]
+    pr = github.pull(number, repo)
+    if pr.get("merged"):
+        return {"status": "refused", "url": pr.get("html_url"), "summary": f"PR #{number} is already merged."}
+    head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+    if pr.get("state") != "open" or pr["base"]["ref"] != "main" or head_repo != repo or pr["head"]["ref"] == "main":
+        return {"status": "refused", "url": pr.get("html_url"),
+                "summary": f"PR #{number} is not an open pull request into main from a branch of {repo}."}
+    sha = pr["head"]["sha"]
+    state = github.check(sha, repo)
+    if state != "success":
+        return {"status": "waiting" if state in ("pending", "missing") else "refused", "check": state,
+                "url": pr["html_url"], "summary": f"CI's test check on PR #{number} is {state}; it merges once that has passed."}
+    old = _git(live, "rev-parse", "refs/heads/main").strip()
+    if not _is_ancestor_on_github(old, repo):
+        return {"status": "refused", "url": pr["html_url"],
+                "summary": f"The live main ({old[:12]}) has commits GitHub's main lacks, so nothing was merged."}
+    merged = github.merge(number, sha, "squash", repo)
+    unit = hand_off({"task_id": task_id, "source": "github", "pr": {"number": number, "url": pr["html_url"]}}, live=live)
+    return {"status": "merged", "merge": merged, "check": state, "url": pr["html_url"], "title": pr["title"], "unit": unit,
+            "summary": f"Merged PR #{number} ({pr['html_url']}) as {merged[:12]}. RMP deploys GitHub's main once you are "
+                       "idle and tells Kirill how it went."}
+
+
+def _is_ancestor_on_github(commit: str, repo: str) -> bool:
+    """Whether GitHub's main contains ``commit``; a commit GitHub has never seen is not."""
+    try:
+        compare = github.api("GET", f"repos/{repo}/compare/{commit}...main")
+    except github.GitHubError:
+        return False
+    return compare.get("status") in ("identical", "ahead")
+
+
+def deploy_note(result: Dict[str, Any], repo: str) -> str:
+    """Kirill's note after a deploy of Aura's own pull requests."""
+    def linked(subject: str) -> str:
+        found = re.search(r"\(#(\d+)\)\s*$", subject)
+        return f"{subject} https://github.com/{repo}/pull/{found.group(1)}" if found else subject
+
+    headline = {"deployed": "Aura's change is live.",
+                "rolled_back": "Aura's change failed its checks and was rolled back."}.get(
+        result["status"], f"Aura's deploy: {result['status']}.")
+    commits = "\n".join(f"• {linked(s)}" for s in result.get("commits") or [])
+    return "\n".join(part for part in (headline, commits, result.get("summary", "")) if part)
 
 
 def open_pull_request(job: workspace.Job, head: str, entry: Dict[str, Any], title: str, body: str,
@@ -209,8 +266,11 @@ class Host:
     ``checks`` returns ``{"failure": None or what failed, "canary": "ok" or "skipped"}``.
     """
 
-    def __init__(self, live: Path = LIVE_REPO):
+    def __init__(self, live: Path = LIVE_REPO, repo: Optional[str] = None):
+        from app.config import get_coding_config
+
         self.live = live
+        self.repo = repo or get_coding_config()["repositories"]["rmp"]["remote"]
 
     def active_user_tasks(self) -> int:
         from app.production.canary_sentinel import count_active_user_tasks_sync
@@ -224,9 +284,14 @@ class Host:
         subprocess.run([str(self.live / "venv" / "bin" / "pip"), "install", "-q", "-r", "requirements.txt"],
                        cwd=self.live, check=True, capture_output=True, timeout=1800)
 
-    def push(self) -> None:
+    def fetch_main(self) -> str:
+        """GitHub's main, fetched into the live repo; its commit."""
         with workspace.github_auth() as env:
-            _git(self.live, "push", "--quiet", "origin", "main", env=env)
+            _git(self.live, "fetch", "--quiet", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main", env=env)
+        return _git(self.live, "rev-parse", "refs/remotes/origin/main").strip()
+
+    def land(self, commit: str, branch: str, title: str, body: str, method: str) -> Dict[str, Any]:
+        return github.land(self.live, commit, branch, title, body, repo=self.repo, method=method)
 
     def readiness_baseline(self) -> List[str]:
         from app.coding import deploy_checks
@@ -258,27 +323,46 @@ def _apply(host: Host, old: str, new: str, changed: List[Tuple[str, str]]) -> Li
 
 
 def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] = print) -> Dict[str, Any]:
-    """The deploy unit's work, once it holds the code-reload lock. Returns the result to record."""
-    live, old, head = host.live, spec["old"], spec["head"]
+    """The deploy unit's work, once it holds the code-reload lock. Returns the result to record.
+
+    ``source`` "github" deploys GitHub's main as it is now; otherwise the spec's approved ``head`` lands first.
+    """
+    live = host.live
     waited = 0
     while host.active_user_tasks() > 0:
         if waited >= IDLE_WAIT_SEC:
             return {"status": "postponed", "summary": "Aura stayed busy for 2 hours, so nothing was deployed; main is unchanged."}
         host.sleep(IDLE_POLL_SEC)
         waited += IDLE_POLL_SEC
-    if _git(live, "rev-parse", "refs/heads/main").strip() != old:
-        return {"status": "failed", "summary": "main moved while the deploy waited, so nothing was deployed. Ask me again."}
+    old = _git(live, "rev-parse", "refs/heads/main").strip()
+    landed = None
+    if spec.get("source") == "github":
+        head = host.fetch_main()
+        if head == old:
+            return {"status": "deployed", "old": old, "head": head, "restarted": [], "commits": [], "canary": None,
+                    "summary": f"GitHub's main ({head[:12]}) was already live, so nothing changed."}
+        if not _is_ancestor(live, old, head):
+            return {"status": "blocked", "summary": f"The live main ({old[:12]}) has commits GitHub's main lacks, so nothing "
+                    "was deployed; main is unchanged."}
+    else:
+        if old != spec["old"]:
+            return {"status": "failed", "summary": "main moved while the deploy waited, so nothing was deployed. Ask me again."}
+        blocked = _drift(live, old, changes(live, old, spec["head"]))
+        if blocked:
+            return blocked
+        landed = host.land(spec["head"], spec["branch"], spec["title"], spec["body"], "squash")
+        if landed["status"] != "merged":
+            return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on {landed['pr']['url']} is "
+                    f"{landed['check']}, so nothing was deployed; main is unchanged."}
+        head = host.fetch_main()
+        log(f"landed {landed['pr']['url']} as {head[:12]}")
     changed = changes(live, old, head)
-    for prefix, target in MIRRORS:
-        if any(path.startswith(prefix) for _, path in changed):
-            drift = drifted(live, old, prefix, target)
-            if drift:
-                return {"status": "blocked", "summary": f"The live copy of {prefix} was edited by hand ({', '.join(drift[:5])}), "
-                        "so nothing was deployed; main is unchanged."}
+    blocked = _drift(live, old, changed)
+    if blocked:
+        return blocked
     baseline = host.readiness_baseline()
     _git(live, "merge", "--ff-only", "--quiet", head)
     log(f"main fast-forwarded {old[:12]}..{head[:12]}")
-    pushed = _push(host, log)
     restarted = restarts_for(path for _, path in changed)
     try:
         restarted = _apply(host, old, head, changed)
@@ -287,13 +371,13 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     except Exception as exc:
         checked = {"failure": f"applying the change failed ({str(exc)[:300]})", "canary": None}
     failure = checked["failure"]
+    shipped = {"old": old, "head": head, "restarted": restarted, "commits": _subjects(live, old, head),
+               **({"pr": landed["pr"]} if landed else {})}
     if failure is None:
         canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
-        unpushed = "" if pushed else " The push to GitHub failed; main is ahead of origin until the next push."
-        return {"status": "deployed", "old": old, "head": head, "pushed": pushed, "restarted": restarted,
-                "canary": checked["canary"],
+        return {"status": "deployed", **shipped, "canary": checked["canary"],
                 "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
-                f"readiness passed and {canary}.{unpushed}"}
+                f"readiness passed and {canary}."}
     log(f"verification failed: {failure}; reverting")
     _git(live, "revert", "--no-edit", "--no-commit", f"{old}..{head}")
     _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit", "--quiet",
@@ -301,18 +385,48 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     revert = _git(live, "rev-parse", "HEAD").strip()
     _apply(host, head, revert, changes(live, head, revert))
     still = host.checks(restarted, baseline)["failure"]
-    pushed_revert = _push(host, log)
+    published = _publish_revert(host, revert, head, failure, log)
     health = "Aura is healthy again" if still is None else f"the checks still fail: {still}"
-    return {"status": "rolled_back", "old": old, "head": head, "revert": revert, "pushed": pushed_revert, "error": failure,
-            "restarted": restarted,
+    if published["status"] == "merged":
+        github_now = f"GitHub's main is reverted too ({published['pr']['url']})"
+    elif published.get("pr"):
+        github_now = f"on GitHub the revert waits in {published['pr']['url']} (its test check is {published['check']})"
+    else:
+        github_now = f"the revert is not on GitHub yet ({published['error']})"
+    return {"status": "rolled_back", **shipped, "revert": revert, "revert_pr": published, "error": failure,
             "summary": f"Deploying {head[:12]} failed its checks ({failure}), so I reverted main ({revert[:12]}) and restarted "
-            f"{', '.join(restarted) or 'nothing'}; {health}."}
+            f"{', '.join(restarted) or 'nothing'}; {health}; {github_now}."}
 
 
-def _push(host: Host, log: Callable[[str], None]) -> bool:
+def _drift(live: Path, old: str, changed: List[Tuple[str, str]]) -> Optional[Dict[str, Any]]:
+    for prefix, target in MIRRORS:
+        if any(path.startswith(prefix) for _, path in changed):
+            drift = drifted(live, old, prefix, target)
+            if drift:
+                return {"status": "blocked", "summary": f"The live copy of {prefix} was edited by hand ({', '.join(drift[:5])}), "
+                        "so nothing was deployed; main is unchanged."}
+    return None
+
+
+def _is_ancestor(live: Path, old: str, head: str) -> bool:
     try:
-        host.push()
-        return True
-    except Exception as exc:
-        log(f"push failed: {exc}")
+        _git(live, "merge-base", "--is-ancestor", old, head)
+    except RuntimeError:
         return False
+    return True
+
+
+def _subjects(live: Path, old: str, head: str) -> List[str]:
+    return _git(live, "log", "--format=%s", f"{old}..{head}").splitlines()[:20]
+
+
+def _publish_revert(host: Host, revert: str, head: str, failure: str, log: Callable[[str], None]) -> Dict[str, Any]:
+    """The live revert onto GitHub's main through a pull request of its own. A merge commit, not a squash, keeps the
+    live main an ancestor of GitHub's, so the next deploy fast-forwards."""
+    try:
+        return host.land(revert, f"aura/revert-{head[:12]}", f"Revert {head[:12]}: the deploy's checks failed",
+                         f"RMP deployed {head[:12]}, its checks failed ({failure[:300]}), and RMP reverted the live code at "
+                         "once. This brings GitHub's main to the same state.", "merge")
+    except Exception as exc:
+        log(f"publishing the revert failed: {exc}")
+        return {"status": "failed", "error": str(exc)[:300]}
