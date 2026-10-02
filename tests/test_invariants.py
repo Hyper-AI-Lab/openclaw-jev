@@ -58,6 +58,14 @@ async def test_a_completed_user_task_needs_an_evaluator_accept(session):
     assert (await invariants.check_judged_deliveries()).status == "pass"
 
 
+async def test_rmps_own_acknowledgement_and_coding_report_need_no_accept(session):
+    await seed(session, task("ack", goal="I approve"), event("ack", "intake.skip_ack", ago(minutes=11)),
+               task("shipped", goal="Fix the greeting"), event("shipped", "coding.reported_by_rmp", ago(minutes=11)),
+               task("unjudged"))
+    result = await invariants.check_judged_deliveries()
+    assert result.status == "fail" and result.details["task_ids"] == ["unjudged"]
+
+
 async def test_an_attached_message_is_answered_or_resubmitted(session):
     await seed(
         session,

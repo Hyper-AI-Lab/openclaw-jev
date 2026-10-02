@@ -37,9 +37,11 @@ def _since() -> datetime:
 async def check_judged_deliveries() -> CheckResult:
     """A user task completes only after the evaluator accepted its reply.
 
-    A coding task whose replies the evaluator never accepted completes with RMP's own record of what shipped.
+    Two completions carry RMP's own words instead of a reply of Aura's: intake's acknowledgement of a message with
+    nothing new to run, and a coding task's record of what shipped when none of Aura's replies passed the evaluator.
     """
-    accepted = exists().where(Event.entity_id == Task.id, Event.event_type.in_(("evaluator.accept", "coding.reported_by_rmp")))
+    accepted = exists().where(Event.entity_id == Task.id,
+                              Event.event_type.in_(("evaluator.accept", "intake.skip_ack", "coding.reported_by_rmp")))
     async with AsyncSessionLocal() as db:
         rows = (
             await db.execute(
