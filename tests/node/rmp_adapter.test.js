@@ -397,7 +397,7 @@ test('a Claude wait rides out an RMP restart, and a refused message or a usage l
     ['POST /api/claude/sessions/s-2/messages', () => json({ detail: 'turn 3 is still running' }, 409)],
     ['GET /api/claude/sessions/s-3', () => ({ id: 's-3', status: 'open', turns: 1 })],
     ['GET /api/claude/sessions/s-3/turns/1', () => ({ turn: 1, done: false, outcome: 'running',
-      progress: ['Ran: pytest', 'Edited calc.py'], files_edited: ['calc.py'], commands: ['pytest -q', 'git diff'] })],
+      progress: ['Ran: pytest', 'Edited calc.py'] })],
   ]);
   const tools = {};
   require(path.join(path.dirname(PLUGIN), 'claude_tools.js')).register(
@@ -409,7 +409,7 @@ test('a Claude wait rides out an RMP restart, and a refused message or a usage l
   assert.equal(polls, 2);
   assert.equal(text(await tools.claude_send.execute('c2', { session: 's-2', message: 'again' })),
     'Claude message failed: HTTP 409: turn 3 is still running');
-  assert.equal(text(await tools.claude_status.execute('c3', { session: 's-3', wait_seconds: 1 })),
+  assert.equal(text(await tools.claude_status.execute('c3', { session: 's-3' })),
     'Claude is still working on turn 1.\nLatest: Ran: pytest; Edited calc.py\nWait for it with claude_status, or stop it with claude_end.');
 });
 
