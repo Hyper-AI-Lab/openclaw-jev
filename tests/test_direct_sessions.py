@@ -158,7 +158,8 @@ def test_a_turn_reads_its_exit_line_before_its_stream_so_a_finished_turn_never_l
     order, exit_line, read_events = [], runner.exit_line, runner.read_events
     monkeypatch.setattr(runner, "exit_line", lambda run: order.append("exit") or exit_line(run))
     monkeypatch.setattr(runner, "read_events", lambda run, offset: order.append("stream") or read_events(run, offset))
-    assert direct.status(s["id"], 1)["outcome"] == "success" and order[:2] == ["exit", "stream"]
+    # A just-written exit file can read empty for an instant; status then reads it again before the stream.
+    assert direct.status(s["id"], 1)["outcome"] == "success" and order[0] == "exit" and "stream" in order
 
 
 def test_a_turn_whose_unit_vanished_without_an_exit_line_is_done_with_no_result(fakes):
