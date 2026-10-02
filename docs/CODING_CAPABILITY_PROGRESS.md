@@ -830,3 +830,41 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
   - a stop within seconds: 3 s live;
   - 2026.9.7: the probes, canary and a live DM;
   - the full suite and CI green, readiness 0 fail.
+
+---
+
+## Follow-up — the remaining risks and the task_documents alert
+
+**Date:** 2026-10-02.
+
+**The alert** ("task_documents: 1 finished user task lacks an enriched task document after 30 min (ddcbad8a)"):
+- **Cause:** `ddcbad8a` is Kirill's "I approve", sent after the deploy had finished, which intake acknowledged as having nothing new to run. That no-op path (since Sep 9) creates a completed task but never runs the end-of-task step, `index_terminal_task_async`. So its memory document, started when the message arrived, stayed raw, and the task was never indexed in the registry (`vector_sync`: "registry_unindexed: 1"). Nothing reached this path between the invariants' start on Sep 29 and today.
+- **Fix** (`71b18b7`): after the no-op path commits, it now queues the task like any other finished task.
+  - A first attempt (`df44e7d`) excluded acknowledgements from memory instead. It was reverted, because a message intake acknowledges can still carry a fact ("FYI, I moved the meeting to Friday"), and because the existing raw document then read as internal content.
+  - `ddcbad8a` was queued once by hand, and its document was enriched within a minute.
+- `judged_deliveries` already counted `intake.skip_ack` (fix 6 in step 14).
+
+**Risks closed:**
+1. **Early approvals** (`df44e7d`): an approve that arrives while a round runs gets an immediate reply ("That approval came before there was anything to approve (round N is still running)…"), and any approval sent before the card is dropped quietly when the card goes out. The card no longer refuses an early approval. Only an approval sent after the card ships, checked by provenance as before.
+2. **Jev and coding tasks** (`df44e7d`):
+   - **Live evaluation** (59 cases, about $0.004 per run): the rubric's coding cases were right or abstained, with no harmful answer. Naming the repository in the rubric moved Jev's score for "add a dark mode toggle in agentic-design and open a PR" from 0.87 to 0.91 `coding_task`, past the 0.9 bar, which is one harmful answer. Wording cannot steer that reliably.
+   - **The change:** Jev now never starts a coding task on its own (`LLM_ONLY_CATALOG`). When its catalog answer is `coding_task`, it abstains and the intake LLM decides, and that LLM knows which repositories Aura may change.
+   - **Final live run:** harmful 0; every request leaning `coding_task` abstained; awareness, "can you code?" and review-only were answered correctly.
+   - **Not this work:** the four remaining misses (execution mode on three status questions, the login catalog) are the same ones recorded in the deep-memory step 12 (accuracy 0.882–0.886), and the 0.9 accuracy gate stays failing as it was.
+   - **Safety net:** a brief may answer `out_of_scope` for a request about another repository. The task then ends with "I can only change my own code… Nothing was started." and no checkout is made.
+3. **Stops:**
+   - **Recognition:** `is_whole_message_stop` now reads Kirill's words after any catch-up brief, for every caller (generic, catalog, the evaluator wait, attached messages, the API). The risk as stated was mostly theoretical: the Slack plugin sends a whole-message stop straight to the active task, bare.
+   - **The real gap:** the plugin's active-task lookup (`/sessions/{key}/active_user_task`) matched only running, waiting-for-input and created tasks. A coding task queued for the coding slot or paused at the usage limit (`blocked`) could not be stopped. The lookup now uses the server's active statuses (`deploying` stays out: a deploy is not stoppable).
+   - **A side effect:** with the stop recognised inside a catch-up brief, it is no longer re-sent to intake as a leftover message after the task stops. The coding replay histories were re-recorded for this; no task was in flight when it deployed.
+- Tests:
+  - an approve during a round is declined at once and never refused at the card;
+  - a brief for another repository starts nothing;
+  - Jev abstains on `coding_task` at any confidence, while running-task answers are unaffected;
+  - a stop inside a catch-up brief is recognised;
+  - in the whole path, Kirill's stop reaches a coding task waiting for the slot. It fails without the lookup fix, which was checked.
+  - In the whole path, an acknowledged message is answered, queued for the registry and its document, and passes `judged_deliveries`. It fails without the fix, which was checked.
+
+**Verification:**
+- **Tests:** full suite 1011 passed, 4 skipped; node 23/23.
+- **Deploy:** `df44e7d` and `71b18b7` went out with no active tasks; the API and worker reloaded with health OK.
+- **Readiness:** 44 pass, 1 warn (telemetry), 0 fail. `task_documents` (7 of 7 enriched), `deep_index_internal`, `vector_sync` and `judged_deliveries` pass, and the canary gives CANARY OK.
