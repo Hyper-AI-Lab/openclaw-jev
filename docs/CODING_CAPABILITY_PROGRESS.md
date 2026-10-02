@@ -573,3 +573,61 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
 - **Tests:** full suite 911 passed, 4 skipped. The one failure, an exact-dict test, was then updated to cover the sender, and its module passes. 79 gate, evaluator and catalog tests; node 23/23.
 - **Deploy:** the plugin was synced (live == repo), and the gateway was ready 108 s after the restart. The plugin probe shows all six runtime plugins loaded with no load failures. The API and worker reloaded without errors.
 - **Live provenance:** Kirill sent a DM ("Quick check, please reply OK"), and its task message records `user_id=U0AELFYTLKS` (the configured owner) and `event_ts=1790818985363`. The message before the deploy had neither.
+
+---
+
+## Step 10 — Coding workflow
+
+**Date:** 2026-10-02.
+
+**What changed:**
+- `app/workflows/coding_task.py` (new): `CodingTaskWorkflow`, registered in `worker.py`. `start_task_workflow` starts it for `coding_task`, given as the process type, task type or catalog type (the catalog entry arrives in step 12).
+  - **Slot:** one coding job at a time. A busy slot gets one queue notice, and the task waits as `blocked`/`queued`, polling every 2 minutes. The workflow releases the slot when it ends, and a holder whose task has ended loses it.
+  - **Brief:** Aura writes it as JSON: repo, title, goal, acceptance criteria, constraints and questions. Questions go to Kirill (`pending_user_input`, one reminder after 12 h, closed after 7 days), for up to two rounds. An unknown repository becomes a question.
+  - **Workspace:** step 8's `prepare`, the shared venv and the test-server seed. Kirill then gets a "Starting on <repo>" notice naming the branch.
+  - **Rounds:** Claude Code runs (a rework resumes its session), then RMP collects the work and runs the tests. Aura reviews only when RMP's record shows commits, passing tests and no secret. She reviews in a fresh session per round (`__r<round>`) that reads the diff from disk. The evaluator judges her reply with the external evidence only when she says ready. Failing tests, her feedback, the evaluator's issues and Kirill's new messages go into the next round. `max_rounds` (3) applies per batch of rounds.
+  - **Usage limit:** the round pauses (`blocked`/`paused`) until the reset plus a minute, with a notice. Then the same session continues with a continue prompt. A stop during the pause ends the task.
+  - **Gate:** applies to every repository with a deploy target, `self` and `pr`. The card holds Aura's judged summary, the commits and head, RMP's test result, the diffstat, the services a deploy restarts (`self` only, from `app/coding/deploy.py`) and dependency changes.
+    - A change that is still not ready after the last round gets a card listing the problems, and an approve is refused.
+    - Replies are read with `gate_decision`. A batch of replies containing any change request is one change request (joined), which starts a new batch of rounds in the same session. Only a batch of approvals reaches `confirm_approval_provenance`. A refused one (such as an API approve) gets a notice, and the gate stays open.
+  - **Ship:** the `deploy_coding_change` activity (step 11), then Aura's final reply, judged with the deploy result as evidence. If no draft passes in two tries, RMP's own record of what shipped is sent instead.
+  - **Stop:** `cancel`, or a whole-message stop in Kirill's own words (`user_words`). The workflow first runs `stop_coding_units`, which records the run's stop, sends SIGINT and then stops the unit. Then it cancels the activity and waits for its cleanup (`WAIT_CANCELLATION_COMPLETED`). The checkout is kept, and the notice names the branch.
+  - **Failures** close the task as failed with a notice, keeping the checkout. They are a runner outcome of `auth_failed`, `api_error`, `timeout`, `no_result` or a stop from outside, or a failed preparation or verification.
+- `app/activities/coding_activities.py` (new): `coding_settings`, `acquire_coding_slot` and `release_coding_slot` (a locked file in the runs directory), `draft_coding_brief` (asks once more after unreadable output), `prepare_coding_workspace`, `run_claude_round`, `verify_coding_round`, `review_coding_round` and `stop_coding_units`.
+  - `run_claude_round` tails the stream and heartbeats the offset. It touches liveness every 3 minutes and sends a milestone notice at most every 15. A retry reattaches (the runner's start is idempotent) and rebuilds the run's record from the whole stream. Only a cancel the workflow asked for (`cancellation_details().cancel_requested`) stops the unit; a worker shutdown or a missed heartbeat leaves it running.
+  - `verify_coding_round` stops the round's leftover units on a retry. It keeps the diff on disk (`diff-<run>.patch`) and returns RMP's collection without it, plus the test run. Work RMP cannot collect comes back as `error`, which becomes feedback for Claude.
+- `app/coding/prompts.py` (new): the brief, system, rework, change-request, review and final prompts, `REPORT_SCHEMA`, and parsers that fail closed. `app/coding/deploy.py` (new): `restarts_for(paths)`.
+- **The reconciler and liveness:**
+  - **Orphans:** a new pass closes a coding task whose workflow is gone. It stops the task's units, marks it failed, sends a notice and records `reconciler.coding_orphan_closed`.
+  - **No re-judging:** the orphaned-reply recovery never re-judges a coding task.
+  - **Stuck repair:** it skips a coding task while one of its units is live (then the worker is down, not the run), and stops the units when it terminates the workflow.
+  - **Terminate:** `terminate_task_workflow` (supersede, rebuild) stops the task's coding units too.
+  - **Janitor:** it already recognises `workflow-<task>`, and the coding workflow has no children.
+- The evaluator's external evidence gains the deploy result.
+- Tests:
+  - `tests/test_coding_workflow.py` (17), with scripted activities on the time-skipping server: approve and deploy; rework from failing tests and from review feedback; Kirill's messages reaching the next round; a stop mid-run (units stopped within seconds, before the activity is cancelled); a stop at the gate; a change request; an approve sent with a change request; a refused API approve; the usage-limit pause, and a stop during it; a runner failure; the queue; brief questions; not ready after the last round; a secret in the diff; a PR repository.
+  - In the same file, a worker restart mid-run: the real round activity on a scripted runner. The unit was started once and never stopped, the retry attached while it was still running, and the record covers the whole run.
+  - `tests/test_coding_activities.py` (9): the slot; stopping a task's units with fake systemd; only a requested cancel stops a run; verification keeps the diff on disk; uncollectable work; the brief retry.
+  - `tests/test_coding_prompts.py` (20), `tests/test_reconciler_coding.py` (7), and five recorded histories in `tests/test_workflow_replay.py`. Also routing, terminate and janitor cases, and the evaluator's deploy line. The fake `systemctl` gains `list-units`.
+
+**Deviations and why:**
+- **Review and judgment only where they can matter:** a round that RMP's own record already fails goes straight back to Claude, without Aura's review or the evaluator. This saves two LLM turns per failing round. Everything that reaches Kirill is still judged.
+- **The gate covers PR repositories too:** the plan's architecture diagram puts the approval card before the split by target.
+- **The deploy activity is called by name** until step 11 adds it. Nothing routes to coding tasks before step 12.
+- **The reconciler's query:** the first version used `SELECT DISTINCT` over task rows. Postgres refuses that because of the JSON column ("could not identify an equality operator for type json"), confirmed read-only on the live database. The pass uses a subquery instead. SQLite tests cannot catch this, so the live query was run read-only before the deploy.
+- **The reattach test uses a real dev server** (`start_local`), because Temporal's time-skipping server never retries an attempt whose worker shut down. On a real server the retry came about 2 s after the old worker's shutdown (measured), not after the 2-minute heartbeat timeout.
+
+**Verification:**
+- **Tests:** full suite 969 passed, 4 skipped; node 23/23. A deliberately nondeterministic edit makes the replay test fail.
+- **SDK behaviour, confirmed by experiment on temporalio 1.23:**
+  - heartbeat details survive a retry;
+  - a workflow cancel arrives with `cancel_requested`, and a worker shutdown with `worker_shutdown`;
+  - with the default cancellation type, the workflow moves on before the activity's cleanup runs.
+- **Live probe on this host** (real activities, no Slack):
+  - a checkout of RMP at `49544ed`;
+  - a read-only Claude Code round: success in 15 s, 3 turns;
+  - a second round, stopped 0.3 s after the cancel, with outcome `stopped`;
+  - RMP's verification as `aura-coder`: no commits, 910 passed, 5 skipped, node 22 passed and 1 skipped, in 315 s.
+
+  The probe's files were removed.
+- **Deploy:** `main` was fast-forwarded to `4a2e8c2` with no active tasks. The code watcher restarted the API and worker within a minute, with no errors. Readiness is 38/1/0, the gateway's `/readyz` returns 200, and `ops/canary.sh` gives CANARY OK. The new reconciler pass runs without warnings.
