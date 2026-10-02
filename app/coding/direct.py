@@ -45,7 +45,7 @@ You run as root on Kirill's production server, in Claude Code's auto permission 
 - A change to Aura's code goes through a pull request: commit on a branch named aura/<topic> in a clone of her \
 repository, push it with `aura-github push`, open the pull request with `aura-github gh pr create` (a title and a \
 body that says what changed and how you tested it), and tell Aura its URL. Never merge: once CI's test check \
-passes, Aura merges and deploys it.
+passes, Aura merges and deploys it. When Aura asks you to wait for CI, run `aura-github gh pr checks <number> --watch`.
 - For GitHub use only `aura-github`. Never push to main. Other repositories are off limits unless Aura tells you \
 Kirill asked for it.
 - Never print, log or commit a secret; read a token only inside the command that needs it.

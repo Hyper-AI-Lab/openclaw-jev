@@ -151,6 +151,11 @@ def test_deploy_pr_merges_nothing_that_is_not_ready(merging, change, status, wor
     assert merging.merged == [] and merging.handed == []
 
 
+def test_a_pull_request_still_in_ci_tells_aura_how_to_wait_for_it(merging):
+    merging.check = "pending"
+    assert "Have Claude wait for it with `aura-github gh pr checks 12 --watch`" in deploy.merge_pull_request("t1", 12, CFG)["summary"]
+
+
 def test_kirills_note_links_each_pull_request():
     note = deploy.deploy_note({"status": "deployed", "commits": ["Fix the greeting (#12)", "Tidy the logs"],
                                "summary": "Deployed abc to main."}, REPO)
