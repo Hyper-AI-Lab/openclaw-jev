@@ -495,6 +495,21 @@ async def test_kirills_stop_reaches_a_coding_task_waiting_for_the_coding_slot(h)
     assert h.slack[-1] == "Stopped. Nothing shipped." and (await h.task(tid)).status == "stopped_by_user"
 
 
+async def test_a_message_with_nothing_new_to_run_is_acknowledged_and_remembered_like_any_finished_task(h, monkeypatch):
+    from app.db.models import DeepIngestJob, VectorOutbox
+
+    h.intake = [{"decision": "skip_valid", "confidence": 95, "rationale": "Kirill confirms what already happened."}]
+    result = await h.send("I approve", "1790000009.000100")
+
+    tid = result["task_id"]
+    assert result["skipped"] and (await h.task(tid)).status == "completed"
+    assert h.slack[0].startswith("Got it — nothing new to run.")
+    assert [j.kind for j in await h.rows(DeepIngestJob, DeepIngestJob.ref_id == tid)] == ["task"]
+    assert [o.kind for o in await h.rows(VectorOutbox, VectorOutbox.ref_id == tid)] == ["registry"]
+    checks = await invariants_once_settled(monkeypatch)
+    assert checks["judged_deliveries"].status == "pass"
+
+
 async def test_a_long_answer_reaches_slack_in_ordered_parts_with_one_ledger_row(h):
     long = "\n\n".join(
         f"Part {i}. " + " ".join(f"Kansai cooking note {i}.{j} covers dashi, street food and markets." for j in range(9))

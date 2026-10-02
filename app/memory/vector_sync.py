@@ -343,7 +343,6 @@ async def reconcile(apply: bool = True) -> Dict[str, Any]:
         and ("registry", t.id) not in pending
         and not is_internal_task(t.goal or "", t.task_type or "", [])
         and (t.supplementary_context or {}).get("closed_reason") != INTAKE_PLACEHOLDER
-        and not (t.supplementary_context or {}).get("intake_ack")
     ]
 
     stats = {

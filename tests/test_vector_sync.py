@@ -149,8 +149,6 @@ async def test_reconcile_backfills_missing_rows_and_tasks_deletes_orphans_and_re
         SimpleNamespace(id="t-queued", goal="Draft the memo", task_type="user", supplementary_context=None),
         SimpleNamespace(id="t-placeholder", goal="Also give it in EUR.", task_type="user",
                         supplementary_context={"intake_reserved": False, "closed_reason": "intake_placeholder"}),
-        SimpleNamespace(id="t-ack", goal="I approve", task_type="user",
-                        supplementary_context={"intake_ack": True, "skip_kind": "skip_valid"}),
     ]
     db = MagicMock()
     results = []

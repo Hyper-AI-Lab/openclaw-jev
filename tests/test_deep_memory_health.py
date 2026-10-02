@@ -137,7 +137,6 @@ async def test_every_finished_user_task_needs_an_enriched_document_after_30_minu
               task("t-ok"), task("t-raw"), task("t-none"), task("t-fresh", ended_minutes=10),
               task("t-canary", task_type="canary", goal="RMP CANARY: Reply with exactly CANARY_OK"),
               task("t-before", created_minutes=60 * 5),
-              task("t-ack", goal="I approve", supplementary_context={"intake_ack": True, "skip_kind": "skip_valid"}),
               DeepDocument(id=document_id(task_source_key("t-ok")), kind="task", source_key="task:t-ok", status="enriched"),
               DeepDocument(id=document_id(task_source_key("t-raw")), kind="task", source_key="task:t-raw", status="raw"))
     result = await health.check_task_documents()

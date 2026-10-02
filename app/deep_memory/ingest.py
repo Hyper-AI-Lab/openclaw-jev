@@ -129,8 +129,7 @@ async def enqueue_facts(task_id: str) -> None:
 
 
 def ingestible(task: Optional[Task]) -> bool:
-    """User work only: never canaries, cron, heartbeats, internal intents, intake placeholders or intake's
-    acknowledgements of a message with nothing new to run."""
+    """User work only: never canaries, cron, heartbeats, internal intents or intake placeholders."""
     if task is None:
         return False
     if (task.task_type or "").lower() in INTERNAL_TASK_TYPES:
@@ -138,7 +137,7 @@ def ingestible(task: Optional[Task]) -> bool:
     if is_internal_task(task.goal or "", task.task_type or "", []):
         return False
     ctx = task.supplementary_context or {}
-    return not ctx.get("intake_reserved") and not ctx.get("intake_ack") and ctx.get("closed_reason") != INTAKE_PLACEHOLDER
+    return not ctx.get("intake_reserved") and ctx.get("closed_reason") != INTAKE_PLACEHOLDER
 
 
 def _local(dt: Optional[datetime]) -> str:

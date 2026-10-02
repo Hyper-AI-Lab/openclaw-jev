@@ -580,6 +580,11 @@ async def create_task(
                 execution_mode = outcome.get("execution_mode")
             if outcome.get("skipped"):
                 await _cancel_intake_reservation(task, db)
+                await db.commit()
+                # The acknowledged message is a finished task too: index it and finish its memory document.
+                from app.task_registry.hooks import index_terminal_task_async
+
+                await index_terminal_task_async(outcome["task_id"])
                 return outcome
             if outcome.get("intake_action") in ("wait_active", "clarify"):
                 await _cancel_intake_reservation(task, db)
