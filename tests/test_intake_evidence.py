@@ -22,7 +22,7 @@ def test_high_vector_score_on_awareness_does_not_force_attach():
             {
                 "task_id": "upgrade-1",
                 "score": 0.97,
-                "process_type": "tool_self_upgrade",
+                "process_type": "coding_task",
                 "intent_snippet": "self-upgrade add plugin",
             }
         ],
@@ -31,7 +31,7 @@ def test_high_vector_score_on_awareness_does_not_force_attach():
                 "task_id": "upgrade-1",
                 "session_key": "agent:main:main",
                 "task_kind": "one_shot",
-                "process_type": "tool_self_upgrade",
+                "process_type": "coding_task",
             }
         ],
         "recent_registry": [],

@@ -33,8 +33,8 @@ def test_llm_catalog_hint_accepted_without_forcing_via_task_type_hack():
             "decision": "create_fresh",
             "confidence": 92,
             "execution_mode": "structured_work",
-            "catalog_hint": "tool_self_upgrade",
-            "rationale": "user asked to run self-upgrade for plugin X",
+            "catalog_hint": "coding_task",
+            "rationale": "user asked for a weather plugin in Aura's own code",
         },
         {
             "intent": "Please self-upgrade and add a weather plugin to your arsenal",
@@ -43,7 +43,7 @@ def test_llm_catalog_hint_accepted_without_forcing_via_task_type_hack():
         },
         tags=["user-request"],
     )
-    assert result["catalog_type"] == "tool_self_upgrade"
+    assert result["catalog_type"] == "coding_task"
     assert "catalog_from_intake_llm" in result["policy_overrides"]
 
 
@@ -59,19 +59,19 @@ def test_llm_alias_catalog_hint_normalized():
         {"intent": "run self upgrade please", "active_tasks": [], "task_type": "user"},
         tags=["user-request"],
     )
-    assert result["catalog_type"] == "tool_self_upgrade"
+    assert result["catalog_type"] == "coding_task"
 
 
 def test_soft_candidates_advisory_for_awareness():
     hits = soft_catalog_candidates(AWARENESS)
-    assert "tool_self_upgrade" in hits
+    assert "coding_task" in hits
 
 
 def test_intake_prompt_includes_soft_candidates_and_adjudicator_rules():
     prompt = build_intake_prompt({"intent": AWARENESS, "active_tasks": []})
     assert "soft_catalog_candidates" in prompt
     assert "ADVISORY ONLY" in prompt
-    assert "tool_self_upgrade" in prompt
+    assert "coding_task" in prompt
 
 
 def test_merge_web_interact_does_not_hard_assign_catalog():

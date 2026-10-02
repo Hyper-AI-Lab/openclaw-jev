@@ -12,7 +12,7 @@ Do **not** use Slack `apps.connections.open` (or any API that opens another sock
 
 1. `systemctl status openclaw-gateway`
 2. `pgrep -a openclaw-gateway`
-3. If two local processes: stop extras; keep one `openclaw-gateway` unit. Restart only when `count_active_user_tasks_sync()==0` (`ops/controlled_capability_restart.sh --gateway`).
+3. If two local processes: stop extras; keep one `openclaw-gateway` unit. Restart only when `count_active_user_tasks_sync()==0` (`systemctl restart openclaw-gateway`).
 4. If Slack still looks dual after a single local PID: look at **other hosts / leftover laptops**, not this check.
 
 ## Related

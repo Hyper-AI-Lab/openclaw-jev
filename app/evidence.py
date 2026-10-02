@@ -221,55 +221,6 @@ def check_catalog_completion(
         if not has_screenshot:
             issues.append("Browser automation completion lacks screenshot evidence")
 
-    elif process_type == "tool_self_upgrade":
-        has_draft = any(
-            kw in response
-            for kw in (
-                "upgrade plan",
-                "draft",
-                "plugin",
-                "capability",
-                "files touched",
-            )
-        )
-        has_tests = any(
-            kw in response
-            for kw in (
-                "tests_passed",
-                "pytest",
-                "tests passed",
-                "test pass",
-                "all tests",
-            )
-        )
-        has_restart = any(
-            kw in response
-            for kw in (
-                "restart",
-                "controlled_capability_restart",
-                "openclaw-gateway",
-                "restart_ok",
-            )
-        )
-        has_verify = any(
-            kw in response
-            for kw in (
-                "verify",
-                "web_capability_status",
-                "verify_ok",
-                "canary",
-                "health ok",
-            )
-        )
-        if not has_draft:
-            issues.append("Self-upgrade completion lacks draft/plan evidence")
-        if not has_tests:
-            issues.append("Self-upgrade completion lacks tests-passed evidence")
-        if not has_restart:
-            issues.append("Self-upgrade completion lacks controlled-restart evidence")
-        if not has_verify:
-            issues.append("Self-upgrade completion lacks verify/canary evidence")
-
     return {"passed": len(issues) == 0, "issues": issues}
 
 

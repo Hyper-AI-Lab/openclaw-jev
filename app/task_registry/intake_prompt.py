@@ -74,7 +74,9 @@ RULES:
   - conversational: greetings, awareness, status with no deliverable — one turn, catalog_hint MUST be null.
   - structured_work: tools, files, research, implement.
 - catalog_hint: YOU assign (or null). Valid ids are in available_catalog_types.
-  Never set tool_self_upgrade for awareness ("are you aware", "now you can").
+  coding_task: Kirill asks for a change to code, in Aura's own code or one of his repositories; Claude Code makes it.
+  Never set coding_task for awareness ("can you code?", "are you aware"), questions about code ("how does the
+  reconciler work?", "what does this function do?") or a review without a change.
 - web_intent: search|fetch|crawl|adaptive_extract|schema_extract|interact|none. interact only for real click/login/screenshot.
 - recall_depth: deep when the message refers to or builds on anything from before recent_dialogue (earlier conversations, past tasks and their results, documents Aura read or wrote, remembered facts or preferences of Kirill's), or when such memory could change the answer; none for greetings, thanks, and self-contained questions or tasks. When unsure, deep.
 - reply_to, when present, is the earlier message this one directly replies to (quoted) and the task it belongs to: strong evidence for relation_class and the target.

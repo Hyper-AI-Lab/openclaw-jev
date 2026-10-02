@@ -196,7 +196,7 @@ async def test_handle_rebuild_stale_terminates_and_returns_memory():
     old_task.status = "blocked"
     old_task.next_check_at = None
     old_task.goal = "stuck upgrade"
-    old_task.task_type = "tool_self_upgrade"
+    old_task.task_type = "coding_task"
     old_task.supplementary_context = {}
     task_result = MagicMock()
     task_result.scalar_one_or_none.return_value = old_task

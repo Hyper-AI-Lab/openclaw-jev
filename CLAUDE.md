@@ -1,0 +1,37 @@
+# CLAUDE.md
+
+This is RMP, the orchestration layer behind Aura, Kirill's assistant. You are working in a job checkout: RMP collects your commits, runs the tests itself, Aura and an evaluator review the change, and nothing ships before Kirill approves it in Slack.
+
+## Where things are
+
+- `app/api/server.py`: the FastAPI service. Slack messages arrive at `POST /tasks`; it also serves signals and readiness.
+- `app/task_registry/`: intake, which decides whether a message continues a running task, starts a new one or needs a question. Its prompt is in `intake_prompt.py`.
+- `app/workflows/`: the Temporal workflows. `generic_task.py` answers Kirill, `catalog_task.py` runs the step templates in `catalog.py`, and `coding_task.py` runs coding tasks.
+- `app/activities/`: Temporal activities (OpenClaw turns, database, coding).
+- `app/orchestrator/`: the Process Evaluator, briefs and prompt policies.
+- `app/coding/`: coding jobs. `runner.py` (Claude Code units), `workspace.py`, `verify.py`, `deploy.py`.
+- `app/reconciler.py`: repairs stuck and orphaned tasks.
+- `plugins/`: OpenClaw plugins, copied to the gateway's plugin directory when a change deploys.
+- `web-stack/`: Aura's web backends.
+- `docs/CONCEPT_TREE.md` and `ARCHITECTURE.md`: the architecture. Read them before changing routing.
+
+## Tests
+
+- Python: the full suite with `-m pytest -q -p no:warnings`, using the interpreter named in your system prompt.
+- Plugins: `node --test tests/node/*.test.js`.
+- A change to a workflow must keep `tests/test_workflow_replay.py` passing: recorded histories must still replay.
+- Add or update tests with every change in behaviour. Never weaken or skip a test to make it pass.
+
+## Invariants
+
+- Every Slack DM goes plugin, `POST /tasks`, intake, Temporal, evaluator, and RMP posts the reply. OpenClaw never replies in Slack itself.
+- Aura's replies reach Slack only after the Process Evaluator accepts them.
+- Workflow code is deterministic: no I/O, clocks or randomness in workflow functions. Use activities, and `workflow.now()` for time.
+- Don't add keyword rules that decide routing or catalog types; the intake LLM decides.
+- No secrets in the repository, and never print tokens or keys.
+- `.cursor/rules/rmp-architecture.mdc` is copied to the host when a change deploys; change it deliberately.
+
+## Commits
+
+- Small, focused commits. The message is one line in plain English saying what changed and why.
+- Leave the history in `docs/*_PROGRESS.md` as it is; those logs are append-only.

@@ -65,23 +65,6 @@ def test_evidence_high_confidence_conversational_short_fails():
     assert evidence_high_confidence("How are you?", "Fine.") is False
 
 
-def test_catalog_tool_self_upgrade_requires_pipeline_signals():
-    short = check_catalog_completion(
-        "tool_self_upgrade",
-        "Self-upgrade please",
-        "Upgrade finished.",
-    )
-    assert short["passed"] is False
-
-    ok = check_catalog_completion(
-        "tool_self_upgrade",
-        "Self-upgrade please",
-        (
-            "Draft plugin landed under plugins/aura_demo. Upgrade plan listed files touched. "
-            "pytest focused suite: all tests passed (tests_passed=true). "
-            "Ran controlled_capability_restart.sh; openclaw-gateway restart_ok=true. "
-            "verify_capability_upgrade.sh OK; web_capability_status healthy; canary soft skip. "
-            "verify_ok=true."
-        ),
-    )
-    assert ok["passed"] is True
+def test_coding_tasks_are_judged_on_rmps_evidence_not_completion_keywords():
+    """The coding workflow's evaluator reads RMP's recorded runs, tests and commits instead."""
+    assert check_catalog_completion("coding_task", "Fix the greeting", "The greeting now says hello, as you asked.")["passed"] is True

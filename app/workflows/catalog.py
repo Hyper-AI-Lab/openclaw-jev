@@ -387,25 +387,26 @@ BROWSER_AUTOMATION = WorkflowTemplate(
     ],
 )
 
-TOOL_SELF_UPGRADE = WorkflowTemplate(
-    process_type="tool_self_upgrade",
-    display_name="Tool / Capability Self-Upgrade",
+CODING_TASK = WorkflowTemplate(
+    process_type="coding_task",
+    display_name="Coding task (Claude Code)",
     version=1,
+    # Advisory hits for the intake LLM only; CodingTaskWorkflow (app/workflows/coding_task.py) runs the task.
     intent_patterns=[
-        r"\btool[_\s-]?self[_\s-]?upgrade\b",
-        r"\b(please|can you|could you|want you to|go ahead and|start|run|do a)\b.{0,48}\b(self[_\s-]?upgrade|capability[_\s-]?upgrade)\b",
-        r"\b(self[_\s-]?upgrade|capability[_\s-]?upgrade)\b.{0,40}\b(please|now|for me)\b",
-        r"\bupgrade\s+yourself\b",
-        r"\b(add|install|build|create)\s+(a\s+)?(new\s+)?(tool|plugin)\b.{0,60}\b(to\s+)?(your|her|aura'?s?)\s+(arsenal|stack)\b",
-        r"\binstall\s+(an?\s+)?openclaw\s+plugin\b",
-        r"\bdraft\s+(a\s+)?plugin\b.{0,40}\b(test|approval|restart)\b",
-        r"\b(please|can you|could you)\b.{0,40}\bgive\s+(yourself|her|aura)\s+(the\s+)?capability\b",
-        r"\bexpand\s+(your|her|aura'?s?)\s+(tool|arsenal|capabilities)\b",
+        r"\b(fix|change|modify|refactor|implement|add|write|update|remove)\b.{0,60}\b(code|function|module|bug|tests?|"
+        r"feature|endpoint|workflow|plugin|repo|repository)\b",
+        r"\b(open|create|make|send)\s+(a\s+)?(pr|pull request)\b",
+        r"\bclaude code\b.{0,40}\b(fix|change|implement|build|write|add)\b",
+        r"\b(upgrade\s+yourself|self[_\s-]?upgrade|capability[_\s-]?upgrade)\b",
+        r"\b(add|install|build|create)\s+(a\s+)?(new\s+)?(tool|plugin)\b",
     ],
     negative_intent_patterns=[
         r"\bare you aware\b",
         r"\bnow you can\b",
-        r"\byou can (now )?self",
+        r"\bcan you (write )?code\b",
+        r"\bhow does\b",
+        r"\bwhat does\b.{0,60}\bdo\b",
+        r"\bexplain\b",
         r"\bi (just )?(added|built|implemented|shipped)\b",
     ],
     success_criteria={
@@ -413,95 +414,6 @@ TOOL_SELF_UPGRADE = WorkflowTemplate(
         "requires_tests_passed": True,
         "requires_verify_ok": True,
     },
-    steps=[
-        WorkflowStep(
-            name="draft_upgrade",
-            prompt=(
-                "STEP: Draft capability upgrade (NO restarts yet).\n"
-                "You are implementing a gated self-upgrade of Aura's tool arsenal.\n"
-                "If the user only asked whether you are aware of self-upgrade (no concrete "
-                "target tool/plugin), do NOT explore the filesystem and do NOT invent a "
-                "capability — reply that you know the gated path and ask what to add, then "
-                "stop with upgrade_drafted=false.\n"
-                "1. Clarify the target capability (new OpenClaw plugin tool, web-stack backend, "
-                "or RMP routing change).\n"
-                "2. Draft/code changes under allowed paths only:\n"
-                "   - /root/.openclaw/plugins/<plugin_id>/ (and mirror under "
-                "/root/.openclaw/rmp/plugins/ when applicable)\n"
-                "   - /root/.openclaw/web-stack/ for backends\n"
-                "   - /root/.openclaw/rmp/app/ only for routing/docs/tests that support the tool\n"
-                "3. Do NOT put secrets in git. Leave API key placeholders as <> in openclaw.json "
-                "if needed; never print secrets.\n"
-                "4. Do NOT restart services in this step.\n"
-                "5. Write a short UPGRADE PLAN: files touched, risk, restart units needed "
-                "(openclaw-gateway / aura-web-backends / rmp-api / rmp-worker), and test commands.\n"
-                "End with facts JSON including step_complete=true and upgrade_drafted=true."
-            ),
-            user_update="Drafting the capability upgrade plan and code…",
-            max_attempts=3,
-        ),
-        WorkflowStep(
-            name="run_tests",
-            prompt=(
-                "STEP: Run tests for the draft (NO restarts yet).\n"
-                "Execute relevant tests, e.g.:\n"
-                "  cd /root/.openclaw/rmp && ./venv/bin/pytest -q "
-                "tests/test_catalog.py tests/test_web_capability.py tests/test_session_recovery.py "
-                "tests/test_runtime_sync.py\n"
-                "Plus any new tests you added for the upgrade.\n"
-                "If web-stack Python changed, smoke-import or pytest those modules if present.\n"
-                "Report pass/fail with command output summary.\n"
-                "If tests fail, fix the draft and re-run until green (within attempt budget).\n"
-                "Do NOT restart services.\n"
-                "End with facts including tests_passed=true|false."
-            ),
-            user_update="Running upgrade tests…",
-            max_attempts=3,
-        ),
-        WorkflowStep(
-            name="approval_gate",
-            kind="approval_gate",
-            user_update=(
-                "Capability self-upgrade approval required.\n"
-                "Review the draft + test results above.\n"
-                "Reply *approve* to run controlled restart + verify, or *stop* to cancel "
-                "(draft stays on disk; nothing is restarted)."
-            ),
-        ),
-        WorkflowStep(
-            name="controlled_restart",
-            prompt=(
-                "STEP: Controlled restart (approved).\n"
-                "Run ONLY one of:\n"
-                "  bash /root/.openclaw/rmp/ops/controlled_capability_restart.sh "
-                "--gateway          # plugin-only\n"
-                "  bash /root/.openclaw/rmp/ops/controlled_capability_restart.sh "
-                "--all-safe         # gateway + web; RMP only if idle\n"
-                "Do not invent ad-hoc systemctl restart of random units.\n"
-                "Never pass --force-rmp unless the user explicitly approved killing "
-                "in-flight work. Mid-upgrade, RMP restart is normally deferred.\n"
-                "Paste the script's summary (units restarted / deferred).\n"
-                "End with facts including restart_ok=true|false."
-            ),
-            user_update="Applying controlled restart…",
-            max_attempts=2,
-        ),
-        WorkflowStep(
-            name="verify_upgrade",
-            prompt=(
-                "STEP: Verify upgrade.\n"
-                "Run:\n"
-                "  bash /root/.openclaw/rmp/ops/verify_capability_upgrade.sh\n"
-                "Also call tool web_capability_status if this upgrade touched web tools.\n"
-                "Summarize: plugin load, backend health, canary/sentinel soft status.\n"
-                "If verify fails, report clearly; do not loop infinite restarts.\n"
-                "End with a user-facing summary of the new capability and facts "
-                "verify_ok=true|false, step_complete=true."
-            ),
-            user_update="Verifying capability upgrade…",
-            max_attempts=2,
-        ),
-    ],
 )
 
 CATALOG: Dict[str, WorkflowTemplate] = {
@@ -513,7 +425,7 @@ CATALOG: Dict[str, WorkflowTemplate] = {
         PROCUREMENT,
         OUTREACH,
         BROWSER_AUTOMATION,
-        TOOL_SELF_UPGRADE,
+        CODING_TASK,
     )
 }
 
@@ -521,13 +433,14 @@ CATALOG: Dict[str, WorkflowTemplate] = {
 CATALOG_ALIASES: Dict[str, str] = {
     "moltmarket_check": "browser_automation",
     "email_followup": "outreach",
-    "self_upgrade": "tool_self_upgrade",
-    "capability_upgrade": "tool_self_upgrade",
+    "tool_self_upgrade": "coding_task",
+    "self_upgrade": "coding_task",
+    "capability_upgrade": "coding_task",
 }
 
 # Order matters: more specific patterns first.
 _CLASSIFY_ORDER = (
-    "tool_self_upgrade",
+    "coding_task",
     "email_verification",
     "browser_automation",
     "procurement",

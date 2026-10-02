@@ -17,7 +17,7 @@ def test_catalog_lists_templates():
     assert "procurement" in ids
     assert "outreach" in ids
     assert "browser_automation" in ids
-    assert "tool_self_upgrade" in ids
+    assert "coding_task" in ids and "tool_self_upgrade" not in ids
 
 
 def test_catalog_templates_have_version():
@@ -123,30 +123,19 @@ def test_browser_automation_has_approval_and_screenshot():
     assert any(s.name == "capture_screenshot" for s in template.steps)
 
 
-def test_resolve_self_upgrade_intent():
-    t = resolve_catalog_template(
-        "Please self-upgrade and add a new plugin to your arsenal"
-    )
-    assert t == "tool_self_upgrade"
+def test_resolve_coding_request_intent():
+    assert resolve_catalog_template("Please fix the bug in the reconciler code and open a PR") == "coding_task"
+    assert resolve_catalog_template("Please self-upgrade and add a new plugin to your arsenal") == "coding_task"
 
 
-def test_self_upgrade_aliases():
-    assert normalize_catalog_type("self_upgrade", "") == "tool_self_upgrade"
-    assert normalize_catalog_type("capability_upgrade", "") == "tool_self_upgrade"
+def test_self_upgrade_names_are_aliases_of_coding_task():
+    for alias in ("tool_self_upgrade", "self_upgrade", "capability_upgrade"):
+        assert normalize_catalog_type(alias, "") == "coding_task"
 
 
-def test_tool_self_upgrade_pipeline_gates():
-    template = get_template("tool_self_upgrade")
-    assert template is not None
-    names = [s.name for s in template.steps]
-    assert names == [
-        "draft_upgrade",
-        "run_tests",
-        "approval_gate",
-        "controlled_restart",
-        "verify_upgrade",
-    ]
-    assert any(s.kind == "approval_gate" for s in template.steps)
+def test_coding_task_is_run_by_the_coding_workflow():
+    template = get_template("coding_task")
+    assert template is not None and template.steps == [], "CodingTaskWorkflow runs it, not catalog steps"
     assert template.success_criteria.get("requires_human_approval") is True
     assert template.success_criteria.get("requires_tests_passed") is True
     assert template.success_criteria.get("requires_verify_ok") is True
@@ -163,14 +152,14 @@ def test_loose_upgrade_mention_does_not_force_catalog():
     )
 
 
-def test_hint_confirms_matching_self_upgrade_intent():
+def test_hint_confirms_matching_coding_intent():
     assert (
         catalog_type_for_workflow(
-            "tool_self_upgrade",
-            "Please self-upgrade and add a new plugin to your arsenal",
+            "coding_task",
+            "Please fix the failing test in the reconciler and open a PR",
             "user",
         )
-        == "tool_self_upgrade"
+        == "coding_task"
     )
 
 
@@ -181,7 +170,13 @@ def test_awareness_of_self_upgrade_is_not_catalog():
     )
     assert resolve_catalog_template(intent) is None
     assert catalog_type_for_workflow(None, intent, "user") is None
-    assert catalog_type_for_workflow("tool_self_upgrade", intent, "user") is None
+    assert catalog_type_for_workflow("coding_task", intent, "user") is None
+
+
+def test_questions_about_code_and_awareness_of_coding_are_not_catalog():
+    for intent in ("How does the reconciler decide a task is stale?", "Can you code now with Claude Code?",
+                   "Explain what the coding workflow does when tests fail."):
+        assert resolve_catalog_template(intent) is None, intent
 
 
 def test_follow_up_after_you_said_is_not_outreach():
@@ -193,13 +188,8 @@ def test_follow_up_after_you_said_is_not_outreach():
     assert catalog_type_for_workflow(None, intent, "user") is None
 
 
-def test_actionable_self_upgrade_still_matches():
-    assert (
-        resolve_catalog_template(
-            "Please self-upgrade and add a new plugin to your arsenal"
-        )
-        == "tool_self_upgrade"
-    )
+def test_actionable_coding_request_still_matches():
+    assert resolve_catalog_template("Add a test for the stale task threshold and fix the bug it finds") == "coding_task"
 
 
 def test_degraded_intake_never_regex_assigns_catalog():
@@ -207,7 +197,7 @@ def test_degraded_intake_never_regex_assigns_catalog():
 
     assert (
         catalog_assignment_from_intake(
-            intake_ran=False, intake_catalog_type="tool_self_upgrade"
+            intake_ran=False, intake_catalog_type="coding_task"
         )
         is None
     )

@@ -32,7 +32,8 @@ CATALOG_RUBRIC = {
     "login": "Sign in to an existing account on a website or service.",
     "outreach": "Draft or send a message or follow-up to people or organizations.",
     "procurement": "Find, compare, order or buy products or services.",
-    "tool_self_upgrade": "Build or upgrade one of Aura's own tools or capabilities. Not a question about what Aura can already do.",
+    "coding_task": "Change code in Aura's own code or one of Kirill's repositories: fix, build or extend it. "
+                   "Not a question about code or about what Aura can do.",
 }
 WEB_RUBRIC = {
     "none": "No web access is needed.",

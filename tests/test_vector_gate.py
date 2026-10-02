@@ -9,7 +9,7 @@ def _high_score_ctx():
                 "task_id": "abc",
                 "score": 0.95,
                 "intent_snippet": "self-upgrade and add a plugin",
-                "process_type": "tool_self_upgrade",
+                "process_type": "coding_task",
             }
         ],
         "active_tasks": [
