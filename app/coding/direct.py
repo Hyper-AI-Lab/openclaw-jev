@@ -82,7 +82,8 @@ def create(task_id: str, workspace: str, title: str, cfg: Dict[str, Any]) -> Dic
     work = home / WORKSPACES[workspace]
     try:
         if workspace == "repo":
-            _clone(work, cfg)
+            repo = cfg["repositories"]["rmp"]
+            _clone(work, f"https://github.com/{repo['remote']}.git", repo["source"])
         else:
             work.mkdir(mode=0o700)
     except Exception:
@@ -250,11 +251,9 @@ def system_prompt(session: Dict[str, Any], cfg: Dict[str, Any]) -> str:
     return SYSTEM_PROMPT.format(workspace=session["path"], live=cfg["repositories"]["rmp"]["source"])
 
 
-def _clone(target: Path, cfg: Dict[str, Any]) -> None:
-    repo = cfg["repositories"]["rmp"]
-    # The live checkout lends its objects so the clone is quick; --dissolve leaves the clone on its own.
-    _git("clone", "--quiet", "--reference-if-able", repo["source"], "--dissolve",
-         f"https://github.com/{repo['remote']}.git", str(target), timeout=300)
+def _clone(target: Path, url: str, reference: str) -> None:
+    # The live checkout lends its objects so the clone is quick; --dissociate leaves the clone on its own.
+    _git("clone", "--quiet", "--reference-if-able", reference, "--dissociate", url, str(target), timeout=300)
     _git("-C", str(target), "config", "user.name", "Aura (Claude Code)")
     _git("-C", str(target), "config", "user.email", "aura-coder@aura.local")
 

@@ -185,7 +185,7 @@ def test_a_repo_workspace_is_cloned_from_github_with_the_live_checkout_lending_i
     monkeypatch.setattr(direct, "_git", git)
     s = direct.create(TASK, "repo", "", CFG)
     assert s["path"].endswith("/repo") and calls[0] == (
-        "clone", "--quiet", "--reference-if-able", "/root/.openclaw/rmp", "--dissolve",
+        "clone", "--quiet", "--reference-if-able", "/root/.openclaw/rmp", "--dissociate",
         "https://github.com/Hyper-AI-Lab/openclaw-jev.git", s["path"])
     assert ("-C", s["path"], "config", "user.name", "Aura (Claude Code)") in calls
 
@@ -196,6 +196,25 @@ def test_a_repo_workspace_is_cloned_from_github_with_the_live_checkout_lending_i
     with pytest.raises(subprocess.CalledProcessError):
         direct.create(TASK, "repo", "", CFG)
     assert [x["id"] for x in direct.sessions(TASK)] == [s["id"]]
+
+
+def test_the_clone_is_real_git_that_borrows_objects_and_then_stands_alone(tmp_path):
+    def git(*args, cwd=None):
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+    origin, reference = tmp_path / "origin.git", tmp_path / "live"
+    git("init", "--quiet", "--bare", "-b", "main", str(origin))
+    git("clone", "--quiet", str(origin), str(reference))
+    (reference / "README.md").write_text("hello\n")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "--allow-empty", "-m", "first", cwd=reference)
+    git("add", "README.md", cwd=reference)
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "readme", cwd=reference)
+    git("push", "--quiet", "origin", "main", cwd=reference)
+    direct._clone(tmp_path / "work", origin.as_uri(), str(reference))
+    assert (tmp_path / "work" / "README.md").read_text() == "hello\n"
+    assert not (tmp_path / "work" / ".git" / "objects" / "info" / "alternates").exists()
+    assert subprocess.run(["git", "-C", str(tmp_path / "work"), "config", "user.name"],
+                          capture_output=True, text=True).stdout.strip() == "Aura (Claude Code)"
 
 
 def test_prune_removes_only_the_workspaces_of_sessions_that_ended_long_ago(fakes):
