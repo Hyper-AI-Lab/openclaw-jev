@@ -71,7 +71,9 @@ def test_intake_prompt_includes_soft_candidates_and_adjudicator_rules():
     prompt = build_intake_prompt({"intent": AWARENESS, "active_tasks": []})
     assert "soft_catalog_candidates" in prompt
     assert "ADVISORY ONLY" in prompt
-    assert "coding_task" in prompt
+    assert "coding_task: Kirill explicitly asks for a reviewed coding job" in prompt
+    # Every other change to Aura's code is her own work with Claude Code, through a pull request.
+    assert "Any other request to change Aura's own code is structured_work with catalog_hint\n  null" in prompt
 
 
 def test_merge_web_interact_does_not_hard_assign_catalog():
