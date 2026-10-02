@@ -695,3 +695,46 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
   The probe's files were removed. A real self-deploy and a real PR are step 14's acceptance with Kirill.
 - **Deploy:** `main` was fast-forwarded to `ec55c06` with no active tasks. The watcher restarted the API and worker (health OK), with no errors. Readiness is 38/1/0, the gateway's `/readyz` returns 200, and the canary gives CANARY OK.
 - **Finding for Kirill:** the live `web-stack/backends/app/adapters/crawl4ai_adapter.py` still has the old User-Agent (`.../aura`). The first coding deploy that touches `web-stack/` brings it up to date.
+
+---
+
+## Step 12 — Intake and Aura integration
+
+**Date:** 2026-10-02.
+
+**What changed:**
+- **The catalog:** `CODING_TASK` (`coding_task`, "Coding task (Claude Code)") replaces `TOOL_SELF_UPGRADE`.
+  - `tool_self_upgrade`, `self_upgrade` and `capability_upgrade` are its aliases.
+  - It has no catalog steps: `start_task_workflow` starts `CodingTaskWorkflow` for it.
+  - Its patterns stay advisory (soft candidates for the intake LLM): change requests, PRs, "upgrade yourself" and new tools. Negatives cover awareness ("are you aware", "can you code"), questions ("how does", "what does … do", "explain") and "I just added".
+  - Its success criteria require Kirill's approval, passing tests and verification.
+- **Removed:** `ops/controlled_capability_restart.sh` and `ops/verify_capability_upgrade.sh`, with the old template's keyword check in `app/evidence.py`; coding tasks are judged on RMP's recorded evidence instead. The Slack-sockets runbook now names `systemctl restart openclaw-gateway` (only when idle).
+- **Intake prompt:** `coding_task` is set when Kirill asks for a change to code in Aura's own code or one of his repositories. It is never set for awareness, questions about code or a review without a change.
+- **Jev:** `CATALOG_RUBRIC` gains `coding_task` ("Change code in Aura's own code or one of Kirill's repositories… Not a question about code or about what Aura can do."). `jev_intake_eval.jsonl` relabels the PDF-tool request and gains 8 cases:
+  - three coding requests: an own-code fix, a PR in agentic-design, a test plus fix;
+  - two awareness messages;
+  - two questions about code;
+  - a review without changes.
+- **Workspace:** a "Coding tasks (Claude Code)" section replaces the self-upgrade section in `/root/.openclaw/workspace/TOOLS.md` and its `AGENTS.md` copy (identical).
+  - **Aura's part:** the brief as JSON, a review against RMP's evidence with the verdict JSON, and the final reply from RMP's record.
+  - **Never:** run `claude`, or edit, commit, push or restart live code.
+  - **How it ships:** her own code deploys through RMP, and other repositories get a PR.
+- `CLAUDE.md` (new, repo root): where things are, test commands (including the replay test for workflow changes), invariants (the Slack path, judged replies, deterministic workflows, no keyword routing, no secrets, the rule copy) and commit conventions.
+- Tests:
+  - the catalog: coding requests resolve, aliases, no steps and the gates, awareness and questions about code are not catalog;
+  - intake adjudication: the hint is accepted and the alias normalized;
+  - evidence: no keyword gate for coding tasks;
+  - the relabelled intake fixtures;
+  - a whole-path scenario (`tests/test_whole_path.py`): a DM whose intake answer assigns `coding_task` starts `CodingTaskWorkflow` through the real API, intake and policy. Its start notice and PR card reach Slack through real delivery, the evaluator judges with RMP's evidence, and Kirill's stop ends it.
+
+**Deviations:**
+- **The paid Jev evaluation (`--live`) was not run;** the offline harness validates all 59 cases. The intake LLM was checked live instead (below). A live Jev run costs TypeSafe credits and is worth doing once before Jev's catalog answers are trusted for `coding_task`.
+
+**Verification:**
+- **Tests:** full suite 987 passed, 4 skipped; node 23/23. `ops/jev_eval.py --intake`: 59 cases validated, no model called.
+- **Live intake classification** (new prompt and catalog, the production intake LLM; no task, no Slack):
+  - "In agentic-design, add a dark mode toggle… and open a PR" became `coding_task`, structured work;
+  - "Please fix that in your code" (reconciler notices) became `coding_task`, structured work;
+  - "Did you know you can write code with Claude Code now?" had no catalog and stayed conversational;
+  - "How does your reconciler decide that a task is stuck?" had no catalog.
+- **Deploy:** `main` was fast-forwarded to `98cf9ec` with no active tasks. The watcher restarted the API and worker (health OK), with no errors. Readiness is 38/1/0, the gateway's `/readyz` returns 200, and the canary gives CANARY OK. From now on, a coding request in a DM starts a coding task.
