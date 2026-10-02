@@ -207,8 +207,11 @@ def merge_pull_request(task_id: str, number: int, cfg: Dict[str, Any], *, live: 
     sha = pr["head"]["sha"]
     state = github.check(sha, repo)
     if state != "success":
-        return {"status": "waiting" if state in ("pending", "missing") else "refused", "check": state,
-                "url": pr["html_url"], "summary": f"CI's test check on PR #{number} is {state}; it merges once that has passed."}
+        waiting = state in ("pending", "missing")
+        then = (f" Have Claude wait for it with `aura-github gh pr checks {number} --watch`, then call deploy_pr again."
+                if waiting else " Have Claude fix the branch, then call deploy_pr again once CI has passed.")
+        return {"status": "waiting" if waiting else "refused", "check": state, "url": pr["html_url"],
+                "summary": f"CI's test check on PR #{number} is {state}; it merges once that has passed.{then}"}
     old = _git(live, "rev-parse", "refs/heads/main").strip()
     if not _is_ancestor_on_github(old, repo):
         return {"status": "refused", "url": pr["html_url"],

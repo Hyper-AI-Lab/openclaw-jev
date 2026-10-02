@@ -43,6 +43,6 @@ This is RMP, the orchestration layer behind Aura, Kirill's assistant. You work o
 
 - `main` is protected: nothing is pushed to it, and a pull request merges only when CI's `test` check passed.
 - Work on a branch named `aura/<topic>`, run the tests, then `aura-github push` and `aura-github gh pr create` with a title and a body that says what changed and how you tested it. Tell Aura the pull request's URL.
-- Never merge: Aura does it with `deploy_pr`, and RMP deploys. If CI fails, fix the same branch.
+- Never merge: Aura does it with `deploy_pr`, and RMP deploys. To wait for CI, run `aura-github gh pr checks <number> --watch`. If CI fails, fix the same branch.
 - Never edit the live checkout `/root/.openclaw/rmp` (or `/root/.openclaw/plugins`, `/root/.openclaw/web-stack`): a change there goes live at once, without CI.
 - Use only `aura-github` for GitHub; never read or pass the token yourself. Other repositories are off limits unless Aura says Kirill asked for it.
