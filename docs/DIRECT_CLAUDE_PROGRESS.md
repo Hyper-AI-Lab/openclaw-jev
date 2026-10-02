@@ -54,3 +54,33 @@ Append-only. One entry per plan step: what changed, files, verification, deviati
 - **Step 3.** Turns use `--session-id`, then `--resume`. The transcript Claude writes in the session's config directory is the full record that step 4 puts into memory. Aura's turn deadline extends while her Claude turn works.
 
 **Clean-up:** the probe folders and outputs under `/tmp` were removed.
+
+---
+
+## Step 2 — Two Claude profiles
+
+**Date:** 2026-10-02.
+
+**What changed:**
+- **Coding units.** `unit_properties` binds `/srv/aura-code/policy` over `/etc/claude-code` (`BindReadOnlyPaths`). Claude Code reads its policy file, the drop-ins in `managed-settings.d/` and managed MCP servers (`managed-mcp.json`) from that directory ([managed settings docs](https://code.claude.com/docs/en/managed-settings)). So every coding unit sees exactly today's lockdown and nothing from the host. `MANAGED_SETTINGS` now names the coding copy, so the readiness and smoke comparisons keep their meaning.
+- **Host policy (the direct profile's).** `ops/claude_host/managed-settings.json`, installed at `/etc/claude-code/managed-settings.json`, pins updates, turns off nonessential traffic and keeps the 30-day cleanup. It restricts nothing.
+- **Setup.** `ops/setup_aura_coder.sh` installs both files.
+- **Smoke.** A new in-unit probe, "coding policy in place": `/etc/claude-code` holds only `managed-settings.json`, with the coding policy's hash.
+
+**Files:** `app/coding/units.py`, `ops/claude_host/managed-settings.json`, `ops/setup_aura_coder.sh`, `ops/claude_code_smoke.py`, `tests/test_coding_host.py`.
+
+**Rollout order:**
+1. The coding copy was installed, identical to the old host file.
+2. The code was deployed; the API and worker reloaded 8 s after the fast-forward.
+3. The host policy was relaxed.
+4. The smoke check ran.
+
+No coding job was running.
+
+**Verification:**
+- **Tests:** `test_coding_host.py` and `test_coding_observability.py`, 30 passed.
+- **Smoke (live):** isolation ok, including "coding policy in place" while the host file already differed; Claude in a coding unit answered (`claude-opus-5-5`, `bypassPermissions`).
+- **Behavior (live):** the same request to run `gh --version` was denied inside a coding unit and ran as root in auto mode on the host.
+- **Readiness:** 44 pass, 1 warn (telemetry), 0 fail; `claude_code`, `coding_isolation` and `coding_jobs` pass.
+
+**Deviation:** the plan's per-run flags were replaced by the bind (see step 1).
