@@ -89,30 +89,31 @@ class ScriptedRecall:
 
 def coding_boundaries():
     """The coding workflow's boundaries: Claude Code, RMP's units and Aura's turns, scripted for one clean round."""
-    job = {"task_id": "t", "repo": "agentic-design", "branch": "aura/dark-mode-toggle", "base": "b" * 40,
-           "source": "/srv/aura-code/repos/agentic-design.git", "checkout": "/srv/aura-code/jobs/t",
-           "review": "/srv/aura-code/review/t.git", "created_at": "2026-10-02T00:00:00+00:00", "tests": [["npm", "test"]]}
+    job = {"task_id": "t", "repo": "rmp", "branch": "aura/coding-status-commit", "base": "b" * 40,
+           "source": "/root/.openclaw/rmp", "checkout": "/srv/aura-code/jobs/t",
+           "review": "/srv/aura-code/review/t.git", "created_at": "2026-10-02T00:00:00+00:00", "tests": [["pytest", "-q"]]}
     answers = {
         "coding_settings": {"enabled": True, "max_rounds": 3,
-                            "repositories": {"agentic-design": {"remote": "Hyper-AI-Lab/agentic-design", "deploy": "pr"}}},
+                            "repositories": {"rmp": {"remote": "Hyper-AI-Lab/openclaw-jev", "deploy": "self"}}},
         "acquire_coding_slot": {"granted": True, "holder": "t"},
         "release_coding_slot": True,
-        "draft_coding_brief": {"repo": "agentic-design", "title": "Dark mode toggle", "goal": "Add a dark mode toggle.",
-                               "acceptance_criteria": ["The settings page toggles dark mode"], "constraints": [],
+        "draft_coding_brief": {"repo": "rmp", "title": "Commit in coding status", "goal": "Show the RMP commit in coding status.",
+                               "acceptance_criteria": ["GET /api/coding/status includes the short commit"], "constraints": [],
                                "questions": []},
         "prepare_coding_workspace": job,
-        "run_claude_round": {"kind": "success", "session_id": "s1", "report": {"summary": "Added the toggle."},
-                             "num_turns": 9, "commands": ["npm test"], "files_edited": ["src/Settings.tsx"],
+        "run_claude_round": {"kind": "success", "session_id": "s1", "report": {"summary": "Added the commit."},
+                             "num_turns": 9, "commands": ["pytest -q"], "files_edited": ["app/production/coding_readiness.py"],
                              "number": 1},
         "stop_coding_units": [],
         "verify_coding_round": {"error": None, "tests": {"ok": True, "commands": [
-            {"command": ["npm", "test"], "setup": False, "ok": True, "exit": "success exited 0", "counts": {"passed": 40}}]},
-            "collected": {"head": "c" * 40, "commits": [{"sha": "c" * 40, "subject": "Add a dark mode toggle",
+            {"command": ["pytest", "-q"], "setup": False, "ok": True, "exit": "success exited 0", "counts": {"passed": 40}}]},
+            "collected": {"head": "c" * 40, "commits": [{"sha": "c" * 40, "subject": "Show the commit in coding status",
                                                          "author": "Aura (Claude Code)"}],
-                          "diffstat": " src/Settings.tsx | 20 ++++\n 1 file changed, 20 insertions(+)\n",
-                          "changed": [{"status": "M", "path": "src/Settings.tsx"}], "secrets": [], "dependencies_changed": []}},
+                          "diffstat": " app/production/coding_readiness.py | 2 ++\n 1 file changed, 2 insertions(+)\n",
+                          "changed": [{"status": "M", "path": "app/production/coding_readiness.py"}], "secrets": [],
+                          "dependencies_changed": []}},
         "review_coding_round": {"verdict": "ready", "feedback": [],
-                                "reply": "I added a dark mode toggle to the settings page; RMP's tests pass (40 passed)."},
+                                "reply": "GET /api/coding/status now shows the short RMP commit; RMP's tests pass (40 passed)."},
     }
 
     def scripted(name, answer):
@@ -452,13 +453,13 @@ async def test_stop_during_a_task_ends_it_without_delivering_the_draft(h):
 
 
 async def test_a_coding_request_in_a_dm_becomes_a_coding_task_whose_card_reaches_slack(h):
-    ask = "In agentic-design, add a dark mode toggle to the settings page and open a PR."
+    ask = "Add the current RMP commit to the response of GET /api/coding/status, with a test."
     h.intake = [{"decision": "create_fresh", "execution_mode": "structured_work", "catalog_hint": "coding_task"}]
 
     tid = (await h.send(ask, "1790000007.000100"))["task_id"]
     handle = h.env.client.get_workflow_handle(f"workflow-{tid}")
     deadline = asyncio.get_running_loop().time() + BOUND
-    while not any("Reply approve to push the branch and open a pull request" in m for m in h.slack):
+    while not any("Reply approve to deploy it" in m for m in h.slack):
         assert asyncio.get_running_loop().time() < deadline, h.slack
         await asyncio.sleep(0.05)
     await h.stop()
@@ -467,9 +468,9 @@ async def test_a_coding_request_in_a_dm_becomes_a_coding_task_whose_card_reaches
     assert (await handle.describe()).workflow_type == "CodingTaskWorkflow"
     assert (await h.rows(ProcessRun, ProcessRun.task_id == tid))[0].process_type == "coding_task"
     starting, card, stopped = h.slack
-    assert starting.startswith("Starting on agentic-design: Dark mode toggle.") and "aura/dark-mode-toggle" in starting
-    assert card.startswith("I added a dark mode toggle to the settings page") and "Tests (RMP's own run): passed" in card
-    assert stopped == "Stopped. Nothing shipped. The work so far is kept on branch aura/dark-mode-toggle."
+    assert starting.startswith("Starting on rmp: Commit in coding status.") and "aura/coding-status-commit" in starting
+    assert card.startswith("GET /api/coding/status now shows the short RMP commit") and "Restarts on deploy: rmp-api, rmp-worker" in card
+    assert stopped == "Stopped. Nothing shipped. The work so far is kept on branch aura/coding-status-commit."
     assert result == {"status": "stopped_by_user", "task_id": tid} and (await h.task(tid)).status == "stopped_by_user"
     assert len(h.judged) == 1 and "EXTERNAL EVIDENCE" in h.judged[0] and "RMP's own test run: passed" in h.judged[0]
 

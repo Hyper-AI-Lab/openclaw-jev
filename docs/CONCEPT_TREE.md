@@ -100,7 +100,7 @@ RMP chat.postMessage (idempotent)
 
 - **GenericTaskWorkflow** — default for user DMs and most work. Plan-driven steps.
 - **CatalogTaskWorkflow** — named templates (registration, login, email verify, procurement, outreach, browser automation). **Assigned by Intake Analyst `catalog_hint`**, never by keyword alone.
-- **CodingTaskWorkflow** — catalog `coding_task` (aliases `tool_self_upgrade`, `self_upgrade`, `capability_upgrade`): Claude Code changes code as `aura-coder` in its own checkout, RMP tests it, Aura and the evaluator review, and Kirill approves before anything ships.
+- **CodingTaskWorkflow** — catalog `coding_task` (aliases `tool_self_upgrade`, `self_upgrade`, `capability_upgrade`): Claude Code changes Aura's own code (only her repository is registered) as `aura-coder` in its own checkout, RMP tests it, Aura and the evaluator review, and Kirill approves before anything ships.
 - **IntakeWorkflow** — classify. If it fails, still create an RMP user task (`create_fresh` + Generic). Never native Slack.
 - **DeepRecallWorkflow** — the IA's deep recall, a bounded child `{task_id}-recall` of a user task: plan, hybrid retrieval with expansion, and a cited context report.
 

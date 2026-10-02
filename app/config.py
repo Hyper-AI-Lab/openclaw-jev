@@ -268,18 +268,6 @@ DEFAULT_CODING = {
                 "deploy": "self", "setup": [],
                 "tests": [["{venv}/bin/python", "-m", "pytest", "-q", "-p", "no:warnings"],
                           ["node", "--test", "tests/node/*.test.js"]]},
-        "agentic-design": {"remote": "Hyper-AI-Lab/agentic-design", "branch": "main", "deploy": "pr",
-                           "setup": [["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]],
-                           "tests": [["npm", "test"]]},
-        "cursor-dual-agent-loop": {"remote": "Hyper-AI-Lab/cursor-dual-agent-loop", "branch": "main", "deploy": "pr",
-                                          "setup": [["python3", "-m", "venv", ".aura/venv"],
-                                                    [".aura/venv/bin/pip", "install", "-q", "cursor-sdk", "pyyaml", "pytest"]],
-                                          "tests": [[".aura/venv/bin/python", "-m", "pytest", "-q", "tests/"]]},
-        "cyber-ai-team": {"remote": "Hyper-AI-Lab/cyber-ai-team", "branch": "main", "deploy": "pr",
-                                 "setup": [["python3", "-m", "venv", ".aura/venv"],
-                                           [".aura/venv/bin/pip", "install", "-q", "-r", "backend/requirements.txt", "pytest",
-                                            "pytest-asyncio", "greenlet"]],
-                                 "tests": [["sh", "-c", "cd backend && PYTHONPATH=src ../.aura/venv/bin/python -m pytest -q"]]},
     },
 }
 
