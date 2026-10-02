@@ -87,7 +87,7 @@ class ScriptedRecall:
             start_to_close_timeout=timedelta(seconds=30))
 
 
-def coding_boundaries():
+def coding_boundaries(h):
     """The coding workflow's boundaries: Claude Code, RMP's units and Aura's turns, scripted for one clean round."""
     job = {"task_id": "t", "repo": "rmp", "branch": "aura/coding-status-commit", "base": "b" * 40,
            "source": "/root/.openclaw/rmp", "checkout": "/srv/aura-code/jobs/t",
@@ -95,7 +95,6 @@ def coding_boundaries():
     answers = {
         "coding_settings": {"enabled": True, "max_rounds": 3,
                             "repositories": {"rmp": {"remote": "Hyper-AI-Lab/openclaw-jev", "deploy": "self"}}},
-        "acquire_coding_slot": {"granted": True, "holder": "t"},
         "release_coding_slot": True,
         "draft_coding_brief": {"repo": "rmp", "title": "Commit in coding status", "goal": "Show the RMP commit in coding status.",
                                "acceptance_criteria": ["GET /api/coding/status includes the short commit"], "constraints": [],
@@ -123,7 +122,11 @@ def coding_boundaries():
 
         return boundary
 
-    return [scripted(name, answer) for name, answer in answers.items()]
+    @activity.defn(name="acquire_coding_slot")
+    async def acquire_coding_slot(payload):
+        return h.coding_slot
+
+    return [acquire_coding_slot, *(scripted(name, answer) for name, answer in answers.items())]
 
 
 class Harness:
@@ -140,6 +143,7 @@ class Harness:
         self.slack_error = None
         self.while_posting = None
         self.recall_released = asyncio.Event()
+        self.coding_slot = {"granted": True, "holder": "t"}
 
     async def send(self, text, slack_ts):
         """A Slack DM as the rmp_adapter plugin posts it."""
@@ -199,7 +203,7 @@ class Harness:
 
         return [classify_task_intake, send_to_openclaw, recall_script, dm.start_recall_report, dm.read_recall_step,
                 dm.judge_recall_novelty, dm.settle_recall_report, db.confirm_approval_provenance, *WORKER_ACTIVITIES,
-                *coding_boundaries()]
+                *coding_boundaries(h)]
 
 
     async def evaluator_turn(self, task_id, prompt, verdict=0):
@@ -473,6 +477,22 @@ async def test_a_coding_request_in_a_dm_becomes_a_coding_task_whose_card_reaches
     assert stopped == "Stopped. Nothing shipped. The work so far is kept on branch aura/coding-status-commit."
     assert result == {"status": "stopped_by_user", "task_id": tid} and (await h.task(tid)).status == "stopped_by_user"
     assert len(h.judged) == 1 and "EXTERNAL EVIDENCE" in h.judged[0] and "RMP's own test run: passed" in h.judged[0]
+
+
+async def test_kirills_stop_reaches_a_coding_task_waiting_for_the_coding_slot(h):
+    h.coding_slot = {"granted": False, "holder": "another-task-1234"}
+    h.intake = [{"decision": "create_fresh", "execution_mode": "structured_work", "catalog_hint": "coding_task"}]
+
+    tid = (await h.send("Add the current RMP commit to GET /api/coding/status, with a test.", "1790000008.000100"))["task_id"]
+    deadline = asyncio.get_running_loop().time() + BOUND
+    while not any("Another coding job is running" in m for m in h.slack):
+        assert asyncio.get_running_loop().time() < deadline, h.slack
+        await asyncio.sleep(0.05)
+    assert (await h.task(tid)).status == "blocked"
+    await h.stop()
+
+    assert await h.finish(tid) == {"status": "stopped_by_user", "task_id": tid}
+    assert h.slack[-1] == "Stopped. Nothing shipped." and (await h.task(tid)).status == "stopped_by_user"
 
 
 async def test_a_long_answer_reaches_slack_in_ordered_parts_with_one_ledger_row(h):

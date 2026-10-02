@@ -161,6 +161,15 @@ def test_catalog_needs_structured_work_and_high_confidence(mode, catalog, expect
     assert result["catalog_hint"] == expected
 
 
+@pytest.mark.parametrize("confidence", [.99, .6])
+def test_a_coding_task_is_always_left_to_the_intake_llm(confidence):
+    request = answers(relation=answer("new"), execution_mode=answer("structured_work"),
+                      catalog=answer("coding_task", confidence))
+    assert intake.compose_intake_result(request, ALIASES, Policy()) is None
+    status = answers(catalog=answer("coding_task", .99))
+    assert intake.compose_intake_result(status, ALIASES, Policy())["decision"] == "wait_active", "running work is unaffected"
+
+
 def test_confidence_is_the_weakest_required_answer_and_web_intent_is_gated():
     relation = answer("new", .9, probabilities={"new": .9, "finished": .03, "running": .05, "unclear": .02})
     result = intake.compose_intake_result(

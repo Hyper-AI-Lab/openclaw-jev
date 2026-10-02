@@ -1154,7 +1154,7 @@ async def get_active_user_task(session_key: str, db: AsyncSession = Depends(get_
         select(Task)
         .where(
             Task.openclaw_session_key.in_(lookup),
-            Task.status.in_(["running", "pending_user_input", "created"]),
+            Task.status.in_(ACTIVE_TASK_STATUSES),
             Task.task_type.notin_(["cron", "heartbeat", "canary"]),
         )
         .order_by(Task.created_at.desc())

@@ -327,6 +327,10 @@ async def test_kirills_messages_during_a_round_reach_the_next_one():
     assert "Kirill added: Keep the old greeting as a fallback." in rec.runs[1]["prompt"]
     assert "Kirill added: approve" not in rec.runs[1]["prompt"], "an approval before the card is not for Claude"
     assert rec.brief_calls[0]["answers"] == [] and len(rec.provenance_calls) == 1
+    declined = [m for m in rec.notices() if m.startswith("That approval came before there was anything to approve")]
+    assert declined == ["That approval came before there was anything to approve (round 1 is still running), so it "
+                        "doesn't count. I'll send the card when the change is ready; approve it then."]
+    assert not any("only ship this on your own approve" in m for m in rec.notices()), "no refusal at the card"
 
 
 async def test_a_stop_during_the_run_stops_the_unit_within_seconds_and_ships_nothing():
@@ -481,6 +485,15 @@ async def test_questions_in_the_brief_go_to_kirill_and_his_answer_comes_back():
 
     await drive(rec, script)
     assert rec.brief_calls[1]["answers"] == ["The Slack one."]
+
+
+async def test_a_request_for_another_repository_starts_nothing():
+    refused = {**BRIEF, "repo": None, "out_of_scope": "I can only change my own code (rmp) for now."}
+    rec = CodingRun(briefs=[refused])
+    result = await drive(rec)
+    assert result["status"] == "failed" and not rec.runs and not rec.verified and not rec.deploys
+    assert rec.notices() == ["I can only change my own code (rmp) for now. Nothing was started."]
+    assert rec.released == ["t1"]
 
 
 async def test_a_change_that_is_not_ready_after_the_last_round_cannot_be_approved():

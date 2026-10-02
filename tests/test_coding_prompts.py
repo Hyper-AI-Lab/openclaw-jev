@@ -17,6 +17,12 @@ def test_a_brief_names_its_repo_by_name_or_by_github_remote():
     assert by_remote["title"] == "Add a button.", "a missing title comes from the goal"
 
 
+def test_a_request_outside_the_registered_repositories_gets_no_brief():
+    brief = prompts.parse_brief('{"repo": "", "goal": "", "out_of_scope": "I can only change my own code (rmp) for now."}', REPOS)
+    assert brief["out_of_scope"] == "I can only change my own code (rmp) for now." and brief["repo"] is None
+    assert "write no brief" in prompts.brief_prompt("In agentic-design, add a toggle.", REPOS, answers=[])
+
+
 def test_a_brief_without_a_known_repo_asks_kirill_which_one():
     brief = prompts.parse_brief('{"repo": "website", "goal": "Change the footer."}', REPOS)
     assert brief["repo"] is None and brief["questions"] == ["Which repository should I change: rmp, agentic-design?"]

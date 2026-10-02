@@ -24,6 +24,9 @@ MAX_FINISHED = 5
 MAX_MEMORY = 3
 MAX_DIALOGUE_TURNS = 4
 CATALOG_MIN_CONFIDENCE = 0.9
+# Starting Claude Code is left to the intake LLM, whose prompt knows which repositories Aura may change;
+# Jev cannot tell them apart (it scored "add a toggle in agentic-design and open a PR" as coding_task at 0.91).
+LLM_ONLY_CATALOG = frozenset({"coding_task"})
 
 CATALOG_RUBRIC = {
     "account_registration": "Create a new account on a website or service.",
@@ -32,8 +35,9 @@ CATALOG_RUBRIC = {
     "login": "Sign in to an existing account on a website or service.",
     "outreach": "Draft or send a message or follow-up to people or organizations.",
     "procurement": "Find, compare, order or buy products or services.",
-    "coding_task": "Change Aura's own code: fix, build or extend it. Not a change to any other repository, "
-                   "a question about code, or a question about what Aura can do.",
+    "coding_task": "Change Aura's own code (RMP, her plugins or web stack, in her repository openclaw-jev): fix, build "
+                   "or extend it. Not a change to any other repository, a question about code, or a question about "
+                   "what Aura can do.",
 }
 WEB_RUBRIC = {
     "none": "No web access is needed.",
@@ -222,6 +226,8 @@ def compose_intake_result(answers: dict, aliases: dict, policy: Policy) -> dict 
             rationale = "Intake (Jev): this is a new request in the same conversation."
     execution_mode = mode["choice"] if _passes(mode, policy.intake_min_confidence) else None
     catalog, web, depth = answers["catalog"], answers["web_intent"], answers.get("recall_depth")
+    if decision in ("create_fresh", "create_guided") and catalog["choice"] in LLM_ONLY_CATALOG:
+        return None
     catalog_hint = None
     if execution_mode == "structured_work" and catalog["choice"] != "none" and _passes(catalog, CATALOG_MIN_CONFIDENCE):
         catalog_hint = catalog["choice"]

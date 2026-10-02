@@ -77,8 +77,10 @@ Claude Code only changes code in its own checkout; it cannot push, open pull req
 finished change, RMP opens the pull request or deploys Aura's own code. So never put pushing, a pull request or a deploy
 in the goal or the acceptance criteria.
 Reply with one JSON object and nothing else:
-{{"repo": "<one of the names above>", "title": "<a few words for the branch name>", "goal": "<what to change and why>", "acceptance_criteria": ["<how to tell it is done>"], "constraints": ["<what must not change>"], "questions": []}}
-Put a question in "questions" only when the change cannot be done well without Kirill's answer."""
+{{"repo": "<one of the names above>", "title": "<a few words for the branch name>", "goal": "<what to change and why>", "acceptance_criteria": ["<how to tell it is done>"], "constraints": ["<what must not change>"], "questions": [], "out_of_scope": ""}}
+Put a question in "questions" only when the change cannot be done well without Kirill's answer.
+Only the repositories above may be changed. If Kirill asks for a change anywhere else, write no brief: set "out_of_scope"
+to one sentence telling him you can only change the repositories above."""
 
 
 def parse_brief(text: str, repositories: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -86,6 +88,10 @@ def parse_brief(text: str, repositories: Dict[str, Dict[str, Any]]) -> Dict[str,
     data = _json(text)
     if data is None:
         raise ValueError("the brief was not a JSON object")
+    refused = str(data.get("out_of_scope") or "").strip()
+    if refused:
+        return {"out_of_scope": refused, "repo": None, "title": "", "goal": "", "acceptance_criteria": [],
+                "constraints": [], "questions": []}
     names = {name.lower(): name for name in repositories}
     names.update({entry["remote"].lower(): name for name, entry in repositories.items()})
     repo = names.get(str(data.get("repo") or "").strip().lower())

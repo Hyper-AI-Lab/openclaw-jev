@@ -128,6 +128,8 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
             if brief is None:
                 return await self._fail("I couldn't work out a clear brief for this change, so nothing was started. "
                                         "Please ask again with more detail.")
+            if brief.get("out_of_scope"):
+                return await self._fail(f"{brief['out_of_scope'].rstrip('.')}. Nothing was started.")
             try:
                 self._job = await workflow.execute_activity(
                     prepare_coding_workspace, {"task_id": task_id, "repo": brief["repo"], "title": brief["title"]},
@@ -180,9 +182,22 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
             return
         raise Stopped()
 
+    def _early_approvals(self) -> bool:
+        return any(gate_decision(str(m)) == "approve" for m in self.user_inputs)
+
     async def _unless_stopped(self, handle) -> Any:
-        """The activity's result; on a stop its units are stopped first, then it is cancelled."""
-        await workflow.wait_condition(lambda: handle.done() or self._stop_requested())
+        """The activity's result; on a stop its units are stopped first, then it is cancelled.
+
+        An approval that arrives meanwhile is declined at once: only an approval of the card counts.
+        """
+        while True:
+            await workflow.wait_condition(lambda: handle.done() or self._stop_requested() or self._early_approvals())
+            if handle.done() or self._stop_requested():
+                break
+            self.user_inputs = [m for m in self.user_inputs if gate_decision(str(m)) != "approve"]
+            stage = f"round {self._round} is still running" if self._round else "I'm still writing the brief"
+            await self._notice(f"That approval came before there was anything to approve ({stage}), so it doesn't count. "
+                               "I'll send the card when the change is ready; approve it then.")
         if handle.done():
             return handle.result()
         await workflow.execute_activity(stop_coding_units, {"task_id": self._ctx["task_id"]},
@@ -240,7 +255,7 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                 start_to_close_timeout=AURA_TURN, retry_policy=RetryPolicy(maximum_attempts=2)))
             if brief.get("error"):
                 return None
-            if brief["repo"] in settings["repositories"] and not brief["questions"]:
+            if brief.get("out_of_scope") or (brief["repo"] in settings["repositories"] and not brief["questions"]):
                 return brief
             if asked == BRIEF_QUESTIONS:
                 return None
@@ -396,6 +411,8 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
 
     async def _gate(self, card: str, ready: bool, target: str) -> Optional[str]:
         """None once Kirill approved in Slack after the card; otherwise his change request."""
+        # Approvals sent before this card are for nothing yet; the card asks for a fresh one.
+        self.user_inputs = [m for m in self.user_inputs if gate_decision(str(m)) != "approve"]
         await self._ask(card, "awaiting_approval")
         opened = self._asked_at
         how = "deploy it" if target == "self" else "open the pull request"
