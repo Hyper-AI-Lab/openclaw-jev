@@ -87,7 +87,9 @@ def commands_for(job: Job, cfg: Dict[str, Any]) -> List[List[str]]:
                       [f"{JOB_VENV}/bin/pip", "install", "-q", "--disable-pip-version-check", "-r", "requirements.txt"]]
             venv = checkout / JOB_VENV
     tests = [[arg.replace("{venv}", str(venv)) for arg in argv] for argv in entry["tests"]]
-    return setup + tests
+    # systemd refuses a relative executable path; a bare name is still looked up on PATH.
+    return [[str(checkout / argv[0]) if "/" in argv[0] and not argv[0].startswith("/") else argv[0], *argv[1:]]
+            for argv in setup + tests]
 
 
 def run_tests(job: Job, cfg: Dict[str, Any], *, attempt: int = 1) -> Dict[str, Any]:

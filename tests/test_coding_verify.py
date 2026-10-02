@@ -83,7 +83,17 @@ def test_the_shared_venv_serves_only_jobs_with_the_same_requirements(env):
     commands = verify.commands_for(env.job, cfg)
     local = env.checkout / verify.JOB_VENV
     assert commands[0] == ["python3", "-m", "venv", verify.JOB_VENV] and "requirements.txt" in commands[1]
+    assert commands[1][0] == f"{local}/bin/pip", "systemd refuses relative executables"
     assert commands[-1] == [f"{local}/bin/python", "-m", "pytest", "-q"]
+
+
+def test_relative_executables_run_from_the_checkout_and_bare_names_from_path(env):
+    cfg = {**env.cfg, "repositories": {"demo": {**env.cfg["repositories"]["demo"],
+                                                 "setup": [["python3", "-m", "venv", ".aura/venv"],
+                                                           [".aura/venv/bin/pip", "install", "-e", "."]],
+                                                 "tests": [[".aura/venv/bin/python", "-m", "pytest"], ["npm", "test"]]}}}
+    assert [argv[0] for argv in verify.commands_for(env.job, cfg)] == [
+        "python3", f"{env.checkout}/.aura/venv/bin/pip", f"{env.checkout}/.aura/venv/bin/python", "npm"]
 
 
 def test_the_shared_venv_is_rebuilt_only_when_the_trusted_requirements_change(env):
