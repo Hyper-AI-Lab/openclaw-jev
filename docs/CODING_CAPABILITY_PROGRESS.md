@@ -738,3 +738,44 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
   - "Did you know you can write code with Claude Code now?" had no catalog and stayed conversational;
   - "How does your reconciler decide that a task is stuck?" had no catalog.
 - **Deploy:** `main` was fast-forwarded to `98cf9ec` with no active tasks. The watcher restarted the API and worker (health OK), with no errors. Readiness is 38/1/0, the gateway's `/readyz` returns 200, and the canary gives CANARY OK. From now on, a coding request in a DM starts a coding task.
+
+---
+
+## Step 13 — Observability, docs, rules
+
+**Date:** 2026-10-02.
+
+**What changed:**
+- **Coding API** (behind the API key, like the rest of `/api`):
+  - `GET /api/coding/status`: the installed and pinned Claude Code version, days left on the token, the coding slot's holder, live coding units, the repositories and recent jobs.
+  - `GET /api/coding/jobs/{task_id}`: the job record, each Claude Code run (meta, exit, outcome, turns, usage, error), each verification (without the output tails), the deploy's commits and the coding events (`approval.confirmed`/`refused`, `coding.deploy`, `coding.reported_by_rmp`, `reconciler.coding_orphan_closed`). A task id that is not a plain identifier gets 404, so the path cannot leave the runs directory.
+- **Readiness** (`app/production/coding_readiness.py`, added to the report):
+  - `claude_code`: the binary present at the pinned version (read from the versions path it links to, never executed as root), the token present (fail when expired, warn under 30 days), and the last smoke run (warn when missing or failed).
+  - `coding_isolation`: the nftables table loaded, every loopback listener covered, managed settings identical to the repo's copy.
+  - `coding_jobs`: Claude Code units running past their limit, and job checkouts without a job record (warn).
+- **Invariants:**
+  - `approved_deploys`: every shipped change (`deployed`, `rolled_back` or `pr_opened`) has an `approval.confirmed` before its `coding.deploy`. `confirm_approval_provenance` now records `approval.confirmed`, and the deploy activity records a PR as `coding.deploy`, as the deploy unit already did for self-deploys.
+  - `deploy_verification`: every `deployed` self-deploy records the exact-commit suite (now carried from the activity into the unit's result) and a canary that ran or was skipped.
+  - `coding_units`: no `aura-claude-*` unit without a live task.
+  - `judged_deliveries` accepts `coding.reported_by_rmp`, the event a coding task records when it completes with RMP's own record because no reply of Aura's passed the evaluator.
+- **Docs:**
+  - `ARCHITECTURE.md` §5.11 "Coding tasks (Claude Code)": isolation, flow, shipping, durability and observability, plus the two endpoints in §5.7.
+  - `docs/CONCEPT_TREE.md`: `CodingTaskWorkflow` among the workflow kinds (the catalog list loses "tool self-upgrade"), and a MUST for coding jobs.
+  - `README.md`: a "Coding" guarantee, and monitoring now names the coding checks and the twelve invariants.
+- **The rule:** item 6 of `rmp-architecture.mdc` covers coding jobs. The repo copy and `/root/.cursor/rules/` are identical.
+- Tests: `tests/test_coding_observability.py` (12):
+  - healthy `claude_code`, and five ways it reports what is wrong;
+  - isolation failing on each of its three conditions;
+  - a stuck unit and an orphan checkout;
+  - an unapproved and a late-approved deploy;
+  - a self-deploy without a verification record;
+  - a Claude Code unit without a live task;
+  - the job API, including the path refusal.
+
+**Verification:**
+- **Tests:** full suite 999 passed, 4 skipped; node 23/23.
+- **Before the deploy,** the three readiness checks on this host: Claude Code 2.1.280 (pinned), the token valid for 363 more days, the smoke run from Sep 30 passed; firewall loaded, every listener covered, managed settings intact; no stuck units or orphan checkouts.
+- **Deploy:** `main` was fast-forwarded to `e20d900` with no active tasks. The watcher restarted the API and worker (health OK), with no errors.
+  - Readiness is now **44 pass, 1 warn (telemetry), 0 fail**; the six new checks and invariants all pass.
+  - `GET /api/coding/status` answers, and an unknown job gets 404.
+  - The canary gives CANARY OK.
