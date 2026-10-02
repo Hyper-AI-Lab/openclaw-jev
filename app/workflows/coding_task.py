@@ -18,8 +18,10 @@ with workflow.unsafe.imports_passed_through():
     from app.activities.coding_activities import (
         acquire_coding_slot,
         coding_settings,
+        deploy_coding_change,
         draft_coding_brief,
         prepare_coding_workspace,
+        refresh_coding_base,
         release_coding_slot,
         review_coding_round,
         run_claude_round,
@@ -49,7 +51,6 @@ AURA_TURN = timedelta(minutes=45)
 SLOT_POLL = timedelta(minutes=2)
 USAGE_LIMIT_WAIT = timedelta(hours=1)
 BRIEF_QUESTIONS = 2
-DEPLOY_ACTIVITY = "deploy_coding_change"
 RUNNER_FAILURES = {
     "auth_failed": "Claude Code's login was rejected, so its token needs renewing (ops/claude_login.sh)",
     "api_error": "Claude Code's API kept failing",
@@ -86,6 +87,7 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
         self._round = 0
         self._asked_at: Optional[datetime] = None
         self._reminded = False
+        self._handed_off = False
 
     @workflow.signal
     def user_input(self, message: str) -> None:
@@ -112,6 +114,8 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                      "tags": payload.get("tags") or []}
         self.process_run_id = await workflow.execute_activity(
             ensure_process_run, {"task_id": task_id, "process_type": "coding_task"}, start_to_close_timeout=QUICK)
+        if payload.get("report"):
+            return await self._report(payload["report"])
         settings = await workflow.execute_activity(coding_settings, {}, start_to_close_timeout=QUICK)
         holding = False
         try:
@@ -139,8 +143,15 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
             await self._notice(f"Task {task_id[:8]} closed: no answer from you within 7 days, so nothing shipped.")
             return {"status": "cancelled", "task_id": task_id}
         finally:
-            if holding:
+            if holding and not self._handed_off:
                 await workflow.execute_activity(release_coding_slot, {"task_id": task_id}, start_to_close_timeout=QUICK)
+
+    async def _report(self, report: Dict[str, Any]) -> Dict[str, Any]:
+        """The run the deploy unit starts after a self-deploy: the judged reply, on the code it deployed."""
+        try:
+            return await self._final(report["brief"], report["review"], report["evidence"], report["shipped"])
+        finally:
+            await workflow.execute_activity(release_coding_slot, {"task_id": self._ctx["task_id"]}, start_to_close_timeout=QUICK)
 
     async def _status(self, task_status: str, process_state: str, *, minutes: Optional[int] = None) -> None:
         later = {"next_check_minutes": minutes} if minutes else {}
@@ -330,9 +341,18 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                 prompt = prompts.rework_prompt(feedback, evidence.get("tests"))
                 continue
             change = await self._gate(self._card(review, evidence, problems, target), not problems, target)
-            if change is None:
-                return await self._ship(brief, review, evidence, target)
-            prompt, batch = prompts.change_request_prompt(change), 0
+            if change is not None:
+                prompt, batch = prompts.change_request_prompt(change), 0
+                continue
+            shipped = await self._ship(brief, review, evidence, target)
+            if shipped["status"] != "needs_rebase":
+                return shipped
+            self._job = await workflow.execute_activity(refresh_coding_base, {"job": self._job},
+                                                        start_to_close_timeout=timedelta(minutes=10),
+                                                        retry_policy=RetryPolicy(maximum_attempts=3))
+            await self._notice(f"main moved since this change was made, so Claude Code is rebasing it onto "
+                               f"{shipped['main'][:12]}. You'll get a new card to approve.")
+            prompt, batch = prompts.rebase_prompt(self._job["bundle"], shipped["main"]), 0
 
     def _checks(self, claude: Dict[str, Any], evidence: Dict[str, Any]) -> List[str]:
         """What RMP's own record says is wrong with a round, before anyone reviews it."""
@@ -396,16 +416,24 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                                "Reply approve here, tell me what to change, or stop.")
 
     async def _ship(self, brief: Dict[str, Any], review: Dict[str, Any], evidence: Dict[str, Any], target: str) -> Dict[str, Any]:
-        await self._notice("Approved. Deploying it now; I'll report when it's verified." if target == "self"
-                           else "Approved. Pushing the branch and opening a pull request.")
+        """Done (then the judged reply), handed off to the deploy unit, or ``needs_rebase``."""
+        await self._notice("Approved. RMP runs the full suite on the approved commit, then deploys it; I'll report when "
+                           "it's verified." if target == "self" else "Approved. Pushing the branch and opening a pull request.")
         try:
             shipped = await workflow.execute_activity(
-                DEPLOY_ACTIVITY, {**self._ctx, "job": self._job, "head": evidence["collected"]["head"], "target": target,
-                                  "title": brief["title"], "summary": review["reply"]},
+                deploy_coding_change, {**self._ctx, "job": self._job, "head": evidence["collected"]["head"], "target": target,
+                                       "title": brief["title"], "summary": review["reply"],
+                                       "report": {"brief": brief, "review": review, "evidence": evidence}},
                 start_to_close_timeout=timedelta(hours=2), heartbeat_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(maximum_attempts=1))
+                retry_policy=RetryPolicy(maximum_attempts=3))
         except ActivityError as exc:
-            shipped = {"status": "failed", "summary": f"Shipping failed: {_cause(exc)}"}
+            shipped = {"status": "failed", "summary": f"Shipping failed ({_cause(exc)}); nothing was deployed."}
+        if shipped["status"] == "needs_rebase":
+            return shipped
+        if shipped["status"] == "handed_off":
+            self._handed_off = True
+            await self._status("deploying", "deploying")
+            return {"status": "deploying", "task_id": self._ctx["task_id"], "shipped": shipped}
         return await self._final(brief, review, evidence, shipped)
 
     async def _final(self, brief: Dict[str, Any], review: Dict[str, Any], evidence: Dict[str, Any],

@@ -24,6 +24,6 @@ async def test_coding_task_histories_replay():
     recorded = json.loads((FIXTURES / "coding_task_histories.json").read_text())
     replayer = Replayer(workflows=[CodingTaskWorkflow])
     assert set(recorded) == {"approve_and_deploy", "rework_then_approve", "stop_mid_run", "change_request_then_approve",
-                             "usage_limit_pause"}
+                             "usage_limit_pause", "rebase_then_approve"}
     for item in recorded.values():
         await replayer.replay_workflow(WorkflowHistory.from_json(item["workflow_id"], item["history"]))

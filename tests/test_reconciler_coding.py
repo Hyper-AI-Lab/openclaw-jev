@@ -67,6 +67,21 @@ async def test_a_running_or_just_touched_coding_task_is_left_alone():
         assert closed == [] and task.status != "failed" and not stop.called and notify.await_count == 0 and not added
 
 
+async def test_a_deploying_task_belongs_to_its_deploy_unit_until_it_reports_back():
+    client = _client(WorkflowExecutionStatus.COMPLETED)
+    for minutes, live in ((30, False), (300, True)):
+        task = _task(status="deploying", minutes=minutes)
+        with patch.object(reconciler, "runner_unit_active", return_value=live):
+            closed, stop, fail, notify, added = await _close(client, _db([task]))
+        assert closed == [] and task.status == "deploying" and notify.await_count == 0
+
+    task = _task(status="deploying", minutes=300)
+    with patch.object(reconciler, "runner_unit_active", return_value=False):
+        closed, stop, fail, notify, added = await _close(client, _db([task]))
+    assert closed == ["t1"] and task.status == "failed"
+    assert "deploy never reported back" in notify.await_args.args[1]
+
+
 async def test_an_orphaned_coding_reply_is_never_re_judged():
     client = _client(WorkflowExecutionStatus.FAILED)
     db = _db()

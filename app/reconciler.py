@@ -73,6 +73,14 @@ ORPHAN_EVENTS = (
     "reconciler.orphan_run_failed",
 )
 CODING_PROCESS = "coding_task"
+# Longer than a deploy unit may run (app.coding.deploy.DEPLOY_UNIT_MAX_SEC).
+DEPLOY_GRACE = timedelta(hours=4)
+
+
+def runner_unit_active(unit: str) -> bool:
+    from app.coding.runner import unit_active
+
+    return unit_active(unit)
 
 
 async def _is_coding_task(db, task: Task) -> bool:
@@ -96,6 +104,11 @@ async def _close_orphaned_coding_tasks(client: Client, db, now: datetime, stats:
     closed = []
     for task in rows.scalars().all():
         if task.updated_at and now - task.updated_at < timedelta(seconds=ORPHAN_REPLY_MIN_AGE_SEC):
+            continue
+        # After the hand-off the deploy unit owns the task; it starts the reply run when it is done.
+        deploying = task.status == "deploying"
+        if deploying and (now - task.updated_at < DEPLOY_GRACE
+                          or await asyncio.to_thread(runner_unit_active, f"aura-deploy-{task.id}")):
             continue
         try:
             desc = await client.get_workflow_handle(f"workflow-{task.id}").describe()
@@ -123,6 +136,8 @@ async def _close_orphaned_coding_tasks(client: Client, db, now: datetime, stats:
         stopped_note = " and stopped its Claude Code run" if stopped else ""
         await _notify_repair(
             task,
+            f"Coding task {task.id[:8]}'s deploy never reported back, so I closed it. Please check main and the deploy log."
+            if deploying else
             f"Coding task {task.id[:8]} lost its workflow, so I closed it{stopped_note}. "
             "Nothing shipped; the work so far is kept in its checkout.",
         )

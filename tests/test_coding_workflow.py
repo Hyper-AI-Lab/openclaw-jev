@@ -71,7 +71,9 @@ class CodingRun:
     """Scripted activities and what the workflow did with them."""
 
     def __init__(self, *, briefs=None, runs=None, evidences=None, reviews=None, verdicts=None, slot=None,
-                 provenance=None, block_first_run=False, hold_first_run=False, real_activities=()):
+                 provenance=None, block_first_run=False, hold_first_run=False, shipping=None, real_activities=()):
+        self.shipping = list(shipping or [])
+        self.refreshed: List[dict] = []
         self.briefs = list(briefs or [BRIEF])
         self.outcomes = list(runs or [claude()])
         self.evidences = list(evidences or [evidence()])
@@ -211,9 +213,16 @@ class CodingRun:
         async def record_event(payload):
             return "event-1"
 
+        @activity.defn(name="refresh_coding_base")
+        async def refresh_coding_base(payload):
+            rec.refreshed.append(payload)
+            return {**payload["job"], "base": "d" * 40, "bundle": "/srv/aura-code/bundles/t1/main.bundle"}
+
         @activity.defn(name="deploy_coding_change")
         async def deploy_coding_change(payload):
             rec.deploys.append(payload)
+            if rec.shipping:
+                return rec.shipping.pop(0)
             if payload["target"] == "self":
                 return {"status": "deployed", "summary": f"Deployed {payload['head'][:12]} to main; health, readiness and canary passed."}
             return {"status": "pr_opened", "summary": "Opened https://github.com/Hyper-AI-Lab/agentic-design/pull/7"}
@@ -222,7 +231,7 @@ class CodingRun:
                     run_claude_round, stop_coding_units, verify_coding_round, review_coding_round, verify_response_quality,
                     notify_slack_user, send_to_openclaw, update_task_status, update_process_state, ensure_process_run,
                     finalize_task_failure, confirm_approval_provenance, resubmit_user_messages, record_event,
-                    deploy_coding_change]
+                    deploy_coding_change, refresh_coding_base]
         return [rec.real.get(fn.__name__, fn) for fn in scripted]
 
 
@@ -556,6 +565,44 @@ async def test_a_worker_restart_mid_run_reattaches_to_the_same_unit(tmp_path, mo
     reviewed = rec.reviewed[0]["claude"]
     assert reviewed["kind"] == "success" and reviewed["session_id"] == "f1c0e0b3-dfee-4ad2-b2cd-398dbd21bfcd"
     assert reviewed["num_turns"] == 4 and len(reviewed["commands"]) == 2, "the retry reads the whole run, not just its tail"
+
+
+async def test_a_self_deploy_hands_off_keeps_the_slot_and_the_report_run_replies():
+    handed = {"status": "handed_off", "unit": "aura-deploy-t1", "summary": "RMP's full suite passed on cccccccccccc."}
+    rec = CodingRun(shipping=[handed])
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with Worker(env.client, task_queue=QUEUE, workflows=[CodingTaskWorkflow], activities=rec.activities()):
+            first = await env.client.start_workflow(CodingTaskWorkflow.run, PAYLOAD, id="workflow-t1", task_queue=QUEUE)
+            await approve_first_card(env, first, rec)
+            assert (await first.result())["status"] == "deploying"
+            assert rec.statuses[-1] == "deploying" and rec.released == [], "the slot stays taken until the reply"
+            assert "report" in rec.deploys[0] and rec.deploys[0]["report"]["review"] == READY
+
+            shipped = {"status": "deployed", "summary": "Deployed cccccccccccc to main; health, readiness and the canary passed."}
+            report = {**rec.deploys[0]["report"], "shipped": shipped}
+            second = await env.client.start_workflow(CodingTaskWorkflow.run, {**PAYLOAD, "report": report},
+                                                     id="workflow-t1", task_queue=QUEUE)
+            result = await second.result()
+
+    assert result["status"] == "completed" and rec.slack[-1] == (FINAL, "reply") and rec.released == ["t1"]
+    assert rec.judged[-1]["external_evidence"]["deploy"] == shipped and rec.statuses[-1] == "completed"
+
+
+async def test_main_moving_before_the_deploy_runs_a_rebase_round_and_a_new_card():
+    rec = CodingRun(runs=[claude(), claude()], evidences=[evidence(), evidence()], reviews=[READY, READY],
+                    shipping=[{"status": "needs_rebase", "main": "d" * 40}], provenance=[{"ok": True}, {"ok": True}])
+
+    async def script(env, handle):
+        await approve_first_card(env, handle, rec)
+        await until(lambda: len(rec.cards()) == 2)
+        await handle.signal("user_input", kirill("approve"))
+
+    result = await drive(rec, script, record="rebase_then_approve")
+    assert result["status"] == "completed" and len(rec.deploys) == 2 and rec.refreshed[0]["job"]["base"] == "b" * 40
+    assert rec.runs[1]["prompt"] == prompts.rebase_prompt("/srv/aura-code/bundles/t1/main.bundle", "d" * 40)
+    assert rec.runs[1]["resume_session"] == "sess-1" and rec.verified[1]["job"]["base"] == "d" * 40
+    assert any(m.startswith("main moved since this change was made") for m in rec.notices())
+    assert len(rec.provenance_calls) == 2, "the rebased change is approved again"
 
 
 async def test_a_pull_request_repo_gets_its_own_card_and_no_restarts():

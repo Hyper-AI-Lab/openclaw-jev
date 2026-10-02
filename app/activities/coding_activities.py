@@ -21,12 +21,14 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from temporalio import activity
 
-from app.coding import prompts, runner, stream, verify, workspace
+from app.coding import deploy, prompts, runner, stream, verify, workspace
 from app.coding.units import RUNS_DIR
 from app.telemetry import traced_activity
 
 SLOT_FILE = RUNS_DIR / "coding-slot.json"
-ACTIVE_TASK_STATUSES = frozenset({"created", "running", "pending", "pending_user_input", "blocked", "needs_replan"})
+# "deploying": the deploy unit owns the task after the hand-off, and holds the slot until the report run ends.
+ACTIVE_TASK_STATUSES = frozenset({"created", "running", "pending", "pending_user_input", "blocked", "needs_replan",
+                                  "deploying"})
 POLL_SEC = 2.0
 LIVENESS_SEC = 180
 NOTICE_SEC = 900
@@ -270,7 +272,7 @@ async def verify_coding_round(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     cfg = get_coding_config()
     task_id, number = payload["task_id"], int(payload["number"])
-    job = workspace.Job(**{k: v for k, v in payload["job"].items() if k in workspace.Job.__dataclass_fields__})
+    job = _job(payload)
     units = (f"aura-collect-{task_id}-{number}", f"aura-verify-{task_id}-{number}-*")
     for pattern in units:
         await asyncio.to_thread(_stop_units, pattern)
@@ -283,22 +285,63 @@ async def verify_coding_round(payload: Dict[str, Any]) -> Dict[str, Any]:
         _save_diff(task_id, number, collected.pop("diff"))
         return {"error": None, "collected": collected, "tests": verify.run_tests(job, cfg, attempt=number)}
 
-    worker = asyncio.ensure_future(asyncio.to_thread(work))
-    last_touch = 0.0
     try:
-        while not worker.done():
-            activity.heartbeat()
-            if time.time() - last_touch >= LIVENESS_SEC:
-                await _touch(task_id)
-                last_touch = time.time()
-            await asyncio.wait({worker}, timeout=POLL_SEC)
+        return await _heartbeating(task_id, asyncio.to_thread(work))
     except asyncio.CancelledError:
         cancel = activity.cancellation_details()
         if cancel is not None and cancel.cancel_requested:
             for pattern in units:
                 await asyncio.to_thread(_stop_units, pattern)
         raise
+
+
+async def _heartbeating(task_id: str, work) -> Any:
+    """Await blocking work in a thread while heartbeating and keeping the task live."""
+    worker = asyncio.ensure_future(work)
+    last_touch = 0.0
+    while not worker.done():
+        activity.heartbeat()
+        if time.time() - last_touch >= LIVENESS_SEC:
+            await _touch(task_id)
+            last_touch = time.time()
+        await asyncio.wait({worker}, timeout=POLL_SEC)
     return worker.result()
+
+
+def _job(payload: Dict[str, Any]) -> workspace.Job:
+    return workspace.Job(**{k: v for k, v in payload["job"].items() if k in workspace.Job.__dataclass_fields__})
+
+
+@traced_activity("coding.deploy")
+async def deploy_coding_change(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Ship an approved head: a pull request, or for Aura's own code the exact-commit suite and the hand-off."""
+    from app.config import get_coding_config
+
+    cfg = get_coding_config()
+    job, head = _job(payload), payload["head"]
+    entry = cfg["repositories"][job.repo]
+    if payload["target"] != "self":
+        body = prompts.pr_body(payload["summary"], (payload.get("report") or {}).get("evidence", {}).get("tests"))
+        return await asyncio.to_thread(deploy.open_pull_request, job, head, entry, payload["title"], body)
+    ready = await asyncio.to_thread(deploy.fetch_approved, job, head)
+    if ready["status"] != "ready":
+        return ready
+    suite = await _heartbeating(job.task_id, asyncio.to_thread(deploy.exact_commit_suite, job, head, cfg))
+    if not suite["ok"]:
+        return {"status": "failed", "tests": suite,
+                "summary": f"RMP's full suite failed on the approved commit {head[:12]} ({prompts.tests_line(suite)}), "
+                           "so nothing was deployed; main is unchanged."}
+    spec = {"task_id": job.task_id, "old": ready["old"], "head": head, "context": _context(payload), "report": payload["report"]}
+    unit = await asyncio.to_thread(deploy.hand_off, spec)
+    return {"status": "handed_off", "unit": unit, "summary": f"RMP's full suite passed on {head[:12]}; {unit} deploys it."}
+
+
+@traced_activity("coding.refresh_base")
+async def refresh_coding_base(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The job with today's main as its base, for a rebase round."""
+    job = await asyncio.to_thread(deploy.refresh_base, _job(payload))
+    return {**asdict(job), "tests": payload["job"].get("tests") or [],
+            "bundle": str(deploy.BUNDLES_DIR / job.task_id / "main.bundle")}
 
 
 @traced_activity("coding.review_round")
@@ -326,4 +369,6 @@ CODING_ACTIVITIES = [
     stop_coding_units,
     verify_coding_round,
     review_coding_round,
+    deploy_coding_change,
+    refresh_coding_base,
 ]

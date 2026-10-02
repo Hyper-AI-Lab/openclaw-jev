@@ -128,6 +128,17 @@ def change_request_prompt(words: str) -> str:
             "Make the change in the same checkout, run the tests again, commit, and finish with the structured report.")
 
 
+def rebase_prompt(bundle: str, main: str) -> str:
+    return (f"main moved after you started; it is now at {main[:12]}. Rebase your branch onto it: "
+            f"`git fetch {bundle} main`, then `git rebase FETCH_HEAD`. Resolve any conflicts so the change still does "
+            "what the brief asks, run the tests again, and finish with the structured report. Rebase; do not merge.")
+
+
+def pr_body(summary: str, tests: Optional[Dict[str, Any]]) -> str:
+    return (f"{summary}\n\n---\nTests (RMP's own run in an isolated checkout): {tests_line(tests)}\n"
+            "Made by Aura with Claude Code; Kirill approved it in Slack.")
+
+
 def tests_line(tests: Optional[Dict[str, Any]]) -> str:
     if not tests:
         return "not run"
