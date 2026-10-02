@@ -179,6 +179,7 @@ async def test_the_coding_status_names_the_short_rmp_commit_and_open_direct_sess
     # Only the ended session's turn is running: the count is of open sessions, not of running turns.
     monkeypatch.setattr(direct.runner, "unit_active", lambda unit: unit.endswith("-00000001-1"))
     assert [s["running"] for s in direct.sessions()] == [False, True, False, False]
+    monkeypatch.setattr(direct, "running_units", lambda: ["aura-direct-task-a-00000001-1"])
     monkeypatch.setenv("RMP_API_KEY", "k")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://rmp",
                                  headers={"X-RMP-API-Key": "k"}) as api:
@@ -190,7 +191,42 @@ async def test_the_coding_status_names_the_short_rmp_commit_and_open_direct_sess
     assert {"enabled", "claude_version", "pinned", "token_days_left", "slot_holder", "live_units", "repositories",
             "jobs", "direct_sessions_open"} <= status.keys()
     assert status["enabled"] is True and status["pinned"] == "2.1.280" and status["repositories"] == {}
-    assert status["direct_sessions_open"] == 2
+    assert status["direct_sessions_open"] == 2 and status["direct_turns_running"] == 1
+
+
+async def test_the_coding_status_counts_the_direct_turns_running_now_from_their_systemd_units(host, monkeypatch):
+    import subprocess
+
+    from app.activities import coding_activities
+    from app.coding import direct
+
+    monkeypatch.setattr(cr, "live_units", lambda: [])
+    monkeypatch.setattr(coding_activities, "slot_holder", lambda: None)
+    # One open session whose last turn finished: open sessions are not running turns.
+    home = direct.DIRECT_DIR / "task-a" / "00000000-0000-4000-8000-000000000000"
+    home.mkdir(parents=True)
+    (home / "session.json").write_text(json.dumps({"id": home.name, "task_id": "task-a", "status": "open",
+                                                   "created_at": "2026-10-02T10:00:00+00:00", "turns": 1}))
+    monkeypatch.setattr(direct.runner, "unit_active", lambda unit: False)
+    listings = iter(["", "aura-direct-task-a-00000000-1 loaded active running claude -p\n"
+                         "aura-direct-task-b-00000001-3 loaded activating start claude -p\n\n"])
+    calls = []
+
+    def systemctl(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=next(listings), stderr="")
+
+    monkeypatch.setattr(direct.subprocess, "run", systemctl)
+    monkeypatch.setenv("RMP_API_KEY", "k")
+    monkeypatch.setattr(server, "_rmp_commit", lambda: "abc1234")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://rmp",
+                                 headers={"X-RMP-API-Key": "k"}) as api:
+        idle = (await api.get("/api/coding/status")).json()
+        busy = (await api.get("/api/coding/status")).json()
+    assert idle["direct_turns_running"] == 0 and idle["direct_sessions_open"] == 1
+    assert busy["direct_turns_running"] == 2 and busy["direct_sessions_open"] == 1
+    assert calls == [["systemctl", "list-units", "--plain", "--no-legend", "--state=active,activating",
+                      "aura-direct-*"]] * 2
 
 
 async def test_deploys_of_githubs_main_need_no_approval_but_ci_on_the_deployed_commit(session):  # noqa: F811

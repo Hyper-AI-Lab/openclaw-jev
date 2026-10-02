@@ -131,7 +131,7 @@ def check_coding_jobs() -> CheckResult:
 def check_claude_direct() -> CheckResult:
     """Aura's direct sessions: the host's policy and the GitHub wrapper as in the repo, GitHub's main protected for
     everyone, and the live main contained in GitHub's, so her merged pull requests can deploy."""
-    from app.coding import deploy, direct, github
+    from app.coding import deploy, github
 
     problems, warnings = [], []
     for path, source in ((HOST_POLICY, HOST_POLICY_SOURCE), (GITHUB_WRAPPER, GITHUB_WRAPPER_SOURCE)):
@@ -152,7 +152,7 @@ def check_claude_direct() -> CheckResult:
                           capture_output=True, text=True, timeout=30).stdout.strip()
     if not warnings and not deploy._is_ancestor_on_github(live, repo):
         problems.append(f"the live main ({live[:12]}) has commits GitHub's main lacks, so no merged pull request can deploy")
-    details = {"running_turns": len(direct.running_units()),
+    details = {"running_turns": running_direct_turns(),
                "open_sessions": open_direct_sessions()}
     status = "fail" if problems else "warn" if warnings else "pass"
     message = "; ".join(problems + warnings) or (
@@ -189,7 +189,7 @@ def coding_status() -> Dict[str, Any]:
             "token_days_left": token_days_left(), "slot_holder": slot_holder(), "live_units": live_units(),
             "repositories": {name: {"remote": e["remote"], "deploy": e.get("deploy")} for name, e in cfg["repositories"].items()},
             "jobs": sorted((p.parent.name for p in RUNS_DIR.glob("*/job.json")), reverse=True)[:50],
-            "direct_sessions_open": open_direct_sessions()}
+            "direct_sessions_open": open_direct_sessions(), "direct_turns_running": running_direct_turns()}
 
 
 def open_direct_sessions() -> int:
@@ -197,6 +197,14 @@ def open_direct_sessions() -> int:
     from app.coding import direct
 
     return sum(1 for s in direct.sessions() if s["status"] == "open")
+
+
+def running_direct_turns() -> int:
+    """How many of Aura's direct Claude turns are running now: each turn is its own systemd unit, and this counts
+    the active or activating ones, as the cap on running turns (``direct_max_running``) does."""
+    from app.coding import direct
+
+    return len(direct.running_units())
 
 
 def coding_job(task_id: str) -> Optional[Dict[str, Any]]:
