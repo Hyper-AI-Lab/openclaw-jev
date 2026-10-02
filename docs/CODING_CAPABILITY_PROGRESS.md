@@ -779,3 +779,54 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
   - Readiness is now **44 pass, 1 warn (telemetry), 0 fail**; the six new checks and invariants all pass.
   - `GET /api/coding/status` answers, and an unknown job gets 404.
   - The canary gives CANARY OK.
+
+---
+
+## Step 14 — End-to-end proof, live acceptance, push
+
+**Date:** 2026-10-02.
+
+**Automated proof:**
+- **Full suite:** 1004 passed, 4 skipped, with the harnesses and the six recorded histories included; node 23/23.
+- `ops/verify_openclaw_patch.sh` passes (patches, model policy, the utility-model route off), and `ops/openclaw_preflight.py openclaw@2026.9.7` passes (Node range, RMP patches, transcript format).
+
+**Fixes the acceptance found** (each deployed before the next attempt):
+1. **Relative executables** (`10d3fcb`): systemd refuses a relative executable path, so `.aura/venv/bin/pip` never started (exit "missing"). The fake `systemd-run` accepted relative paths, and step 8's live run used the absolute shared venv, so neither caught it. `verify.commands_for` now resolves them against the checkout. The same commit corrected the other repositories' declared commands, later removed with the registry (fix 5).
+2. **Shipping as a round criterion** (`80ab11e`): Kirill asked to "open a PR", my brief made that an acceptance criterion, and my review held 12 rounds back because Claude Code (rightly) cannot push.
+   - The brief and review prompts now say that pushing, PRs and deploys are RMP's job after approval.
+   - Cards and round notices say what the review found.
+   - An approval sent before the card is no longer passed to Claude.
+3. **The evaluator** (`a830b95`) also judged rounds against the literal ask and could not see the diff. It now gets a stage note (a round's reply comes before approval; nothing has shipped) and a bounded copy of the diff, read from disk. Replayed on the failed round, it accepted.
+4. **The PR push was refused (403):** `git push --dry-run` showed the token can push only to openclaw-jev.
+5. **Only Aura's own repository** (`f356adb`): Kirill decided Aura must not touch his other repositories. The registry now holds only `rmp`. Intake, Jev's rubric and fixtures, Aura's `TOOLS.md`/`AGENTS.md` and the docs say a change to another repository is not a coding task. With Kirill's approval, the local mirrors of the three repositories and the four acceptance tasks' checkouts, review copies and run records were deleted. Nothing was ever pushed to them.
+6. **A false alarm in `judged_deliveries`** (`276b2e6`): intake's acknowledgement of a message with nothing new to run ("I approve", sent after the deploy had finished) completes a task with RMP's own words. It is now counted like a coding task's shipped record. This was latent since the invariant appeared on Sep 29; today's was the first such acknowledgement.
+
+**Live with Kirill in Slack:**
+1. **A stop during a run** (task `9e31b599`): "Starting on cursor-dual-agent-loop…", then Kirill's "stop". The task was `stopped_by_user` 3 s later, the unit was gone, the run's outcome was `stopped`, and the slot was released. Nothing shipped.
+2. **A change request at the gate** (task `80e6c732`):
+   - The first card came after one round (evaluator accept).
+   - Kirill's change request started a new round. The evaluator returned Aura's reply once for an unsupported claim, then accepted, and the second card followed.
+   - Kirill's approve was confirmed (`approval.confirmed`, his Slack user, after the gate opened).
+   - The PR push was refused (fix 4); Aura's judged final reply said so, and the task closed `failed` with nothing deployed.
+   - Earlier attempts (`db383558`, 12 rounds; `0dae0365`) led to fixes 2 and 3.
+3. **A self-deploy of Aura's own code** (task `bd56025f`, "Add the current RMP commit (short hash) to the response of GET /api/coding/status, with a test"):
+   - Claude Code's commit `cea120b`, by Aura (Claude Code), touched `app/api/server.py` (`rmp_commit` from `git rev-parse --short HEAD`, `null` outside git) and a test. RMP's run passed, and the evaluator accepted the reply.
+   - An "approve" Kirill sent before the card was refused by the provenance check, which asked again. The next approve was confirmed.
+   - The full suite on the exact commit passed.
+   - The deploy unit held the code-reload lock, fast-forwarded `main` (`f356adb..cea120b`), pushed, restarted rmp-api and rmp-worker, and passed health, readiness and the canary, all in 28 s. It then started the reply run, whose judged reply reached Slack, and the task completed.
+   - CI on `cea120b`: success (run 36967544033). `GET /api/coding/status` now returns `rmp_commit: cea120b`.
+
+**Deviations:**
+- **No PR acceptance:** Kirill ruled his other repositories out of bounds (fix 5), and the token has no write access to them. The PR path stays in the code and its hermetic tests, unused.
+- **A stuck watcher:** my monitoring loop during the self-deploy missed the task's completion and waited until Kirill restarted Cursor. The system was not affected: the deploy had finished at 05:08 UTC.
+
+**Final state:**
+- **Readiness:** 43 pass, 2 warn, 0 fail. The warnings are telemetry (by design) and `vector_sync` (one registry entry awaiting the nightly reconcile).
+- **The coding invariants** pass on real data: `approved_deploys` (1 shipped change, approved), `deploy_verification` (1 self-deploy, verified), `coding_units` (0 orphans).
+- **Acceptance targets:**
+  - isolation: step 2's probes;
+  - no unapproved deploy: the provenance refusal was observed live, and the invariant enforces it;
+  - verified deploys with automatic rollback: live for the deploy, hermetic for the rollback;
+  - a stop within seconds: 3 s live;
+  - 2026.9.7: the probes, canary and a live DM;
+  - the full suite and CI green, readiness 0 fail.
