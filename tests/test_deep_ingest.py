@@ -29,6 +29,7 @@ async def sessions(tmp_path, monkeypatch):
     monkeypatch.setattr(messages, "AsyncSessionLocal", maker)
     monkeypatch.setattr("app.openclaw_sessions.task_action_trace", lambda task_id, limit=40: [])
     monkeypatch.setattr("app.openclaw_sessions.task_tool_results", lambda task_id, tools, min_chars: [])
+    monkeypatch.setattr("app.coding.records.task_records", lambda task_id: [])
     yield maker
     await engine.dispose()
 
@@ -157,6 +158,33 @@ async def test_a_finished_task_gets_its_whole_document_tree(sessions, monkeypatc
     assert (doc.id, ingest.document_id("task:t0"), "related") in links
     sections = {s.title: s for s in await rows(sessions, DeepSection, DeepSection.document_id == doc.id)}
     assert sections["Conversation"].chunk_count == 3 and sections["Path history"].chunk_count == 1
+
+
+async def test_claude_work_is_a_section_of_the_task_and_each_conversation_its_own_document(sessions, monkeypatch):
+    token = "sk-ant-oat01-" + "Ab3_-" * 19
+    record = {"kind": "session", "id": "s1", "title": "Check the logs", "where": "Direct session in a scratch folder",
+              "status": "ended: task finished", "started_at": "2026-09-30T05:09:00+00:00",
+              "turns": [{"number": 1, "at": "2026-09-30T05:09:00+00:00", "message": "Find the errors in api.log",
+                         "outcome": "success", "reply": f"Two timeouts at 05:01, and the log printed {token}.",
+                         "files_edited": ["notes.md"], "commands": ["grep -n ERROR api.log"], "prs": [], "tokens": 900}]}
+    monkeypatch.setattr("app.coding.records.task_records", lambda task_id: [record])
+    await seed(sessions, task(), msg("m1", "Look at the logs."),
+               msg("m2", "Two timeouts at 05:01.", role="assistant", kind="reply", at=60))
+    async with sessions() as db:
+        assert await ingest.ingest_task(db, "t1") == "done"
+        await db.commit()
+    doc = (await rows(sessions, DeepDocument, DeepDocument.source_key == "task:t1"))[0]
+    assert [e["title"] for e in doc.toc] == ["Conversation", "Path history", "Claude sessions"]
+    units = {c.meta["unit"]: c for c in await rows(sessions, DeepChunk, DeepChunk.document_id == doc.id)}
+    assert "Aura asked: Find the errors in api.log" in units["claude"].text and "Files edited: notes.md" in units["claude"].text
+    [conversation] = await rows(sessions, DeepDocument, DeepDocument.kind == "claude_session")
+    assert conversation.title.startswith("Check the logs") and conversation.source_ref == {"conversation": "session", "id": "s1"}
+    assert conversation.source_at == datetime(2026, 9, 30, 5, 9)
+    text = " ".join(c.text for c in await rows(sessions, DeepChunk, DeepChunk.document_id == conversation.id))
+    assert "grep -n ERROR api.log" in text and "[REDACTED:api_key]" in text
+    assert token[:12] not in text and token[:12] not in units["claude"].text
+    links = {(l.source_id, l.target_id, l.relation) for l in await rows(sessions, DeepLink)}
+    assert (conversation.id, doc.id, "part_of") in links
 
 
 def test_a_fetched_page_is_taken_out_of_its_envelope_and_markers():

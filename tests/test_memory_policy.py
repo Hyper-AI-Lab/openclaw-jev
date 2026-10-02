@@ -12,6 +12,13 @@ def test_redact_openai_api_key():
     assert "[REDACTED:api_key]" in redacted
 
 
+def test_redact_the_token_shapes_on_this_host():
+    for token, label in (("sk-ant-oat01-" + "Ab3_-" * 19, "api_key"), ("sk-proj-" + "x1_Y-" * 10, "api_key"),
+                         ("github_pat_11ABCDEFG0" + "a1B2_" * 12, "github_token")):
+        redacted = redact_secrets(f"Claude printed {token} by mistake")
+        assert token[:12] not in redacted and f"[REDACTED:{label}]" in redacted
+
+
 def test_redact_slack_token():
     content = "token is xoxb-1234567890-abcdefghij"
     redacted = redact_secrets(content)

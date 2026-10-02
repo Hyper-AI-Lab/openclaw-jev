@@ -34,9 +34,10 @@ FINAL_REPLY_CHARS = 6000
 SECTION_SUMMARY_CHARS = 1200
 
 KIND_LABELS = {
-    "task": "Task record (conversation, route through the system, deliverables, actions)",
+    "task": "Task record (conversation, route through the system, deliverables, actions, Claude sessions)",
     "deliverable": "Aura's deliverable",
     "tool_document": "Page or file Aura read",
+    "claude_session": "Aura's conversation with Claude Code: what she asked, what it did and answered",
     "attachment": "File Kirill sent",
 }
 

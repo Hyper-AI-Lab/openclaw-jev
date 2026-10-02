@@ -16,7 +16,8 @@ from sqlalchemy import func, select
 from app.config import get_deep_memory_config
 from app.db.database import AsyncSessionLocal
 from app.db.models import (
-    DeepChunk, DeepContextReport, DeepDocument, DeepIngestJob, Event, MemoryItem, Task, TaskMessage, VectorOutbox,
+    DeepChunk, DeepContextReport, DeepDocument, DeepIngestJob, DeepSection, Event, MemoryItem, Task, TaskMessage,
+    VectorOutbox,
 )
 from app.production.readiness import CheckResult
 
@@ -299,6 +300,35 @@ async def check_task_documents() -> CheckResult:
     return CheckResult("task_documents", "pass", f"All {len(user)} finished user task(s) have enriched documents", {})
 
 
+async def check_claude_records() -> CheckResult:
+    """Every user task that finished with Claude work has that work in its task document within 30 minutes."""
+    from app.coding.records import has_records
+    from app.deep_memory.ingest import document_id, ingestible, task_source_key
+    from app.orchestrator.decision_engine import TERMINAL_STATUSES
+
+    if not get_deep_memory_config().get("enabled"):
+        return CheckResult("claude_records", "pass", "Deep memory disabled", {})
+    now = datetime.utcnow()
+    async with AsyncSessionLocal() as db:
+        tasks = (await db.execute(
+            select(Task).where(
+                Task.status.in_(TERMINAL_STATUSES), Task.updated_at >= _since(),
+                Task.updated_at < now - timedelta(minutes=ENRICH_WITHIN_MIN))
+        )).scalars().all()
+        worked = [t for t in tasks if ingestible(t) and await asyncio.to_thread(has_records, t.id)]
+        recorded = set((await db.execute(
+            select(DeepSection.document_id).where(
+                DeepSection.document_id.in_([document_id(task_source_key(t.id)) for t in worked]),
+                DeepSection.path == "Claude sessions")
+        )).scalars()) if worked else set()
+    missing = [t.id for t in worked if document_id(task_source_key(t.id)) not in recorded]
+    if missing:
+        return CheckResult("claude_records", "fail",
+                           f"{len(missing)} finished task(s) with Claude work lack it in their memory document after "
+                           f"{ENRICH_WITHIN_MIN} min", {"task_ids": missing[:20]})
+    return CheckResult("claude_records", "pass", f"All {len(worked)} finished task(s) with Claude work have it in memory", {})
+
+
 async def check_deep_index_internal() -> CheckResult:
     """No content from canaries, heartbeats, cron runs, internal intents or intake placeholders in deep memory."""
     from app.deep_memory.ingest import ingestible
@@ -337,4 +367,4 @@ async def check_judged_followups() -> CheckResult:
     return CheckResult("judged_followups", "pass", f"All {len(followups)} follow-up(s) were accepted first", {})
 
 
-INVARIANT_CHECKS = (check_task_documents, check_deep_index_internal, check_judged_followups)
+INVARIANT_CHECKS = (check_task_documents, check_claude_records, check_deep_index_internal, check_judged_followups)

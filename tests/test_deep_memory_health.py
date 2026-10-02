@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.models import (
-    Base, DeepContextReport, DeepDocument, DeepIngestJob, Event, Task, TaskMessage, VectorOutbox,
+    Base, DeepContextReport, DeepDocument, DeepIngestJob, DeepSection, Event, Task, TaskMessage, VectorOutbox,
 )
 from app.deep_memory import health, index
 from app.deep_memory.ingest import document_id, task_source_key
@@ -141,6 +141,23 @@ async def test_every_finished_user_task_needs_an_enriched_document_after_30_minu
               DeepDocument(id=document_id(task_source_key("t-raw")), kind="task", source_key="task:t-raw", status="raw"))
     result = await health.check_task_documents()
     assert result.status == "fail" and sorted(result.details["task_ids"]) == ["t-none", "t-raw"]
+
+
+async def test_a_finished_task_with_claude_work_needs_it_in_its_memory_document_after_30_minutes(sessions, monkeypatch):
+    switches(monkeypatch)
+    worked = {"t-in", "t-out", "t-fresh", "t-canary"}
+    monkeypatch.setattr("app.coding.records.has_records", lambda task_id: task_id in worked)
+    doc_in, doc_out = document_id(task_source_key("t-in")), document_id(task_source_key("t-out"))
+    await add(sessions, task("t-in"), task("t-out"), task("t-plain"), task("t-fresh", ended_minutes=10),
+              task("t-canary", task_type="canary", goal="RMP CANARY: Reply with exactly CANARY_OK"),
+              DeepDocument(id=doc_in, kind="task", source_key="task:t-in", status="enriched"),
+              DeepDocument(id=doc_out, kind="task", source_key="task:t-out", status="enriched"),
+              DeepSection(id="s-in", document_id=doc_in, ordinal=4, title="Claude sessions", path="Claude sessions"),
+              DeepSection(id="s-out", document_id=doc_out, ordinal=3, title="Actions", path="Actions"))
+    result = await health.check_claude_records()
+    assert result.status == "fail" and result.details["task_ids"] == ["t-out"]
+    worked.discard("t-out")
+    assert (await health.check_claude_records()).status == "pass"
 
 
 async def test_no_internal_task_has_a_deep_memory_document(sessions):

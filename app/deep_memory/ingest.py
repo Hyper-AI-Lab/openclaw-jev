@@ -77,7 +77,7 @@ DRAIN_BATCH = 20
 MAX_BACKOFF_SEC = 3600
 # A claimed job is hidden from other drainers this long; a crash mid-job frees it afterwards.
 CLAIM_LEASE_SEC = 300
-TASK_SECTIONS = ("Conversation", "Path history", "Deliverables", "Actions")
+TASK_SECTIONS = ("Conversation", "Path history", "Deliverables", "Actions", "Claude sessions")
 _HEADING = re.compile(r"^ {0,3}#{1,6}[ \t]+\S", re.MULTILINE)
 # OpenClaw wraps fetched pages in these markers, after a security preamble.
 _UNTRUSTED = re.compile(
@@ -146,6 +146,17 @@ def _local(dt: Optional[datetime]) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(ZoneInfo(USER_TIMEZONE)).strftime("%Y-%m-%d %H:%M")
+
+
+def _utc(stamp: Optional[str]) -> Optional[datetime]:
+    """An ISO timestamp as the naive UTC the database keeps; None when missing or unreadable."""
+    try:
+        dt = datetime.fromisoformat(stamp) if stamp else None
+    except ValueError:
+        return None
+    if dt is None or dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _clip(text: str, limit: int) -> str:
@@ -502,6 +513,7 @@ def _tool_title(tool: str, arguments: Dict[str, Any]) -> str:
 
 
 async def ingest_task(db: AsyncSession, task_id: str) -> str:
+    from app.coding.records import conversation_text, section_text, task_records
     from app.openclaw_sessions import task_action_trace, task_tool_results
 
     task = await db.get(Task, task_id)
@@ -541,6 +553,28 @@ async def ingest_task(db: AsyncSession, task_id: str) -> str:
     if trace:
         await w.unit(doc, await _task_section(w, doc, "Actions"), "actions", chunk_text(_actions_text(trace)),
                      **common, meta={"kind": "actions", "calls": len(trace)})
+
+    # What Claude did is in RMP's records, not in Aura's transcript: each conversation is also its own document.
+    claude = await asyncio.to_thread(task_records, task.id)
+    if claude:
+        await w.unit(doc, await _task_section(w, doc, "Claude sessions"), "claude",
+                     chunk_text(redact_secrets(section_text(claude))),
+                     **common, meta={"kind": "claude_sessions", "conversations": len(claude)})
+    for record in claude:
+        started = _utc(record["started_at"]) or task.updated_at
+        claude_doc = await _document_from_text(
+            w,
+            source_key=f"claude:{task.id}:{record['id']}",
+            kind="claude_session",
+            title=_clip(f"{record['title']} ({record['where']})", 200),
+            text=redact_secrets(conversation_text(record)),
+            fields={"task_id": task.id, "session_key": task.openclaw_session_key, "source_at": started,
+                    "source_ref": {"conversation": record["kind"], "id": record["id"]}, "process_run_id": run},
+            chunk_fields={"task_id": task.id, "session_key": task.openclaw_session_key, "process_run_id": run,
+                          "role": "tool", "source_at": started,
+                          "meta": {"kind": "claude_session", "conversation": record["kind"]}},
+        )
+        await w.link(claude_doc.id, doc.id, "part_of", tool="claude")
 
     threshold = int(get_deep_memory_config().get("tool_document_min_chars") or 2000)
     results = await asyncio.to_thread(task_tool_results, task.id, tools=CONTENT_TOOLS, min_chars=threshold)

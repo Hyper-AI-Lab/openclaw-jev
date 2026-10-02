@@ -3,9 +3,10 @@ import re
 from typing import Dict, FrozenSet, Tuple
 
 SECRET_PATTERNS = [
-    (re.compile(r"sk-[a-zA-Z0-9]{20,}"), "[REDACTED:api_key]"),
+    # sk-..., sk-proj-... (OpenAI) and sk-ant-oat01-... (Claude Code's login token).
+    (re.compile(r"sk-[a-zA-Z0-9_-]{20,}"), "[REDACTED:api_key]"),
     (re.compile(r"xox[baprs]-[a-zA-Z0-9-]+"), "[REDACTED:slack_token]"),
-    (re.compile(r"ghp_[a-zA-Z0-9]{20,}"), "[REDACTED:github_token]"),
+    (re.compile(r"(?:ghp|github_pat)_[a-zA-Z0-9_]{20,}"), "[REDACTED:github_token]"),
     (re.compile(r"Bearer\s+[a-zA-Z0-9._-]+", re.I), "Bearer [REDACTED]"),
     (
         re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+"),
