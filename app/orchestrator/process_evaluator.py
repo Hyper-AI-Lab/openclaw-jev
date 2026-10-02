@@ -135,10 +135,26 @@ def format_external_evidence(evidence: Optional[Dict[str, Any]]) -> str:
         lines.append("Diffstat:\n" + str(evidence["diffstat"]).strip()[-2000:])
     if evidence.get("secrets"):
         lines.append(f"Secret scan: {len(evidence['secrets'])} finding(s); nothing deploys until they are removed")
+    diff = _read_bounded(evidence.get("diff_file"), DIFF_CHARS)
+    if diff:
+        lines.append(f"Diff (RMP's copy{', cut short' if len(diff) == DIFF_CHARS else ''}):\n{diff}")
     deploy = evidence.get("deploy")
     if deploy:
         lines.append(f"After Kirill's approval: {deploy.get('status')}. {str(deploy.get('summary') or '')[:1000]}")
     return "\n".join(lines)
+
+
+DIFF_CHARS = 8000
+
+
+def _read_bounded(path: Optional[str], limit: int) -> str:
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read(limit)
+    except OSError:
+        return ""
 
 
 def format_artifacts(artifacts: List[Dict[str, Any]]) -> str:

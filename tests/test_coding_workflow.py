@@ -287,6 +287,8 @@ async def test_an_approved_change_to_auras_own_code_deploys_and_gets_a_judged_re
     assert "Hyper-AI-Lab/openclaw-jev" in rec.runs[0]["system_prompt"] and "pytest" in rec.runs[0]["system_prompt"]
     assert rec.judged[0]["external_evidence"]["tests"]["ok"] is True
     assert rec.judged[0]["external_evidence"]["commits"][0]["sha"] == HEAD
+    assert rec.judged[0]["external_evidence"]["diff_file"].endswith("/t1/diff-1.patch")
+    assert prompts.ROUND_STAGE in rec.judged[0]["process_brief"] and prompts.FINAL_STAGE in rec.judged[-1]["process_brief"]
     assert rec.provenance_calls and rec.deploys[0]["head"] == HEAD and rec.deploys[0]["target"] == "self"
     assert rec.judged[-1]["agent_response"] == FINAL and rec.judged[-1]["external_evidence"]["deploy"]["status"] == "deployed"
     assert rec.slack[-1] == (FINAL, "reply")

@@ -39,6 +39,7 @@ with workflow.unsafe.imports_passed_through():
     from app.activities.openclaw_activities import notify_slack_user, send_to_openclaw
     from app.coding import prompts
     from app.coding.deploy import restarts_for
+    from app.coding.units import RUNS_DIR
     from app.notification_policy import sanitize_user_facing_text
     from app.orchestrator.process_brief import user_words
     from app.orchestrator.step_predicates import extract_agent_facts
@@ -284,16 +285,18 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
 
     def _evidence(self, claude: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
         collected = evidence.get("collected") or {}
+        diff = f"{RUNS_DIR}/{self._ctx['task_id']}/diff-{evidence['number']}.patch" if evidence.get("number") else None
         return {"claude": {"outcome": claude.get("kind"), "num_turns": claude.get("num_turns"),
                            "commands": claude.get("commands"), "files_edited": claude.get("files_edited")},
                 "tests": evidence.get("tests"), "commits": collected.get("commits"),
-                "diffstat": collected.get("diffstat"), "secrets": collected.get("secrets")}
+                "diffstat": collected.get("diffstat"), "secrets": collected.get("secrets"), "diff_file": diff}
 
-    async def _judge_round(self, brief: Dict[str, Any], reply: str, external: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def _judge_round(self, brief: Dict[str, Any], reply: str, external: Dict[str, Any],
+                           stage: str = prompts.ROUND_STAGE) -> Optional[Dict[str, Any]]:
         return await self._judge(
             {"task_id": self._ctx["task_id"], "user_intent": self._ctx["intent"], "agent_response": reply,
-             "process_run_id": self.process_run_id, "attempt": self._round, "process_brief": prompts.brief_text(brief),
-             "external_evidence": external},
+             "process_run_id": self.process_run_id, "attempt": self._round,
+             "process_brief": f"{prompts.brief_text(brief)}\n\n{stage}", "external_evidence": external},
             session_key=self._ctx["session_key"], user_intent=self._ctx["intent"],
             task_type=self._ctx["task_type"], tags=self._ctx["tags"])
 
@@ -317,6 +320,7 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
             except ActivityError as exc:
                 return await self._fail(f"RMP's verification of round {self._round} failed: {_cause(exc)}. Nothing shipped; "
                                         f"the work is kept on branch {self._job['branch']}.")
+            evidence["number"] = self._runs
             problems, feedback, review = self._checks(claude, evidence), [], None
             if not problems:
                 review = await self._unless_stopped(workflow.start_activity(
@@ -335,7 +339,7 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                     return await self._reviewer_unavailable(self._ctx["task_id"], self._ctx["session_key"],
                                                             self._ctx["intent"], self._ctx["task_type"], self._ctx["tags"])
                 if judged["verdict"] != "accept":
-                    problems.append(f"the evaluator: {judged['issues']}")
+                    problems.append(f"the evaluator: {judged['issues'].rstrip('.')}")
                     feedback += [item for item in (judged.get("command_to_aura"), judged.get("issues")) if item]
             if problems and batch < int(settings["max_rounds"]):
                 # An approval sent before the card is no instruction for Claude; the gate asks again.
@@ -451,7 +455,7 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                                                        start_to_close_timeout=AURA_TURN)
             text = str(((response.get("result") or {}).get("payloads") or [{}])[0].get("text") or "")
             draft = sanitize_user_facing_text(extract_agent_facts(text).get("body") or text)
-            judged = await self._judge_round(brief, draft, external)
+            judged = await self._judge_round(brief, draft, external, prompts.FINAL_STAGE)
             if judged is not None and judged["verdict"] == "accept":
                 message = draft
                 break

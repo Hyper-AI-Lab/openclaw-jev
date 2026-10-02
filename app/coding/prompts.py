@@ -28,6 +28,12 @@ REPORT_SCHEMA = {
 
 CONTINUE_PROMPT = ("You were interrupted by the usage limit. Continue the task from where you stopped, "
                    "then commit and finish with the structured report.")
+# What the evaluator is told about where the reply stands in a coding task.
+ROUND_STAGE = ("STAGE: this reply goes to Kirill with the approval card. Nothing has shipped yet: RMP pushes the branch and "
+               "opens the pull request, or deploys Aura's own code, only after he approves. Judge whether the change does what "
+               "the brief asks and whether the reply matches RMP's evidence; do not require a pull request, a push or a deploy.")
+FINAL_STAGE = ("STAGE: Kirill approved the change and RMP shipped it; what RMP did is in the external evidence. The reply must "
+               "report that accurately.")
 
 
 def _json(text: str) -> Optional[Dict[str, Any]]:

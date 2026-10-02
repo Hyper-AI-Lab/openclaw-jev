@@ -80,6 +80,17 @@ def test_code_claims_are_judged_against_the_evidence_rmp_recorded():
     assert "tests pass only when RMP's own test run passed" in prompt
 
 
+def test_the_evaluator_sees_a_bounded_copy_of_the_diff(tmp_path):
+    from app.orchestrator.process_evaluator import DIFF_CHARS, format_external_evidence
+
+    diff = tmp_path / "diff-1.patch"
+    diff.write_text("+## Testing\n+Run `npm test`.\n")
+    assert "Diff (RMP's copy):\n+## Testing\n+Run `npm test`." in format_external_evidence({**EVIDENCE, "diff_file": str(diff)})
+    diff.write_text("+x\n" * DIFF_CHARS)
+    assert "Diff (RMP's copy, cut short):" in format_external_evidence({"diff_file": str(diff)})
+    assert "Diff (RMP's copy" not in format_external_evidence({**EVIDENCE, "diff_file": str(tmp_path / "missing.patch")})
+
+
 def test_a_final_coding_reply_is_judged_against_what_shipped():
     from app.orchestrator.process_evaluator import format_external_evidence
 
