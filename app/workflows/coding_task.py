@@ -46,10 +46,10 @@ with workflow.unsafe.imports_passed_through():
     from app.task_registry.stop_command import is_whole_message_stop
     from app.workflows.approval import CLOSE_AFTER, REMINDER_AFTER, gate_decision
     from app.workflows.judgment import EvaluatorRetry
+    from app.workflows.timeouts import AURA_TURN
     from app.workflows.user_messages import AttachedMessages
 
 QUICK = timedelta(seconds=30)
-AURA_TURN = timedelta(minutes=45)
 SLOT_POLL = timedelta(minutes=2)
 USAGE_LIMIT_WAIT = timedelta(hours=1)
 BRIEF_QUESTIONS = 2

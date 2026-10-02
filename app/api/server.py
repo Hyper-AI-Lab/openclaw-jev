@@ -1583,6 +1583,106 @@ async def coding_job_view(task_id: str, db: AsyncSession = Depends(get_db)):
                                "payload": e.event_payload} for e in events]}
 
 
+class ClaudeSessionRequest(BaseModel):
+    session_key: str = ""
+    task_id: str = ""
+    workspace: str = "repo"
+    title: str = ""
+
+
+class ClaudeMessageRequest(BaseModel):
+    message: str
+
+
+async def _claude_event(db: AsyncSession, task_id: str, event_type: str, payload: Dict[str, Any]) -> None:
+    db.add(Event(correlation_id=task_id, entity_type="task", entity_id=task_id, event_type=event_type,
+                 event_payload=payload))
+    await db.commit()
+
+
+async def _live_task(db: AsyncSession, task_id: Optional[str]) -> Task:
+    task = await db.get(Task, task_id) if task_id else None
+    if task is None or task.status in TERMINAL_TASK_STATUSES:
+        raise HTTPException(status_code=409, detail="Claude sessions belong to a task that is still running")
+    return task
+
+
+@app.post("/api/claude/sessions")
+async def claude_session_start(req: ClaudeSessionRequest, db: AsyncSession = Depends(get_db)):
+    from app.coding import direct
+    from app.config import get_coding_config
+
+    task = await _live_task(db, req.task_id or direct.task_of(req.session_key))
+    try:
+        session = await asyncio.to_thread(direct.create, task.id, req.workspace, req.title, get_coding_config())
+    except direct.SessionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(status_code=502, detail=f"preparing the workspace failed: {(exc.stderr or '')[-300:]}")
+    await _claude_event(db, task.id, "claude.session_started",
+                        {"session": session["id"], "workspace": session["workspace"], "title": session["title"]})
+    return session
+
+
+@app.get("/api/claude/sessions")
+async def claude_sessions_view(task_id: str = ""):
+    from app.coding import direct
+
+    return {"sessions": await asyncio.to_thread(direct.sessions, task_id or None)}
+
+
+@app.get("/api/claude/sessions/{session_id}")
+async def claude_session_view(session_id: str):
+    from app.coding import direct
+
+    try:
+        return await asyncio.to_thread(direct.load, session_id)
+    except direct.SessionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/claude/sessions/{session_id}/messages")
+async def claude_session_send(session_id: str, req: ClaudeMessageRequest, db: AsyncSession = Depends(get_db)):
+    from app.coding import direct
+    from app.config import get_coding_config
+
+    try:
+        session = await asyncio.to_thread(direct.load, session_id)
+    except direct.SessionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    await _live_task(db, session["task_id"])
+    try:
+        started = await asyncio.to_thread(direct.send, session_id, req.message, get_coding_config())
+    except direct.SessionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    await _claude_event(db, session["task_id"], "claude.turn_started",
+                        {"session": session_id, "turn": started["turn"], "chars": len(req.message)})
+    return started
+
+
+@app.get("/api/claude/sessions/{session_id}/turns/{number}")
+async def claude_turn_view(session_id: str, number: int, wait: float = 0):
+    from app.coding import direct
+
+    try:
+        return await direct.wait(session_id, number, wait)
+    except direct.SessionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/claude/sessions/{session_id}/end")
+async def claude_session_end(session_id: str, db: AsyncSession = Depends(get_db)):
+    from app.coding import direct
+
+    try:
+        session = await asyncio.to_thread(direct.end, session_id, "ended by Aura")
+    except direct.SessionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    await _claude_event(db, session["task_id"], "claude.session_ended",
+                        {"session": session_id, "turns": session["turns"], "stopped": session["stopped"]})
+    return session
+
+
 @app.get("/api/deep_memory/status")
 async def deep_memory_status():
     from app.deep_memory.health import deep_memory_status as status

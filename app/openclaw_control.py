@@ -199,7 +199,16 @@ async def _abort_with_cli(session_key: str) -> Dict[str, Any]:
 
 
 async def abort_task_runs(task_id: str, *, reason: str) -> List[Dict[str, Any]]:
-    """Abort every session of the task that may still run, and record what the gateway answered."""
+    """Abort every session of the task that may still run, and record what the gateway answered.
+
+    Aura's Claude sessions in the task end first: their turns are her tool calls.
+    """
+    from app.coding.direct import end_task_sessions
+
+    try:
+        await asyncio.to_thread(end_task_sessions, task_id, reason)
+    except Exception as exc:
+        logger.warning("Ending the Claude sessions of task %s failed: %s", task_id[:8], exc)
     keys = await asyncio.to_thread(task_run_session_keys, task_id)
     if not keys:
         return []

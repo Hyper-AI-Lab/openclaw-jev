@@ -92,6 +92,23 @@ async def _is_coding_task(db, task: Task) -> bool:
     return found.scalars().first() is not None
 
 
+async def _end_claude_sessions_of_finished_tasks(db) -> int:
+    """A Claude session outlives its task only when a stop went astray; it ends with the task."""
+    from app.coding import direct
+
+    open_sessions = [s for s in await asyncio.to_thread(direct.sessions) if s["status"] == "open"]
+    if not open_sessions:
+        return 0
+    rows = await db.execute(select(Task.id, Task.status).where(Task.id.in_({s["task_id"] for s in open_sessions})))
+    statuses = dict(rows.all())
+    ended = 0
+    for session in open_sessions:
+        if statuses.get(session["task_id"], "missing") in TERMINAL_STATUSES | {"missing"}:
+            await asyncio.to_thread(direct.end, session["id"], "task finished")
+            ended += 1
+    return ended
+
+
 async def _close_orphaned_coding_tasks(client: Client, db, now: datetime, stats: dict) -> list:
     """A coding task whose workflow is gone gets its units stopped and a notice; it is never re-judged."""
     from app.activities.coding_activities import stop_task_units
@@ -496,6 +513,7 @@ async def reconcile_once() -> dict:
 
     async with AsyncSessionLocal() as db:
         stats["coding_orphans_closed"] = len(await _close_orphaned_coding_tasks(client, db, now, stats))
+        stats["claude_sessions_closed"] = await _end_claude_sessions_of_finished_tasks(db)
         # Fast path: OpenClaw finished but worker died before Slack notify.
         orphan_candidates = await db.execute(
             select(Task).where(Task.status.in_(["running", "created"]))
@@ -726,11 +744,14 @@ async def close_runs_of_ended_tasks(db, now: datetime) -> int:
 
 
 def prune_coding_jobs() -> list:
-    """Coding job checkouts past their retention, unless a run of theirs is still live."""
+    """Coding job checkouts past their retention, unless a run of theirs is still live, and the
+    workspaces of Claude sessions that ended as long ago."""
+    from app.coding import direct
     from app.coding.workspace import prune
     from app.config import get_coding_config
 
-    return prune(int(get_coding_config()["job_retention_days"]))
+    days = int(get_coding_config()["job_retention_days"])
+    return prune(days) + direct.prune(days)
 
 
 async def reconciler_loop(stop_event: asyncio.Event):

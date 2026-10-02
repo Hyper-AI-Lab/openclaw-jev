@@ -20,6 +20,7 @@ with workflow.unsafe.imports_passed_through():
     from app.notification_policy import sanitize_user_facing_text
     from app.orchestrator.prompt_policy import build_generic_execute_prompt
     from app.orchestrator.step_predicates import decide_status_from_predicates, extract_agent_facts
+    from app.workflows.timeouts import AURA_TURN
 
 
 @workflow.defn
@@ -92,7 +93,7 @@ class GenericExecuteChildWorkflow:
                     "task_type": payload.get("task_type") or "",
                     "tags": payload.get("tags") or [],
                 },
-                start_to_close_timeout=timedelta(minutes=45),
+                start_to_close_timeout=AURA_TURN,
                 retry_policy=RetryPolicy(maximum_attempts=2, backoff_coefficient=2.0),
                 heartbeat_timeout=timedelta(minutes=12),
             )

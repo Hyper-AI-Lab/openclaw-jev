@@ -261,6 +261,9 @@ DEFAULT_CODING = {
     "verify_timeout_sec": 1800,
     "job_retention_days": 14,
     "diff_limit_chars": 200_000,
+    # Aura's direct Claude sessions (app/coding/direct.py): one turn's limit, and turns running at once.
+    "direct_turn_timeout_sec": 3600,
+    "direct_max_running": 2,
     # The repositories coding tasks may change. "self" deploys to this host after Kirill's approval;
     # "pr" pushes a branch and opens a pull request. {venv} is the shared read-only test venv.
     "repositories": {

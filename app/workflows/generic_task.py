@@ -50,6 +50,7 @@ with workflow.unsafe.imports_passed_through():
     from app.orchestrator.step_predicates import extract_agent_facts
     from app.workflows.judgment import EvaluatorRetry
     from app.workflows.recall_phase import DeepRecallPhase
+    from app.workflows.timeouts import AURA_TURN
     from app.workflows.user_messages import AttachedMessages
 
 
@@ -653,7 +654,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                     "tags": tags,
                     **({"session_suffix": f"__r{attempt + 1}"} if fresh else {}),
                 },
-                start_to_close_timeout=timedelta(minutes=45),
+                start_to_close_timeout=AURA_TURN,
             )
             try:
                 clean_result = rework_resp["result"]["payloads"][0]["text"]

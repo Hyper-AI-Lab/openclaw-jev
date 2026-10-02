@@ -197,6 +197,15 @@ def _jsonl_hard_failure(lines: list, start_time: float) -> Optional[str]:
     return last
 
 
+def _reply_deadline(poll_deadline: float, task_id: Optional[str], deadline: Optional[float]) -> float:
+    """Aura's reply deadline, moved on while one of her Claude turns in the task works; a hard ``deadline`` stays."""
+    from app.coding.direct import task_turn_running
+
+    if task_id and deadline is None and task_turn_running(task_id):
+        return max(poll_deadline, time.time() + 120)
+    return poll_deadline
+
+
 def _jsonl_agent_stalled(lines: list, start_time: float) -> bool:
     """True when the latest post-dispatch turn ended without a usable reply."""
     last_assistant: Optional[dict] = None
@@ -544,6 +553,8 @@ async def _dispatch_openclaw_session(
             while time.time() < poll_deadline:
                 _safe_activity_heartbeat()
                 await _maybe_touch_liveness()
+                if time.time() > poll_deadline - 60:
+                    poll_deadline = await asyncio.to_thread(_reply_deadline, poll_deadline, task_id, deadline)
                 if session_id and session_id not in seen_session_ids:
                     seen_session_ids.append(session_id)
                 latest = get_session_entry(

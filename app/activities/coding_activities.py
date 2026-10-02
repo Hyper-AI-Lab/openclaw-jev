@@ -233,8 +233,13 @@ def live_task_units(task_id: str) -> List[str]:
 
 
 def stop_task_units(task_id: str) -> List[str]:
-    """Stop every live coding unit of a task. A Claude run's stop is recorded first, so it reads as stopped."""
-    stopped = []
+    """Stop every live coding unit of a task, and end Aura's Claude sessions in it.
+
+    A Claude run's stop is recorded first, so it reads as stopped.
+    """
+    from app.coding.direct import end_task_sessions
+
+    stopped = end_task_sessions(task_id, "stopped")
     root = RUNS_DIR / task_id
     for path in sorted(root.iterdir()) if root.is_dir() else []:
         run = runner.Run(task_id, int(path.name), RUNS_DIR) if path.is_dir() and path.name.isdigit() else None

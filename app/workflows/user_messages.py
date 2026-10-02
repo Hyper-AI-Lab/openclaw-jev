@@ -12,6 +12,7 @@ with workflow.unsafe.imports_passed_through():
     from app.orchestrator.process_brief import format_user_catchup, user_words
     from app.orchestrator.step_predicates import extract_agent_facts
     from app.task_registry.stop_command import is_whole_message_stop
+    from app.workflows.timeouts import AURA_TURN
 
 
 def _is_user_message(message: str) -> bool:
@@ -66,7 +67,7 @@ class AttachedMessages:
                 "task_type": task_type,
                 "tags": tags,
             },
-            start_to_close_timeout=timedelta(minutes=45),
+            start_to_close_timeout=AURA_TURN,
         )
         try:
             text = resp["result"]["payloads"][0]["text"]

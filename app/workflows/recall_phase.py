@@ -28,6 +28,7 @@ with workflow.unsafe.imports_passed_through():
     from app.orchestrator.process_brief import compose_executor_memory
     from app.orchestrator.step_predicates import extract_agent_facts
     from app.workflows.deep_recall import DeepRecallWorkflow, recall_workflow_id
+    from app.workflows.timeouts import AURA_TURN
 
 FOLLOWUP_JUDGED_ATTEMPTS = 3
 
@@ -196,7 +197,7 @@ class DeepRecallPhase:
             send_to_openclaw,
             {"message": prompt, "task_id": task_id, "session_key": session_key, "task_type": task_type,
              "tags": tags, "session_suffix": suffix},
-            start_to_close_timeout=timedelta(minutes=45),
+            start_to_close_timeout=AURA_TURN,
         )
         try:
             text = resp["result"]["payloads"][0]["text"]

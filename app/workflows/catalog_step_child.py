@@ -19,6 +19,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from app.orchestrator.prompt_policy import build_catalog_step_prompt
     from app.orchestrator.step_predicates import decide_status_from_predicates
+    from app.workflows.timeouts import AURA_TURN
 
 
 @workflow.defn
@@ -74,7 +75,7 @@ class CatalogStepChildWorkflow:
             execution_response = await workflow.execute_activity(
                 send_to_openclaw,
                 {"message": prompt, "task_id": task_id, "session_key": session_key},
-                start_to_close_timeout=timedelta(minutes=45),
+                start_to_close_timeout=AURA_TURN,
                 retry_policy=RetryPolicy(maximum_attempts=2, backoff_coefficient=2.0),
                 heartbeat_timeout=timedelta(minutes=12),
             )
