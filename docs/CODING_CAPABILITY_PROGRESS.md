@@ -631,3 +631,67 @@ Listeners in the ephemeral range are test servers and containerd's streaming end
 
   The probe's files were removed.
 - **Deploy:** `main` was fast-forwarded to `4a2e8c2` with no active tasks. The code watcher restarted the API and worker within a minute, with no errors. Readiness is 38/1/0, the gateway's `/readyz` returns 200, and `ops/canary.sh` gives CANARY OK. The new reconciler pass runs without warnings.
+
+---
+
+## Step 11 — Deploy pipelines
+
+**Date:** 2026-10-02.
+
+**What changed:**
+- **The deploy activity** (`deploy_coding_change`, in the worker):
+  - **Other repositories:** it pushes the approved head from the review repository as the job's branch, through the askpass that reads the token file. It opens the PR with `gh pr create`, giving `GH_TOKEN` only to that command, with Aura's judged summary and RMP's test result as the body, and returns the link.
+  - **Aura's own code:**
+    1. It fetches the approved commit from the review repository into the live repo (`refs/aura/<task>`). If `main` is no longer its ancestor, it returns `needs_rebase`.
+    2. It runs the full suite on exactly that commit, in a clean checkout owned by `aura-coder` in hardened units, never as root.
+    3. It writes the deploy spec and starts the detached root unit `aura-deploy-<task>` (`ops/coding_deploy.py`, with the API's environment files). A retried activity that finds the spec does not start a second deploy.
+- **The workflow:**
+  - A hand-off ends the run as `deploying` (the task's status too), keeping the coding slot.
+  - `needs_rebase` gives the job today's `main`: a bundle in a root-owned, readable directory (`/srv/aura-code/bundles/<task>`, never inside the checkout) and the review repository's new base. Claude rebases in the same session, and the round goes through review, the evaluator and a new card, because the rebased change is approved again.
+  - A run started with `report` (by the deploy unit) only writes and judges the final reply, with the deploy's result as evidence, then releases the slot.
+- **The deploy unit** (`app/coding/deploy.py` `self_deploy`, run by `ops/coding_deploy.py`):
+  - It imports everything it uses before `main` moves. It holds `/run/rmp-code-reload.lock`, so the code watcher cannot restart anything during the deploy.
+  - It waits until no other user task is active (a `deploying` task does not count; at most 2 hours, then `postponed` with `main` unchanged). It refuses if `main` moved meanwhile.
+  - It checks each touched mirror for drift: a live file that matches no committed version of its path means a hand edit, which blocks the deploy before `main` moves. A live copy that is only behind is updated.
+  - It takes a readiness baseline, fast-forwards `main` and pushes it.
+  - It writes the commit's version of changed mirror files and deletes removed ones: `plugins/`, `web-stack/`, `systemd/` and `.cursor/rules/`. It runs `pip install -r` when `requirements.txt` changed and `daemon-reload` for units, then restarts only what changed (`restarts_for`).
+  - **Checks** (`app/coding/deploy_checks.py`):
+    - RMP's `/health`;
+    - the gateway's `/readyz` when it restarted;
+    - no readiness check failing that was not failing before;
+    - the canary, whose "CANARY OK" is required (a skip while Kirill is busy is retried, then reported as skipped).
+  - **On failure** (or an exception while applying), it commits a revert of the range, restores the mirrors, restarts the same services, checks again and pushes the revert.
+  - It records the result as a `coding.deploy` event and in the task's context, then starts a fresh run of `workflow-<task>`, which replies on the new code. Nothing replays the old history across the change, even when the change touches the coding workflow itself.
+- **The reconciler** leaves a `deploying` task to its deploy unit while the unit lives or within 4 hours. A deploy that never reported back is closed with "please check main and the deploy log".
+- Tests:
+  - `tests/test_coding_deploy.py` (13), against a real live repo, its GitHub remote, the review repository and mirrors, with a recording host:
+    - fast-forward, push, sync and restarting only what changed;
+    - pip and daemon-reload before the restart;
+    - a hand-edited mirror blocks before `main` moves, while a mirror that is only behind is updated;
+    - the full rollback: the revert's tree equals the old tree, mirrors are restored, restarted twice, and the revert pushed;
+    - the idle wait and postponing, and `main` moving meanwhile;
+    - fast-forward or rebase, and the rebase bundle;
+    - the PR with the token given to `gh` only;
+    - one hand-off as root, with a failed start forgotten;
+    - the exact-commit suite on a clean checkout;
+    - the deploy unit holding the lock, recording the result and starting the reply run.
+  - The harness (+2): the hand-off keeps the slot and the report run replies, and a rebase round leads to a new card. Reconciler (+1): a deploying task. A sixth recorded history (`rebase_then_approve`); all six were re-recorded on the final code.
+
+**Deviations and why:**
+- **Fast-forward and push happen in the deploy unit, under the code-reload lock, not before the hand-off.** If `main` moved first, the watcher would restart the worker under the still-running deploy activity, and the worker would come back on the new code.
+- **The exact-commit suite runs as `aura-coder` in a clean checkout,** not in a root-owned RMP worktree, so code written by Claude never runs as root.
+- **The reply comes from a fresh run of `workflow-<task>`,** started by the deploy unit, not from the original run waiting through the restart. That is what makes the deploy safe for changes to the coding workflow itself.
+- **The drift rule tolerates a mirror that is only behind:** the live web stack has one file older than the repo (the User-Agent string from before the repository rename in `371c87d`). A strict comparison would block every web-stack deploy over a harmless lag.
+- **A failed rebase does not loop silently:** the rebased change is reviewed, judged and approved again, because it is no longer the commit Kirill approved.
+
+**Verification:**
+- **Tests:** full suite 985 passed, 4 skipped; node 23/23.
+- **Live, nothing shipped:**
+  - drift on the four real mirrors: none (the web stack's older file counts as behind);
+  - `deploy_checks.run` on production: health, readiness (baseline empty) and a real canary passed in 27 s;
+  - the exact-commit suite on `main` (`d45aed1`) as `aura-coder` in a clean checkout: 968 passed, 5 skipped, node 22 passed and 1 skipped (362 s);
+  - a root transient unit with the deploy unit's properties ran as uid 0 with the database settings from the environment files, importing from the live repo.
+
+  The probe's files were removed. A real self-deploy and a real PR are step 14's acceptance with Kirill.
+- **Deploy:** `main` was fast-forwarded to `ec55c06` with no active tasks. The watcher restarted the API and worker (health OK), with no errors. Readiness is 38/1/0, the gateway's `/readyz` returns 200, and the canary gives CANARY OK.
+- **Finding for Kirill:** the live `web-stack/backends/app/adapters/crawl4ai_adapter.py` still has the old User-Agent (`.../aura`). The first coding deploy that touches `web-stack/` brings it up to date.
