@@ -1,9 +1,10 @@
 """Prove the coding runner's host setup: isolation holds, and Claude Code answers on Kirill's plan.
 
-1. Preconditions: the aura-coder user, the pinned Claude Code, the managed settings and the firewall.
+1. Preconditions: the aura-coder user, the pinned Claude Code, the coding policy and the firewall.
 2. Isolation probes in a hardened unit, as aura-coder: secrets, /root, this host's services, private
    networks and system paths must be out of reach; the job directory, its home, its own ephemeral
-   test servers and Anthropic's API must work.
+   test servers and Anthropic's API must work; Claude Code's policy directory holds only the
+   coding policy.
 3. With a token: a real ``claude -p`` in a hardened unit reads a file and returns its phrase. The
    configured model is tried first, then the fallback; the result says which the plan allows.
 
@@ -37,11 +38,12 @@ from app.coding.units import (  # noqa: E402
 from app.config import RMP_DATA_DIR, RMP_ROOT, get_coding_config  # noqa: E402
 
 RECORD = Path(RMP_DATA_DIR) / "coding" / "claude_smoke.json"
-EXPECT_ALLOWED = {"write job dir", "write home", "own ephemeral server", "connect api.anthropic.com:443"}
+EXPECT_ALLOWED = {"write job dir", "write home", "own ephemeral server", "connect api.anthropic.com:443",
+                  "coding policy in place"}
 
 PROBE = r'''
-import json, os, socket, sys
-job = sys.argv[1]
+import hashlib, json, os, socket, sys
+job, policy_sha = sys.argv[1], sys.argv[2]
 results = {}
 def attempt(name, fn):
     try:
@@ -76,6 +78,13 @@ def own_server():
     with socket.create_connection(("127.0.0.1", srv.getsockname()[1]), timeout=3):
         pass
     srv.close()
+def coding_policy():
+    if sorted(os.listdir("/etc/claude-code")) != ["managed-settings.json"]:
+        raise ValueError("other policy files are visible")
+    with open("/etc/claude-code/managed-settings.json", "rb") as fh:
+        if hashlib.sha256(fh.read()).hexdigest() != policy_sha:
+            raise ValueError("not the coding policy")
+attempt("coding policy in place", coding_policy)
 for path in ("/etc/rmp/rmp.env", "/etc/openclaw/openclaw.env", "/etc/aura-coder/claude.env",
              "/root/.config/github_pat", "/root/.openclaw/openclaw.json", "/root/.openclaw/rmp/settings.json"):
     attempt("read " + path, lambda p=path: read(p))
@@ -149,8 +158,8 @@ def _run_unit(name: str, command: list, job: Path, cfg: dict, *, token: bool, ti
 def isolation(cfg: dict, tag: str) -> dict:
     job = _job_dir(f"{tag}-probe")
     try:
-        run = _run_unit(f"{UNIT_PREFIX}probe-{tag}", ["/usr/bin/python3", "-c", PROBE, str(job)], job, cfg,
-                        token=False, timeout=120)
+        run = _run_unit(f"{UNIT_PREFIX}probe-{tag}", ["/usr/bin/python3", "-c", PROBE, str(job), _sha(MANAGED_SETTINGS)],
+                        job, cfg, token=False, timeout=120)
         try:
             results = json.loads(run.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):

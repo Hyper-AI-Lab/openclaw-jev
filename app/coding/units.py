@@ -4,6 +4,8 @@ Claude Code's own permission checks are not a boundary in headless mode (claude-
 so the boundary is the operating system: an unprivileged user, a read-only system, writes only
 to the job directory and its home, secrets hidden, resource limits below the production
 services, and a firewall that keeps it off this host's services (``app/coding/firewall.py``).
+Inside every unit Claude Code's policy directory is the coding lockdown, whatever the host's
+policy says (the host's is relaxed for Aura's direct sessions).
 """
 from __future__ import annotations
 
@@ -21,7 +23,9 @@ CLAUDE_BIN = CODER_HOME / ".local" / "bin" / "claude"
 SECRETS_DIR = Path("/etc/aura-coder")
 TOKEN_ENV_FILE = SECRETS_DIR / "claude.env"
 TOKEN_META_FILE = SECRETS_DIR / "claude-token.json"
-MANAGED_SETTINGS = Path("/etc/claude-code/managed-settings.json")
+CLAUDE_POLICY_DIR = Path("/etc/claude-code")
+CODING_POLICY_DIR = CODE_ROOT / "policy"
+MANAGED_SETTINGS = CODING_POLICY_DIR / "managed-settings.json"
 UNIT_PREFIX = "aura-claude-"
 # Hidden from every coding unit whatever their file modes; missing ones are skipped.
 # Sockets are named by their /run paths: /var/run is a symlink to /run.
@@ -86,6 +90,8 @@ def unit_properties(
         f"RuntimeMaxSec={runtime_max_sec}",
         "InaccessiblePaths=" + " ".join(f"-{p}" for p in HIDDEN_PATHS),
         "ReadWritePaths=" + " ".join(str(p) for p in writable),
+        # Claude Code reads its policy, policy drop-ins and managed MCP servers from this directory.
+        f"BindReadOnlyPaths={CODING_POLICY_DIR}:{CLAUDE_POLICY_DIR}",
     ]
     if env_file:
         # systemd reads it as root before dropping to the user, who cannot read the file.

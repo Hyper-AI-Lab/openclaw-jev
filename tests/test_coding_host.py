@@ -31,6 +31,7 @@ def test_every_coding_unit_is_hardened_limited_and_blind_to_secrets():
                  "/run/dbus", "/run/user"):
         assert f"-{path}" in hidden.split("=", 1)[1].split()
     assert "ReadWritePaths=/srv/aura-code/jobs/t1 /home/aura-coder" in props
+    assert "BindReadOnlyPaths=/srv/aura-code/policy:/etc/claude-code" in props
     assert "EnvironmentFile=/etc/aura-coder/claude.env" in props
     assert not any(p.startswith("EnvironmentFile=") for p in units.unit_properties(
         writable=["/tmp/x"], memory_max="1G", cpu_quota="100%", tasks_max=10, runtime_max_sec=60))
@@ -154,3 +155,6 @@ def test_the_ops_scripts_parse():
     assert managed["env"]["DISABLE_UPDATES"] == "1" and managed["allowedMcpServers"] == []
     assert "Bash(git push *)" in managed["permissions"]["deny"]
     assert "disableBypassPermissionsMode" not in managed.get("permissions", {})
+    # The host's policy is for Aura's direct sessions: updates pinned, nothing else restricted.
+    host = json.loads(open("ops/claude_host/managed-settings.json").read())
+    assert host["env"]["DISABLE_UPDATES"] == "1" and set(host) == {"env", "cleanupPeriodDays"}

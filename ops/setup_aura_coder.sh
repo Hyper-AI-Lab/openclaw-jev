@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Prepare this host for Aura's coding runs: the aura-coder user and its directories, a pinned
-# Claude Code, Claude Code's managed lockdown settings, and the firewall that keeps aura-coder
-# off this host's services. Idempotent; run as root. The subscription token comes separately
-# from ops/claude_code_login.sh.
+# Claude Code, Claude Code's lockdown policy for coding units (bound over /etc/claude-code inside
+# them) and the host's relaxed policy for Aura's direct sessions, and the firewall that keeps
+# aura-coder off this host's services. Idempotent; run as root. The subscription token comes
+# separately from ops/claude_code_login.sh.
 #
 #   bash ops/setup_aura_coder.sh
 set -euo pipefail
@@ -35,6 +36,7 @@ chmod 700 "${CODER_HOME}"
 install -d -o root -g root -m 755 /srv/aura-code
 install -d -o root -g "${CODER}" -m 750 /srv/aura-code/jobs
 install -d -o root -g root -m 755 /srv/aura-code/venvs
+install -d -o root -g root -m 755 /srv/aura-code/policy
 install -d -o "${CODER}" -g "${CODER}" -m 700 /srv/aura-code/cache
 # Run streams and exit records: written by systemd as root, never by aura-coder.
 install -d -o root -g root -m 700 /srv/aura-code/runs
@@ -52,8 +54,9 @@ if [[ "${current}" != "${VERSION}" ]]; then
 fi
 
 install -d -o root -g root -m 755 /etc/claude-code
-install -o root -g root -m 644 "${RMP_ROOT}/ops/aura_coder/managed-settings.json" "${MANAGED}"
-log "managed settings installed at ${MANAGED}"
+install -o root -g root -m 644 "${RMP_ROOT}/ops/aura_coder/managed-settings.json" /srv/aura-code/policy/managed-settings.json
+install -o root -g root -m 644 "${RMP_ROOT}/ops/claude_host/managed-settings.json" "${MANAGED}"
+log "coding policy at /srv/aura-code/policy, host policy at ${MANAGED}"
 [[ "${current}" == "${VERSION}" ]] || die "Claude Code is ${current:-missing}, expected ${VERSION}"
 log "Claude Code ${current} at ${CLAUDE}"
 
