@@ -841,6 +841,42 @@ async def check_intermediate_updates_enabled(payload: Dict[str, Any]) -> bool:
     return should_send_intermediate_updates()
 
 
+PR_EVENTS = ("coding.pr_merged", "coding.pr_not_merged")
+
+
+async def _direct_claude_evidence(task_id: str) -> str:
+    """Aura's direct Claude sessions in the task and the pull requests RMP merged for her, from RMP's records.
+
+    A reviewed coding job brings its own evidence; this is what Aura did with Claude herself.
+    """
+    from sqlalchemy import select
+
+    from app.coding.records import section_text, task_records
+    from app.db.database import AsyncSessionLocal
+    from app.db.models import Event
+    from app.memory.policy import redact_secrets
+
+    sessions = [r for r in await asyncio.to_thread(task_records, task_id) if r["kind"] == "session"]
+    async with AsyncSessionLocal() as db:
+        events = (await db.execute(
+            select(Event).where(Event.entity_id == task_id, Event.event_type.in_((*PR_EVENTS, "coding.deploy")))
+            .order_by(Event.occurred_at)
+        )).scalars().all()
+    if not any(e.event_type in PR_EVENTS for e in events):
+        events = []
+    lines = ["Aura's Claude sessions (what she asked, what Claude did and answered):\n"
+             + section_text(sessions, reply_chars=1500)] if sessions else []
+    for event in events:
+        p = event.event_payload or {}
+        if event.event_type == "coding.pr_merged":
+            lines.append(f"RMP merged PR #{p.get('pr')} ({p.get('url')}) after CI's test check passed, as {str(p.get('merge'))[:12]}.")
+        elif event.event_type == "coding.pr_not_merged":
+            lines.append(f"RMP did not merge PR #{p.get('pr')}: {p.get('summary')}")
+        else:
+            lines.append(f"Deploy {p.get('status')}: {p.get('summary')}")
+    return redact_secrets("\n".join(lines))
+
+
 @traced_activity("openclaw.verify_quality")
 async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
     from app.artifacts.store import ArtifactStore
@@ -858,6 +894,12 @@ async def verify_response_quality(payload: Dict[str, Any]) -> Dict[str, Any]:
     task_id = payload.get("task_id", "unknown")
     enriched = dict(payload)
     enriched["external_evidence_text"] = format_external_evidence(payload.get("external_evidence"))
+    try:
+        direct = await _direct_claude_evidence(task_id)
+    except Exception as exc:
+        activity.logger.warning("Claude evidence unavailable for %s: %s", task_id, exc)
+        direct = ""
+    enriched["external_evidence_text"] = "\n\n".join(p for p in (enriched["external_evidence_text"], direct) if p)
     try:
         enriched["situational_tools"] = await collect_situational_context(payload)
     except Exception:

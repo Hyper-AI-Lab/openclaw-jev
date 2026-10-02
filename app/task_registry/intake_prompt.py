@@ -74,10 +74,11 @@ RULES:
   - conversational: greetings, awareness, status with no deliverable — one turn, catalog_hint MUST be null.
   - structured_work: tools, files, research, implement.
 - catalog_hint: YOU assign (or null). Valid ids are in available_catalog_types.
-  coding_task: Kirill asks for a change to Aura's own code (her repository); Claude Code makes it. A request to change
-  any other repository is not a coding task: Aura may not touch other repositories. Never set coding_task for awareness
-  ("can you code?", "are you aware"), questions about code ("how does the reconciler work?", "what does this function
-  do?") or a review without a change.
+  coding_task: Kirill explicitly asks for a reviewed coding job: rounds that RMP tests and Aura reviews, and his
+  approval card before anything ships. Any other request to change Aura's own code is structured_work with catalog_hint
+  null: Aura works with Claude Code herself and ships through a pull request. A change to any other repository is never
+  a coding task. Never set coding_task for awareness ("can you code?", "are you aware"), questions about code ("how does
+  the reconciler work?", "what does this function do?") or a review without a change.
 - web_intent: search|fetch|crawl|adaptive_extract|schema_extract|interact|none. interact only for real click/login/screenshot.
 - recall_depth: deep when the message refers to or builds on anything from before recent_dialogue (earlier conversations, past tasks and their results, documents Aura read or wrote, remembered facts or preferences of Kirill's), or when such memory could change the answer; none for greetings, thanks, and self-contained questions or tasks. When unsure, deep.
 - reply_to, when present, is the earlier message this one directly replies to (quoted) and the task it belongs to: strong evidence for relation_class and the target.
