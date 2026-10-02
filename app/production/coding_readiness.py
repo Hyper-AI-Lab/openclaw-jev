@@ -22,7 +22,11 @@ SMOKE_RECORD = Path(RMP_DATA_DIR) / "coding" / "claude_smoke.json"
 MANAGED_SETTINGS_SOURCE = Path(RMP_ROOT) / "ops" / "aura_coder" / "managed-settings.json"
 TOKEN_WARN_DAYS = 30
 STUCK_MARGIN_SEC = 900
-UNIT = re.compile(r"^aura-(claude|verify|collect|deploy)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+UNIT = re.compile(r"^aura-(claude|verify|collect|deploy|direct)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+HOST_POLICY = Path("/etc/claude-code/managed-settings.json")
+HOST_POLICY_SOURCE = Path(RMP_ROOT) / "ops" / "claude_host" / "managed-settings.json"
+GITHUB_WRAPPER = Path("/usr/local/bin/aura-github")
+GITHUB_WRAPPER_SOURCE = Path(RMP_ROOT) / "ops" / "aura_github.sh"
 
 
 def _sha(path: Path) -> Optional[str]:
@@ -124,7 +128,40 @@ def check_coding_jobs() -> CheckResult:
     return CheckResult("coding_jobs", "pass", "No stuck coding units or orphan checkouts", {})
 
 
-CODING_CHECKS = (check_claude_code, check_coding_isolation, check_coding_jobs)
+def check_claude_direct() -> CheckResult:
+    """Aura's direct sessions: the host's policy and the GitHub wrapper as in the repo, GitHub's main protected for
+    everyone, and the live main contained in GitHub's, so her merged pull requests can deploy."""
+    from app.coding import deploy, direct, github
+
+    problems, warnings = [], []
+    for path, source in ((HOST_POLICY, HOST_POLICY_SOURCE), (GITHUB_WRAPPER, GITHUB_WRAPPER_SOURCE)):
+        if _sha(path) is None or _sha(path) != _sha(source):
+            problems.append(f"{path} is missing or differs from the repo's copy")
+    repo = get_coding_config()["repositories"]["rmp"]["remote"]
+    try:
+        protection = github.api("GET", f"repos/{repo}/branches/main/protection")
+        checks = [c.get("context") for c in (protection.get("required_status_checks") or {}).get("checks") or []]
+        if not (protection.get("enforce_admins") or {}).get("enabled") or github.CHECK not in checks:
+            problems.append("GitHub's main is not protected for everyone with the test check")
+    except github.GitHubError as exc:
+        if "not protected" in str(exc).lower():
+            problems.append("GitHub's main is not protected")
+        else:
+            warnings.append(f"GitHub could not be checked ({str(exc)[:150]})")
+    live = subprocess.run(["git", "-C", str(deploy.LIVE_REPO), "rev-parse", "refs/heads/main"],
+                          capture_output=True, text=True, timeout=30).stdout.strip()
+    if not warnings and not deploy._is_ancestor_on_github(live, repo):
+        problems.append(f"the live main ({live[:12]}) has commits GitHub's main lacks, so no merged pull request can deploy")
+    details = {"running_turns": len(direct.running_units()),
+               "open_sessions": sum(1 for s in direct.sessions() if s["status"] == "open")}
+    status = "fail" if problems else "warn" if warnings else "pass"
+    message = "; ".join(problems + warnings) or (
+        f"Host policy and aura-github as in the repo; main protected; the live main is on GitHub's; "
+        f"{details['open_sessions']} open session(s), {details['running_turns']} turn(s) running")
+    return CheckResult("claude_direct", status, message, details)
+
+
+CODING_CHECKS = (check_claude_code, check_coding_isolation, check_coding_jobs, check_claude_direct)
 
 
 def run_coding_checks() -> List[CheckResult]:

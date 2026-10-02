@@ -211,7 +211,7 @@ def test_a_deploy_of_githubs_main_ships_it_as_it_is_now_and_then_finds_nothing_n
     assert [c for c in host.calls if c[:2] == ("systemctl", "restart")] == [("systemctl", "restart", "rmp-api", "rmp-worker")]
 
     again = deploy.self_deploy({"task_id": "t1", "source": "github"}, FakeHost(repos.live), log=lambda m: None)
-    assert again["status"] == "deployed" and "already live" in again["summary"] and again["restarted"] == []
+    assert again["status"] == "unchanged" and "already live" in again["summary"] and again["restarted"] == []
 
 
 def test_a_live_main_with_commits_github_lacks_is_never_deployed_over(repos):

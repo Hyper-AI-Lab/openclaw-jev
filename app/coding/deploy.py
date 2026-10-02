@@ -235,7 +235,7 @@ def deploy_note(result: Dict[str, Any], repo: str) -> str:
         found = re.search(r"\(#(\d+)\)\s*$", subject)
         return f"{subject} https://github.com/{repo}/pull/{found.group(1)}" if found else subject
 
-    headline = {"deployed": "Aura's change is live.",
+    headline = {"deployed": "Aura's change is live.", "unchanged": "Aura's change was already live.",
                 "rolled_back": "Aura's change failed its checks and was rolled back."}.get(
         result["status"], f"Aura's deploy: {result['status']}.")
     commits = "\n".join(f"• {linked(s)}" for s in result.get("commits") or [])
@@ -339,7 +339,7 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     if spec.get("source") == "github":
         head = host.fetch_main()
         if head == old:
-            return {"status": "deployed", "old": old, "head": head, "restarted": [], "commits": [], "canary": None,
+            return {"status": "unchanged", "old": old, "head": head, "restarted": [], "commits": [],
                     "summary": f"GitHub's main ({head[:12]}) was already live, so nothing changed."}
         if not _is_ancestor(live, old, head):
             return {"status": "blocked", "summary": f"The live main ({old[:12]}) has commits GitHub's main lacks, so nothing "
