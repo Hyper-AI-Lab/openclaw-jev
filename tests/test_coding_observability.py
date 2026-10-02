@@ -156,3 +156,24 @@ async def test_the_coding_api_shows_a_job_and_refuses_a_path_outside_the_runs_di
     assert job["runs"][0]["outcome"] == "no_result" and job["verifications"] == [{"attempt": "1", "ok": True,
                                                                                   "commands": [{"exit": "success exited 0"}]}]
     assert outside.status_code == 404 and missing.status_code == 404
+
+
+async def test_the_coding_status_names_the_short_rmp_commit_alongside_the_existing_fields(host, monkeypatch):
+    import subprocess
+    from pathlib import Path
+
+    from app.activities import coding_activities
+
+    monkeypatch.setattr(cr, "live_units", lambda: [])
+    monkeypatch.setattr(coding_activities, "slot_holder", lambda: None)
+    monkeypatch.setenv("RMP_API_KEY", "k")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://rmp",
+                                 headers={"X-RMP-API-Key": "k"}) as api:
+        response = await api.get("/api/coding/status")
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=Path(server.__file__).parent,
+                          capture_output=True, text=True, check=True).stdout.strip()
+    status = response.json()
+    assert response.status_code == 200 and status["rmp_commit"] == head and len(head) >= 7
+    assert {"enabled", "claude_version", "pinned", "token_days_left", "slot_holder", "live_units", "repositories",
+            "jobs"} <= status.keys()
+    assert status["enabled"] is True and status["pinned"] == "2.1.280" and status["repositories"] == {}

@@ -1546,7 +1546,20 @@ CODING_EVENTS = ("approval.confirmed", "approval.refused", "coding.deploy", "cod
 async def coding_status_view():
     from app.production.coding_readiness import coding_status
 
-    return await asyncio.to_thread(coding_status)
+    status = await asyncio.to_thread(coding_status)
+    return {**status, "rmp_commit": await asyncio.to_thread(_rmp_commit)}
+
+
+def _rmp_commit() -> Optional[str]:
+    """The short hash of the RMP commit this process runs from, or None outside a git checkout."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
 
 
 @app.get("/api/coding/jobs/{task_id}")
