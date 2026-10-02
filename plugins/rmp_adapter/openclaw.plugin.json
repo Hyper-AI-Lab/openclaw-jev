@@ -20,7 +20,11 @@
     "tools": [
       "rmp_memory_recall",
       "rmp_task_create",
-      "rmp_task_status"
+      "rmp_task_status",
+      "claude_start",
+      "claude_send",
+      "claude_status",
+      "claude_end"
     ]
   }
 }

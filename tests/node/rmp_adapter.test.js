@@ -341,6 +341,14 @@ test('plugin never spawns processes, and the live copy matches the repo', () => 
   }
 });
 
+test('every tool the plugin registers is declared in its manifest, which OpenClaw requires', () => {
+  const manifest = JSON.parse(realReadFileSync(path.join(path.dirname(PLUGIN), 'openclaw.plugin.json'), 'utf8'));
+  assert.deepEqual(Object.keys(loadPlugin().tools).sort(), [...manifest.contracts.tools].sort());
+  if (fs.existsSync(LIVE_PLUGIN)) {
+    assert.deepEqual(JSON.parse(realReadFileSync(path.join(path.dirname(LIVE_PLUGIN), 'openclaw.plugin.json'), 'utf8')), manifest);
+  }
+});
+
 test('claude tools start a session, send a message, wait across long polls and end it', async () => {
   let polls = 0;
   const calls = installFetch([
