@@ -361,3 +361,37 @@ Deploy records now carry `source` (`github` or `reviewed`), and each invariant a
   - `ARCHITECTURE`, `README`, `CONCEPT_TREE` and rule item 6, both copies.
 
 **Verification:** full suite 1063 passed, 4 skipped; node 25 of 27 before the plugin deploy (the 2 live-copy checks).
+
+---
+
+## Step 9 — Acceptance, on the new flow
+
+**Date:** 2026-10-02.
+
+**Test 2 again, a change through a pull request (task `ae08907d`): passed.**
+- Claude's first turn ran for about 18 minutes. It made the change on `aura/direct-turns-running` and ran the full suite in its clone. That suite had killed its turns before; this time the turn survived. It then opened PR #8 and watched CI pass.
+- Aura reviewed the work and approved, and Claude merged PR #8 in its second turn (`test: SUCCESS`, 15:01:44Z). It then checked that the merged tree matched its branch.
+- The evaluator accepted her reply (15:05:32Z), and the reconciler ended the session 41 s later.
+- The watcher started `aura-deploy-main` once CI passed on `daf5864`. The unit restarted `rmp-api` and `rmp-worker`, the checks passed, and Kirill got the note at 15:07:41Z.
+- Aura made 110 tool calls (174,000 characters of results), 28 of them her own shell commands. Most of the rest were `claude_status` checks, each carrying up to ten commands. Her context stayed under the canary's limit.
+
+**A plugin-only deploy was rolled back for nothing (PRs #9, #10, #11).**
+- PR #9 made `claude_status` answer with Claude's latest three steps only while it works, and wait up to 55 s by default.
+- The watcher deployed it and restarted only the gateway, as the restart map says for `plugins/`.
+- `runtime_code_sync` then failed. It counted `plugins/rmp_adapter/*.js` as code the API and worker run, so they looked stale. That inclusion dates from 2026-08-11 (`cb0fcd6`). The code watcher reloads them for Python only, and the gateway is what runs the plugin.
+- The unit reverted the live code, landed the revert as PR #10, and told Kirill. The watcher then deployed the merged revert, which changed nothing, restarted nothing and passed.
+- The fix, PR #11:
+  - `watched_code_paths` counts only the Python the API and worker import. A new test checks that a plugin edit leaves them in sync; it fails without the fix.
+  - It also re-applies PR #9's change.
+- The watcher deployed PR #11 on its own: `openclaw-gateway`, `rmp-api` and `rmp-worker` restarted, CI success, canary ok. Node then passed 27 of 27 against the live plugin.
+
+**Test 3, stop during a Claude turn (task `3ea38568`): passed.**
+- Claude was running the full suite when Kirill replied "stop" (15:59:14Z).
+- His notice was delivered and Aura's run aborted at 15:59:15Z. At 15:59:16Z the task was `stopped_by_user`, the session had ended with reason `stop`, and the turn's unit was gone.
+- The turn is recorded as `stopped`. The task document was enriched with its "Claude sessions" section.
+
+**State:** readiness 48 pass, 1 warn (telemetry); invariants 15 of 15 pass.
+
+**Left as they are:**
+- A deploy that changes no files, such as a merged revert, still sends Kirill an "Aura's change is live" note.
+- The ledger row of an RMP notice still fails its foreign key after the Slack message is sent. That predates this work.
