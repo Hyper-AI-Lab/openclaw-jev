@@ -25,8 +25,11 @@ function format(state) {
     lines.push('', reply.length > REPLY_CHARS
       ? `${reply.slice(0, REPLY_CHARS)}\n[cut at ${REPLY_CHARS} characters; the whole answer is in the session's record]`
       : reply);
-  } else if (state.progress && state.progress.length) {
-    lines.push(`Latest: ${state.progress.slice(-5).join('; ')}`, 'Wait for it with claude_status, or stop it with claude_end.');
+  } else {
+    // Asked often while Claude works, so kept short; the files and commands come with the answer.
+    if (state.progress && state.progress.length) lines.push(`Latest: ${state.progress.slice(-3).join('; ')}`);
+    lines.push('Wait for it with claude_status, or stop it with claude_end.');
+    return lines.join('\n');
   }
   if (state.files_edited && state.files_edited.length) lines.push('', `Files edited: ${state.files_edited.join(', ')}`);
   if (state.commands && state.commands.length) {
@@ -126,8 +129,8 @@ function register(api, { rmpFetch, pause = sleep }) {
   api.registerTool({
     name: 'claude_status',
     description:
-      "Where a Claude session stands: its latest turn's answer, or its progress while it works. With wait_seconds (up to 55) "
-      + 'it first waits that long for the turn to finish.',
+      "Where a Claude session stands: its latest turn's answer, or its progress while it works. It first waits up to "
+      + 'wait_seconds (default and most 55) for the turn to finish.',
     parameters: {
       type: 'object',
       properties: {
@@ -140,7 +143,7 @@ function register(api, { rmpFetch, pause = sleep }) {
       try {
         const s = await rmpFetch('GET', `/api/claude/sessions/${encodeURIComponent(params.session)}`);
         if (!s.turns) return result(`Claude session ${s.id} (${s.status}) has no turns yet.`, { session: s.id, turn: 0 });
-        return await waitFor(s.id, s.turns, Math.min(Number(params.wait_seconds) || 1, 55), signal);
+        return await waitFor(s.id, s.turns, Math.min(Number(params.wait_seconds) || 55, 55), signal);
       } catch (err) {
         return result(`Claude status failed: ${err.message}`, { error: err.message });
       }
