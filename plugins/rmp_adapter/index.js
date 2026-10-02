@@ -627,6 +627,7 @@ async function routeScheduledToRmp(payload) {
 
 module.exports = {
   name: 'rmp_adapter',
+  rmpFetch,
   register: (api) => {
     log('rmp_adapter plugin register() called');
     installNativeSlackSuppressor();
@@ -703,6 +704,8 @@ module.exports = {
         }
       }
     });
+
+    require('./claude_tools').register(api, { rmpFetch });
 
     // Claim Slack DMs before OpenClaw's native agent turn. Returning
     // { handled: true } stops the gateway from answering (and double-posting).

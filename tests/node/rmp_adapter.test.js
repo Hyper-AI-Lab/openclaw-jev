@@ -332,11 +332,62 @@ test('a route that outlives its test cannot reach the live API', async () => {
 });
 
 test('plugin never spawns processes, and the live copy matches the repo', () => {
-  const src = realReadFileSync(PLUGIN, 'utf8');
-  assert.doesNotMatch(src, /child_process|execFileSync|execSync|spawnSync/);
-  if (fs.existsSync(LIVE_PLUGIN)) {
-    assert.equal(realReadFileSync(LIVE_PLUGIN, 'utf8'), src);
+  for (const file of [PLUGIN, path.join(path.dirname(PLUGIN), 'claude_tools.js')]) {
+    const src = realReadFileSync(file, 'utf8');
+    assert.doesNotMatch(src, /child_process|execFileSync|execSync|spawnSync/);
+    if (fs.existsSync(LIVE_PLUGIN)) {
+      assert.equal(realReadFileSync(path.join(path.dirname(LIVE_PLUGIN), path.basename(file)), 'utf8'), src);
+    }
   }
+});
+
+test('claude tools start a session, send a message, wait across long polls and end it', async () => {
+  let polls = 0;
+  const calls = installFetch([
+    ['POST /api/claude/sessions', () => ({ id: 's-1', workspace: 'repo', path: '/srv/aura-code/direct/t/s-1/repo' })],
+    ['POST /api/claude/sessions/s-1/messages', () => ({ session: 's-1', turn: 2 })],
+    ['GET /api/claude/sessions/s-1/turns/2', () => ((polls += 1) < 3
+      ? { turn: 2, done: false, outcome: 'running', progress: ['Read README.md'] }
+      : { turn: 2, done: true, outcome: 'success', reply: 'Fixed add().', files_edited: ['calc.py'],
+        commands: ['pytest -q'], denied: [] })],
+    ['POST /api/claude/sessions/s-1/end', () => ({ id: 's-1', turns: 2, stopped: [] })],
+  ]);
+  const { tools } = loadPlugin();
+  assert.match(await tools.claude_start.execute('c1', { title: 'Fix calc' }), /^Claude session s-1 is ready \(repo: /);
+  assert.equal(await tools.claude_send.execute('c2', { session: 's-1', message: 'Fix add()' }),
+    'Claude, turn 2: success\n\nFixed add().\n\nFiles edited: calc.py\nCommands (last 1): pytest -q');
+  assert.equal(polls, 3);
+  assert.deepEqual(calls[0].body, { session_key: SLACK_KEY, workspace: 'repo', title: 'Fix calc' });
+  assert.deepEqual(calls[1].body, { message: 'Fix add()' });
+  assert.equal(await tools.claude_end.execute('c3', { session: 's-1' }), 'Claude session s-1 ended after 2 turn(s).');
+});
+
+test('a Claude wait rides out an RMP restart, and a refused message or a usage limit is reported', async () => {
+  let polls = 0;
+  installFetch([
+    ['POST /api/claude/sessions/s-1/messages', () => ({ session: 's-1', turn: 1 })],
+    ['GET /api/claude/sessions/s-1/turns/1', () => {
+      polls += 1;
+      if (polls === 1) throw new TypeError('fetch failed');
+      return { turn: 1, done: true, outcome: 'usage_limit', reply: '', resets_at: 1790000000 };
+    }],
+    ['POST /api/claude/sessions/s-2/messages', () => json({ detail: 'turn 3 is still running' }, 409)],
+    ['GET /api/claude/sessions/s-3', () => ({ id: 's-3', status: 'open', turns: 1 })],
+    ['GET /api/claude/sessions/s-3/turns/1', () => ({ turn: 1, done: false, outcome: 'running',
+      progress: ['Ran: pytest', 'Edited calc.py'] })],
+  ]);
+  const tools = {};
+  require(path.join(path.dirname(PLUGIN), 'claude_tools.js')).register(
+    { registerTool: (tool) => { const built = typeof tool === 'function' ? tool({}) : tool; tools[built.name] = built; } },
+    { rmpFetch: require(PLUGIN).rmpFetch, pause: async () => {} },
+  );
+  assert.equal(await tools.claude_send.execute('c1', { session: 's-1', message: 'go' }),
+    "Claude, turn 1: usage_limit\n\n(no reply)\nClaude's usage limit is reached; it resets at 2026-09-21T14:13:20.000Z.");
+  assert.equal(polls, 2);
+  assert.equal(await tools.claude_send.execute('c2', { session: 's-2', message: 'again' }),
+    'Claude message failed: HTTP 409: turn 3 is still running');
+  assert.equal(await tools.claude_status.execute('c3', { session: 's-3' }),
+    'Claude is still working on turn 1.\nLatest: Ran: pytest; Edited calc.py\nWait for it with claude_status, or stop it with claude_end.');
 });
 
 test('session lookup reads the OpenClaw SQLite store in-process', {
