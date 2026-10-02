@@ -205,3 +205,53 @@ No coding job was running.
 - **Node:** 26/26, including the claude tools end to end against a fake RMP (start, a send across three polls, end), an RMP outage ridden out, a refused message, a usage limit, progress while working, the manifest check, and the live copies.
 - **Gateway:** active; `http server listening (6 plugins ...)` with no `contracts.tools` warnings.
 - **Not yet:** Aura using the tools in a real task, which comes with step 7's notes and the acceptance.
+
+---
+
+## Step 6 — Aura's code through GitHub pull requests
+
+**Date:** 2026-10-02.
+
+**Kirill's decisions:**
+- `main` is protected for everyone, RMP included: every change lands through a pull request with green CI.
+- Aura needs no approval for her own changes: once CI is green she merges, RMP deploys, and Kirill gets a note with the link. He can always roll back to an earlier `main` from GitHub.
+- The approval card stays only for reviewed jobs he explicitly asks for, and those ship through a pull request too.
+
+**What changed:**
+- **`app/coding/github.py`.** It calls the GitHub API through `gh`, with the token only in that command's environment: a pull request, the `test` check on a commit (latest run), waiting for it, merging at an exact commit, opening a pull request or reusing an open one, `land` (push a commit as a branch, open its pull request, merge once the check passed) and `protect_main`.
+- **`deploy_pr` (`deploy.merge_pull_request`, `POST /api/claude/deploy`, the tool in `rmp_adapter`).** RMP squash-merges Aura's pull request only if all of these hold:
+  - it is open, into `main`, from a branch of her repository;
+  - its `test` check passed;
+  - GitHub's `main` contains the live `main`.
+
+  Then it starts the task's deploy unit. A deploy that is already waiting just picks up the later merge. Events: `coding.pr_merged` or `coding.pr_not_merged`.
+- **The deploy unit.**
+  - A deploy of GitHub's `main` waits until no user task is active, so it never restarts Aura's own run. Then it fetches GitHub's `main`, and fast-forwards, syncs, restarts and checks as before.
+  - A reviewed job's approved commit first lands through its own pull request; CI failing there deploys nothing.
+  - No deploy pushes `main` any more.
+  - A failed deploy still reverts the live code at once. The revert then lands as a pull request merged with a merge commit, so the live `main` stays an ancestor of GitHub's.
+  - After Aura's own deploy, Kirill gets a note (`notify_ops_slack`) with each pull request's link. A reviewed job still gets its judged reply run.
+- **`aura-github` (`ops/aura_github.sh`, installed in `/usr/local/bin`).** Claude's way to GitHub in direct sessions: `push` a branch and `gh` on her repository, with the token read inside the command. It refuses pushing `main`, a clone of another repository, and `gh pr merge`. The direct sessions' system prompt says how to open a pull request and that Aura merges it.
+- **A race fixed.** A turn's status read its stream before its exit line, so a turn finishing between the two reads looked cut short (`no_result`). A test that failed two runs in three under load exposed it. The exit line is now read first, here and in the records reader, and a test pins that order.
+
+**Deploy:**
+- **Code:** commit `11bfce2`; the API and worker reloaded.
+- **Wrapper:** installed.
+- **Plugin:** `claude_tools.js` and the manifest with `deploy_pr`; the gateway restarted with no task active.
+- **Push:** `main` went to GitHub before protection (`af8a5ee..11bfce2`, the last direct push); CI [run 37003130210](https://github.com/Hyper-AI-Lab/openclaw-jev/actions/runs/37003130210) passed.
+- **Protection:** on `main`, read back from the API: pull request required (0 approvals), `test` required, enforced for admins, no force pushes or deletions.
+
+**Verification:**
+- **Tests:** full suite 1063 passed, 4 skipped; node 27/27.
+- **New tests:**
+  - the token only in `gh`'s environment;
+  - the check's states;
+  - reusing an open pull request;
+  - landing through real git;
+  - the protection body;
+  - every refusal of `deploy_pr`;
+  - a deploy of GitHub's `main`, nothing new, a live `main` ahead of GitHub, a reviewed change failing CI, a rollback whose revert cannot reach GitHub;
+  - the unit telling Kirill;
+  - `aura-github` pushing a branch, refusing `main`, another repository and a merge;
+  - the deploy API.
+- **This entry** landed through a pull request with `github.land`, the reviewed-job path, under the new protection.
