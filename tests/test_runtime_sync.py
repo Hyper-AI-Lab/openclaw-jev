@@ -31,6 +31,20 @@ def test_mark_and_detect_stale(tmp_path, monkeypatch):
     assert "rmp-api" in status["stale_services"]
 
 
+def test_a_plugin_edit_leaves_the_api_and_worker_in_sync(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_sync, "BOOT_DIR", tmp_path)
+    monkeypatch.setattr(runtime_sync, "RMP_DATA_DIR", str(tmp_path))
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "demo.py").write_text("x = 1\n")
+    plugin = tmp_path / "plugins" / "rmp_adapter" / "claude_tools.js"
+    plugin.parent.mkdir(parents=True)
+    runtime_sync.mark_runtime_boot("rmp-api")
+    runtime_sync.mark_runtime_boot("rmp-worker")
+    plugin.write_text("'use strict';\n")
+    os.utime(plugin, (time.time() + 5, time.time() + 5))
+    assert runtime_sync.runtime_sync_status(root=tmp_path)["status"] == "ok"
+
+
 def test_attempt_remediation_restarts_on_stale_health(monkeypatch):
     from app.production import canary_sentinel
     from app.production.canary_sentinel import CanaryIssue

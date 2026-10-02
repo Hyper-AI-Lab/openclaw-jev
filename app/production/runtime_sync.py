@@ -59,9 +59,7 @@ def watched_code_paths(root: Optional[Path] = None) -> List[Path]:
     worker = base / "worker.py"
     if worker.is_file():
         out.append(worker)
-    plugin_dir = base / "plugins" / "rmp_adapter"
-    if plugin_dir.is_dir():
-        out.extend(p for p in plugin_dir.rglob("*.js") if p.is_file())
+    # The API and worker import only Python; the gateway runs the plugin, and a deploy restarts it for a change there.
     seen = set()
     unique: List[Path] = []
     for p in out:
