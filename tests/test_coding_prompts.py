@@ -40,6 +40,14 @@ def test_a_review_that_cannot_be_read_is_a_rework_never_a_pass(text, verdict, re
     assert review["verdict"] == verdict and ("error" not in review) == readable
 
 
+def test_shipping_is_never_part_of_the_brief_or_held_against_a_round():
+    brief = prompts.brief_prompt("Fix the README and open a PR.", REPOS, answers=[])
+    review = prompts.review_prompt({"goal": "Fix it.", "acceptance_criteria": [], "constraints": []}, 1,
+                                   {"kind": "success"}, {"collected": {}, "tests": None}, "")
+    assert "never put pushing, a pull request or a deploy" in brief and "RMP opens the pull request" in brief
+    assert "never ask\nClaude Code for them" in review and "never hold the round back" in review
+
+
 def test_a_rework_carries_the_feedback_and_only_the_failing_tests():
     tests = {"ok": False, "commands": [
         {"command": ["npm", "ci"], "setup": True, "ok": True, "exit": "success exited 0", "tail": "added 10 packages"},

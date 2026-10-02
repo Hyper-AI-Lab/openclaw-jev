@@ -67,6 +67,9 @@ REPOSITORIES:
 {repo_lines(repositories)}
 {answered}
 You may read the repository to write a good brief, but do not change anything: Claude Code makes the change.
+Claude Code only changes code in its own checkout; it cannot push, open pull requests or deploy. After Kirill approves the
+finished change, RMP opens the pull request or deploys Aura's own code. So never put pushing, a pull request or a deploy
+in the goal or the acceptance criteria.
 Reply with one JSON object and nothing else:
 {{"repo": "<one of the names above>", "title": "<a few words for the branch name>", "goal": "<what to change and why>", "acceptance_criteria": ["<how to tell it is done>"], "constraints": ["<what must not change>"], "questions": []}}
 Put a question in "questions" only when the change cannot be done well without Kirill's answer."""
@@ -178,7 +181,9 @@ DIFF{cut}:
 
 Reply with one JSON object and nothing else:
 {{"verdict": "ready" or "rework", "feedback": ["<what Claude Code must fix, when rework>"], "reply": "<your message to Kirill: what changed and why, RMP's test result, and anything he should know>"}}
-"ready" only when the change does what the brief asks, RMP's tests pass, and nothing is left to fix."""
+"ready" only when the change does what the brief asks, RMP's tests pass, and nothing is left to fix.
+Judge the change itself. Pushing, opening the pull request and deploying are RMP's job after Kirill approves: never ask
+Claude Code for them, and never hold the round back because they have not happened yet."""
 
 
 def parse_review(text: str) -> Dict[str, Any]:

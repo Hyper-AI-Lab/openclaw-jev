@@ -324,7 +324,8 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                                           "claude": claude, "evidence": evidence},
                     start_to_close_timeout=AURA_TURN, retry_policy=RetryPolicy(maximum_attempts=2)))
                 if review["verdict"] != "ready":
-                    problems.append(review.get("error") or "my review found more to do")
+                    found = f": {review['feedback'][0][:300].rstrip('.')}" if review["feedback"] else ""
+                    problems.append(review.get("error") or f"my review found more to do{found}")
                     feedback += review["feedback"]
             if not problems:
                 judged = await self._judge_round(brief, review["reply"], self._evidence(claude, evidence))
@@ -337,7 +338,9 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                     problems.append(f"the evaluator: {judged['issues']}")
                     feedback += [item for item in (judged.get("command_to_aura"), judged.get("issues")) if item]
             if problems and batch < int(settings["max_rounds"]):
-                feedback += problems + [f"Kirill added: {words}" for words in self._take_user_messages()]
+                # An approval sent before the card is no instruction for Claude; the gate asks again.
+                feedback += problems + [f"Kirill added: {words}" for words in self._take_user_messages()
+                                        if gate_decision(words) != "approve"]
                 await self._notice(f"Round {self._round}: {problems[0]}. Claude Code is working on it again.")
                 prompt = prompts.rework_prompt(feedback, evidence.get("tests"))
                 continue

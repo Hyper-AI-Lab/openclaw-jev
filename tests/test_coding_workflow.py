@@ -305,7 +305,8 @@ async def test_failing_tests_and_review_feedback_send_claude_back_into_its_sessi
     assert second["resume_session"] == "sess-1" and FAILING_TAIL.splitlines()[0] in second["prompt"]
     assert len(rec.reviewed) == 2, "a round RMP's own record already fails is not sent to review"
     assert third["resume_session"] == "sess-1" and "Also update the greeting's docstring." in third["prompt"]
-    assert "Round 2: my review found more to do. Claude Code is working on it again." in rec.notices()
+    assert ("Round 2: my review found more to do: Also update the greeting's docstring. "
+            "Claude Code is working on it again.") in rec.notices()
     assert [r["round"] for r in rec.runs] == [1, 2, 3] and [v["number"] for v in rec.verified] == [1, 2, 3]
 
 
@@ -315,13 +316,15 @@ async def test_kirills_messages_during_a_round_reach_the_next_one():
     async def script(env, handle):
         await until(lambda: rec.runs)
         await handle.signal("user_input", kirill("Keep the old greeting as a fallback."))
+        await handle.signal("user_input", kirill("approve"))
         await asyncio.sleep(0.2)
         rec.first_run_released.set()
         await approve_first_card(env, handle, rec)
 
     await drive(rec, script)
     assert "Kirill added: Keep the old greeting as a fallback." in rec.runs[1]["prompt"]
-    assert rec.brief_calls[0]["answers"] == []
+    assert "Kirill added: approve" not in rec.runs[1]["prompt"], "an approval before the card is not for Claude"
+    assert rec.brief_calls[0]["answers"] == [] and len(rec.provenance_calls) == 1
 
 
 async def test_a_stop_during_the_run_stops_the_unit_within_seconds_and_ships_nothing():
