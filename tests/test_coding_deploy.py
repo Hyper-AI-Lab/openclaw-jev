@@ -402,13 +402,14 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
     assert db.get.return_value.supplementary_context == {"a": 1, "coding_deploy": payload["report"]["shipped"]}
 
 
-def test_the_deploy_unit_tells_kirill_about_auras_own_deploy_instead_of_starting_a_reply_run(tmp_path, monkeypatch):
+def run_github_unit(tmp_path, monkeypatch, status):
+    """Run the deploy unit for a deploy of GitHub's main that ends in ``status``; what it recorded, said and started."""
     module_spec = importlib.util.spec_from_file_location("coding_deploy", ROOT / "ops" / "coding_deploy.py")
     unit = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(unit)
     monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
     monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
-        "status": "deployed", "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Deployed cccccccccccc."})
+        "status": status, "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Deployed cccccccccccc."})
     monkeypatch.setattr(unit.deploy, "Host", lambda: None)
     added = []
     db = SimpleNamespace(add=added.append, get=AsyncMock(return_value=None), commit=AsyncMock())
@@ -429,14 +430,28 @@ def test_the_deploy_unit_tells_kirill_about_auras_own_deploy_instead_of_starting
     path = tmp_path / "deploy.json"
     path.write_text(json.dumps({"task_id": "main", "source": "github", "head": "c" * 40, "ci": "success"}))
 
-    assert unit.main(str(path)) == 0
+    code = unit.main(str(path))
     assert added[0].event_type == "coding.deploy" and added[0].entity_type == "deploy" and added[0].entity_id == "main"
-    assert added[0].event_payload["status"] == "deployed" and added[0].event_payload["ci"] == "success"
+    assert added[0].event_payload["status"] == status and added[0].event_payload["ci"] == "success"
+    assert db.commit.await_count == 1
     assert json.loads(path.with_name("result.json").read_text())["head"] == "c" * 40
-    [(note, incident)] = notes
-    assert note.startswith("Aura's change is live.") and "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/12" in note
-    assert incident == "deploy:main:cccccccccccc"
     client.start_workflow.assert_not_awaited()
+    return code, notes
+
+
+@pytest.mark.parametrize("status, code", [("deployed", 0), ("unchanged", 1)])
+def test_a_deploy_of_githubs_main_that_is_live_is_recorded_without_telling_kirill(tmp_path, monkeypatch, status, code):
+    assert run_github_unit(tmp_path, monkeypatch, status) == (code, [])
+
+
+@pytest.mark.parametrize("status, headline", [
+    ("rolled_back", "Aura's change failed its checks and was rolled back."),
+    ("blocked", "Aura's deploy: blocked."), ("failed", "Aura's deploy: failed."),
+    ("postponed", "Aura's deploy: postponed.")])
+def test_a_deploy_of_githubs_main_that_is_not_live_still_tells_kirill(tmp_path, monkeypatch, status, headline):
+    code, [(note, incident)] = run_github_unit(tmp_path, monkeypatch, status)
+    assert code == 1 and note.startswith(headline) and "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/12" in note
+    assert incident == "deploy:main:cccccccccccc"
 
 
 @pytest.fixture
