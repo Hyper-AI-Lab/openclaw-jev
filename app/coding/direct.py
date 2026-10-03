@@ -250,6 +250,24 @@ def running_units() -> List[str]:
     return [line.split()[0] for line in listed.stdout.splitlines() if line.strip()]
 
 
+def running_turn_models(units: List[str]) -> List[str]:
+    """The models the running turns' messages came from so far, each once, sorted.
+
+    ``units`` are the running turns' units (``running_units``). Only a session's last turn can run. A turn that has
+    not yet produced a message names no model, and a stream that can't be read adds nothing.
+    """
+    running = set(units)
+    models = set()
+    for path in DIRECT_DIR.glob("*/*/session.json"):
+        session = json.loads(path.read_text())
+        if not session["turns"]:
+            continue
+        turn = _turn(session, session["turns"])
+        if turn.unit in running:
+            models.update(stream.parse_lines(runner.read_events(turn, 0)[0]).models)
+    return sorted(models)
+
+
 def task_working(task_id: str) -> bool:
     """Whether Aura is working with Claude in the task: a turn is running, or an open session's last turn ended,
     or the session started, less than ``BETWEEN_TURNS_SEC`` ago."""
