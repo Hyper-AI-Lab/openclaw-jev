@@ -5,6 +5,7 @@ const { test, mock, beforeEach, afterEach } = require('node:test');
 // failed test, so the real fetch and real settings are never put back in this process.
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -904,18 +905,40 @@ test('exec cap: the plugin module spawns no process and the repo files stay read
   assert.doesNotMatch(src, /openclaw\.json|settings\.json|process\.env/, 'it reads no config or environment');
 });
 
-test('exec cap: the default directory is private under RMP state, and the limits are the documented ones', () => {
+test('exec cap: the default directory is the checkout\'s gitignored data/exec-results, and the limits are the documented ones', () => {
   const { DEFAULT_DIR, MAX_RESULT_CHARS, UPSTREAM_LIMIT_CHARS } = capModule();
-  assert.equal(DEFAULT_DIR, '/root/.openclaw/rmp-exec-results');
-  // Runtime data never goes inside a code or plugin checkout the deploy owns, and nothing is migrated from an older place.
-  for (const code of ['/root/.openclaw/rmp', '/root/.openclaw/plugins', '/root/.openclaw/web-stack']) {
-    const rel = path.relative(code, DEFAULT_DIR);
-    assert.ok(rel.startsWith('..') || path.isAbsolute(rel), `${DEFAULT_DIR} is inside ${code}`);
+  assert.equal(DEFAULT_DIR, '/root/.openclaw/rmp/data/exec-results');
+  const repoRoot = path.resolve(__dirname, '../..');
+  // What the live checkout would hold at DEFAULT_DIR, asked of this clone's git metadata only (no file is read).
+  const rel = path.relative('/root/.openclaw/rmp', DEFAULT_DIR);
+  assert.equal(rel, path.join('data', 'exec-results'));
+  const git = (...args) => execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8' });
+  const resultFile = path.join(rel, 'exec-1-0123456789abcdef.txt');
+  const partialFile = path.join(rel, 'exec-1-0123456789abcdef.partial.txt');
+  for (const file of [resultFile, partialFile]) {
+    assert.doesNotThrow(() => git('check-ignore', '-q', '--no-index', file), `${file} is not ignored by the repository`);
   }
+  assert.equal(git('ls-files', 'data').trim(), '', 'nothing under data/ is tracked');
+  // Still never inside the plugin or web-stack trees the deploy copies.
+  for (const code of ['/root/.openclaw/plugins', '/root/.openclaw/web-stack']) {
+    const r = path.relative(code, DEFAULT_DIR);
+    assert.ok(r.startsWith('..') || path.isAbsolute(r), `${DEFAULT_DIR} is inside ${code}`);
+  }
+  // Nothing is read, moved or copied from an older location.
   const src = realReadFileSync(CAP_MODULE, 'utf8');
-  assert.doesNotMatch(src, /rmp\/exec-results|renameSync|copyFileSync|cpSync/, 'no old location is read, moved or copied');
+  assert.doesNotMatch(src, /rmp-exec-results|rmp\/exec-results|renameSync|copyFileSync|cpSync/, 'no old location is read, moved or copied');
   assert.equal(MAX_RESULT_CHARS, 12000);
   assert.equal(UPSTREAM_LIMIT_CHARS, 100000);
+});
+
+test('exec cap: results saved by an earlier version at the checkout root exec-results/ are ignored by git too', () => {
+  const repoRoot = path.resolve(__dirname, '../..');
+  for (const file of ['exec-results/exec-1-0123456789abcdef.txt', 'exec-results/exec-1-0123456789abcdef.partial.txt']) {
+    assert.doesNotThrow(
+      () => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: repoRoot }),
+      `${file} would be staged by git add -A`,
+    );
+  }
 });
 
 // ---- exec cap, release blockers: hard cap on every path, root ownership, error summary, full/partial truth ----
