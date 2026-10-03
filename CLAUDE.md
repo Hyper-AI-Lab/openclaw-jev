@@ -46,5 +46,6 @@ This is RMP, the orchestration layer behind Aura, Kirill's assistant. You work o
 - To wait for CI, run `aura-github gh pr checks <number> --watch`. If CI fails, fix the same branch.
 - Merge only when Aura approves, with `aura-github gh pr merge <number> --squash`. RMP then deploys GitHub's `main` once CI passed on it and Aura is idle.
 - Run focused tests for what you changed; CI runs the full suite on the pull request.
+- Only a change to this repository needs a pull request. A one-off script or analysis Aura asks for stays in the workspace, uncommitted.
 - Never edit the live checkout `/root/.openclaw/rmp` (or `/root/.openclaw/plugins`, `/root/.openclaw/web-stack`): a change there goes live at once, without CI.
 - Use only `aura-github` for GitHub; never read or pass the token yourself. Other repositories are off limits unless Aura says Kirill asked for it.

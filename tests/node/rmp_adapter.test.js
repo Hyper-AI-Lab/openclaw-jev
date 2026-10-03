@@ -388,6 +388,17 @@ test('a planning turn asks RMP for plan mode and an effort level, and says it wa
   assert.equal(text(answer), 'Claude, turn 1 (planning): success\n\n1. Edit calc.py');
 });
 
+test('attach_file asks RMP to send a file of a Claude session with her accepted reply', async () => {
+  const where = '/srv/aura-code/direct/t/s/scratch/out.csv';
+  const calls = installFetch([
+    ['POST /api/replies/files', () => ({ id: 'f1', name: 'out.csv', size: 8, title: 'The sheet' })],
+  ]);
+  const { tools } = loadPlugin();
+  const attached = await tools.attach_file.execute('c1', { path: where, title: 'The sheet' });
+  assert.equal(text(attached), 'Attached out.csv (8 bytes): it goes to Kirill with your reply.');
+  assert.deepEqual(calls[0].body, { session_key: SLACK_KEY, path: where, title: 'The sheet' });
+});
+
 test('a tool result is an object OpenClaw can read in a script, never a bare string', async () => {
   installFetch([['POST /api/claude/sessions/s-1/messages', () => json({ detail: 'the session has ended' }, 409)]]);
   const { tools } = loadPlugin();

@@ -200,6 +200,7 @@ ATTEMPT: {attempt}
 Greetings/social chat: accept a short matching reply. Do not skip this judgment.
 Check every claim of work done in AURA OUTPUT (read, searched, checked, ran, sent, created, updated, fixed) against TOOLS/ACTIONS TAKEN, EXTERNAL EVIDENCE and ARTIFACTS. A claim with no matching successful action is not done: verdict=rework and name the claim in command_to_aura. Answers that need only knowledge or the conversation need no tools.
 Code work (files changed, commits, tests run or passing) is done only as far as EXTERNAL EVIDENCE shows it: tests pass only when RMP's own test run passed, or GitHub reports CI's test check passed on the pull request.
+A file Aura says she sends counts only if EXTERNAL EVIDENCE lists it among the files she attached.
 Insufficient work: verdict=rework with a concrete command_to_aura.
 Around attempt 10 you may verdict=strategy_change. Around attempt 20, verdict=escalate_user.
 

@@ -1,4 +1,6 @@
 """What the evaluator sees of Aura's own work with Claude: her sessions, and what GitHub says of their pull requests."""
+from unittest.mock import AsyncMock
+
 import pytest
 
 from app.activities import openclaw_activities as oa
@@ -22,6 +24,7 @@ def records(monkeypatch):
     found = []
     monkeypatch.setattr("app.coding.records.task_records", lambda task_id: list(found))
     monkeypatch.setattr("app.config.get_coding_config", lambda: {"repositories": {"rmp": {"remote": "Hyper-AI-Lab/openclaw-jev"}}})
+    monkeypatch.setattr("app.activities.side_effects.pending_reply_files", AsyncMock(return_value=[]))
     return found
 
 
@@ -47,3 +50,12 @@ async def test_github_out_of_reach_is_said_and_no_session_means_no_evidence(reco
     records.append(record("session", "Greeting fix"))
     monkeypatch.setattr(github, "pull", down)
     assert "GitHub: PR #12 could not be checked (GET pulls/12: connection refused)." in await oa._direct_claude_evidence(TASK)
+
+
+async def test_the_evaluator_sees_the_files_aura_attached(records, monkeypatch):
+    records.append(record("session", "Sheet to CSV", prs=()))
+    attached = [{"name": "out.csv", "size": 8, "path": "/srv/aura-code/direct/t/s/scratch/out.csv"}]
+    monkeypatch.setattr("app.activities.side_effects.pending_reply_files", AsyncMock(return_value=attached))
+    text = await oa._direct_claude_evidence(TASK)
+    assert ("Files Aura attached, which RMP sends with this reply once it is accepted: "
+            "out.csv (8 bytes, from /srv/aura-code/direct/t/s/scratch/out.csv).") in text

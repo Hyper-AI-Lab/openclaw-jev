@@ -46,6 +46,9 @@ TERMINAL_STOP_REASONS = frozenset({"stop", "error", "maxTokens"})
 SESSION_SUFFIX = re.compile(r"__(r\d{1,3}|recall)")
 # notify_slack_user outcomes: sent; not sent by policy or config; refused by Slack for good.
 SLACK_DELIVERED, SLACK_SUPPRESSED, SLACK_REFUSED = "delivered", "suppressed", "refused"
+# A delivered reply with files Aura attached, which deliver_reply_files sends next.
+SLACK_DELIVERED_WITH_FILES = "delivered_with_files"
+REPLY_FILE_ATTEMPTS = 5
 # OpenClaw/Kimi use "toolUse"; older transcripts may say "toolCalls".
 NON_TERMINAL_STOP_REASONS = frozenset({"toolCalls", "toolUse"})
 # Left of an activity's start-to-close budget for parsing and persisting after the LLM turn.
@@ -708,7 +711,7 @@ async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
 # Union: histories recorded before Sep 30 2026 hold booleans, and replays decode them through this hint.
 @traced_activity("slack.notify")
 async def notify_slack_user(payload: Dict[str, Any]) -> Union[bool, str]:
-    from app.activities.side_effects import send_slack_message_idempotent
+    from app.activities.side_effects import pending_reply_files, send_slack_message_idempotent
     from app.db.database import AsyncSessionLocal
     from app.db.models import Task
 
@@ -761,7 +764,36 @@ async def notify_slack_user(payload: Dict[str, Any]) -> Union[bool, str]:
         session_key=session_key,
         meta={k: payload[k] for k in ("attempt", "process_run_id") if payload.get(k) is not None},
     )
-    return SLACK_DELIVERED if delivered else SLACK_REFUSED
+    if not delivered:
+        return SLACK_REFUSED
+    if payload.get("message_kind") == "reply" and await pending_reply_files(task_id):
+        return SLACK_DELIVERED_WITH_FILES
+    return SLACK_DELIVERED
+
+
+@traced_activity("slack.reply_files")
+async def deliver_reply_files(payload: Dict[str, Any]) -> List[str]:
+    """Send the files Aura attached after her accepted reply; the last attempt tells Kirill what could not go."""
+    from app.activities.side_effects import (
+        SlackTransientError,
+        pending_reply_files,
+        send_reply_files,
+        send_slack_message_idempotent,
+    )
+
+    task_id = payload["task_id"]
+    bot_token, user_id = get_slack_bot_token(), _get_slack_user_id(payload.get("session_key", "agent:main:main"))
+    if should_suspend_slack() or not bot_token or not user_id:
+        return []
+    try:
+        return await send_reply_files(task_id, user_id, bot_token)
+    except SlackTransientError as exc:
+        if activity.info().attempt < REPLY_FILE_ATTEMPTS:
+            raise
+        names = ", ".join(f["name"] for f in await pending_reply_files(task_id))
+        await send_slack_message_idempotent(
+            task_id, user_id, f"RMP could not send {names}, attached by Aura, after several tries: {exc}", bot_token)
+        return []
 
 
 @traced_activity("openclaw.validate_output")
@@ -842,10 +874,12 @@ async def check_intermediate_updates_enabled(payload: Dict[str, Any]) -> bool:
 
 
 async def _direct_claude_evidence(task_id: str) -> str:
-    """Aura's direct Claude sessions in the task, from RMP's records, and what GitHub says of their pull requests.
+    """Aura's direct Claude sessions in the task, from RMP's records, what GitHub says of their pull requests, and the
+    files she attached.
 
     A reviewed coding job brings its own evidence; this is what Aura did with Claude herself.
     """
+    from app.activities.side_effects import pending_reply_files
     from app.coding import github
     from app.coding.records import section_text, task_records
     from app.config import get_coding_config
@@ -866,6 +900,10 @@ async def _direct_claude_evidence(task_id: str) -> str:
             lines.append(f"GitHub: PR #{number} ({link}) is {state}; CI's test check on it: {ci}.")
         except github.GitHubError as exc:
             lines.append(f"GitHub: PR #{number} could not be checked ({str(exc)[:120]}).")
+    files = await pending_reply_files(task_id)
+    if files:
+        lines.append("Files Aura attached, which RMP sends with this reply once it is accepted: "
+                     + "; ".join(f"{f['name']} ({f['size']} bytes, from {f['path']})" for f in files) + ".")
     return redact_secrets("\n".join(lines))
 
 
