@@ -245,9 +245,11 @@ def end_task_sessions(task_id: str, reason: str) -> List[str]:
 
 
 def running_units() -> List[str]:
+    """The running turns' units as ``Turn.unit`` names them: systemctl lists them with ``.service``, which
+    ``systemd-run --unit`` adds and ``Turn.unit`` leaves out."""
     listed = subprocess.run(["systemctl", "list-units", "--plain", "--no-legend", "--state=active,activating",
                              f"{UNIT_PREFIX}*"], capture_output=True, text=True, timeout=30)
-    return [line.split()[0] for line in listed.stdout.splitlines() if line.strip()]
+    return [line.split()[0].removesuffix(".service") for line in listed.stdout.splitlines() if line.strip()]
 
 
 def running_turn_models(units: List[str]) -> List[str]:
