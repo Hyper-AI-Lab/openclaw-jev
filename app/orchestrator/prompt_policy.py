@@ -59,6 +59,16 @@ MEMORY_FIRST_UNIVERSAL = (
     "Do NOT use memory_search, memory_get, or read workspace MEMORY.md during this RMP step."
 )
 
+# A task session's exec result over 12,000 characters is cut to its start and end by the RMP adapter
+# plugin; this tells the model to avoid producing such output in the first place.
+OUTPUT_BOUNDS_GUIDANCE = (
+    "TOOL OUTPUT: Keep command output small. Bound it before you run the command (head, tail, grep, wc -l, "
+    "a narrower path or flag). A result over 12,000 characters reaches you as its start and end, with the text "
+    "RMP saw saved to a file the notice names: search that file with head, tail or grep instead of printing it "
+    "whole. Do not re-run a command whose output is already in this conversation. Leave diffs and long output "
+    "to Claude (claude_start, claude_send) instead of printing them here."
+)
+
 USER_TIMEZONE = "Asia/Tokyo"
 USER_TIMEZONE_LABEL = "Japan Standard Time (JST, UTC+9)"
 
@@ -124,6 +134,7 @@ def build_generic_execute_prompt(
 {extra}
 {web_block}
 {MEMORY_FIRST_UNIVERSAL}
+{OUTPUT_BOUNDS_GUIDANCE}
 Instructions:
 1. Execute the required steps. Use tools sparingly (at most {budget} tool calls for simple read/summarize requests). When WEB CAPABILITY BRIEF is present, prefer the listed tools in order.
 2. Use the OpenClaw tool named `read` (with `file_path`) to read files — there is no `read_file` tool.
@@ -162,6 +173,7 @@ def build_catalog_step_prompt(
 {step_prompt}
 
 {MEMORY_FIRST_UNIVERSAL}
+{OUTPUT_BOUNDS_GUIDANCE}
 Instructions:
 1. Complete ONLY this step. Use tools as needed (prefer at most 3 tool calls unless the step requires more). Use `read` with `file_path` for files (not `read_file`). {interact}
 2. Reply in clear English — concise, no internal planning monologue or metadata blocks.
