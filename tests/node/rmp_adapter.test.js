@@ -906,7 +906,14 @@ test('exec cap: the plugin module spawns no process and the repo files stay read
 
 test('exec cap: the default directory is private under RMP state, and the limits are the documented ones', () => {
   const { DEFAULT_DIR, MAX_RESULT_CHARS, UPSTREAM_LIMIT_CHARS } = capModule();
-  assert.equal(DEFAULT_DIR, '/root/.openclaw/rmp/exec-results');
+  assert.equal(DEFAULT_DIR, '/root/.openclaw/rmp-exec-results');
+  // Runtime data never goes inside a code or plugin checkout the deploy owns, and nothing is migrated from an older place.
+  for (const code of ['/root/.openclaw/rmp', '/root/.openclaw/plugins', '/root/.openclaw/web-stack']) {
+    const rel = path.relative(code, DEFAULT_DIR);
+    assert.ok(rel.startsWith('..') || path.isAbsolute(rel), `${DEFAULT_DIR} is inside ${code}`);
+  }
+  const src = realReadFileSync(CAP_MODULE, 'utf8');
+  assert.doesNotMatch(src, /rmp\/exec-results|renameSync|copyFileSync|cpSync/, 'no old location is read, moved or copied');
   assert.equal(MAX_RESULT_CHARS, 12000);
   assert.equal(UPSTREAM_LIMIT_CHARS, 100000);
 });
