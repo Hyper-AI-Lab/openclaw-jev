@@ -208,8 +208,8 @@ async def test_the_coding_status_counts_the_direct_turns_running_now_from_their_
     (home / "session.json").write_text(json.dumps({"id": home.name, "task_id": "task-a", "status": "open",
                                                    "created_at": "2026-10-02T10:00:00+00:00", "turns": 1}))
     monkeypatch.setattr(direct.runner, "unit_active", lambda unit: False)
-    listings = iter(["", "aura-direct-task-a-00000000-1 loaded active running claude -p\n"
-                         "aura-direct-task-b-00000001-3 loaded activating start claude -p\n\n"])
+    listings = iter(["", "aura-direct-task-a-00000000-1.service loaded active running claude -p\n"
+                         "aura-direct-task-b-00000001-3.service loaded activating start claude -p\n\n"])
     calls = []
 
     def systemctl(argv, **kwargs):
@@ -310,6 +310,8 @@ def _assistant(model, text="x"):
 
 
 async def test_the_coding_status_lists_the_models_of_the_direct_turns_running_now(host, monkeypatch):
+    import subprocess
+
     from app.activities import coding_activities
     from app.coding import direct
 
@@ -344,7 +346,14 @@ async def test_the_coding_status_lists_the_models_of_the_direct_turns_running_no
     older = direct.Turn("task-a", 1, direct.DIRECT_DIR, "00000000-0000-4000-8000-000000000000")
     older.dir.mkdir(parents=True)
     older.stream_file.write_text(_assistant("claude-haiku-4-5-20251001") + "\n")
-    monkeypatch.setattr(direct, "running_units", lambda: running)
+
+    def systemctl(argv, **kwargs):
+        # As systemctl lists the units: with the .service suffix that Turn.unit leaves out.
+        listing = "".join(f"{unit}.service loaded {'activating start' if n else 'active running'} claude -p\n"
+                          for n, unit in enumerate(running))
+        return subprocess.CompletedProcess(argv, 0, stdout=listing, stderr="")
+
+    monkeypatch.setattr(direct.subprocess, "run", systemctl)
     monkeypatch.setenv("RMP_API_KEY", "k")
     monkeypatch.setattr(server, "_rmp_commit", lambda: "abc1234")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://rmp",
@@ -355,3 +364,15 @@ async def test_the_coding_status_lists_the_models_of_the_direct_turns_running_no
     assert busy["direct_turn_models"] == ["claude-opus-5-5", "claude-sonnet-5-5"]
     assert busy["direct_turns_running"] == 5 and busy["direct_sessions_open"] == 7
     assert idle["direct_turn_models"] == [] and idle["direct_turns_running"] == 0
+
+
+def test_running_units_are_named_as_the_turns_name_their_units(monkeypatch):
+    import subprocess
+
+    from app.coding import direct
+
+    session_id = "0123abcd-0000-4000-8000-000000000000"
+    listing = "aura-direct-task-a-0123abcd-2.service loaded active running claude -p\n\n"
+    monkeypatch.setattr(direct.subprocess, "run",
+                        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=listing, stderr=""))
+    assert direct.running_units() == [direct.Turn("task-a", 2, direct.DIRECT_DIR, session_id).unit]
