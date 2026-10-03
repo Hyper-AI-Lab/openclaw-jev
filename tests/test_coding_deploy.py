@@ -510,3 +510,28 @@ def test_pending_main_says_how_long_githubs_main_has_waited(repos, monkeypatch):
     assert deploy.pending_main("x/y", live=repos.live) == {"head": head, "age_hours": 2.0}
     git(repos.live, "merge", "-q", "--ff-only", head)
     assert deploy.pending_main("x/y", live=repos.live) is None
+
+
+def test_every_file_of_the_rmp_adapter_plugin_restarts_the_gateway_when_it_changes():
+    # The gateway loads plugin code and manifests at start, so a change to any file here (the exec
+    # result cap, its manifest contract, index.js) only takes effect after a restart of the gateway.
+    plugin_files = sorted(
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "plugins" / "rmp_adapter").rglob("*")
+        if path.is_file() and "node_modules" not in path.parts
+    )
+    assert "plugins/rmp_adapter/exec_result_cap.js" in plugin_files
+    assert "plugins/rmp_adapter/openclaw.plugin.json" in plugin_files
+    for file in plugin_files:
+        assert deploy.restarts_for([file]) == ["openclaw-gateway"], file
+    assert deploy.restarts_for(plugin_files) == ["openclaw-gateway"]
+
+
+def test_a_deploy_that_only_adds_a_plugin_file_restarts_only_the_gateway(repos):
+    head = repos.change({"plugins/p/exec_cap.js": "module.exports = {};\n"})
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+
+    assert result["status"] == "deployed"
+    assert (repos.mirror["plugins/"] / "p" / "exec_cap.js").read_text() == "module.exports = {};\n"
+    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "openclaw-gateway")]

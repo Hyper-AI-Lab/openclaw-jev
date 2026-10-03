@@ -578,3 +578,554 @@ test('an RMP run cannot wait on a tool prompt Kirill never sees', () => {
   }
   assert.equal(call('ask_user', { questions: [] }, 'agent:main:main'), undefined);
 });
+
+// ---- exec result cap: a task session's exec output never holds more than 12,000 characters ----
+
+const os = require('node:os');
+
+const CAP_MODULE = path.resolve(__dirname, '../../plugins/rmp_adapter/exec_result_cap.js');
+const TASK_UUID = '3f2a9c1e-5b7d-4e8a-9c0b-1d2e3f4a5b6c';
+const TASK_KEY = `agent:main:rmp_task_${TASK_UUID}`;
+const MAX = 12000;
+const DAY_MS = 24 * 3600 * 1000;
+
+function capModule() {
+  delete require.cache[CAP_MODULE];
+  return require(CAP_MODULE);
+}
+
+/** Deterministic output of exactly n characters, one numbered line at a time. */
+function output(n, { marker } = {}) {
+  let out = '';
+  let i = 0;
+  let marked = !marker;
+  while (out.length < n) {
+    if (!marked && out.length >= n / 2) {
+      out += `${marker}\n`;
+      marked = true;
+      continue;
+    }
+    out += `line ${String(i++).padStart(6, '0')} ${'x'.repeat(40)}\n`;
+  }
+  return out.slice(0, n);
+}
+
+function execResult(textValue, details) {
+  return {
+    content: [{ type: 'text', text: textValue }],
+    ...(details === undefined ? {} : { details }),
+  };
+}
+
+function execDetails(extra = {}) {
+  return { cwd: '/w', durationMs: 5, exitCode: 0, exitReason: 'exit', exitSignal: null, noOutputTimedOut: false, status: 'completed', ...extra };
+}
+
+function tmpDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'rmp-cap-'));
+}
+
+/** A cap handler writing into a fresh private directory, plus the directory it uses. */
+function newCap(options = {}) {
+  const base = tmpDir();
+  const dir = options.dir || path.join(base, 'exec-results');
+  const { createExecResultCap } = capModule();
+  const handler = createExecResultCap({ dir, ownerUid: process.geteuid(), ...options.opts });
+  return { base, dir, handler, run: (result, key = TASK_KEY, tool = 'exec') => handler({ toolName: tool, result, isError: false }, { sessionKey: key, runtime: 'openclaw' }) };
+}
+
+function cappedText(out) {
+  assert.ok(out && out.result, 'a capped result was returned');
+  return out.result.content[0].text;
+}
+
+test('exec cap: the manifest declares the middleware contract and the plugin registers it for exec on openclaw', () => {
+  const manifest = JSON.parse(realReadFileSync(path.join(path.dirname(PLUGIN), 'openclaw.plugin.json'), 'utf8'));
+  assert.deepEqual(manifest.contracts.agentToolResultMiddleware, ['openclaw']);
+
+  delete require.cache[require.resolve(PLUGIN)];
+  const registered = [];
+  require(PLUGIN).register({
+    on: () => {},
+    registerTool: () => {},
+    registerAgentToolResultMiddleware: (handler, options) => registered.push({ handler, options }),
+  });
+  assert.equal(registered.length, 1);
+  assert.equal(typeof registered[0].handler, 'function');
+  assert.deepEqual(registered[0].options, { runtimes: ['openclaw'], matcher: ['exec'] });
+});
+
+test('exec cap: a short result is left exactly as it is', async () => {
+  const { run } = newCap();
+  for (const n of [0, 11, 5000, MAX - 1, MAX]) {
+    assert.equal(await run(execResult(output(n), execDetails({ exitCode: 3, status: 'failed' }))), undefined, `${n} chars`);
+  }
+});
+
+test('exec cap: a long result, notice included, stays within 12,000 characters and keeps its head and tail', async () => {
+  const { run } = newCap();
+  for (const n of [MAX + 1, 12500, 30000, 99000, 100000, 500000]) {
+    const original = output(n);
+    const out = await run(execResult(original, execDetails()));
+    const shown = cappedText(out);
+    assert.ok(shown.length <= MAX, `${n} chars became ${shown.length}`);
+    assert.ok(shown.length > 6000, 'most of the budget is used');
+    assert.ok(shown.includes(original.slice(0, 500)), 'head kept');
+    assert.ok(shown.includes(original.slice(-300)), 'tail kept');
+    assert.match(shown, new RegExp(`${n} chars`));
+  }
+});
+
+test('exec cap: an error line in the omitted middle is carried in the notice', async () => {
+  const { run } = newCap();
+  const original = output(60000, { marker: 'ERROR build step 7 failed: missing symbol frobnicate' });
+  const shown = cappedText(await run(execResult(original, execDetails())));
+  assert.ok(shown.length <= MAX);
+  assert.ok(shown.includes('ERROR build step 7 failed: missing symbol frobnicate'));
+  // Many error lines and very long ones still keep the whole result within the limit.
+  const noisy = Array.from({ length: 400 }, (_, i) => `Traceback error ${i} ${'y'.repeat(500)}`).join('\n');
+  const noisyShown = cappedText(await run(execResult(noisy, execDetails({ exitCode: 1, status: 'failed' }))));
+  assert.ok(noisyShown.length <= MAX);
+  assert.match(noisyShown, /exit code 1/);
+});
+
+test('exec cap: the exit status survives, from details, from the final exit line, or is marked unavailable', async () => {
+  const { run } = newCap();
+  const fromDetails = cappedText(await run(execResult(output(40000), execDetails({ exitCode: 3, status: 'failed', exitReason: 'exit' }))));
+  assert.match(fromDetails, /exit code 3/);
+  assert.match(fromDetails, /failed/);
+  assert.match(cappedText(await run(execResult(output(40000), execDetails({ exitCode: 0 })))), /exit code 0/);
+
+  const exitLine = `${output(40000)}\n\n(Command exited with code 7)`;
+  const fromText = cappedText(await run(execResult(exitLine, { aggregated: exitLine })));
+  assert.match(fromText, /exit code 7/);
+  assert.ok(fromText.includes('(Command exited with code 7)'), 'the exit line itself stays in the tail');
+
+  const unknown = cappedText(await run(execResult(output(40000), { aggregated: 'x' })));
+  assert.match(unknown, /exit status: unavailable/i);
+});
+
+test('exec cap: a result OpenClaw already truncated is marked partial, and its status is unavailable unless present', async () => {
+  const { run, dir } = newCap();
+  const prefix = output(100000);
+  const shown = cappedText(await run(execResult(prefix, { truncated: true, originalSizeBytes: 149114 })));
+  assert.ok(shown.length <= MAX);
+  assert.match(shown, /PARTIAL/);
+  assert.match(shown, /OpenClaw/);
+  assert.match(shown, /exit status: unavailable/i);
+  assert.doesNotMatch(shown, /originalSizeBytes|149114/, 'that number is not the raw size, so it is not reported as one');
+  assert.doesNotMatch(shown, /full (raw )?output/i, 'the saved prefix is never called the full output');
+  const [file] = fs.readdirSync(dir);
+  assert.match(file, /partial/i, 'the saved file is marked partial too');
+  assert.equal(fs.readFileSync(path.join(dir, file), 'utf8'), prefix);
+
+  // truncated:true with the exit line still at the end of the text: the status is visible, the result still partial.
+  const withLine = `${output(99000)}\n(Command exited with code 3)`;
+  const visible = cappedText(await run(execResult(withLine, { truncated: true, originalSizeBytes: 101048 })));
+  assert.match(visible, /PARTIAL/);
+  assert.match(visible, /exit code 3/);
+
+  // A text at the 100,000-character ceiling is partial even when details say nothing.
+  const atCeiling = cappedText(await run(execResult(output(100000), execDetails())));
+  assert.match(atCeiling, /PARTIAL/);
+  // An ordinary long result is not.
+  assert.doesNotMatch(cappedText(await run(execResult(output(50000), execDetails()))), /PARTIAL/);
+});
+
+test('exec cap: the complete middleware-visible text is saved in a 0700 directory as a 0600 file the notice names', async () => {
+  const { run, dir } = newCap();
+  const original = output(45000);
+  const shown = cappedText(await run(execResult(original, execDetails())));
+  const files = fs.readdirSync(dir);
+  assert.equal(files.length, 1);
+  const file = path.join(dir, files[0]);
+  assert.equal(fs.readFileSync(file, 'utf8'), original);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(file).uid, process.getuid());
+  assert.equal(fs.statSync(dir).uid, process.getuid());
+  assert.ok(shown.includes(file), 'the notice gives the path');
+  assert.match(shown, /head|tail|grep/, 'the notice says how to read it');
+  assert.ok(!files[0].includes(TASK_UUID) && !/rmp_|task/.test(files[0]), 'the file name leaks no session or task id');
+  // Two results never share a file.
+  await run(execResult(original, execDetails()));
+  assert.equal(fs.readdirSync(dir).length, 2);
+});
+
+test('exec cap: an existing directory with loose permissions is tightened; a symlinked directory is refused', async () => {
+  const loose = newCap();
+  fs.mkdirSync(loose.dir, { mode: 0o755 });
+  fs.chmodSync(loose.dir, 0o755);
+  await loose.run(execResult(output(30000), execDetails()));
+  assert.equal(fs.statSync(loose.dir).mode & 0o777, 0o700);
+  assert.equal(fs.readdirSync(loose.dir).length, 1);
+
+  const base = tmpDir();
+  const target = path.join(base, 'elsewhere');
+  fs.mkdirSync(target);
+  const link = path.join(base, 'link');
+  fs.symlinkSync(target, link);
+  const linked = newCap({ dir: link });
+  const shown = cappedText(await linked.run(execResult(output(30000), execDetails())));
+  assert.ok(shown.length <= MAX);
+  assert.match(shown, /NOT saved/);
+  assert.deepEqual(fs.readdirSync(target), [], 'nothing was written through the link');
+});
+
+test('exec cap: a file name that already exists, even as a symlink, is never overwritten or followed', async () => {
+  const base = tmpDir();
+  const dir = path.join(base, 'exec-results');
+  fs.mkdirSync(dir, { mode: 0o700 });
+  const victim = path.join(base, 'victim.txt');
+  fs.writeFileSync(victim, 'precious');
+  const { createExecResultCap } = capModule();
+  const handler = createExecResultCap({ dir, ownerUid: process.geteuid(), randomHex: () => '0123456789abcdef', now: () => 1_700_000_000_000 });
+  // Whatever name the module picks with this fixed randomness, plant a symlink on it and on its partial twin.
+  const probe = tmpDir();
+  const dry = createExecResultCap({ dir: path.join(probe, 'd'), ownerUid: process.geteuid(), randomHex: () => '0123456789abcdef', now: () => 1_700_000_000_000 });
+  await dry({ toolName: 'exec', result: execResult(output(30000), execDetails()) }, { sessionKey: TASK_KEY });
+  const [name] = fs.readdirSync(path.join(probe, 'd'));
+  fs.symlinkSync(victim, path.join(dir, name));
+  const out = await handler({ toolName: 'exec', result: execResult(output(30000), execDetails()) }, { sessionKey: TASK_KEY });
+  assert.ok(cappedText(out).length <= MAX);
+  assert.match(cappedText(out), /NOT saved/);
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'precious');
+});
+
+test('exec cap: saved files older than three days are removed, nothing else is', async () => {
+  const base = tmpDir();
+  const dir = path.join(base, 'exec-results');
+  const t0 = Date.now();
+  let clock = t0;
+  const { createExecResultCap, RETENTION_MS } = capModule();
+  assert.equal(RETENTION_MS, 3 * DAY_MS);
+  const handler = createExecResultCap({ dir, ownerUid: process.geteuid(), now: () => clock });
+  const run = () => handler({ toolName: 'exec', result: execResult(output(30000), execDetails()) }, { sessionKey: TASK_KEY });
+  await run();
+  const [oldName] = fs.readdirSync(dir);
+  fs.utimesSync(path.join(dir, oldName), (t0 - 4 * DAY_MS) / 1000, (t0 - 4 * DAY_MS) / 1000);
+  const young = `exec-${t0 - 2 * DAY_MS}-00000000deadbeef.txt`;
+  fs.writeFileSync(path.join(dir, young), 'young');
+  fs.utimesSync(path.join(dir, young), (t0 - 2 * DAY_MS) / 1000, (t0 - 2 * DAY_MS) / 1000);
+  const stray = 'notes-not-ours.txt';
+  fs.writeFileSync(path.join(dir, stray), 'stray');
+  fs.utimesSync(path.join(dir, stray), (t0 - 9 * DAY_MS) / 1000, (t0 - 9 * DAY_MS) / 1000);
+  const keepTarget = path.join(base, 'keep.txt');
+  fs.writeFileSync(keepTarget, 'keep');
+  const oldLink = `exec-${t0 - 9 * DAY_MS}-00000000cafebabe.txt`;
+  fs.symlinkSync(keepTarget, path.join(dir, oldLink));
+  fs.mkdirSync(path.join(dir, `exec-${t0 - 9 * DAY_MS}-00000000feedface.txt`));
+  clock = t0 + 11 * 60 * 1000; // past the throttle between sweeps
+  await run();
+  const left = fs.readdirSync(dir);
+  assert.ok(!left.includes(oldName), 'the 4-day-old file is gone');
+  assert.ok(left.includes(young), 'the 2-day-old file stays');
+  assert.ok(left.includes(stray), 'a file this module did not write stays');
+  assert.ok(left.includes(oldLink), 'a symlink is never followed or removed as a result file');
+  assert.equal(fs.readFileSync(keepTarget, 'utf8'), 'keep');
+  assert.equal(left.filter((n) => n.startsWith('exec-')).length, 4, 'the young file, the symlink, the directory and the new result');
+});
+
+test('exec cap: a failure to save still returns a capped result with a clear notice, and cleanup trouble is harmless', async () => {
+  const base = tmpDir();
+  const blocker = path.join(base, 'a-file');
+  fs.writeFileSync(blocker, 'x');
+  const broken = newCap({ dir: path.join(blocker, 'exec-results') });
+  const shown = cappedText(await broken.run(execResult(output(50000), execDetails({ exitCode: 3, status: 'failed' }))));
+  assert.ok(shown.length <= MAX);
+  assert.match(shown, /NOT saved/);
+  assert.match(shown, /exit code 3/);
+  assert.doesNotMatch(shown, new RegExp(blocker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'no phantom path is offered');
+});
+
+test('exec cap: the handler never throws; if building the notice fails it falls back to a plain head and tail', async () => {
+  const { run } = newCap();
+  const hostile = { content: [{ type: 'text', text: output(60000) }] };
+  Object.defineProperty(hostile, 'details', { get() { throw new Error('details exploded'); } });
+  const fallback = cappedText(await run(hostile));
+  assert.ok(fallback.length <= MAX);
+  assert.ok(fallback.includes(output(60000).slice(0, 200)));
+  assert.match(fallback, /RMP output cap/);
+  for (const bad of [undefined, null, {}, { content: null }, { content: 'a string' }, { content: [{ type: 'image' }] }, { content: [null] }]) {
+    await assert.doesNotReject(async () => run(bad));
+    assert.equal(await run(bad), undefined);
+  }
+  const { createExecResultCap } = capModule();
+  const handler = createExecResultCap({ dir: path.join(tmpDir(), 'd'), ownerUid: process.geteuid() });
+  await assert.doesNotReject(async () => handler(undefined, undefined));
+  await assert.doesNotReject(async () => handler({ toolName: 'exec' }, null));
+});
+
+test('exec cap: only exec in a task session is capped, retries and recall sessions included', async () => {
+  const { run } = newCap();
+  const long = () => execResult(output(40000), execDetails());
+  for (const key of [TASK_KEY, `${TASK_KEY}__r1`, `${TASK_KEY}__r12`, `${TASK_KEY}__recall`, `agent:other:rmp_task_${TASK_UUID}`]) {
+    assert.ok(cappedText(await run(long(), key)).length <= MAX, key);
+  }
+  for (const key of [
+    `agent:main:rmp_verify_${TASK_UUID}`, 'agent:main:main', 'agent:main:slack:channel:dtest', 'agent:main:spike_plain_1', '',
+    null, `agent:main:rmp_task_${TASK_UUID}:sub`, `agent:main:rmp_task_${TASK_UUID}__`, 'agent:main:rmp_task_not-a-uuid',
+    `x:agent:main:rmp_task_${TASK_UUID}`, `agent:main:rmp_task_${TASK_UUID}\nagent:main:main`,
+  ]) {
+    assert.equal(await run(long(), key), undefined, `${key}`);
+  }
+  assert.equal(await run(long(), TASK_KEY, 'read'), undefined);
+  assert.equal(await run(long(), TASK_KEY, 'web_fetch'), undefined);
+});
+
+test('exec cap: content and details keep the shape OpenClaw expects', async () => {
+  const { run } = newCap();
+  const image = { type: 'image', data: 'AAAA', mimeType: 'image/png' };
+  const original = output(40000);
+  const result = { content: [{ type: 'text', text: original.slice(0, 20000) }, image, { type: 'text', text: original.slice(20000) }], details: execDetails({ aggregated: original }), isError: false, extra: { kept: true } };
+  const out = await run(result);
+  const capped = out.result;
+  assert.equal(capped.content[0].type, 'text');
+  assert.ok(capped.content[0].text.length <= MAX);
+  assert.deepEqual(capped.content.slice(1), [image], 'non-text blocks are carried over');
+  assert.equal(capped.details.aggregated, capped.content[0].text, 'aggregated agrees with what the model sees');
+  assert.equal(capped.details.exitCode, 0);
+  assert.equal(capped.details.status, 'completed');
+  assert.deepEqual(capped.extra, { kept: true });
+  assert.equal(capped.isError, false);
+  assert.deepEqual(Object.keys(capped.details).sort(), Object.keys(result.details).sort(), 'no key is added or lost');
+  assert.equal(result.content.length, 3, 'the input object is not mutated');
+  assert.equal(result.details.aggregated, original);
+
+  const noAgg = (await run(execResult(original, { truncated: true, originalSizeBytes: 5 }))).result;
+  assert.deepEqual(Object.keys(noAgg.details).sort(), ['originalSizeBytes', 'truncated']);
+  const noDetails = (await run(execResult(original))).result;
+  assert.equal(noDetails.details, undefined);
+});
+
+test('exec cap: the plugin module spawns no process and the repo files stay readable by the live-copy check', () => {
+  const src = realReadFileSync(CAP_MODULE, 'utf8');
+  assert.doesNotMatch(src, /child_process|execFileSync|execSync|spawnSync/);
+  assert.doesNotMatch(src, /openclaw\.json|settings\.json|process\.env/, 'it reads no config or environment');
+});
+
+test('exec cap: the default directory is private under RMP state, and the limits are the documented ones', () => {
+  const { DEFAULT_DIR, MAX_RESULT_CHARS, UPSTREAM_LIMIT_CHARS } = capModule();
+  assert.equal(DEFAULT_DIR, '/root/.openclaw/rmp/exec-results');
+  assert.equal(MAX_RESULT_CHARS, 12000);
+  assert.equal(UPSTREAM_LIMIT_CHARS, 100000);
+});
+
+// ---- exec cap, release blockers: hard cap on every path, root ownership, error summary, full/partial truth ----
+
+function shownLength(out) {
+  return out.result.content.filter((b) => b && b.type === 'text').reduce((n, b) => n + b.text.length, 0);
+}
+
+function lonelySurrogate(textValue) {
+  return /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(textValue);
+}
+
+test('exec cap: a long exec never leaves the handler above 12,000 characters, whichever step fails', async () => {
+  const long = output(150000);
+  const boom = () => { throw new Error('injected'); };
+  const faults = {
+    'content getter throws': () => { const r = {}; Object.defineProperty(r, 'content', { get: boom }); return { result: r }; },
+    'event.result getter throws': () => { const e = { toolName: 'exec' }; Object.defineProperty(e, 'result', { get: boom }); return e; },
+    'text read fails on the second access': () => {
+      let reads = 0;
+      const block = { type: 'text' };
+      Object.defineProperty(block, 'text', { get() { if (++reads > 1) boom(); return long; } });
+      return { result: { content: [block] } };
+    },
+    'details getter throws': () => { const r = { content: [{ type: 'text', text: long }] }; Object.defineProperty(r, 'details', { get: boom }); return { result: r }; },
+    'result keys cannot be listed': () => ({ result: new Proxy({ content: [{ type: 'text', text: long }] }, { ownKeys: boom }) }),
+    'result is a proxy that throws on every read': () => ({ result: new Proxy({}, { get: boom, ownKeys: boom, has: boom, getOwnPropertyDescriptor: boom }) }),
+    'content is a long string, not blocks': () => ({ result: { content: long } }),
+    'content blocks are a proxy array': () => ({ result: { content: new Proxy([{ type: 'text', text: long }], { get(t, k, r) { if (k === 'filter' || k === 'map') return boom; return Reflect.get(t, k, r); } }) } }),
+  };
+  const sessions = { sessionKey: TASK_KEY };
+  const throwingLog = { log: boom };
+  for (const [name, make] of Object.entries(faults)) {
+    for (const opts of [{}, throwingLog]) {
+      const { handler } = newCap({ opts });
+      const event = make();
+      const full = 'toolName' in event ? event : { toolName: 'exec', isError: false, ...event };
+      const out = await handler(full, sessions);
+      assert.ok(out && out.result, `${name}: a bounded result is returned, never the original`);
+      assert.ok(shownLength(out) <= MAX, `${name}: ${shownLength(out)} chars`);
+    }
+  }
+  // Collaborators that fail: the clock, the random source, the directory, the disk, the sweep.
+  const collaborators = {
+    'clock throws': { now: boom },
+    'random source throws': { randomHex: boom },
+    'directory is not a string': { dir: 42 },
+    'directory is empty': { dir: '' },
+    'log throws': { log: boom },
+  };
+  for (const [name, opts] of Object.entries(collaborators)) {
+    const { handler } = newCap({ opts, dir: opts.dir });
+    const out = await handler({ toolName: 'exec', result: execResult(long, execDetails({ exitCode: 2 })) }, sessions);
+    assert.ok(shownLength(out) <= MAX, name);
+  }
+  for (const fn of ['writeSync', 'fstatSync', 'fchmodSync', 'openSync', 'mkdirSync', 'readdirSync', 'lstatSync']) {
+    const injected = mock.method(fs, fn, boom);
+    try {
+      const { handler } = newCap();
+      const out = await handler({ toolName: 'exec', result: execResult(long, execDetails()) }, sessions);
+      assert.ok(shownLength(out) <= MAX, `fs.${fn} throws`);
+    } finally {
+      injected.mock.restore();
+    }
+  }
+});
+
+test('exec cap: whatever the output looks like, the result stays within 12,000 characters', async () => {
+  const { run } = newCap();
+  let seed = 12345;
+  const rand = (n) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+  const pieces = ['x', 'é', '😀', '\n', '\r\n', 'error: boom\n', 'Traceback (most recent call last)\n', ' ', '\u0000', 'a'.repeat(900), '\n'.repeat(50)];
+  for (let i = 0; i < 60; i++) {
+    let body = '';
+    const target = MAX + 1 + rand(180000);
+    while (body.length < target) body += pieces[rand(pieces.length)];
+    const details = [execDetails({ exitCode: rand(3) }), { truncated: true, originalSizeBytes: 1 }, undefined, { aggregated: body }][rand(4)];
+    const out = await run(execResult(body, details));
+    assert.ok(shownLength(out) <= MAX, `case ${i}: ${body.length} chars became ${shownLength(out)}`);
+    assert.ok(!lonelySurrogate(out.result.content[0].text), `case ${i}: a surrogate pair was cut in two`);
+  }
+});
+
+test('exec cap: only a result that is already short is ever returned unchanged', async () => {
+  const { run } = newCap();
+  for (const result of [execResult(output(MAX)), { content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] }, { content: [{ type: 'image', data: 'AAAA' }] }, { content: 'short' }, { content: [] }]) {
+    assert.equal(await run(result), undefined);
+  }
+  // Two blocks that are each short but together over the limit are capped.
+  const two = { content: [{ type: 'text', text: output(7000) }, { type: 'text', text: output(7000) }] };
+  assert.ok(shownLength(await run(two)) <= MAX);
+});
+
+test('exec cap: files and the directory belong to root, and a tree that would not is never created', async () => {
+  const { createExecResultCap, DEFAULT_OWNER_UID } = capModule();
+  assert.equal(DEFAULT_OWNER_UID, 0, 'root-only means uid 0');
+
+  // With no owner given, the module requires root: as root it saves root-owned files, as anyone else it saves nothing.
+  const base = tmpDir();
+  const dir = path.join(base, 'exec-results');
+  const strict = createExecResultCap({ dir });
+  const shown = cappedText(await strict({ toolName: 'exec', result: execResult(output(40000), execDetails()) }, { sessionKey: TASK_KEY }));
+  assert.ok(shown.length <= MAX);
+  if (process.geteuid() === 0) {
+    const [file] = fs.readdirSync(dir);
+    assert.equal(fs.statSync(path.join(dir, file)).uid, 0);
+    assert.equal(fs.statSync(dir).uid, 0);
+    assert.equal(fs.statSync(path.join(dir, file)).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  } else {
+    assert.match(shown, /NOT saved/);
+    assert.equal(fs.existsSync(dir), false, 'a non-root process creates no tree that only claims to be root-only');
+  }
+
+  // A required owner that is not the running user: refused before anything is created.
+  const elsewhere = path.join(tmpDir(), 'exec-results');
+  const wrongOwner = createExecResultCap({ dir: elsewhere, ownerUid: process.geteuid() + 1 });
+  const refused = cappedText(await wrongOwner({ toolName: 'exec', result: execResult(output(40000), execDetails()) }, { sessionKey: TASK_KEY }));
+  assert.match(refused, /NOT saved/);
+  assert.ok(refused.length <= MAX);
+  assert.equal(fs.existsSync(elsewhere), false);
+});
+
+test('exec cap: an existing directory or file owned by another user is refused', { skip: process.geteuid() !== 0 && 'needs root to chown' }, async () => {
+  const base = tmpDir();
+  const dir = path.join(base, 'exec-results');
+  fs.mkdirSync(dir, { mode: 0o700 });
+  fs.chownSync(dir, 4242, 4242);
+  const { run } = newCap({ dir, opts: { ownerUid: 0 } });
+  const shown = cappedText(await run(execResult(output(40000), execDetails())));
+  assert.match(shown, /NOT saved/);
+  assert.deepEqual(fs.readdirSync(dir), []);
+});
+
+test('exec cap: many error lines are counted and sampled, the notice stays in bounds and keeps the exit status', async () => {
+  const { run } = newCap();
+  // Twenty different errors in the omitted middle, and a long text around them.
+  const distinct = Array.from({ length: 20 }, (_, i) => `ERROR module${String.fromCharCode(97 + i)} failed with reason ${'r'.repeat(i + 1)}`);
+  const body = `${output(30000)}\n${distinct.join('\n')}\n${output(30000)}\n(Command exited with code 4)`;
+  const shown = cappedText(await run(execResult(body, execDetails({ exitCode: 4, status: 'failed' }))));
+  assert.ok(shown.length <= MAX);
+  assert.match(shown, /exit code 4/);
+  assert.match(shown, /Error-like lines in the omitted part: 20 matching, 20 distinct, showing 6/);
+  assert.ok(shown.includes(distinct[0]) && shown.includes(distinct[3]), 'the first four are listed');
+  assert.ok(shown.includes(distinct[18]) && shown.includes(distinct[19]), 'the last two are listed');
+  assert.ok(!shown.includes(distinct[10]), 'the rest are only counted');
+  assert.ok(shown.includes('(Command exited with code 4)'));
+
+  // Hundreds of lines that differ only in a number are one pattern, so a different error among them still shows.
+  const noisy = Array.from({ length: 600 }, (_, i) => `Traceback error code ${i} while retrying`);
+  noisy.splice(300, 0, 'FATAL: disk quota exceeded on /var/lib');
+  const wide = `${output(20000)}\n${noisy.join('\n')}\n${output(20000)}`;
+  const second = cappedText(await run(execResult(wide, execDetails({ exitCode: 1, status: 'failed' }))));
+  assert.ok(second.length <= MAX);
+  assert.match(second, /601 matching, 2 distinct, showing 2/);
+  assert.ok(second.includes('FATAL: disk quota exceeded on /var/lib'));
+  assert.ok(second.includes('Traceback error code 0 while retrying'));
+
+  // Very long error lines are shortened, and up to six of them still fit.
+  const huge = Array.from({ length: 40 }, (_, i) => `error ${String.fromCharCode(65 + (i % 26))}${i} ${'z'.repeat(5000)}`).join('\n');
+  const third = cappedText(await run(execResult(`${output(20000)}\n${huge}\n${output(20000)}`, execDetails({ exitCode: 2 }))));
+  assert.ok(third.length <= MAX);
+  assert.match(third, /exit code 2/);
+});
+
+test('exec cap: error lines and output are never written to the log, only error codes', async () => {
+  const lines = [];
+  const secret = 'SECRETTOKEN-abc123';
+  const body = `${output(20000)}\nerror: leaked ${secret}\n${output(20000)}`;
+  const blocker = path.join(tmpDir(), 'a-file');
+  fs.writeFileSync(blocker, 'x');
+  const { run } = newCap({ dir: path.join(blocker, 'exec-results'), opts: { log: (m) => lines.push(String(m)) } });
+  await run(execResult(body, execDetails()));
+  const hostile = { content: [{ type: 'text', text: body }] };
+  Object.defineProperty(hostile, 'details', { get() { throw new Error(`explode ${secret}`); } });
+  await run(hostile);
+  assert.ok(lines.length > 0, 'failures are logged');
+  assert.ok(lines.every((m) => !m.includes(secret) && m.length < 200), lines.join('|'));
+});
+
+test('exec cap: the saved file is exactly what the middleware saw, and partial is marked everywhere or nowhere', async () => {
+  // Several text blocks are saved as the model would read them: joined by a newline. Non-text blocks are not text.
+  const base = tmpDir();
+  const dir = path.join(base, 'exec-results');
+  const { run } = newCap({ dir });
+  const a = `${output(9000)}é😀`;
+  const b = output(9000);
+  await run({ content: [{ type: 'text', text: a }, { type: 'image', data: 'AAAA' }, { type: 'text', text: b }], details: execDetails() });
+  const [file] = fs.readdirSync(dir);
+  const bytes = fs.readFileSync(path.join(dir, file));
+  assert.equal(bytes.toString('utf8'), `${a}\n${b}`);
+  assert.equal(fs.statSync(path.join(dir, file)).size, Buffer.byteLength(`${a}\n${b}`));
+  assert.doesNotMatch(file, /partial/);
+
+  // Not partial: no partial wording anywhere, and the file says complete.
+  const plain = cappedText(await run(execResult(output(50000), execDetails())));
+  assert.doesNotMatch(plain, /PARTIAL|partial|truncat/i);
+  assert.match(plain, /Saved the complete output/);
+
+  // Partial, by the flag or by the length: the file name, the notice and the wording agree, even when saving fails.
+  for (const [textValue, details] of [[output(99000), { truncated: true, originalSizeBytes: 101048 }], [output(100000), execDetails()], [output(100000), { truncated: true, originalSizeBytes: 149114 }]]) {
+    const before = fs.readdirSync(dir).length;
+    const shown = cappedText(await run(execResult(textValue, details)));
+    const names = fs.readdirSync(dir);
+    assert.equal(names.length, before + 1);
+    const partialFile = names.find((n) => /\.partial\.txt$/.test(n) && fs.readFileSync(path.join(dir, n), 'utf8') === textValue);
+    assert.ok(partialFile, 'a .partial file holds exactly the visible text');
+    assert.match(shown, /PARTIAL/);
+    assert.match(shown, /100000/, 'the upstream limit is stated');
+    assert.match(shown, /NOT the complete raw output/);
+    assert.doesNotMatch(shown, /Saved the complete output|full (raw )?output/i);
+  }
+  const blocker = path.join(tmpDir(), 'a-file');
+  fs.writeFileSync(blocker, 'x');
+  const broken = newCap({ dir: path.join(blocker, 'x') });
+  const failed = cappedText(await broken.run(execResult(output(100000), { truncated: true, originalSizeBytes: 149114 })));
+  assert.match(failed, /PARTIAL/);
+  assert.match(failed, /NOT saved/);
+  assert.match(failed, /exit status: unavailable/i);
+});
