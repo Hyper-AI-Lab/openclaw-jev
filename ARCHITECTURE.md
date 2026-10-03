@@ -568,13 +568,14 @@ Claude Code is Aura's tool in any task (direct sessions, the default). When Kiri
 
 **Direct sessions** (`app/coding/direct.py`; tools `claude_start`, `claude_send`, `claude_status`, `claude_end` in `plugins/rmp_adapter/claude_tools.js`; API `/api/claude/*`):
 
-- **Turns.** Each turn is `claude -p` as root in Claude's auto permission mode, in a transient unit `aura-direct-<task>-<session>-<n>`: `--session-id` the first time, `--resume` after.
+- **Turns.** Each turn is `claude -p --model opusplan` as root, in a transient unit `aura-direct-<task>-<session>-<n>`: `--session-id` the first time, `--resume` after.
+  - **Models and effort:** a planning turn (`plan`) runs in plan mode on Opus and answers with a plan, changing nothing; every other turn runs in Claude's auto permission mode on Sonnet. Aura can set a turn's effort: `medium` (the default), `high` or `xhigh`. The records name the models each turn ran on.
   - **Policy and config:** the host's relaxed policy `/etc/claude-code/managed-settings.json`, and `CLAUDE_CONFIG_DIR=/root/.claude`.
   - **Workspace:** a clone of her repository from GitHub (`repo`) or an empty folder (`scratch`), never the live checkout.
   - **Limits:** one turn at a time per session, two on the host, 60 minutes per turn.
-- **Aura's turn time.** While one of her turns runs, Aura's reply deadline stays open (`_reply_deadline`), and her turns' activities allow 4 hours (`app/workflows/timeouts.py`).
+- **Aura's turn time.** While she works with Claude in the task (a turn running, or one that ended less than 10 minutes ago), her reply deadline stays open (`_reply_deadline`, `task_working`), and her turns' activities allow 4 hours (`app/workflows/timeouts.py`).
 - **Stops.** A stop, cancel or supersede ends the task's sessions (`abort_task_runs`, `stop_task_units`). The reconciler ends the sessions of finished tasks and prunes old workspaces.
-- **Memory and evidence.** What Claude did is in memory: a "Claude sessions" section in the task document, and a `claude_session` document per conversation (`app/coding/records.py`). The evaluator gets the same records as external evidence, along with the pull requests RMP merged.
+- **Memory and evidence.** What Claude did is in memory: a "Claude sessions" section in the task document, and a `claude_session` document per conversation (`app/coding/records.py`). The evaluator gets the same records as external evidence, along with GitHub's word on the pull requests they link.
 
 **Shipping** (`app/coding/github.py`, `app/coding/deploy.py`, `ops/coding_deploy.py`):
 

@@ -1592,6 +1592,8 @@ class ClaudeSessionRequest(BaseModel):
 
 class ClaudeMessageRequest(BaseModel):
     message: str
+    plan: bool = False
+    effort: Optional[str] = None
 
 
 async def _claude_event(db: AsyncSession, task_id: str, event_type: str, payload: Dict[str, Any]) -> None:
@@ -1652,11 +1654,13 @@ async def claude_session_send(session_id: str, req: ClaudeMessageRequest, db: As
         raise HTTPException(status_code=404, detail=str(exc))
     await _live_task(db, session["task_id"])
     try:
-        started = await asyncio.to_thread(direct.send, session_id, req.message, get_coding_config())
+        started = await asyncio.to_thread(direct.send, session_id, req.message, get_coding_config(),
+                                          plan=req.plan, effort=req.effort)
     except direct.SessionError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     await _claude_event(db, session["task_id"], "claude.turn_started",
-                        {"session": session_id, "turn": started["turn"], "chars": len(req.message)})
+                        {"session": session_id, "turn": started["turn"], "chars": len(req.message),
+                         "plan": req.plan, "effort": req.effort})
     return started
 
 

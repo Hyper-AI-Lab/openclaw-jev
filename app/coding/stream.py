@@ -36,6 +36,8 @@ _TOKEN_FIELDS = (
 class StreamState:
     session_id: Optional[str] = None
     model: Optional[str] = None
+    # The models Claude's messages came from: under opusplan a planning turn runs on Opus while init names Sonnet.
+    models: List[str] = field(default_factory=list)
     claude_code_version: Optional[str] = None
     permission_mode: Optional[str] = None
     tools: List[str] = field(default_factory=list)
@@ -170,6 +172,10 @@ def _apply(state: StreamState, event: dict) -> None:
     elif kind == "assistant":
         if event.get("error"):
             state.assistant_errors.append(event["error"])
+        model = (event.get("message") or {}).get("model") or ""
+        # "<synthetic>" marks Claude Code's own messages, such as an API error.
+        if model and not model.startswith("<") and model not in state.models:
+            state.models.append(model)
         for block in _blocks(event):
             if block.get("type") == "tool_use":
                 _tool_use(state, block.get("name"), block.get("input") or {})

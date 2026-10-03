@@ -8,7 +8,7 @@ from tests.test_direct_sessions import CFG, OTHER, TASK, fakes, finished  # noqa
 def test_a_direct_session_reads_as_a_conversation_of_what_aura_asked_and_claude_did(fakes, monkeypatch):  # noqa: F811
     monkeypatch.setattr(records, "RUNS_DIR", fakes.tmp / "runs")
     s = direct.create(TASK, "scratch", "Fix calc", CFG)
-    direct.send(s["id"], "fixture:edit_and_test fix add()", CFG)
+    direct.send(s["id"], "fixture:edit_and_test fix add()", CFG, plan=True, effort="high")
     finished(s["id"], 1)
     direct.end(s["id"], "task finished")
     [record] = records.task_records(TASK)
@@ -16,6 +16,9 @@ def test_a_direct_session_reads_as_a_conversation_of_what_aura_asked_and_claude_
     assert record["where"] == "Direct session in a scratch folder"
     [turn] = record["turns"]
     assert turn["message"] == "fixture:edit_and_test fix add()" and turn["outcome"] == "success"
+    assert turn["plan"] is True and turn["effort"] == "high" and turn["models"] == ["claude-opus-5-5"]
+    assert "- Turn 1 (success; planning turn; claude-opus-5-5; effort high)." in records.section_text([record])
+    assert "## Turn 1 (success; planning turn; claude-opus-5-5; effort high)" in records.conversation_text(record)
     # The recorded run edited with sed through Bash, so the edit shows among the commands.
     assert any("sed -i" in command for command in turn["commands"]) and "add()" in turn["reply"]
     assert records.has_records(TASK) and not records.has_records(OTHER)

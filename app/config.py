@@ -246,7 +246,7 @@ def get_deep_memory_config() -> dict:
 DEFAULT_CODING = {
     # Coding tasks: Claude Code as the aura-coder user, run and verified by RMP.
     "enabled": True,
-    "claude_version": "2.1.280",
+    "claude_version": "2.1.288",
     "model": "opus",
     "fallback_model": "sonnet",
     "max_turns": 200,
@@ -261,7 +261,9 @@ DEFAULT_CODING = {
     "verify_timeout_sec": 1800,
     "job_retention_days": 14,
     "diff_limit_chars": 200_000,
-    # Aura's direct Claude sessions (app/coding/direct.py): one turn's limit, and turns running at once.
+    # Aura's direct Claude sessions (app/coding/direct.py): their model (opusplan: Opus in a planning turn,
+    # Sonnet in the others), one turn's limit, and turns running at once.
+    "direct_model": "opusplan",
     "direct_turn_timeout_sec": 3600,
     "direct_max_running": 2,
     # The repositories coding tasks may change. "self" deploys to this host after Kirill's approval;

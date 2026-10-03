@@ -373,8 +373,19 @@ test('claude tools start a session, send a message, wait across long polls and e
   assert.deepEqual(answer.details, { session: undefined, turn: 2, done: true, outcome: 'success' });
   assert.equal(polls, 3);
   assert.deepEqual(calls[0].body, { session_key: SLACK_KEY, workspace: 'repo', title: 'Fix calc' });
-  assert.deepEqual(calls[1].body, { message: 'Fix add()' });
+  assert.deepEqual(calls[1].body, { message: 'Fix add()', plan: false });
   assert.equal(text(await tools.claude_end.execute('c3', { session: 's-1' })), 'Claude session s-1 ended after 2 turn(s).');
+});
+
+test('a planning turn asks RMP for plan mode and an effort level, and says it was planning', async () => {
+  const calls = installFetch([
+    ['POST /api/claude/sessions/s-1/messages', () => ({ session: 's-1', turn: 1 })],
+    ['GET /api/claude/sessions/s-1/turns/1', () => ({ turn: 1, done: true, outcome: 'success', plan: true, reply: '1. Edit calc.py' })],
+  ]);
+  const { tools } = loadPlugin();
+  const answer = await tools.claude_send.execute('c1', { session: 's-1', message: 'Plan the fix', plan: true, effort: 'high' });
+  assert.deepEqual(calls[0].body, { message: 'Plan the fix', plan: true, effort: 'high' });
+  assert.equal(text(answer), 'Claude, turn 1 (planning): success\n\n1. Edit calc.py');
 });
 
 test('a tool result is an object OpenClaw can read in a script, never a bare string', async () => {

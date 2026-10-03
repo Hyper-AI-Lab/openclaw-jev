@@ -19,7 +19,8 @@ function result(text, details) {
 }
 
 function format(state) {
-  const lines = [state.done ? `Claude, turn ${state.turn}: ${state.outcome}` : `Claude is still working on turn ${state.turn}.`];
+  const kind = state.plan ? ' (planning)' : '';
+  const lines = [state.done ? `Claude, turn ${state.turn}${kind}: ${state.outcome}` : `Claude is still working on turn ${state.turn}${kind}.`];
   if (state.done) {
     const reply = state.reply || '(no reply)';
     lines.push('', reply.length > REPLY_CHARS
@@ -105,12 +106,19 @@ function register(api, { rmpFetch, pause = sleep }) {
       'Send Claude a message in a session and wait for its answer. One message is one turn: Claude reads, edits and runs '
       + 'commands until it answers, which can take minutes; your reply deadline stays open meanwhile. Write it like a brief '
       + 'to a senior engineer: the goal, the context, the constraints, and what to report. Returns its answer, the files it '
-      + 'edited and the commands it ran.',
+      + 'edited and the commands it ran. Claude plans on Opus and carries out on Sonnet: with plan true it only investigates '
+      + 'and answers with a plan, changing nothing; review it, then send the go-ahead without plan.',
     parameters: {
       type: 'object',
       properties: {
         session: { type: 'string', description: 'The session id from claude_start' },
         message: { type: 'string' },
+        plan: { type: 'boolean', description: 'A planning turn on Opus: for a change or anything non-trivial, before the work' },
+        effort: {
+          type: 'string',
+          enum: ['medium', 'high', 'xhigh'],
+          description: 'How hard Claude thinks: medium (default) for clear-scope work, high for bug fixes, xhigh for hard investigations',
+        },
         wait_minutes: { type: 'number', description: 'Stop waiting after this long (default: until it answers)' },
       },
       required: ['session', 'message'],
@@ -118,7 +126,7 @@ function register(api, { rmpFetch, pause = sleep }) {
     execute: async (_id, params, signal) => {
       try {
         const started = await rmpFetch('POST', `/api/claude/sessions/${encodeURIComponent(params.session)}/messages`,
-          { message: params.message }, { maxTimeSec: 60 });
+          { message: params.message, plan: Boolean(params.plan), effort: params.effort }, { maxTimeSec: 60 });
         return await waitFor(params.session, started.turn, params.wait_minutes ? params.wait_minutes * 60 : 0, signal);
       } catch (err) {
         return result(`Claude message failed: ${err.message}`, { error: err.message });

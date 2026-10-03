@@ -33,7 +33,7 @@ def section_text(records: List[Dict[str, Any]], reply_chars: int = 600) -> str:
         lines.append(f"{record['title']} ({record['where']}; {len(record['turns'])} turn(s); {record['status']})")
         for turn in record["turns"]:
             asked = f" Aura asked: {_clip(turn['message'], 300)}" if turn["message"] else ""
-            lines.append(f"- Turn {turn['number']} ({turn['outcome']}).{asked} Claude: {_clip(turn['reply'], reply_chars) or '(no reply)'}")
+            lines.append(f"- Turn {turn['number']} ({_how(turn)}).{asked} Claude: {_clip(turn['reply'], reply_chars) or '(no reply)'}")
             if turn["files_edited"]:
                 lines.append(f"  Files edited: {', '.join(turn['files_edited'][:20])}")
             if turn["prs"]:
@@ -47,7 +47,7 @@ def conversation_text(record: Dict[str, Any]) -> str:
     """One conversation in full, a heading per turn, for its own document."""
     parts = [f"# {record['title']}", f"{record['where']}. Started {record['started_at']}; {record['status']}."]
     for turn in record["turns"]:
-        parts.append(f"## Turn {turn['number']} ({turn['outcome']})")
+        parts.append(f"## Turn {turn['number']} ({_how(turn)})")
         if turn["message"]:
             parts.append(f"Aura asked:\n\n{turn['message']}")
         parts.append(f"Claude answered:\n\n{turn['reply'] or '(no reply)'}")
@@ -62,6 +62,13 @@ def conversation_text(record: Dict[str, Any]) -> str:
     return "\n\n".join(parts)
 
 
+def _how(turn: Dict[str, Any]) -> str:
+    """How a turn went and ran: "success; planning turn; claude-opus-5-5; effort high"."""
+    bits = [turn["outcome"], "planning turn" if turn.get("plan") else "", ", ".join(turn.get("models") or []),
+            f"effort {turn['effort']}" if turn.get("effort") else ""]
+    return "; ".join(bit for bit in bits if bit)
+
+
 def _sessions(task_id: str) -> List[Dict[str, Any]]:
     out = []
     for session in direct.sessions(task_id):
@@ -70,7 +77,7 @@ def _sessions(task_id: str) -> List[Dict[str, Any]]:
             turn = direct._turn(session, number)
             meta = _read(turn.dir / "meta.json") or {}
             turns.append({"number": number, "at": meta.get("started_at"), "message": meta.get("message", ""),
-                          **_what_claude_did(turn)})
+                          "plan": bool(meta.get("plan")), "effort": meta.get("effort"), **_what_claude_did(turn)})
         where = "a clone of her repository" if session["workspace"] == "repo" else "a scratch folder"
         status = f"ended: {session.get('end_reason')}" if session["status"] == "ended" else "open"
         out.append({"kind": "session", "id": session["id"], "title": session["title"] or "Claude session",
@@ -108,7 +115,7 @@ def _what_claude_did(run: runner.Run) -> Dict[str, Any]:
     commands = [command[:COMMAND_CHARS] for command in state.commands]
     return {"outcome": result.kind, "reply": reply, "files_edited": state.files_edited, "commands": commands,
             "prs": sorted(set(PR_LINK.findall("\n".join([reply, *state.commands])))),
-            "tokens": (result.usage or {}).get("total_tokens")}
+            "models": state.models, "tokens": (result.usage or {}).get("total_tokens")}
 
 
 def _run_numbers(root: Path) -> List[int]:

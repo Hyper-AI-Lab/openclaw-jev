@@ -31,6 +31,7 @@ CONFIG_DIR = Path("/root/.claude")
 WORKSPACES = {"repo": "repo", "scratch": "work"}
 PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 MAX_WAIT_SEC = 55
+EFFORTS = ("medium", "high", "xhigh")
 # After a turn ends Aura reads the answer and writes the next message; her reply is due after that.
 BETWEEN_TURNS_SEC = 600
 # A message travels as one argument of claude -p; Linux caps one argument at 128 KiB.
@@ -120,10 +121,16 @@ def sessions(task_id: Optional[str] = None) -> List[Dict[str, Any]]:
     return sorted(found, key=lambda s: s["created_at"])
 
 
-def send(session_id: str, message: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Start the session's next turn with Aura's message; the reply is read with ``wait``."""
+def send(session_id: str, message: str, cfg: Dict[str, Any], *, plan: bool = False,
+         effort: Optional[str] = None) -> Dict[str, Any]:
+    """Start the session's next turn with Aura's message; the reply is read with ``wait``.
+
+    A planning turn runs in plan mode: Claude investigates and answers with a plan, changing nothing.
+    """
     if not message.strip():
         raise SessionError("the message is empty")
+    if effort is not None and effort not in EFFORTS:
+        raise SessionError(f"effort is one of {', '.join(EFFORTS)}")
     if len(message.encode()) > MAX_MESSAGE_BYTES:
         raise SessionError(f"the message is over {MAX_MESSAGE_BYTES} bytes; put long material in a file in the workspace")
     path = _session_file(session_id)
@@ -137,8 +144,9 @@ def send(session_id: str, message: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     turn = _turn(session, session["turns"] + 1)
     resume = any(CONFIG_DIR.glob(f"projects/*/{session_id}.jsonl"))
     argv = [str(CLAUDE_BIN), "-p", message, "--output-format", "stream-json", "--verbose",
-            "--model", cfg["model"], "--fallback-model", cfg["fallback_model"], "--max-turns", str(cfg["max_turns"]),
-            "--permission-mode", "auto", "--append-system-prompt", system_prompt(session, cfg),
+            "--model", cfg["direct_model"], "--fallback-model", cfg["fallback_model"], "--max-turns", str(cfg["max_turns"]),
+            "--permission-mode", "plan" if plan else "auto", *(["--effort", effort] if effort else []),
+            "--append-system-prompt", system_prompt(session, cfg),
             *(["--resume", session_id] if resume else ["--session-id", session_id])]
     props = [
         f"EnvironmentFile={TOKEN_ENV_FILE}",
@@ -159,8 +167,8 @@ def send(session_id: str, message: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
                *[f"--setenv={key}={value}" for key, value in env.items()],
                *[f"--property={prop}" for prop in props], "--", *argv]
     turn.dir.mkdir(mode=0o700, parents=True)
-    _write(turn.dir / "meta.json", {"unit": turn.unit, "started_at": _now(), "model": cfg["model"],
-                                    "resume": resume, "message": message})
+    _write(turn.dir / "meta.json", {"unit": turn.unit, "started_at": _now(), "model": cfg["direct_model"],
+                                    "plan": plan, "effort": effort, "resume": resume, "message": message})
     try:
         subprocess.run(command, check=True, capture_output=True, timeout=60)
     except Exception:
@@ -189,8 +197,10 @@ def status(session_id: str, number: int) -> Dict[str, Any]:
     done = result.kind != "running"
     if done:
         runner.record_usage(turn, result)
+    meta = json.loads((turn.dir / "meta.json").read_text())
     return {
         "session": session_id, "turn": number, "done": done, "outcome": result.kind,
+        "plan": bool(meta.get("plan")), "effort": meta.get("effort"), "models": state.models,
         "reply": ((state.result or {}).get("result") or state.last_text) if done else "",
         "error": result.error, "resets_at": result.resets_at,
         "progress": state.milestones[-10:], "files_edited": state.files_edited,
