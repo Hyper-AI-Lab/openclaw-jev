@@ -163,9 +163,10 @@ async def send_slack_message_idempotent(
     """Send a Slack DM once per (task_id, message), in ordered parts when it is long.
 
     ``kind`` is how the conversation log records it: ``reply`` (Aura's judged answer),
-    ``followup`` or ``notice`` (RMP's own text). Returns False on a permanent Slack
-    error (recorded and alerted); raises SlackTransientError when delivery may still
-    succeed later.
+    ``followup`` or ``notice`` (RMP's own text). A task_id with no tasks row, as an RMP notice
+    has, is recorded as a ``slack.delivered`` event only, with no conversation message. Returns
+    False on a permanent Slack error (recorded and alerted); raises SlackTransientError when
+    delivery may still succeed later.
     """
     if not message or not user_id or not bot_token:
         return False
@@ -198,7 +199,7 @@ async def send_slack_message_idempotent(
         {"task_id": task_id, "user_id": user_id, "parts": len(parts), "ts": first_ts},
     )
     try:
-        from app.db.models import Event, TaskMessage
+        from app.db.models import Event, Task, TaskMessage
         from app.deep_memory.ingest import TURN_KINDS, enqueue
         import uuid as _uuid
 
@@ -213,22 +214,25 @@ async def send_slack_message_idempotent(
                     event_payload={"user_id": user_id, "parts": len(parts)},
                 )
             )
-            db.add(
-                TaskMessage(
-                    id=message_id,
-                    task_id=task_id,
-                    role="assistant",
-                    content=message,
-                    source="slack",
-                    slack_ts=first_ts,
-                    kind=kind,
-                    session_key=session_key or None,
-                    meta={**(meta or {}), "parts": len(parts)},
+            # RMP's own notices (ops alerts, user notices) have an id but no tasks row, so a message
+            # row would fail its foreign key and roll the delivery event back with it.
+            if await db.get(Task, task_id) is not None:
+                db.add(
+                    TaskMessage(
+                        id=message_id,
+                        task_id=task_id,
+                        role="assistant",
+                        content=message,
+                        source="slack",
+                        slack_ts=first_ts,
+                        kind=kind,
+                        session_key=session_key or None,
+                        meta={**(meta or {}), "parts": len(parts)},
+                    )
                 )
-            )
-            if kind in TURN_KINDS:
-                await db.flush()
-                await enqueue(db, "turn", message_id)
+                if kind in TURN_KINDS:
+                    await db.flush()
+                    await enqueue(db, "turn", message_id)
             await db.commit()
     except Exception as exc:
         logger.warning("Slack ledger write failed for %s: %s", task_id, exc)

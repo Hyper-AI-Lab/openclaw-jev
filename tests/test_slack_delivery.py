@@ -46,6 +46,7 @@ def ledger(monkeypatch):
     db = MagicMock()
     db.add = lambda obj: added.append(obj)
     db.commit = AsyncMock()
+    db.get = AsyncMock(return_value=object())  # the task exists: a real task's reply is a conversation message
     session = MagicMock()
     session.__aenter__ = AsyncMock(return_value=db)
     session.__aexit__ = AsyncMock(return_value=False)
