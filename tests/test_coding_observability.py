@@ -189,7 +189,7 @@ async def test_the_coding_status_names_the_short_rmp_commit_and_open_direct_sess
     status = response.json()
     assert response.status_code == 200 and status["rmp_commit"] == head and len(head) >= 7
     assert {"enabled", "claude_version", "pinned", "token_days_left", "slot_holder", "live_units", "repositories",
-            "jobs", "direct_sessions_open"} <= status.keys()
+            "jobs", "direct_sessions_open", "direct_turn_models"} <= status.keys()
     assert status["enabled"] is True and status["pinned"] == "2.1.280" and status["repositories"] == {}
     assert status["direct_sessions_open"] == 2 and status["direct_turns_running"] == 1
 
@@ -225,6 +225,8 @@ async def test_the_coding_status_counts_the_direct_turns_running_now_from_their_
         busy = (await api.get("/api/coding/status")).json()
     assert idle["direct_turns_running"] == 0 and idle["direct_sessions_open"] == 1
     assert busy["direct_turns_running"] == 2 and busy["direct_sessions_open"] == 1
+    # None of those units has a turn on disk, so no model is named; the count is unchanged.
+    assert idle["direct_turn_models"] == [] and busy["direct_turn_models"] == []
     assert calls == [["systemctl", "list-units", "--plain", "--no-legend", "--state=active,activating",
                       "aura-direct-*"]] * 2
 
@@ -301,3 +303,55 @@ def test_direct_sessions_are_ready_with_their_policy_wrapper_protection_and_a_li
     monkeypatch.setattr(github, "api", unreachable)
     (tmp_path / "GITHUB_WRAPPER").write_text("GITHUB_WRAPPER")
     assert cr.check_claude_direct().status == "warn"
+
+
+def _assistant(model, text="x"):
+    return json.dumps({"type": "assistant", "message": {"model": model, "content": [{"type": "text", "text": text}]}})
+
+
+async def test_the_coding_status_lists_the_models_of_the_direct_turns_running_now(host, monkeypatch):
+    from app.activities import coding_activities
+    from app.coding import direct
+
+    monkeypatch.setattr(cr, "live_units", lambda: [])
+    monkeypatch.setattr(coding_activities, "slot_holder", lambda: None)
+    # (task, session, turns, stream lines of the last turn): a planning turn on Opus, a work turn on Sonnet that
+    # also ran a synthetic message, a second work turn on Sonnet, a turn that has not answered yet, one without a
+    # stream file, and a finished turn on Haiku that must not be listed.
+    sessions = [("task-a", "00000000", 2, [_assistant("claude-opus-5-5")]),
+                ("task-b", "00000001", 1, [_assistant("claude-sonnet-5-5"), _assistant("<synthetic>"),
+                                           _assistant("claude-sonnet-5-5")]),
+                ("task-c", "00000002", 3, [_assistant("claude-sonnet-5-5")]),
+                ("task-d", "00000003", 1, ['{"type": "system", "subtype": "init", "model": "claude-sonnet-5-5"}']),
+                ("task-e", "00000004", 1, None),
+                ("task-f", "00000005", 4, [_assistant("claude-haiku-4-5-20251001")]),
+                ("task-g", "00000006", 0, None)]
+    running = []
+    for n, (task_id, short, turns, lines) in enumerate(sessions):
+        session_id = f"{short}-0000-4000-8000-000000000000"
+        home = direct.DIRECT_DIR / task_id / session_id
+        home.mkdir(parents=True)
+        (home / "session.json").write_text(json.dumps({"id": session_id, "task_id": task_id, "status": "open",
+                                                       "created_at": f"2026-10-03T10:0{n}:00+00:00", "turns": turns}))
+        if turns:
+            turn = direct.Turn(task_id, turns, direct.DIRECT_DIR, session_id)
+            if lines is not None:
+                turn.dir.mkdir(parents=True)
+                turn.stream_file.write_text("".join(line + "\n" for line in lines))
+            if task_id != "task-f":
+                running.append(turn.unit)
+    # An earlier turn of a running session is not the session's last turn and is not read.
+    older = direct.Turn("task-a", 1, direct.DIRECT_DIR, "00000000-0000-4000-8000-000000000000")
+    older.dir.mkdir(parents=True)
+    older.stream_file.write_text(_assistant("claude-haiku-4-5-20251001") + "\n")
+    monkeypatch.setattr(direct, "running_units", lambda: running)
+    monkeypatch.setenv("RMP_API_KEY", "k")
+    monkeypatch.setattr(server, "_rmp_commit", lambda: "abc1234")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://rmp",
+                                 headers={"X-RMP-API-Key": "k"}) as api:
+        busy = (await api.get("/api/coding/status")).json()
+        running.clear()
+        idle = (await api.get("/api/coding/status")).json()
+    assert busy["direct_turn_models"] == ["claude-opus-5-5", "claude-sonnet-5-5"]
+    assert busy["direct_turns_running"] == 5 and busy["direct_sessions_open"] == 7
+    assert idle["direct_turn_models"] == [] and idle["direct_turns_running"] == 0

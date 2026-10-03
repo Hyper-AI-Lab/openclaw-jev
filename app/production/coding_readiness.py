@@ -183,13 +183,16 @@ def _read_json(path: Path) -> Optional[Any]:
 
 def coding_status() -> Dict[str, Any]:
     from app.activities.coding_activities import slot_holder
+    from app.coding import direct
 
     cfg = get_coding_config()
+    units = direct.running_units()
     return {"enabled": bool(cfg.get("enabled")), "claude_version": installed_version(), "pinned": cfg["claude_version"],
             "token_days_left": token_days_left(), "slot_holder": slot_holder(), "live_units": live_units(),
             "repositories": {name: {"remote": e["remote"], "deploy": e.get("deploy")} for name, e in cfg["repositories"].items()},
             "jobs": sorted((p.parent.name for p in RUNS_DIR.glob("*/job.json")), reverse=True)[:50],
-            "direct_sessions_open": open_direct_sessions(), "direct_turns_running": running_direct_turns()}
+            "direct_sessions_open": open_direct_sessions(), "direct_turns_running": running_direct_turns(units),
+            "direct_turn_models": direct_turn_models(units)}
 
 
 def open_direct_sessions() -> int:
@@ -199,12 +202,21 @@ def open_direct_sessions() -> int:
     return sum(1 for s in direct.sessions() if s["status"] == "open")
 
 
-def running_direct_turns() -> int:
+def running_direct_turns(units: Optional[List[str]] = None) -> int:
     """How many of Aura's direct Claude turns are running now: each turn is its own systemd unit, and this counts
-    the active or activating ones, as the cap on running turns (``direct_max_running``) does."""
+    the active or activating ones, as the cap on running turns (``direct_max_running``) does.
+    ``units`` is that listing when the caller already has it."""
     from app.coding import direct
 
-    return len(direct.running_units())
+    return len(direct.running_units() if units is None else units)
+
+
+def direct_turn_models(units: Optional[List[str]] = None) -> List[str]:
+    """The models of the direct Claude turns running now, as their streams name them (a planning turn on Opus, a
+    work turn on Sonnet), each once and sorted; a turn that has not answered yet adds none."""
+    from app.coding import direct
+
+    return direct.running_turn_models(direct.running_units() if units is None else units)
 
 
 def coding_job(task_id: str) -> Optional[Dict[str, Any]]:
