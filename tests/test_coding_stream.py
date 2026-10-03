@@ -110,3 +110,14 @@ def test_blank_truncated_and_foreign_lines_never_raise():
     state = stream.parse_lines(["", "   ", '{"type": "assist', "not json", "[1, 2]", '{"type": "unknown_kind"}'])
     assert (state.events, state.malformed) == (1, 3)
     assert stream.outcome(stream.StreamState()).kind == "running"
+
+
+def test_the_models_are_those_claudes_messages_came_from_not_the_one_init_names():
+    lines = [json.dumps(event) for event in (
+        {"type": "system", "subtype": "init", "model": "claude-sonnet-5-5"},
+        {"type": "assistant", "message": {"model": "claude-opus-5-5", "content": [{"type": "text", "text": "Plan"}]}},
+        {"type": "assistant", "message": {"model": "claude-opus-5-5", "content": [{"type": "text", "text": "More"}]}},
+        {"type": "assistant", "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "API error"}]}},
+    )]
+    state = stream.parse_lines(lines)
+    assert state.model == "claude-sonnet-5-5" and state.models == ["claude-opus-5-5"]

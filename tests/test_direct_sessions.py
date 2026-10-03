@@ -22,7 +22,7 @@ from tests.test_invariants import seed, session, task  # noqa: F401  (session is
 FAKES = Path(__file__).resolve().parent / "fakes" / "coding"
 TASK = "11111111-2222-4333-8444-555555555555"
 OTHER = "66666666-7777-4888-9999-000000000000"
-CFG = {"model": "opus", "fallback_model": "sonnet", "max_turns": 50, "memory_max": "1G", "cpu_quota": "100%",
+CFG = {"model": "opus", "direct_model": "opusplan", "fallback_model": "sonnet", "max_turns": 50, "memory_max": "1G", "cpu_quota": "100%",
        "tasks_max": 64, "direct_turn_timeout_sec": 60, "direct_max_running": 2,
        "repositories": {"rmp": {"remote": "Hyper-AI-Lab/openclaw-jev", "source": "/root/.openclaw/rmp"}}}
 
@@ -83,6 +83,7 @@ def test_a_turn_runs_as_root_in_auto_mode_and_the_next_one_resumes_the_session(f
     assert first["outcome"] == "success" and "HERON-7" in first["reply"]
     argv = json.loads(fakes.argv.read_text())
     assert flags(argv)["--permission-mode"] == "auto" and flags(argv)["--session-id"] == s["id"]
+    assert flags(argv)["--model"] == "opusplan" and "--effort" not in argv
     assert "--resume" not in argv and "--permission-prompts" not in argv
     told = flags(argv)["--append-system-prompt"]
     assert s["path"] in told and "Never edit /root/.openclaw/rmp" in told and "Never push to main" in told
@@ -166,6 +167,7 @@ def test_a_turn_whose_unit_vanished_without_an_exit_line_is_done_with_no_result(
     s = direct.create(TASK, "scratch", "", CFG)
     turn = direct._turn(s, 1)
     turn.dir.mkdir(parents=True)
+    (turn.dir / "meta.json").write_text("{}")
     turn.stream_file.write_text('{"type":"system","subtype":"init","session_id":"x"}\n')
     rewrite(s["id"], turns=1)
     state = direct.status(s["id"], 1)
@@ -260,6 +262,20 @@ async def test_the_reconciler_ends_sessions_whose_task_has_finished_and_no_other
     assert direct.load(live_task["id"])["status"] == "open" and direct.load(unknown["id"])["status"] == "open"
 
 
+def test_a_planning_turn_runs_in_plan_mode_and_effort_is_medium_high_or_xhigh(fakes):
+    s = direct.create(TASK, "scratch", "", CFG)
+    direct.send(s["id"], "fixture:success_readonly plan the fix", CFG, plan=True, effort="high")
+    first = finished(s["id"], 1)
+    argv = json.loads(fakes.argv.read_text())
+    assert flags(argv)["--permission-mode"] == "plan" and flags(argv)["--effort"] == "high"
+    assert first["plan"] is True and first["effort"] == "high" and first["models"] == ["claude-opus-5-5"]
+    with pytest.raises(direct.SessionError, match="effort is one of medium, high, xhigh"):
+        direct.send(s["id"], "fixture:success_readonly", CFG, effort="max")
+    direct.send(s["id"], "fixture:resumed go ahead", CFG)
+    assert finished(s["id"], 2)["plan"] is False
+    assert flags(json.loads(fakes.argv.read_text()))["--permission-mode"] == "auto"
+
+
 def test_aura_is_working_with_claude_while_a_turn_runs_and_for_a_while_after_it(fakes, monkeypatch):
     s = direct.create(TASK, "scratch", "", CFG)
     assert direct.task_working(TASK)
@@ -290,7 +306,7 @@ async def test_the_api_runs_a_session_for_a_live_task_and_records_it(fakes, sess
             created = (await api.post("/api/claude/sessions", json={
                 "session_key": f"agent:main:rmp_task_{TASK}", "workspace": "scratch", "title": "Logs"})).json()
             sent = (await api.post(f"/api/claude/sessions/{created['id']}/messages",
-                                   json={"message": "fixture:success_readonly hello"})).json()
+                                   json={"message": "fixture:success_readonly hello", "plan": True, "effort": "high"})).json()
             turn = (await api.get(f"/api/claude/sessions/{created['id']}/turns/1", params={"wait": 20})).json()
             listed = (await api.get("/api/claude/sessions", params={"task_id": TASK})).json()
             ended = (await api.post(f"/api/claude/sessions/{created['id']}/end")).json()
@@ -300,8 +316,11 @@ async def test_the_api_runs_a_session_for_a_live_task_and_records_it(fakes, sess
         server.app.dependency_overrides.pop(server.get_db, None)
     assert refused.status_code == 409
     assert sent == {"session": created["id"], "turn": 1} and turn["done"] and turn["outcome"] == "success"
+    assert turn["plan"] is True and turn["effort"] == "high"
     assert [s["id"] for s in listed["sessions"]] == [created["id"]] and ended["status"] == "ended"
     assert after.status_code == 409 and missing.status_code == 404
     async with session() as s:
         events = (await s.execute(select(Event).where(Event.entity_id == TASK))).scalars().all()
     assert sorted(e.event_type for e in events) == ["claude.session_ended", "claude.session_started", "claude.turn_started"]
+    [started] = [e for e in events if e.event_type == "claude.turn_started"]
+    assert started.event_payload["plan"] is True and started.event_payload["effort"] == "high"

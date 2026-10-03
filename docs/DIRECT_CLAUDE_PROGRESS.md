@@ -395,3 +395,39 @@ Deploy records now carry `source` (`github` or `reviewed`), and each invariant a
 **Left as they are:**
 - A deploy that changes no files, such as a merged revert, still sends Kirill an "Aura's change is live" note.
 - The ledger row of an RMP notice still fails its foreign key after the Slack message is sent. That predates this work.
+
+---
+
+## Models: `opusplan`, planning turns, effort; Claude Code 2.1.288
+
+**Date:** 2026-10-03.
+
+**Before:**
+- Every Claude turn, in direct sessions and reviewed jobs, ran on Opus 5.5 (`--model opus`, `--fallback-model sonnet`) at its default `medium` effort.
+- Each result's `modelUsage` listed only `claude-opus-5-5`.
+
+**Kirill's decision:**
+- Aura's direct sessions use `opusplan`, with planning turns.
+- Claude Code goes up to 2.1.288, so the work runs on Sonnet 5.5 rather than Sonnet 5.
+- Aura chooses the effort per turn.
+- Reviewed jobs stay on `opus`.
+
+**Probe on 2.1.280, headless, the way RMP runs a turn:**
+- A planning turn (`--permission-mode plan --model opusplan`) ran on `claude-opus-5-5`. Claude read the code, wrote the plan to `/root/.claude/plans/`, answered with it and changed nothing. Nothing waited for a plan approval.
+- The next turn (`--resume`, auto mode) ran on `claude-sonnet-5` and implemented the plan.
+- Both turns' `init` events name `claude-sonnet-5`, so the stream's own model is not the model a planning turn ran on. A result's `modelUsage` also counts the whole session.
+
+**What changed:**
+- **Config:** `direct_model: "opusplan"` for direct sessions; `model: "opus"` stays for reviewed jobs; the pin is `claude_version: "2.1.288"`.
+- **Sending a turn:** `direct.send(..., plan=False, effort=None)` runs a planning turn with `--permission-mode plan`, and passes `--effort` for `medium`, `high` or `xhigh`; anything else is refused. `meta.json` records `plan` and `effort`.
+- **What the records show:** `stream.StreamState.models` lists the models Claude's messages came from (Claude Code's own `<synthetic>` messages excluded). `status()` and the records carry `plan`, `effort` and `models`. Memory shows a turn as "(success; planning turn; claude-opus-5-5; effort high)".
+- **API and tool:** `POST /api/claude/sessions/{id}/messages` takes `plan` and `effort` and records them on `claude.turn_started`. `claude_send` takes `plan` and `effort`, and a planning turn's answer starts "Claude, turn N (planning)".
+- **Aura's notes:** a new bullet, "Planning, models and effort". For anything non-trivial she plans first, reviews the plan, then gives the go-ahead. A quick question needs no planning turn, and stuck work goes back to planning. Effort is `medium` for clear-scope work, `high` for bug fixes, `xhigh` for hard investigations.
+- **Docs:** ARCHITECTURE, README, CONCEPT_TREE and rule item 6 (both copies). The stale "while one of her turns runs" and "pull requests RMP merged" lines in ARCHITECTURE are fixed.
+
+**Upgrade order:**
+- A version mismatch fails `claude_code` readiness, and the deploy's checks would roll the deploy back.
+- So Claude Code 2.1.288 goes in with `CLAUDE_CODE_VERSION=2.1.288 bash ops/setup_aura_coder.sh` after the merge, while CI runs on `main` and before the watcher's deploy checks it.
+- The smoke test then runs on the new version.
+
+**Verification:** full suite 1067 passed, 4 skipped; node 27 of 28 before the plugin deploy (the live-copy check).
