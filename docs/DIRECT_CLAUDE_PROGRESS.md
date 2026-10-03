@@ -470,3 +470,14 @@ Deploy records now carry `source` (`github` or `reviewed`), and each invariant a
 - **Evaluator:** the evidence lists the files waiting, and a new rule says a file Aura says she sends counts only if the evidence lists it.
 
 **Verification:** full suite 1077 passed, 4 skipped; node 27 of 29 before the plugin deploy (the two live-copy checks).
+
+**The first live file (task `c8ab0794`, a CSV to PDF):**
+- Aura converted the file herself, with 7 shell commands and about 160,000 characters of output, into OpenClaw's outbound media folder.
+- Her first reply relied on OpenClaw sending it, which RMP bypasses. The evaluator answered "rework: the PDF was not successfully attached".
+- She then had Claude copy the PDF into a scratch session (byte-for-byte, matching SHA-256), attached it, and the evaluator accepted. RMP sent it into Kirill's DM (8.8 MB) with no pull request.
+
+**Kirill's decision:** Aura decides job by job whether to use Claude; her notes must tell her what Claude does and what each choice costs.
+
+**What changed:**
+- `attach_file` also takes files from `/root/.openclaw/media/outbound` (`outbox.OUTBOUND_DIR`, under OpenClaw's home), with the same checks.
+- Her notes replace "Leave the work to Claude" with "When to use Claude", a guide to the choice. Repository work and diffs still go to Claude.

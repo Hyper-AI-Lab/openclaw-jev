@@ -1,4 +1,5 @@
-"""Files Aura sends Kirill with her reply: made in one of the task's Claude sessions.
+"""Files Aura sends Kirill with her reply: made in one of the task's Claude sessions, or by her in OpenClaw's
+outbound media folder.
 
 She attaches a file while she works (``POST /api/replies/files``); RMP records its checksum, and uploads it into
 Kirill's DM after the reply the evaluator accepted (``send_reply_files``). The file is checked again right before
@@ -11,14 +12,16 @@ from pathlib import Path
 from typing import Any, Dict
 
 from app.coding import direct
+from app.config import OPENCLAW_HOME
 from app.memory.policy import redact_secrets
 
 MAX_BYTES = 50 * 1024 * 1024
 MAX_FILES = 10
+OUTBOUND_DIR = Path(OPENCLAW_HOME) / "media" / "outbound"
 
 
 class FileRefused(Exception):
-    """A file RMP won't send: outside the task's Claude sessions, not a regular file, too big, or holding a secret."""
+    """A file RMP won't send: from elsewhere, not a regular file, too big, or holding a secret."""
 
 
 def check(task_id: str, path: str) -> Dict[str, Any]:
@@ -27,8 +30,9 @@ def check(task_id: str, path: str) -> Dict[str, Any]:
         real = Path(path).resolve(strict=True)
     except (OSError, RuntimeError):
         raise FileRefused(f"{path} does not exist")
-    if (direct.DIRECT_DIR / task_id).resolve() not in real.parents:
-        raise FileRefused("only a file from one of this task's Claude sessions can be sent")
+    roots = ((direct.DIRECT_DIR / task_id).resolve(), OUTBOUND_DIR.resolve())
+    if not any(root in real.parents for root in roots):
+        raise FileRefused(f"only a file from one of this task's Claude sessions or from {OUTBOUND_DIR} can be sent")
     if not real.is_file():
         raise FileRefused(f"{real.name} is not a regular file")
     size = real.stat().st_size

@@ -168,8 +168,8 @@ function register(api, { rmpFetch, pause = sleep }) {
     name: 'attach_file',
     description:
       "Attach a file to your reply to Kirill: RMP sends it in his Slack DM with your reply once the evaluator accepts the "
-      + "reply. Only a file from one of this task's Claude sessions, up to 50 MB; RMP refuses one that looks like it "
-      + 'holds a secret.',
+      + "reply. A file from one of this task's Claude sessions, or one you made in /root/.openclaw/media/outbound; up to "
+      + '50 MB. RMP refuses one that looks like it holds a secret.',
     parameters: {
       type: 'object',
       properties: {

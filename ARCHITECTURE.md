@@ -470,7 +470,7 @@ Key endpoints:
 | `POST /api/claude/sessions/{id}/messages` | The session's next turn |
 | `GET /api/claude/sessions/{id}/turns/{n}?wait=` | A turn's progress or Claude's answer (long poll up to 55 s) |
 | `POST /api/claude/sessions/{id}/end` | End a session, stopping a running turn |
-| `POST /api/replies/files` | `attach_file`: a file from one of the task's Claude sessions, sent to Kirill with her accepted reply |
+| `POST /api/replies/files` | `attach_file`: a file from one of the task's Claude sessions or OpenClaw's outbound media folder, sent to Kirill with her accepted reply |
 | `GET /api/claude/sessions[/{id}]` | Sessions, by task |
 | `GET /api/production/readiness` | Go-live readiness score |
 | `GET /api/deep_memory/status` | Switches, ingest queue, documents, index points vs objects, memory lane, recall outcomes of the last 24 h |
@@ -575,7 +575,7 @@ Claude Code is Aura's tool in any task (direct sessions, the default). When Kiri
   - **Workspace:** a clone of her repository from GitHub (`repo`, for work on her own code) or an empty folder (`scratch`, for everything else), never the live checkout. Only a change to her code goes through a pull request.
   - **Limits:** one turn at a time per session, two on the host, 60 minutes per turn.
 - **Aura's turn time.** While she works with Claude in the task (a turn running, or one that ended less than 10 minutes ago), her reply deadline stays open (`_reply_deadline`, `task_working`), and her turns' activities allow 4 hours (`app/workflows/timeouts.py`).
-- **Files to Kirill.** `attach_file` takes a file from one of the task's Claude sessions (at most 50 MB and 10 waiting; one that looks like it holds a secret is refused) and records its checksum (`app/coding/outbox.py`). Once the evaluator accepted her reply and RMP delivered it, `deliver_reply_files` checks each file again and uploads it into Kirill's DM, once. A file that changed or that Slack refuses is not sent, and Kirill gets a notice; a file problem never fails the task.
+- **Files to Kirill.** `attach_file` takes a file from one of the task's Claude sessions or from OpenClaw's outbound media folder, where Aura puts files she makes herself (at most 50 MB and 10 waiting; one that looks like it holds a secret is refused) and records its checksum (`app/coding/outbox.py`). Once the evaluator accepted her reply and RMP delivered it, `deliver_reply_files` checks each file again and uploads it into Kirill's DM, once. A file that changed or that Slack refuses is not sent, and Kirill gets a notice; a file problem never fails the task.
 - **Stops.** A stop, cancel or supersede ends the task's sessions (`abort_task_runs`, `stop_task_units`). The reconciler ends the sessions of finished tasks and prunes old workspaces.
 - **Memory and evidence.** What Claude did is in memory: a "Claude sessions" section in the task document, and a `claude_session` document per conversation (`app/coding/records.py`). The evaluator gets the same records as external evidence, along with GitHub's word on the pull requests they link.
 

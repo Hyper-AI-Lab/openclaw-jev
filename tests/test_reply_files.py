@@ -86,6 +86,10 @@ def test_only_a_file_from_the_tasks_claude_sessions_goes_and_never_a_secret(tmp_
     assert outbox.check(TASK, str(good)) == {"name": "out.csv", "path": str(good.resolve()), "size": 8,
                                              "sha256": hashlib.sha256(b"a,b\n1,2\n").hexdigest()}
     assert outbox.check(TASK, str(made(TASK, "chart.png", b"\x89PNG\r\n\x1a\n\xff\xfe")))["size"] == 10
+    outbound = outbox.OUTBOUND_DIR / "report.pdf"
+    outbound.parent.mkdir(parents=True, exist_ok=True)
+    outbound.write_bytes(b"%PDF-1.7\n")
+    assert outbox.check(TASK, str(outbound))["name"] == "report.pdf"
     elsewhere = tmp_path / "elsewhere.csv"
     elsewhere.write_text("x\n")
     link = good.parent / "link.csv"
