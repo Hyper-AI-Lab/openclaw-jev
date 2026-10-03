@@ -14,9 +14,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// OpenClaw's tool result: the text Aura reads, and a few facts a script can use.
+// OpenClaw's tool result: the text Aura reads, and a few facts a script can use. A script that prints the
+// result (json(r)) sees only its details, so the text is in them too, or Claude's answer never reaches her.
 function result(text, details) {
-  return { content: [{ type: 'text', text }], details: details || {} };
+  return { content: [{ type: 'text', text }], details: { ...(details || {}), text } };
 }
 
 function format(state) {

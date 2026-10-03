@@ -367,10 +367,10 @@ test('claude tools start a session, send a message, wait across long polls and e
   const { tools } = loadPlugin();
   const started = await tools.claude_start.execute('c1', { title: 'Fix calc' });
   assert.match(text(started), /^Claude session s-1 is ready \(repo: /);
-  assert.deepEqual(started.details, { session: 's-1', workspace: 'repo', path: '/srv/aura-code/direct/t/s-1/repo' });
+  assert.deepEqual(started.details, { session: 's-1', workspace: 'repo', path: '/srv/aura-code/direct/t/s-1/repo', text: text(started) });
   const answer = await tools.claude_send.execute('c2', { session: 's-1', message: 'Fix add()' });
   assert.equal(text(answer), 'Claude, turn 2: success\n\nFixed add().\n\nFiles edited: calc.py\nCommands (last 1): pytest -q');
-  assert.deepEqual(answer.details, { session: undefined, turn: 2, done: true, outcome: 'success' });
+  assert.deepEqual(answer.details, { session: undefined, turn: 2, done: true, outcome: 'success', text: text(answer) });
   assert.equal(polls, 3);
   assert.deepEqual(calls[0].body, { session_key: SLACK_KEY, workspace: 'repo', title: 'Fix calc' });
   assert.deepEqual(calls[1].body, { message: 'Fix add()', plan: false });
@@ -404,6 +404,8 @@ test('a tool result is an object OpenClaw can read in a script, never a bare str
   const { tools } = loadPlugin();
   const failed = await tools.claude_send.execute('c1', { session: 's-1', message: 'go' });
   assert.ok('details' in failed && Array.isArray(failed.content));
+  // A script that prints the result sees only its details: Claude's answer must be in them.
+  assert.equal(failed.details.text, 'Claude message failed: HTTP 409: the session has ended');
   assert.equal(text(failed), 'Claude message failed: HTTP 409: the session has ended');
 });
 

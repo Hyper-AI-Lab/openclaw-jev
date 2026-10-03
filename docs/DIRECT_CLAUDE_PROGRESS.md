@@ -481,3 +481,13 @@ Deploy records now carry `source` (`github` or `reviewed`), and each invariant a
 **What changed:**
 - `attach_file` also takes files from `/root/.openclaw/media/outbound` (`outbox.OUTBOUND_DIR`, under OpenClaw's home), with the same checks.
 - Her notes replace "Leave the work to Claude" with "When to use Claude", a guide to the choice. Repository work and diffs still go to Claude.
+
+---
+
+## Claude's answers did not reach Aura when she printed a tool result
+
+**Date:** 2026-10-03, found while monitoring task `7211b69f` (the context-guard proposal).
+
+- Aura ran `claude_send` and printed the result with `json(r)`. OpenClaw's code harness shows a script only a tool result's `details` (`session`, `turn`, `done`, `outcome`), so Claude's whole report, which was in `content`, never reached her. She asked Claude again for "the report that was not delivered", costing a turn.
+- The cause is the result format from the `'details' in result` fix in PR #7: the text moved into `content`.
+- `result()` in `claude_tools.js` now also puts the text in `details.text`; a test checks it for the three kinds of result.
