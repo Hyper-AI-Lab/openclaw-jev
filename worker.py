@@ -26,6 +26,7 @@ from app.activities.db_activities import (
 )
 from app.activities.openclaw_activities import (
     check_intermediate_updates_enabled,
+    deliver_reply_files,
     notify_slack_user,
     parse_agent_evaluation,
     send_to_openclaw,
@@ -82,6 +83,7 @@ async def main():
             parse_agent_evaluation,
             update_task_status,
             notify_slack_user,
+            deliver_reply_files,
             check_intermediate_updates_enabled,
             verify_response_quality,
             ensure_process_run,

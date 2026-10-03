@@ -51,6 +51,9 @@ body that says what changed and how you tested it), and tell Aura its URL. To wa
 `aura-github gh pr checks <number> --watch`. Merge only when Aura approves, with `aura-github gh pr merge <number> \
 --squash`; main only takes it once CI's test check passed. RMP then deploys main when Aura is idle.
 - Run focused tests for what you changed; CI runs the full suite on the pull request.
+- Only a change to Aura's code needs a branch and a pull request. Other work, such as a script, a file conversion or \
+an analysis, stays in your workspace: do it there and report the result, with the full path of every file Aura should \
+send Kirill.
 - For GitHub use only `aura-github`. Never push to main. Other repositories are off limits unless Aura tells you \
 Kirill asked for it.
 - Never print, log or commit a secret; read a token only inside the command that needs it.

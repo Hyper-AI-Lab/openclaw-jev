@@ -87,6 +87,7 @@ def test_a_turn_runs_as_root_in_auto_mode_and_the_next_one_resumes_the_session(f
     assert "--resume" not in argv and "--permission-prompts" not in argv
     told = flags(argv)["--append-system-prompt"]
     assert s["path"] in told and "Never edit /root/.openclaw/rmp" in told and "Never push to main" in told
+    assert "Only a change to Aura's code needs a branch and a pull request." in told
     unit = json.loads((fakes.units / f"{unit_name(s, 1)}.json").read_text())
     assert unit["env"]["HOME"] == "/root" and unit["env"]["CLAUDE_CONFIG_DIR"] == str(direct.CONFIG_DIR)
     assert unit["workdir"] == s["path"] and unit["props"]["RuntimeMaxSec"] == "60"

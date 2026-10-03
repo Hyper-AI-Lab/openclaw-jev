@@ -431,3 +431,42 @@ Deploy records now carry `source` (`github` or `reviewed`), and each invariant a
 - The smoke test then runs on the new version.
 
 **Verification:** full suite 1067 passed, 4 skipped; node 27 of 28 before the plugin deploy (the live-copy check).
+
+---
+
+## Pull requests only for her code; files to Kirill with her reply
+
+**Date:** 2026-10-03.
+
+**Kirill's question:** does Aura always end with a pull request, even when a task (a file conversion, say) needs none?
+
+**Findings:**
+- Nothing in RMP forces a pull request. Claude's system prompt and `CLAUDE.md` require one only for "a change to Aura's code".
+- Three things nudged her toward one:
+  - Her planning bullet said the go-ahead means Sonnet "implements, tests and opens the pull request".
+  - `claude_start` defaults to a clone of her repository without saying when to use `scratch`.
+  - Every test task so far was a change to her code.
+- Aura could receive Kirill's files (attachments arrive as local paths) but not send one back: RMP's Slack path was `chat.postMessage` only.
+- The bot already holds `files:write` and `im:write`.
+
+**Her notes (live at once, outside the repo):**
+- "A pull request is only for your own code": scripts, conversions, data work and analyses go in a `scratch` session, with no branch, pull request or merge.
+- "Review before you approve a merge": Claude walks her through what changed and why, the tests, the risks and CI, and she approves only when satisfied.
+- "Leave the work to Claude" now covers diffs: no `git diff`, `gh pr diff` or reading the branch's files herself.
+- The planning bullet no longer implies a pull request, and "Claude Code (Opus)" is now "Claude Code".
+
+**Code:**
+- `claude_start` says `repo` is for her own code and `scratch` for everything else.
+- Claude's system prompt says only a change to Aura's code needs a branch and a pull request, and that other work stays in the workspace, reported with the full path of every file Aura should send. `CLAUDE.md` says the same for repository sessions.
+- **Files to Kirill:**
+  - `attach_file` (plugin) and `POST /api/replies/files` take a file from one of the task's Claude sessions while the task runs.
+  - `app/coding/outbox.py` checks it: the resolved path lies under `/srv/aura-code/direct/<task>/`, it is a regular file of 1 byte to 50 MB, and its text doesn't match `redact_secrets`.
+  - At most 10 files wait. RMP records a `reply.file_attached` event with the file's SHA-256.
+- **Sending:**
+  - `notify_slack_user` answers `delivered_with_files` for a delivered reply with files waiting.
+  - `_deliver_final` then runs `deliver_reply_files`, behind `workflow.patched("reply-files")`, with 10 minutes per attempt and at most 5 attempts. Its failure is caught: a file never fails or holds up the task.
+  - `side_effects.send_reply_files` checks each file again (same SHA-256), then uploads it with Slack's external upload into the DM (`conversations.open`) and records a `SideEffectReceipt` and a `reply.file_sent` event, once.
+  - A file that changed or that Slack refuses gets a receipt, a `reply.file_refused` event and a notice to Kirill. A Slack outage raises for a retry, and the last attempt tells Kirill which files did not go.
+- **Evaluator:** the evidence lists the files waiting, and a new rule says a file Aura says she sends counts only if the evidence lists it.
+
+**Verification:** full suite 1077 passed, 4 skipped; node 27 of 29 before the plugin deploy (the two live-copy checks).

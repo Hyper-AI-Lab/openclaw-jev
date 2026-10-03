@@ -1,7 +1,8 @@
 'use strict';
 
 // Aura's direct Claude tools. RMP runs each turn of Claude Code in its own unit (app/coding/direct.py);
-// these tools only call RMP's API, so a turn outlives an RMP restart and a stop reaches it.
+// these tools only call RMP's API, so a turn outlives an RMP restart and a stop reaches it. attach_file
+// sends Kirill a file Claude made, with her accepted reply (app/coding/outbox.py).
 
 const POLL_SEC = 50;
 // Aura's whole context is bounded; the full answer stays in the session's record.
@@ -74,14 +75,19 @@ function register(api, { rmpFetch, pause = sleep }) {
   api.registerTool((context) => ({
     name: 'claude_start',
     description:
-      'Start a conversation with Claude Code, a strong coding agent, for this task. RMP runs it as root on this server in '
-      + "Claude's auto permission mode, in its own workspace: \"repo\" is a fresh clone of your repository "
-      + '(Hyper-AI-Lab/openclaw-jev) from GitHub, "scratch" an empty folder. Use it whenever it helps: questions about code, '
-      + 'analysis, scripts, data work, changes to your code. Then talk to it with claude_send, and end with claude_end.',
+      'Start a conversation with Claude Code, a strong coding agent, for this task. RMP runs it as root on this server, in '
+      + 'its own workspace: "repo" is a fresh clone of your repository (Hyper-AI-Lab/openclaw-jev) from GitHub, for work on '
+      + 'your own code; "scratch" is an empty folder, for everything else, such as a script, a file conversion, data work '
+      + 'or an analysis, with no pull request. Use it whenever it helps. Then talk to it with claude_send, and end with '
+      + 'claude_end.',
     parameters: {
       type: 'object',
       properties: {
-        workspace: { type: 'string', enum: ['repo', 'scratch'], description: 'repo (default) or scratch' },
+        workspace: {
+          type: 'string',
+          enum: ['repo', 'scratch'],
+          description: 'repo (default) for work on your own code; scratch for everything else',
+        },
         title: { type: 'string', description: 'What the session is for, in a few words' },
       },
     },
@@ -157,6 +163,32 @@ function register(api, { rmpFetch, pause = sleep }) {
       }
     },
   });
+
+  api.registerTool((context) => ({
+    name: 'attach_file',
+    description:
+      "Attach a file to your reply to Kirill: RMP sends it in his Slack DM with your reply once the evaluator accepts the "
+      + "reply. Only a file from one of this task's Claude sessions, up to 50 MB; RMP refuses one that looks like it "
+      + 'holds a secret.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'The full path of the file' },
+        title: { type: 'string', description: 'What Kirill sees as its title (default: the file name)' },
+      },
+      required: ['path'],
+    },
+    execute: async (_id, params) => {
+      try {
+        const f = await rmpFetch('POST', '/api/replies/files',
+          { session_key: context?.sessionKey || '', path: params.path, title: params.title || '' }, { maxTimeSec: 120 });
+        return result(`Attached ${f.name} (${f.size} bytes): it goes to Kirill with your reply.`,
+          { id: f.id, name: f.name, size: f.size });
+      } catch (err) {
+        return result(`File not attached: ${err.message}`, { error: err.message });
+      }
+    },
+  }), { name: 'attach_file' });
 
   api.registerTool({
     name: 'claude_end',

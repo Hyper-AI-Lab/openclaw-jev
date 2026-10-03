@@ -78,6 +78,7 @@ def test_code_claims_are_judged_against_the_evidence_rmp_recorded():
                                      "attempt": 1, "external_evidence_text": text})
     assert "EXTERNAL EVIDENCE (recorded by RMP, not by Aura):\nClaude Code run" in prompt
     assert "tests pass only when RMP's own test run passed, or GitHub reports CI's test check passed on the pull request" in prompt
+    assert "A file Aura says she sends counts only if EXTERNAL EVIDENCE lists it among the files she attached." in prompt
 
 
 def test_the_evaluator_sees_a_bounded_copy_of_the_diff(tmp_path):

@@ -9,7 +9,14 @@ from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from app.activities.db_activities import finalize_task_failure, record_event
-    from app.activities.openclaw_activities import SLACK_REFUSED, notify_slack_user, verify_response_quality
+    from app.activities.openclaw_activities import (
+        REPLY_FILE_ATTEMPTS,
+        SLACK_DELIVERED_WITH_FILES,
+        SLACK_REFUSED,
+        deliver_reply_files,
+        notify_slack_user,
+        verify_response_quality,
+    )
     from app.notification_policy import is_internal_task
     from app.orchestrator.decision_engine import SLACK_DELIVERY_FAILED
     from app.task_registry.stop_command import is_whole_message_stop
@@ -36,6 +43,18 @@ class EvaluatorRetry:
             {"message_kind": "reply", "process_run_id": self.process_run_id, **notify_payload},
             start_to_close_timeout=timedelta(seconds=30),
         )
+        if outcome == SLACK_DELIVERED_WITH_FILES and workflow.patched("reply-files"):
+            # A file that can't go must not hold up or fail the task; the activity tells Kirill.
+            try:
+                await workflow.execute_activity(
+                    deliver_reply_files,
+                    {"task_id": notify_payload["task_id"], "session_key": notify_payload.get("session_key")},
+                    start_to_close_timeout=timedelta(minutes=10),
+                    retry_policy=RetryPolicy(maximum_attempts=REPLY_FILE_ATTEMPTS,
+                                             initial_interval=timedelta(seconds=10)),
+                )
+            except ActivityError as exc:
+                workflow.logger.warning("Reply files not sent for %s: %s", notify_payload["task_id"], exc)
         if outcome != SLACK_REFUSED:
             return True
         await workflow.execute_activity(

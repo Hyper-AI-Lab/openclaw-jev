@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 
 import pytest
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -40,6 +41,8 @@ class Recorder:
         self.before_memory = None
         self.signal_after_reply = None
         self.after_reply = None
+        self.files: List[Dict[str, Any]] = []
+        self.files_fail = False
 
     def activities(self):
         rec = self
@@ -132,7 +135,14 @@ class Recorder:
                 rec.after_reply()
             return rec.slack_result
 
-        return [ensure_process_run, record_event, update_task_status, update_process_state,
+        @activity.defn(name="deliver_reply_files")
+        async def deliver_reply_files(payload: Dict[str, Any]) -> List[str]:
+            rec.files.append(payload)
+            if rec.files_fail:
+                raise ApplicationError("Slack is down", non_retryable=True)
+            return ["out.csv"]
+
+        return [deliver_reply_files, ensure_process_run, record_event, update_task_status, update_process_state,
                 promote_completion_memory, finalize_task_failure, execute_compensation,
                 verify_response_quality, send_to_openclaw, notify_slack_user, resubmit_user_messages,
                 build_process_memory_context, task_actions_digest]
@@ -159,6 +169,17 @@ async def test_a_recovered_draft_is_judged_before_it_is_delivered():
     assert rec.slack == ["Pack layers and a light rain jacket."]
     # The recovered draft skipped the plan loop, so its memory was assembled once for the evaluator.
     assert rec.memory_builds == 1 and "Kirill: I'm off to Osaka in October." in rec.briefs[0]
+
+
+async def test_files_aura_attached_go_after_the_accepted_reply_and_cannot_fail_the_task():
+    rec = Recorder(verdicts=["accept"], reworks=[], slack_result="delivered_with_files")
+    assert (await _run(rec))["status"] == "completed"
+    assert rec.files == [{"task_id": "t1", "session_key": "agent:main:slack:channel:d0test"}]
+    failing = Recorder(verdicts=["accept"], reworks=[], slack_result="delivered_with_files")
+    failing.files_fail = True
+    assert (await _run(failing))["status"] == "completed" and len(failing.files) == 1
+    plain = Recorder(verdicts=["accept"], reworks=[])
+    assert (await _run(plain))["status"] == "completed" and plain.files == []
 
 
 async def test_a_delivery_result_recorded_as_a_boolean_before_sep_30_still_decodes():

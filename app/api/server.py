@@ -1664,6 +1664,30 @@ async def claude_session_send(session_id: str, req: ClaudeMessageRequest, db: As
     return started
 
 
+class ReplyFileRequest(BaseModel):
+    session_key: str
+    path: str
+    title: str = ""
+
+
+@app.post("/api/replies/files")
+async def attach_reply_file(req: ReplyFileRequest, db: AsyncSession = Depends(get_db)):
+    """Aura attaches a file from one of the task's Claude sessions; RMP sends it with her accepted reply."""
+    from app.activities.side_effects import pending_reply_files
+    from app.coding import direct, outbox
+
+    task = await _live_task(db, direct.task_of(req.session_key))
+    if len(await pending_reply_files(task.id)) >= outbox.MAX_FILES:
+        raise HTTPException(status_code=409, detail=f"{outbox.MAX_FILES} files already wait to go with your reply")
+    try:
+        checked = await asyncio.to_thread(outbox.check, task.id, req.path)
+    except outbox.FileRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    attached = {"id": str(uuid.uuid4()), "title": req.title.strip() or checked["name"], **checked}
+    await _claude_event(db, task.id, "reply.file_attached", attached)
+    return attached
+
+
 @app.get("/api/claude/sessions/{session_id}/turns/{number}")
 async def claude_turn_view(session_id: str, number: int, wait: float = 0):
     from app.coding import direct

@@ -1,7 +1,9 @@
 """Idempotent side-effect wrappers for Slack and external HTTP."""
 import asyncio
 import hashlib
+import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -231,3 +233,110 @@ async def send_slack_message_idempotent(
     except Exception as exc:
         logger.warning("Slack ledger write failed for %s: %s", task_id, exc)
     return True
+
+
+SLACK_API = "https://slack.com/api"
+
+
+class SlackFileError(RuntimeError):
+    """Slack refused a file for good; retrying won't send it."""
+
+
+def _file_key(task_id: str, file_id: str) -> str:
+    return f"slack-file:{task_id}:{file_id}"
+
+
+async def pending_reply_files(task_id: str) -> List[Dict[str, Any]]:
+    """The files Aura attached in the task that RMP has neither sent nor refused, oldest first."""
+    from app.db.models import Event
+
+    async with AsyncSessionLocal() as db:
+        attached = (await db.execute(
+            select(Event).where(Event.entity_id == task_id, Event.event_type == "reply.file_attached")
+            .order_by(Event.occurred_at)
+        )).scalars().all()
+        keys = {_file_key(task_id, e.event_payload["id"]) for e in attached}
+        done = set((await db.execute(
+            select(SideEffectReceipt.idempotency_key).where(SideEffectReceipt.idempotency_key.in_(keys))
+        )).scalars().all()) if keys else set()
+    return [e.event_payload for e in attached if _file_key(task_id, e.event_payload["id"]) not in done]
+
+
+async def send_reply_files(task_id: str, user_id: str, bot_token: str) -> List[str]:
+    """Upload the files Aura attached into Kirill's DM, each once; the names sent.
+
+    A file that changed or fails RMP's checks since it was attached, or that Slack refuses, is not sent, and
+    Kirill gets a notice saying so. Slack or the network failing for now raises SlackTransientError.
+    """
+    from app.coding import outbox
+
+    files = await pending_reply_files(task_id)
+    if not files:
+        return []
+    sent = []
+    async with httpx.AsyncClient() as client:
+        channel = (await _slack_call(client, bot_token, "conversations.open", {"users": user_id}))["channel"]["id"]
+        for attached in files:
+            key = _file_key(task_id, attached["id"])
+            try:
+                now = await asyncio.to_thread(outbox.check, task_id, attached["path"])
+                if now["sha256"] != attached["sha256"]:
+                    raise outbox.FileRefused(f"{attached['name']} changed after Aura attached it")
+                slack_file = await _upload(client, bot_token, channel, Path(now["path"]), attached["title"])
+            except (outbox.FileRefused, SlackFileError) as exc:
+                await _record_receipt(key, "slack.file_refused", {"task_id": task_id, "error": str(exc)})
+                await _file_event(task_id, "reply.file_refused", {"id": attached["id"], "name": attached["name"],
+                                                                  "error": str(exc)})
+                await send_slack_message_idempotent(
+                    task_id, user_id, f"RMP did not send {attached['name']}, a file Aura attached: {exc}", bot_token)
+                continue
+            await _record_receipt(key, "slack.file", {"task_id": task_id, "slack_file": slack_file})
+            await _file_event(task_id, "reply.file_sent", {"id": attached["id"], "name": attached["name"],
+                                                           "size": now["size"], "slack_file": slack_file})
+            sent.append(attached["name"])
+    return sent
+
+
+async def _upload(client: httpx.AsyncClient, bot_token: str, channel: str, path: Path, title: str) -> str:
+    """Slack's external upload: an upload URL, the bytes, then the share into the channel; the file's id."""
+    data = await asyncio.to_thread(path.read_bytes)
+    target = await _slack_call(client, bot_token, "files.getUploadURLExternal",
+                               {"filename": path.name, "length": str(len(data))})
+    try:
+        resp = await client.post(target["upload_url"], files={"file": (path.name, data)}, timeout=300.0)
+    except httpx.HTTPError as exc:
+        raise SlackTransientError(f"uploading {path.name} failed for now: {exc}")
+    if resp.status_code == 429 or resp.status_code >= 500:
+        raise SlackTransientError(f"uploading {path.name} failed for now: http {resp.status_code}")
+    if resp.status_code != 200:
+        raise SlackFileError(f"Slack refused the upload of {path.name}: http {resp.status_code}")
+    await _slack_call(client, bot_token, "files.completeUploadExternal",
+                      {"files": json.dumps([{"id": target["file_id"], "title": title}]), "channel_id": channel})
+    return target["file_id"]
+
+
+async def _slack_call(client: httpx.AsyncClient, bot_token: str, method: str, form: Dict[str, str]) -> Dict[str, Any]:
+    """A Slack Web API call: its result, SlackFileError for Slack's own error, SlackTransientError for now."""
+    try:
+        resp = await client.post(f"{SLACK_API}/{method}", headers={"Authorization": f"Bearer {bot_token}"},
+                                 data=form, timeout=30.0)
+    except httpx.HTTPError as exc:
+        raise SlackTransientError(f"{method} failed for now: {exc}")
+    if resp.status_code == 429 or resp.status_code >= 500:
+        raise SlackTransientError(f"{method} failed for now: http {resp.status_code}")
+    data = resp.json()
+    if data.get("ok"):
+        return data
+    error = str(data.get("error") or "unknown_error")
+    if error in TRANSIENT_SLACK_ERRORS:
+        raise SlackTransientError(f"{method} failed for now: {error}")
+    raise SlackFileError(f"{method}: {error}")
+
+
+async def _file_event(task_id: str, event_type: str, payload: Dict[str, Any]) -> None:
+    from app.db.models import Event
+
+    async with AsyncSessionLocal() as db:
+        db.add(Event(correlation_id=task_id, entity_type="task", entity_id=task_id, event_type=event_type,
+                     event_payload=payload))
+        await db.commit()
