@@ -26,6 +26,9 @@
       "claude_status",
       "claude_end",
       "attach_file"
+    ],
+    "agentToolResultMiddleware": [
+      "openclaw"
     ]
   }
 }

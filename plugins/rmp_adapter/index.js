@@ -707,6 +707,14 @@ module.exports = {
 
     require('./claude_tools').register(api, { rmpFetch });
 
+    // A task session's exec output never holds more than 12,000 characters (see exec_result_cap.js).
+    // OpenClaw versions without tool result middleware simply skip it.
+    try {
+      require('./exec_result_cap').register(api, { log });
+    } catch (e) {
+      log(`exec result cap not registered: ${e && e.message}`);
+    }
+
     // Claim Slack DMs before OpenClaw's native agent turn. Returning
     // { handled: true } stops the gateway from answering (and double-posting).
     // Routing runs in the background: the claim must not wait on intake.
