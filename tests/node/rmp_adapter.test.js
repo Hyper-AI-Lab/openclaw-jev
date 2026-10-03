@@ -939,6 +939,10 @@ test('exec cap: results saved by an earlier version at the checkout root exec-re
       `${file} would be staged by git add -A`,
     );
   }
+  // The rule is anchored at the checkout root and for a directory: the same name elsewhere is ordinary tracked code.
+  for (const file of ['plugins/exec-results/a.txt', 'tests/exec-results/a.txt', 'exec-results']) {
+    assert.throws(() => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: repoRoot }), `${file} must not be ignored`);
+  }
 });
 
 // ---- exec cap, release blockers: hard cap on every path, root ownership, error summary, full/partial truth ----

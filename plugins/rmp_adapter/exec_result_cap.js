@@ -111,7 +111,19 @@ function snapTail(text, size) {
   return whole(cut >= 0 && cut < size * 0.25 ? tail.slice(cut + 1) : tail, 'start');
 }
 
+/**
+ * The directory that holds the results (data/ in the checkout) may or may not exist. A missing one is created private;
+ * an existing one is used as it is, but only if it is a real directory (not a symlink) owned by the required user that
+ * nobody else can write to, so no other user can swap the results directory for a link or another directory.
+ */
+function checkParentDir(parent, ownerUid) {
+  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const st = fs.lstatSync(parent);
+  if (!st.isDirectory() || st.uid !== ownerUid || (st.mode & 0o022)) throw Object.assign(new Error('unsafe parent directory'), { code: 'EUNSAFE' });
+}
+
 function openPrivateDir(dir, ownerUid) {
+  checkParentDir(path.dirname(dir), ownerUid);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   // O_NOFOLLOW: a symlink in place of the directory is refused, not followed.
   const fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
