@@ -19,6 +19,8 @@ htmlcov/
 
 # RMP runtime data
 data/
+# Exec results an earlier version saved at the checkout root
+/exec-results/
 *.db
 *.sqlite
 *.sqlite3

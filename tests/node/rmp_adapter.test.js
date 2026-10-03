@@ -5,6 +5,7 @@ const { test, mock, beforeEach, afterEach } = require('node:test');
 // failed test, so the real fetch and real settings are never put back in this process.
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -904,18 +905,44 @@ test('exec cap: the plugin module spawns no process and the repo files stay read
   assert.doesNotMatch(src, /openclaw\.json|settings\.json|process\.env/, 'it reads no config or environment');
 });
 
-test('exec cap: the default directory is private under RMP state, and the limits are the documented ones', () => {
+test('exec cap: the default directory is the checkout\'s gitignored data/exec-results, and the limits are the documented ones', () => {
   const { DEFAULT_DIR, MAX_RESULT_CHARS, UPSTREAM_LIMIT_CHARS } = capModule();
-  assert.equal(DEFAULT_DIR, '/root/.openclaw/rmp-exec-results');
-  // Runtime data never goes inside a code or plugin checkout the deploy owns, and nothing is migrated from an older place.
-  for (const code of ['/root/.openclaw/rmp', '/root/.openclaw/plugins', '/root/.openclaw/web-stack']) {
-    const rel = path.relative(code, DEFAULT_DIR);
-    assert.ok(rel.startsWith('..') || path.isAbsolute(rel), `${DEFAULT_DIR} is inside ${code}`);
+  assert.equal(DEFAULT_DIR, '/root/.openclaw/rmp/data/exec-results');
+  const repoRoot = path.resolve(__dirname, '../..');
+  // What the live checkout would hold at DEFAULT_DIR, asked of this clone's git metadata only (no file is read).
+  const rel = path.relative('/root/.openclaw/rmp', DEFAULT_DIR);
+  assert.equal(rel, path.join('data', 'exec-results'));
+  const git = (...args) => execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8' });
+  const resultFile = path.join(rel, 'exec-1-0123456789abcdef.txt');
+  const partialFile = path.join(rel, 'exec-1-0123456789abcdef.partial.txt');
+  for (const file of [resultFile, partialFile]) {
+    assert.doesNotThrow(() => git('check-ignore', '-q', '--no-index', file), `${file} is not ignored by the repository`);
   }
+  assert.equal(git('ls-files', 'data').trim(), '', 'nothing under data/ is tracked');
+  // Still never inside the plugin or web-stack trees the deploy copies.
+  for (const code of ['/root/.openclaw/plugins', '/root/.openclaw/web-stack']) {
+    const r = path.relative(code, DEFAULT_DIR);
+    assert.ok(r.startsWith('..') || path.isAbsolute(r), `${DEFAULT_DIR} is inside ${code}`);
+  }
+  // Nothing is read, moved or copied from an older location.
   const src = realReadFileSync(CAP_MODULE, 'utf8');
-  assert.doesNotMatch(src, /rmp\/exec-results|renameSync|copyFileSync|cpSync/, 'no old location is read, moved or copied');
+  assert.doesNotMatch(src, /rmp-exec-results|rmp\/exec-results|renameSync|copyFileSync|cpSync/, 'no old location is read, moved or copied');
   assert.equal(MAX_RESULT_CHARS, 12000);
   assert.equal(UPSTREAM_LIMIT_CHARS, 100000);
+});
+
+test('exec cap: results saved by an earlier version at the checkout root exec-results/ are ignored by git too', () => {
+  const repoRoot = path.resolve(__dirname, '../..');
+  for (const file of ['exec-results/exec-1-0123456789abcdef.txt', 'exec-results/exec-1-0123456789abcdef.partial.txt']) {
+    assert.doesNotThrow(
+      () => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: repoRoot }),
+      `${file} would be staged by git add -A`,
+    );
+  }
+  // The rule is anchored at the checkout root and for a directory: the same name elsewhere is ordinary tracked code.
+  for (const file of ['plugins/exec-results/a.txt', 'tests/exec-results/a.txt', 'exec-results']) {
+    assert.throws(() => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: repoRoot }), `${file} must not be ignored`);
+  }
 });
 
 // ---- exec cap, release blockers: hard cap on every path, root ownership, error summary, full/partial truth ----
@@ -1048,6 +1075,76 @@ test('exec cap: an existing directory or file owned by another user is refused',
   const shown = cappedText(await run(execResult(output(40000), execDetails())));
   assert.match(shown, /NOT saved/);
   assert.deepEqual(fs.readdirSync(dir), []);
+});
+
+const modeOf = (p) => fs.statSync(p).mode & 0o777;
+
+test('exec cap: a missing parent (data/) is created private along with exec-results, owned by the required user', async () => {
+  const base = tmpDir();
+  const parent = path.join(base, 'data');
+  const dir = path.join(parent, 'exec-results');
+  const { run } = newCap({ dir });
+  assert.equal(fs.existsSync(parent), false);
+  const shown = cappedText(await run(execResult(output(40000), execDetails())));
+  assert.doesNotMatch(shown, /NOT saved/);
+  const [file] = fs.readdirSync(dir);
+  assert.equal(modeOf(parent), 0o700);
+  assert.equal(modeOf(dir), 0o700);
+  assert.equal(modeOf(path.join(dir, file)), 0o600);
+  for (const p of [parent, dir, path.join(dir, file)]) assert.equal(fs.statSync(p).uid, process.geteuid());
+});
+
+test('exec cap: an existing data/ is used as it is: its mode and its other contents are left alone', async () => {
+  const base = tmpDir();
+  const parent = path.join(base, 'data');
+  fs.mkdirSync(parent, { mode: 0o755 });
+  fs.chmodSync(parent, 0o755);
+  fs.writeFileSync(path.join(parent, 'rmp.db'), 'keep', { mode: 0o644 });
+  const dir = path.join(parent, 'exec-results');
+  const { run } = newCap({ dir });
+  const shown = cappedText(await run(execResult(output(40000), execDetails())));
+  assert.doesNotMatch(shown, /NOT saved/);
+  assert.equal(modeOf(parent), 0o755, 'an existing parent is not chmod-ed');
+  assert.equal(modeOf(dir), 0o700);
+  assert.deepEqual(fs.readdirSync(parent).sort(), ['exec-results', 'rmp.db']);
+  assert.equal(fs.readFileSync(path.join(parent, 'rmp.db'), 'utf8'), 'keep');
+  assert.equal(fs.readdirSync(dir).length, 1);
+});
+
+test('exec cap: a data/ that is a symlink is refused, and nothing is written through it', async () => {
+  const base = tmpDir();
+  const target = path.join(base, 'elsewhere');
+  fs.mkdirSync(target, { mode: 0o700 });
+  const parent = path.join(base, 'data');
+  fs.symlinkSync(target, parent);
+  const { run } = newCap({ dir: path.join(parent, 'exec-results') });
+  const shown = cappedText(await run(execResult(output(40000), execDetails())));
+  assert.match(shown, /NOT saved/);
+  assert.deepEqual(fs.readdirSync(target), []);
+  assert.ok(fs.lstatSync(parent).isSymbolicLink(), 'the link is left as it was');
+});
+
+test('exec cap: a data/ that group or others can write to is refused', async () => {
+  for (const mode of [0o775, 0o757, 0o777]) {
+    const parent = path.join(tmpDir(), 'data');
+    fs.mkdirSync(parent);
+    fs.chmodSync(parent, mode);
+    const { run } = newCap({ dir: path.join(parent, 'exec-results') });
+    const shown = cappedText(await run(execResult(output(40000), execDetails())));
+    assert.match(shown, /NOT saved/, `mode ${mode.toString(8)}`);
+    assert.deepEqual(fs.readdirSync(parent), [], `mode ${mode.toString(8)}`);
+    assert.equal(modeOf(parent), mode, 'the refused parent is not changed');
+  }
+});
+
+test('exec cap: a data/ owned by another user is refused', { skip: process.geteuid() !== 0 && 'needs root to chown' }, async () => {
+  const parent = path.join(tmpDir(), 'data');
+  fs.mkdirSync(parent, { mode: 0o755 });
+  fs.chownSync(parent, 4242, 4242);
+  const { run } = newCap({ dir: path.join(parent, 'exec-results'), opts: { ownerUid: 0 } });
+  const shown = cappedText(await run(execResult(output(40000), execDetails())));
+  assert.match(shown, /NOT saved/);
+  assert.deepEqual(fs.readdirSync(parent), []);
 });
 
 test('exec cap: many error lines are counted and sampled, the notice stays in bounds and keeps the exit status', async () => {
