@@ -20,7 +20,8 @@ const MAX_RESULT_CHARS = 12000;
 const UPSTREAM_LIMIT_CHARS = 100000;
 const RETENTION_MS = 3 * 24 * 3600 * 1000;
 const SWEEP_INTERVAL_MS = 10 * 60 * 1000;
-const DEFAULT_DIR = '/root/.openclaw/rmp/exec-results';
+// A sibling of the RMP checkout, not inside it: runtime files must not dirty the code tree the deploy owns.
+const DEFAULT_DIR = '/root/.openclaw/rmp-exec-results';
 // "Root-only" means uid 0: the directory and every file must belong to it, and nothing is created by any other user.
 const DEFAULT_OWNER_UID = 0;
 
