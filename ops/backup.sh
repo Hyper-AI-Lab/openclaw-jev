@@ -8,7 +8,9 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="${BACKUP_ROOT}/${STAMP}"
 PG_DB="${PGDATABASE:-rmp_db}"
 PG_USER="${PGUSER:-rmp}"
-PG_PASSWORD="${PGPASSWORD:-rmp_password}"
+# The rmp role's password lives only in DATABASE_URL (environment or /etc/rmp/rmp.env). Without it pg_dump
+# fails and is logged below, and the rest of the backup still runs.
+PG_PASSWORD="${PGPASSWORD:-$(cd "${RMP_ROOT}" && ./venv/bin/python -c 'from sqlalchemy.engine import make_url; from app.db.database import DATABASE_URL; print(make_url(DATABASE_URL).password or "")' 2>/dev/null || true)}"
 LOG="${DEST}/backup.log"
 
 mkdir -p "${DEST}"
