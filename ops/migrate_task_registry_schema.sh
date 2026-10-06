@@ -3,7 +3,8 @@
 set -euo pipefail
 
 RMP_ROOT="/root/.openclaw/rmp"
-export PGPASSWORD="${PGPASSWORD:-rmp_password}"
+# The rmp role's password lives only in DATABASE_URL (environment or /etc/rmp/rmp.env).
+export PGPASSWORD="${PGPASSWORD:-$(cd "${RMP_ROOT}" && ./venv/bin/python -c 'from sqlalchemy.engine import make_url; from app.db.database import DATABASE_URL; print(make_url(DATABASE_URL).password or "")')}"
 
 psql -h 127.0.0.1 -U rmp -d rmp_db <<'SQL'
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id VARCHAR;

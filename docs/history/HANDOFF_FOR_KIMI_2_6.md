@@ -152,8 +152,7 @@ Current flow for a Slack DM:
 
 - `/root/.openclaw/rmp/app/db/database.py`
   - Async SQLAlchemy engine/session setup.
-  - Default DB URL:
-    - `postgresql+asyncpg://rmp:rmp_password@localhost/rmp_db`
+  - DB URL: `DATABASE_URL` from the environment or `/etc/rmp/rmp.env` (the password is not in the repository).
 
 - `/root/.openclaw/rmp/worker.py`
   - Temporal worker.
@@ -432,7 +431,7 @@ Useful commands:
 ```bash
 pgrep -af 'temporal|worker.py|uvicorn|openclaw-gateway|openclaw gateway'
 ss -ltnp
-PGPASSWORD=rmp_password psql -U rmp -d rmp_db -h localhost -c "select status, count(*) from tasks group by status;"
+sudo -u postgres psql -d rmp_db -c "select status, count(*) from tasks group by status;"
 openclaw status
 ```
 

@@ -8,8 +8,10 @@ if [[ $# -lt 1 ]]; then
 fi
 
 SRC="$1"
+RMP_ROOT="/root/.openclaw/rmp"
 PG_USER="${PGUSER:-rmp}"
-PG_PASSWORD="${PGPASSWORD:-rmp_password}"
+# The rmp role's password lives only in DATABASE_URL (environment or /etc/rmp/rmp.env).
+PG_PASSWORD="${PGPASSWORD:-$(cd "${RMP_ROOT}" && ./venv/bin/python -c 'from sqlalchemy.engine import make_url; from app.db.database import DATABASE_URL; print(make_url(DATABASE_URL).password or "")')}"
 PG_DB="${PGDATABASE:-rmp_db}"
 
 if [[ ! -d "$SRC" ]]; then

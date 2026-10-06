@@ -1,12 +1,34 @@
 import os
+from pathlib import Path
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from app.db.models import Base
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql+asyncpg://rmp:rmp_password@localhost/rmp_db"
-)
+RMP_ENV_PATH = Path("/etc/rmp/rmp.env")
+
+
+def resolve_database_url() -> str:
+    """DATABASE_URL from the environment, else from /etc/rmp/rmp.env.
+
+    Units without that EnvironmentFile (backup, code reload, the Temporal watchdog) read the file. There is
+    no default: the database password lives only there, never in the repository.
+    """
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url:
+        return url
+    try:
+        lines = RMP_ENV_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        key, sep, value = line.strip().partition("=")
+        if sep and key.strip() == "DATABASE_URL" and value.strip():
+            return value.strip().strip("\"'")
+    raise RuntimeError(f"DATABASE_URL is not set and {RMP_ENV_PATH} does not define it; RMP has no default database")
+
+
+DATABASE_URL = resolve_database_url()
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
