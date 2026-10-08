@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import stat
 import subprocess
@@ -52,30 +53,70 @@ def installed_version() -> Optional[str]:
     return CLAUDE_BIN.resolve().name if CLAUDE_BIN.exists() else None
 
 
-def unsafe_path_components(path: Path, owner_uid: int = 0) -> List[str]:
+MAX_LINK_HOPS = 16
+
+
+def unsafe_path_components(path: Path, owner_uid: int = 0, *, lstat=os.lstat, readlink=os.readlink) -> List[str]:
     """Every component that lets a user other than root or ``owner_uid`` change what ``path`` runs.
 
-    Checks the link itself, the file it resolves to, and every parent directory of both: a component owned by
-    another user, or writable by group or others, can be swapped. Sticky directories such as /tmp only let a
-    user replace their own entries, so their mode is not a finding.
+    Follows the symlink chain one hop at a time and checks each link, the final file, and every parent directory
+    of each (as written and as resolved): a component owned by another user, or writable by group or others, can
+    be swapped. Sticky directories such as /tmp only let a user replace their own entries, so their mode is not a
+    finding. A missing component is a finding too: whoever can create it decides what runs.
     """
     seen: set = set()
     problems: List[str] = []
-    for start in (path, path.resolve()):
-        for component in (start, *start.parents):
-            if component in seen:
-                continue
-            seen.add(component)
-            try:
-                st = component.lstat()
-            except FileNotFoundError:
-                continue
-            if st.st_uid not in (0, owner_uid):
-                problems.append(f"{component} is owned by uid {st.st_uid}")
-            elif (st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode)
-                  and not (stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX)):
-                problems.append(f"{component} is writable by group or others")
+
+    def check(component: Path) -> bool:
+        if component in seen:
+            return True
+        seen.add(component)
+        try:
+            st = lstat(component)
+        except FileNotFoundError:
+            problems.append(f"{component} is missing")
+            return False
+        if st.st_uid not in (0, owner_uid):
+            problems.append(f"{component} is owned by uid {st.st_uid}")
+        elif (st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode)
+              and not (stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX)):
+            problems.append(f"{component} is writable by group or others")
+        return True
+
+    current = Path(os.path.abspath(path))
+    for _ in range(MAX_LINK_HOPS):
+        real_parent = Path(os.path.realpath(current.parent))
+        for directory in (*reversed(current.parents), *reversed(real_parent.parents), real_parent):
+            check(directory)
+        if not check(current):
+            return problems
+        if not stat.S_ISLNK(lstat(current).st_mode):
+            return problems
+        target = Path(readlink(current))
+        current = Path(os.path.normpath(target if target.is_absolute() else real_parent / target))
+    problems.append(f"{path} has more than {MAX_LINK_HOPS} symlink hops")
     return problems
+
+
+_SHA_CACHE: Dict[tuple, str] = {}
+
+
+def binary_sha256(path: Path) -> Optional[str]:
+    """sha256 of the file ``path`` resolves to, hashed once per file version (inode, size, mtime)."""
+    real = path.resolve()
+    try:
+        st = real.stat()
+    except FileNotFoundError:
+        return None
+    key = (str(real), st.st_ino, st.st_size, st.st_mtime_ns)
+    if key not in _SHA_CACHE:
+        digest = hashlib.sha256()
+        with real.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        _SHA_CACHE.clear()
+        _SHA_CACHE[key] = digest.hexdigest()
+    return _SHA_CACHE[key]
 
 
 def check_claude_code() -> CheckResult:
@@ -89,6 +130,12 @@ def check_claude_code() -> CheckResult:
     else:
         if version != pinned:
             problems.append(f"claude is {version}, pinned {pinned}")
+        else:
+            pinned_sha = get_coding_config().get("claude_sha256")
+            if not pinned_sha:
+                warnings.append("no sha256 is pinned for Claude Code (coding.claude_sha256)")
+            elif binary_sha256(CLAUDE_BIN) != pinned_sha:
+                problems.append(f"the claude binary's sha256 differs from the pinned {pinned} release")
         # Aura's direct turns run this binary as root: nobody but root may be able to replace it.
         unsafe = unsafe_path_components(CLAUDE_BIN, BINARY_OWNER_UID)
         if unsafe:

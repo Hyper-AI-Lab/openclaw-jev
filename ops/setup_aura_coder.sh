@@ -50,26 +50,37 @@ log "directories ready under /srv/aura-code and /etc/aura-coder"
 
 MANAGED=/etc/claude-code/managed-settings.json
 install_claude() {
-  local version="$1" platform tmp sum
+  local version="$1" pin="$2" platform tmp sum
   case "$(uname -m)" in x86_64) platform=linux-x64 ;; aarch64) platform=linux-arm64 ;; *) die "unsupported machine $(uname -m)" ;; esac
   if ldd /bin/ls 2>&1 | grep -q musl; then platform="${platform}-musl"; fi
   tmp="$(mktemp -d)"
+  trap 'rm -rf "${tmp}"' EXIT
   curl -fsSL "${RELEASES}/${version}/manifest.json" -o "${tmp}/manifest.json"
-  sum="$("${PY}" -c 'import json, sys; print(json.load(open(sys.argv[1]))["platforms"][sys.argv[2]]["checksum"])' "${tmp}/manifest.json" "${platform}")"
-  [[ "${sum}" =~ ^[a-f0-9]{64}$ ]] || { rm -rf "${tmp}"; die "no checksum for ${platform} in the ${version} manifest"; }
+  sum="$("${PY}" -c 'import json, sys; print(json.load(open(sys.argv[1])).get("platforms", {}).get(sys.argv[2], {}).get("checksum", ""))' "${tmp}/manifest.json" "${platform}")"
+  [[ "${sum}" =~ ^[a-f0-9]{64}$ ]] || die "no checksum for ${platform} in the ${version} manifest"
+  # The manifest sits next to the binary, so it only proves the download is intact; the pin in app/config.py
+  # (reviewed with the version bump) decides what root may run.
+  [[ "${sum}" == "${pin}" ]] || die "the ${version} manifest's sha256 for ${platform} is not the pinned coding.claude_sha256"
   curl -fsSL "${RELEASES}/${version}/${platform}/claude" -o "${tmp}/claude"
-  [[ "$(sha256sum "${tmp}/claude" | cut -d' ' -f1)" == "${sum}" ]] || { rm -rf "${tmp}"; die "checksum mismatch for Claude Code ${version}"; }
+  [[ "$(sha256sum "${tmp}/claude" | cut -d' ' -f1)" == "${pin}" ]] || die "checksum mismatch for Claude Code ${version}"
   install -d -o root -g root -m 755 "${CLAUDE_DIR}" "${CLAUDE_DIR}/versions" "${CLAUDE_DIR}/bin"
   install -o root -g root -m 755 "${tmp}/claude" "${CLAUDE_DIR}/versions/${version}"
-  ln -sfn "../versions/${version}" "${CLAUDE}"
+  # Swap the link in one rename, so a turn starting meanwhile finds the old or the new binary, never neither.
+  ln -sfn "../versions/${version}" "${CLAUDE}.new"
+  mv -Tf "${CLAUDE}.new" "${CLAUDE}"
   rm -rf "${tmp}"
+  trap - EXIT
+  # Keep this version and the newest other one, for a quick rollback; older ones go.
+  ls -1t "${CLAUDE_DIR}/versions" | grep -vxF "${version}" | tail -n +2 | while read -r old; do rm -f "${CLAUDE_DIR}/versions/${old}"; done || true
 }
-# The version is the versions/<version> name the link points to: the binary is never run to find out.
-installed() { basename "$(readlink "${CLAUDE}" 2>/dev/null || echo none)"; }
+# The version is the versions/<version> name the link points to, once that file is there: never run to find out.
+installed() { [[ -f "${CLAUDE}" && -x "${CLAUDE}" ]] && basename "$(readlink "${CLAUDE}")" || echo none; }
+PIN="${CLAUDE_CODE_SHA256:-$(cd "${RMP_ROOT}" && "${PY}" -c 'from app.config import get_coding_config; print(get_coding_config().get("claude_sha256", ""))')}"
+[[ "${PIN}" =~ ^[a-f0-9]{64}$ ]] || die "no sha256 pinned for Claude Code ${VERSION} (coding.claude_sha256)"
 current="$(installed)"
 if [[ "${current}" != "${VERSION}" ]]; then
   log "installing Claude Code ${VERSION} root-owned at ${CLAUDE_DIR} (was: ${current})"
-  install_claude "${VERSION}"
+  install_claude "${VERSION}" "${PIN}"
   current="$(installed)"
 fi
 

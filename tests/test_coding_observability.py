@@ -1,4 +1,5 @@
 """Coding readiness checks, the deploy and unit invariants, and the coding API."""
+import hashlib
 import json
 import os
 import subprocess
@@ -17,8 +18,10 @@ from tests.test_invariants import ago, seed, session, task  # noqa: F401  (sessi
 @pytest.fixture
 def host(tmp_path, monkeypatch):
     """A Claude Code install, token, smoke record and managed settings, all healthy."""
+    tmp_path.chmod(0o700)
     versions = tmp_path / "versions"
     versions.mkdir()
+    versions.chmod(0o755)
     (versions / "2.1.280").write_text("#!/bin/sh\n")
     (versions / "2.1.280").chmod(0o755)
     (tmp_path / "claude").symlink_to(versions / "2.1.280")
@@ -41,7 +44,9 @@ def host(tmp_path, monkeypatch):
         monkeypatch.setattr(cr, name, value)
     # The binary's path is the test's own tmp tree: trust this process's uid there, as production trusts root.
     monkeypatch.setattr(cr, "BINARY_OWNER_UID", os.getuid())
-    monkeypatch.setattr(cr, "get_coding_config", lambda: {"claude_version": "2.1.280", "run_timeout_sec": 5400,
+    pinned_sha = hashlib.sha256(b"#!/bin/sh\n").hexdigest()
+    monkeypatch.setattr(cr, "get_coding_config", lambda: {"claude_version": "2.1.280", "claude_sha256": pinned_sha,
+                                                          "run_timeout_sec": 5400,
                                                           "blocked_tcp_ports": [22], "enabled": True, "repositories": {}})
     monkeypatch.setattr(cr.firewall, "active", lambda: True)
     monkeypatch.setattr(cr.firewall, "uncovered_listeners", lambda ports: [])
@@ -75,20 +80,68 @@ def test_a_claude_binary_that_a_non_root_user_could_replace_fails_readiness(host
     assert any(str(host.versions) in item for item in result.details["binary_path_unsafe"])
 
 
-def test_a_component_owned_by_another_user_is_reported_and_a_root_owned_sticky_dir_is_not(tmp_path):
+def _chain(tmp_path):
+    """root/opt-like tree under tmp_path: bin/claude -> ../versions/2.1.280, every directory 0755."""
+    tmp_path.chmod(0o700)
+    for name in ("bin", "versions"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name).chmod(0o755)
     target = tmp_path / "versions" / "2.1.280"
-    target.parent.mkdir()
     target.write_text("")
-    link = tmp_path / "claude"
-    link.symlink_to(target)
+    target.chmod(0o755)
+    link = tmp_path / "bin" / "claude"
+    link.symlink_to("../versions/2.1.280")
+    return link, target
+
+
+def _lstat_as(owner_of):
+    """os.lstat, but reporting the uid that ``owner_of`` maps a path to (tests run as root or as a CI user)."""
+    def fake(path):
+        st = os.lstat(path)
+        uid = owner_of.get(str(path), st.st_uid)
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, uid, st.st_gid, st.st_size,
+                               int(st.st_atime), int(st.st_mtime), int(st.st_ctime)))
+    return fake
+
+
+def test_a_healthy_chain_has_no_findings(tmp_path):
+    link, _ = _chain(tmp_path)
     assert cr.unsafe_path_components(link, os.getuid()) == []
-    stranger = os.getuid() + 12345
-    found = cr.unsafe_path_components(link, stranger)
-    if os.getuid() != 0:
-        assert any(f"is owned by uid {os.getuid()}" in item for item in found)
-    else:
-        assert found == []  # root owns everything here, and root is always trusted
-    assert all("/tmp is" not in item for item in found)
+
+
+def test_a_target_or_a_middle_link_owned_by_another_user_is_reported(tmp_path):
+    link, target = _chain(tmp_path)
+    found = cr.unsafe_path_components(link, os.getuid(), lstat=_lstat_as({str(target): 4242}))
+    assert found == [f"{target} is owned by uid 4242"]
+    middle = tmp_path / "bin" / "middle"
+    middle.symlink_to("../versions/2.1.280")
+    link.unlink()
+    link.symlink_to("middle")
+    found = cr.unsafe_path_components(link, os.getuid(), lstat=_lstat_as({str(middle): 4242}))
+    assert found == [f"{middle} is owned by uid 4242"]
+
+
+def test_world_writable_directories_are_findings_unless_sticky_and_so_is_a_group_writable_binary(tmp_path):
+    link, target = _chain(tmp_path)
+    (tmp_path / "versions").chmod(0o1777)
+    assert cr.unsafe_path_components(link, os.getuid()) == []
+    (tmp_path / "versions").chmod(0o777)
+    assert cr.unsafe_path_components(link, os.getuid()) == [f"{tmp_path / 'versions'} is writable by group or others"]
+    (tmp_path / "versions").chmod(0o755)
+    target.chmod(0o775)
+    assert cr.unsafe_path_components(link, os.getuid()) == [f"{target} is writable by group or others"]
+
+
+def test_a_dangling_link_is_a_finding_because_whoever_creates_the_target_decides_what_runs(tmp_path):
+    link, target = _chain(tmp_path)
+    target.unlink()
+    assert cr.unsafe_path_components(link, os.getuid()) == [f"{target} is missing"]
+
+
+def test_a_binary_that_differs_from_the_pinned_sha256_fails_readiness(host):
+    (host.versions / "2.1.280").write_text("#!/bin/sh\necho tampered\n")
+    result = cr.check_claude_code()
+    assert result.status == "fail" and "differs from the pinned 2.1.280 release" in result.message
 
 
 def test_the_claude_binary_lives_outside_every_path_aura_coder_can_write():

@@ -247,6 +247,9 @@ DEFAULT_CODING = {
     # Coding tasks: Claude Code as the aura-coder user, run and verified by RMP.
     "enabled": True,
     "claude_version": "2.1.288",
+    # sha256 of that version's linux-x64 binary from Anthropic's release manifest, pinned here so a new binary
+    # only reaches root through a reviewed change. Bump it together with claude_version.
+    "claude_sha256": "0298068b686e7fdbaf9402a7a587bb7f49c0b0e084de09f69145a0719207640c",
     "model": "opus",
     "fallback_model": "sonnet",
     "max_turns": 200,
