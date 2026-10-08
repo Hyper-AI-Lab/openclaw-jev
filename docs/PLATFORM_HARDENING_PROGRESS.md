@@ -128,3 +128,33 @@ All runtime services stayed active throughout.
 - Final suite: pending at commit time.
 
 **Other finding:** two 10-05 `mktemp` directories in `/tmp` hold a file named `typesafe-api-key`. They are scheduled for removal in Phase 0.8.
+
+## 2026-10-08 16:55 · Phase 0.5, continued: residual paths from the closure review fixed (Kirill approved both)
+
+1. **Ended Kirill's old root `claude-team` session** (pid 3599048, started 2026-10-06 01:06 in `screen -S claude`). It ran the aura-coder-owned binary, and Claude Code re-execs that binary for its search tools. It exited cleanly on SIGTERM. `root_processes_running_from(/home/aura-coder)` now returns `[]`, and new `claude-team` sessions run `/opt/claude-code`.
+2. **claude-jev repo (`/root/claude-jev`), released as v1.0.3.**
+   - **Change:** `scripts/{install,uninstall,release,validate}.sh`, `tests/e2e/run.sh` and `docs/RUNBOOK.md` now default to `/opt/claude-code/bin/claude` instead of the aura-coder copy (still overridable with `CLAUDE_BIN`). The plugin version is bumped to 1.0.3 in `plugin.json` and `config.mjs`, and the repo's `docs/PROGRESS.md` is appended.
+   - **Commit:** `cc831d2`, on branch `root-owned-claude-bin`, fast-forwarded into `main`.
+   - **Tests:** 119/119 pass. One earlier run had a single failure in a wall-clock test, "oversized command lines… < 1500 ms", which measured 1541 ms with four test files running concurrently on a loaded host. That test passes 3/3 in isolation and the guard code is unchanged. It is a pre-existing flaky test in claude-jev, noted for its owner.
+   - **Release:** `scripts/release.sh v1.0.3` passed its tests and validation, tagged `v1.0.3`, moved `/opt/claude-jev` to `v1.0.3` (clean), and refreshed the jev install records in `/root/.claude-team` (user and project scope) and `/root/.claude` (user scope) using the root-owned binary.
+   - **Check:** neither repo has old-path references left, apart from claude-jev's history log.
+3. **Remaining for AS-02:** merge and deploy the RMP PR, then remove the old aura-coder install (`~/.local/bin/claude` and `~/.local/share/claude/versions`) so nothing can fall back to it.
+
+## 2026-10-08 16:58 · Phase 0.6: Safe Harbor / Kairos cron and daemons retired (K-11)
+
+**Before:**
+- Root's crontab had a single entry, `*/5 * * * * node /root/aura_safe_harbor/kairos_core/ensure_peripheral_daemons.js`.
+- Every 5 minutes it revived two detached daemons, `kairos_core/modules/task_watchdog.js` (pid 1697793) and `self_auditor.js` (pid 1697804). Both were running since 10-01 00:23, outside systemd.
+- On each run it also **re-appended to Aura's `workspace/AGENTS.md`** two blocks, "TOKEN RATE LIMIT SURVIVAL RULE" and "MANDATORY DIRECT IMPERATIVES". The second contains the deep-grep-for-secrets instruction (AS-15, IF-07, UC-14).
+- Nothing in RMP depends on them: a grep of `app/`, `ops/`, `plugins/` and the units finds none. Aura's `AGENTS.md:291` already calls `tasks.md` "optional human notes".
+
+**Change:**
+- Backed up the crontab to `/root/attic/crontab.root.bak-programme-20261008` and removed the entry. Root's crontab is now empty.
+- SIGTERM to both daemons; both exited.
+
+**Still to do** (WP-20/22 under K-11, now possible without the cron re-adding them):
+- remove the two `AGENTS.md` blocks, including the deep-grep instruction;
+- archive both local repos with their history purged of secrets;
+- rotate the exposed keys.
+
+**Rollback:** `crontab /root/attic/crontab.root.bak-programme-20261008`. The next cron run restarts the daemons.
