@@ -9,7 +9,7 @@ set -euo pipefail
 RMP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${RMP_ROOT}/venv/bin/python"
 CODER=aura-coder
-CLAUDE=/home/aura-coder/.local/bin/claude
+CLAUDE=/opt/claude-code/bin/claude
 
 die() { echo "[claude-login] ERROR: $*" >&2; exit 1; }
 [[ "$(id -u)" == "0" ]] || die "run as root"

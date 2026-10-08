@@ -19,7 +19,10 @@ JOBS_DIR = CODE_ROOT / "jobs"
 RUNS_DIR = CODE_ROOT / "runs"
 CACHE_DIR = CODE_ROOT / "cache"
 VENVS_DIR = CODE_ROOT / "venvs"
-CLAUDE_BIN = CODER_HOME / ".local" / "bin" / "claude"
+# Root-owned and read-only, outside every path aura-coder can write: Aura's direct turns run this binary as
+# root, so a copy under aura-coder's home would let a coding job replace what root executes.
+CLAUDE_INSTALL_DIR = Path("/opt/claude-code")
+CLAUDE_BIN = CLAUDE_INSTALL_DIR / "bin" / "claude"
 SECRETS_DIR = Path("/etc/aura-coder")
 TOKEN_ENV_FILE = SECRETS_DIR / "claude.env"
 TOKEN_META_FILE = SECRETS_DIR / "claude-token.json"

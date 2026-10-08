@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,13 +16,15 @@ from typing import Any, Dict, List, Optional
 
 from app.coding import firewall, runner
 from app.coding.credentials import read_meta
-from app.coding.units import CLAUDE_BIN, JOBS_DIR, MANAGED_SETTINGS, RUNS_DIR, TOKEN_ENV_FILE, TOKEN_META_FILE
+from app.coding.units import CLAUDE_BIN, CODER_HOME, JOBS_DIR, MANAGED_SETTINGS, RUNS_DIR, TOKEN_ENV_FILE, TOKEN_META_FILE
 from app.config import RMP_DATA_DIR, RMP_ROOT, get_coding_config
 from app.production.readiness import CheckResult
 
 SMOKE_RECORD = Path(RMP_DATA_DIR) / "coding" / "claude_smoke.json"
 MANAGED_SETTINGS_SOURCE = Path(RMP_ROOT) / "ops" / "aura_coder" / "managed-settings.json"
 TOKEN_WARN_DAYS = 30
+# The only owner (besides root) trusted along the claude binary's path; tests point it at their own uid.
+BINARY_OWNER_UID = 0
 STUCK_MARGIN_SEC = 900
 UNIT = re.compile(r"^aura-(claude|verify|collect|deploy|direct)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
 HOST_POLICY = Path("/etc/claude-code/managed-settings.json")
@@ -49,15 +53,119 @@ def installed_version() -> Optional[str]:
     return CLAUDE_BIN.resolve().name if CLAUDE_BIN.exists() else None
 
 
+MAX_LINK_HOPS = 16
+
+
+def unsafe_path_components(path: Path, owner_uid: int = 0, *, lstat=os.lstat, readlink=os.readlink) -> List[str]:
+    """Every component that lets a user other than root or ``owner_uid`` change what ``path`` runs.
+
+    Follows the symlink chain one hop at a time and checks each link, the final file, and every parent directory
+    of each (as written and as resolved): a component owned by another user, or writable by group or others, can
+    be swapped. Sticky directories such as /tmp only let a user replace their own entries, so their mode is not a
+    finding. A missing component is a finding too: whoever can create it decides what runs.
+    """
+    seen: set = set()
+    problems: List[str] = []
+
+    def check(component: Path) -> bool:
+        if component in seen:
+            return True
+        seen.add(component)
+        try:
+            st = lstat(component)
+        except FileNotFoundError:
+            problems.append(f"{component} is missing")
+            return False
+        if st.st_uid not in (0, owner_uid):
+            problems.append(f"{component} is owned by uid {st.st_uid}")
+        elif (st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode)
+              and not (stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX)):
+            problems.append(f"{component} is writable by group or others")
+        return True
+
+    current = Path(os.path.abspath(path))
+    for _ in range(MAX_LINK_HOPS):
+        real_parent = Path(os.path.realpath(current.parent))
+        for directory in (*reversed(current.parents), *reversed(real_parent.parents), real_parent):
+            check(directory)
+        if not check(current):
+            return problems
+        if not stat.S_ISLNK(lstat(current).st_mode):
+            return problems
+        target = Path(readlink(current))
+        current = Path(os.path.normpath(target if target.is_absolute() else real_parent / target))
+    problems.append(f"{path} has more than {MAX_LINK_HOPS} symlink hops")
+    return problems
+
+
+def root_processes_running_from(directory: Path, proc: Path = Path("/proc")) -> List[str]:
+    """Root processes whose executable lives under ``directory``. A process loads its binary once, but Claude Code
+    re-runs its own executable for search tools, so a root process started from a file someone else can replace
+    keeps running whatever is there now."""
+    found: List[str] = []
+    for entry in sorted(proc.iterdir(), key=lambda p: p.name):
+        if not entry.name.isdigit():
+            continue
+        try:
+            uid_line = next(line for line in (entry / "status").read_text().splitlines() if line.startswith("Uid:"))
+            real, effective = uid_line.split()[1:3]
+            exe = os.readlink(entry / "exe")
+        except (OSError, StopIteration, ValueError):
+            continue
+        if "0" not in (real, effective):
+            continue
+        exe_path = Path(exe.removesuffix(" (deleted)"))
+        if exe_path == directory or directory in exe_path.parents:
+            found.append(f"pid {entry.name} ({exe_path})")
+    return found
+
+
+_SHA_CACHE: Dict[tuple, str] = {}
+
+
+def binary_sha256(path: Path) -> Optional[str]:
+    """sha256 of the file ``path`` resolves to, hashed once per file version (inode, size, mtime)."""
+    real = path.resolve()
+    try:
+        st = real.stat()
+    except FileNotFoundError:
+        return None
+    key = (str(real), st.st_ino, st.st_size, st.st_mtime_ns)
+    if key not in _SHA_CACHE:
+        digest = hashlib.sha256()
+        with real.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        _SHA_CACHE.clear()
+        _SHA_CACHE[key] = digest.hexdigest()
+    return _SHA_CACHE[key]
+
+
 def check_claude_code() -> CheckResult:
     pinned = get_coding_config()["claude_version"]
     version, days = installed_version(), token_days_left()
     smoke = json.loads(SMOKE_RECORD.read_text()) if SMOKE_RECORD.is_file() else None
     problems, warnings = [], []
+    unsafe: List[str] = []
     if version is None:
         problems.append("the claude binary is missing")
-    elif version != pinned:
-        problems.append(f"claude is {version}, pinned {pinned}")
+    else:
+        if version != pinned:
+            problems.append(f"claude is {version}, pinned {pinned}")
+        else:
+            pinned_sha = get_coding_config().get("claude_sha256")
+            if not pinned_sha:
+                warnings.append("no sha256 is pinned for Claude Code (coding.claude_sha256)")
+            elif binary_sha256(CLAUDE_BIN) != pinned_sha:
+                problems.append(f"the claude binary's sha256 differs from the pinned {pinned} release")
+        # Aura's direct turns run this binary as root: nobody but root may be able to replace it.
+        unsafe = unsafe_path_components(CLAUDE_BIN, BINARY_OWNER_UID)
+        if unsafe:
+            problems.append("the claude binary can be replaced by a non-root user: " + "; ".join(unsafe[:3]))
+    stray = root_processes_running_from(CODER_HOME)
+    if stray:
+        warnings.append("a root process runs a binary from aura-coder's home (restart it from "
+                        f"{CLAUDE_BIN}): " + "; ".join(stray[:3]))
     if not TOKEN_ENV_FILE.is_file() or TOKEN_ENV_FILE.stat().st_size == 0 or days is None:
         problems.append("no Claude Code token (run ops/claude_code_login.sh)")
     elif days < 0:
@@ -68,7 +176,7 @@ def check_claude_code() -> CheckResult:
         warnings.append("no smoke run recorded (ops/claude_code_smoke.py)")
     elif not smoke.get("ok"):
         warnings.append("the last smoke run failed")
-    details = {"version": version, "pinned": pinned, "token_days_left": days,
+    details = {"version": version, "pinned": pinned, "token_days_left": days, "binary_path_unsafe": unsafe, "root_processes_from_coder_home": stray,
                "smoke_at": (smoke or {}).get("at"), "smoke_ok": (smoke or {}).get("ok")}
     status = "fail" if problems else "warn" if warnings else "pass"
     message = "; ".join(problems + warnings) or (
