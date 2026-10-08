@@ -158,3 +158,76 @@ All runtime services stayed active throughout.
 - rotate the exposed keys.
 
 **Rollback:** `crontab /root/attic/crontab.root.bak-programme-20261008`. The next cron run restarts the daemons.
+
+## 2026-10-08 17:02 · Phase 0.7 (manual part): Temporal databases dumped
+
+**Change:** `sudo -u postgres pg_dump -Fc` of `temporal` (1.15 MB) and `temporal_visibility` (108 KB) into `/root/.openclaw/archive/temporal-dump-20261008T*/` (mode 0700), with a `SHA256SUMS` file. Kept outside `data/backups/`, so the 14-directory pruning never touches it.
+
+**Check:** `pg_restore -l` reads both dumps back (39 and 3 table-data entries).
+
+**Still to do:** the `ops/backup.sh` PR (resolve the RMP root, fail loudly, real Qdrant snapshot, Temporal dumps nightly). It waits for PR #24 to deploy (one PR in flight).
+
+## 2026-10-08 17:08 · Phase 0.8: host hygiene
+
+| Item | Done | Rollback |
+|---|---|---|
+| Stray `temporal-test-server` (pid 1406490, orphan since 09-30, listening on `*:38869`) | SIGTERM; the port is closed. The binary `/tmp/temporal-test-server-sdk-python-1.23.0` is **kept**, because the offline Temporal tests need it | — |
+| `/etc/rmp/rmp.env.bak-20261006T063550Z` (held the old, public DB password) | `shred -u` | — (that password is rotated) |
+| Agent Cerebro (`agentrecall` 0.2.0, hand-copied into `/usr/local/lib/python3.12/dist-packages`, with 3 console scripts in `/usr/local/bin`); no references anywhere | Moved to `/root/attic/cerebro/` | move back |
+| Root user units: dangling `default.target.wants/openclaw-{gateway,chat-log}.service` links and `openclaw-gateway.service.bak` (OT-2; could revive a second gateway on port 18789) | Moved to `/root/attic/root-user-units/`, then `systemctl --user daemon-reload` | move back |
+| 31 gitignored scratch scripts in the live checkout (`fix_*`, `query_*`, `parse_test*`, and the destructive `terminate_all.py`, `delete_tasks.py`); no references in crons, the persona, `app/`, `ops/`, `plugins/` or units | Moved to `/root/attic/rmp-scratch/` under the `CLAUDE.md:50` override. No tracked files changed; rmp-api and rmp-worker stayed active | move back |
+| `/tmp/tmp.*` (8 mktemp dirs from 09-30 and 10-05; 2 held a `typesafe-api-key` file, 0600 root) | Key files `shred -u`; dirs removed | — |
+| Aura's OpenClaw fork `/tmp/openclaw-v2026.9.7` (2.0 GB, D-8) | **Archived** (moved) to `/root/.openclaw/archive/aura-openclaw-fork-v2026.9.7`; not deleted | move back |
+| Test-suite leaks: `rmp-cap-*` (1,997), `rmp-tests-*` (998), `jev-*` (4,955), `rmp_ctx_*` (66), `openclaw-vitest-include-*.json` | Deleted (544 MB). The leaks themselves are fixed in WP-01 (TU-1) and in claude-jev (its owner) | — |
+
+**Kept:** `/tmp/claude-0` (this session's task outputs), `/tmp/openclaw-upgrade-backup.path`, `/tmp/rmp-intel-*` (evidence; archived before the reboot).
+
+**Also checked:** the Kairos daemons did not respawn after the cron removal.
+
+## 2026-10-08 16:52 · Correction to the times of the entries above
+
+The times on the Phase 0.5-continued, 0.6, 0.7 and 0.8 entry headers (16:55, 16:58, 17:02, 17:08) were estimates written ahead of the clock. The real time when this correction was written is 16:52 CEST, and all of those steps happened before it. Their content is accurate; only the header times are wrong. From this entry on, every timestamp comes from `date`.
+
+The 0.8 statement "the Kairos daemons did not respawn" was checked before a full 5-minute cron boundary had passed. It is re-checked in a later entry.
+
+## 2026-10-08 16:57 · Phase 0.7: backup fix prepared and validated against production (PR waits for #24)
+
+**Root cause of the empty Qdrant archive:**
+- `rmp-backup.service` starts `ops/backup.sh` with no working directory.
+- The inline `python -c 'from app.config import …'` therefore failed to import.
+- The fallback `|| echo data/qdrant` then picked the empty legacy directory, giving a 110-byte `qdrant.tar.gz` every night.
+- The real storage is the 90 MB bind mount `data/qdrant-server`, and a tar of live storage would not be consistent anyway.
+
+**Change** (branch `aura/p0-backup-fail-loudly`, commit on top of main 1a0c3be):
+- `cd "${RMP_ROOT}"` before anything imports `app`.
+- In server mode, a Qdrant **full snapshot** (`POST /snapshots?wait=true`). It is downloaded and checked to be a tar with entries, then deleted from the server. Embedded mode keeps a tar of the configured path.
+- Every component's failure (postgres, qdrant, artifacts, openclaw-state, temporal-sqlite) is collected, written into `manifest.json` `failures`, and makes the script **exit 1**, so the unit shows failed. Previously each failure was only a WARN and the run "passed".
+- Pruning removes only directories named like a backup stamp. Named directories, such as an OpenClaw rollback backup, are never pruned by age (Phase 0.2 root cause).
+- Paths and the interpreter can be overridden for tests (`RMP_ROOT`, `RMP_BACKUP_ROOT`, `RMP_PYTHON`, `OPENCLAW_HOME`); the defaults are production.
+- Two of my own bugs were caught before commit: a `tar | grep -q` SIGPIPE under `pipefail` that would report a good snapshot as failed, and a Python-3.12-only f-string.
+
+**Tests:** new `tests/test_backup_script.py` runs the real script against fake `pg_dump` and a fake Qdrant API. It covers a healthy run (snapshot taken, POST/GET/DELETE in order, no failures), a Qdrant failure (exit 1, only `qdrant` listed, others still produced), a Postgres failure, and pruning (14 dated kept, a named directory untouched). Result: 4/4, plus `test_database_url` 6/6.
+
+**Live check before the PR:** ran the branch's script against production. Exit 0, manifest failures `[]`. `qdrant-full.snapshot` is 88 MB and contains snapshots of all 4 collections plus `config.json`. No snapshots are left on the server. Backup `data/backups/20261008T145634Z` is the **first backup from this host that captures Qdrant**.
+
+**Next:** rebase onto main after PR #24 deploys, then the full suite, review and PR.
+
+## 2026-10-08 16:57 · Phase 0.6 re-check and PR #24 merged
+
+- **Kairos re-check, after several 5-minute cron boundaries:** no `task_watchdog`, `self_auditor` or `ensure_peripheral_daemons` process is running, and root's crontab is still empty. Confirmed retired.
+- **PR #24 merged** (squash, `8469be0`). `main` was unchanged since the local verification (`1a0c3be`), CI `test` passed, both Tier-1 reviews were done, and the full sandboxed suite gave 1103 passed, 4 skipped; node 59/59. The deploy is being watched.
+
+## 2026-10-08 17:03 · PR #24 deployed; finding authz-secrets-02 closed
+
+**Deploy:** RMP's deploy of `8469be0` reached the live checkout about 270 s after the merge.
+- `/srv/aura-code/runs/main/result.json` reports `status: deployed`; rmp-api and rmp-worker restarted; health and readiness passed; the canary passed.
+- The worker journal has no nondeterminism or sandbox errors in the 15 minutes after.
+- `/health` is ok.
+- Live `check_claude_code`: `pass`. `CLAUDE_BIN` is `/opt/claude-code/bin/claude`, and no root process runs from aura-coder's home.
+
+**Old install removed:** with no coding unit and no aura-coder process running, removed `/home/aura-coder/.local/bin/claude` and `~/.local/share/claude/versions/{2.1.280,2.1.288}`. The verified 2.1.288 stays at `/opt/claude-code`, and aura-coder can run it (`runuser -u aura-coder -- /opt/claude-code/bin/claude --version` gives 2.1.288).
+
+**authz-secrets-02 closed** in `ledger.json`:
+- root executes only a root-owned binary pinned by sha256;
+- readiness fails on any regression and warns about stray root processes;
+- no root caller remains on the old path (RMP, `claude-team`, claude-jev v1.0.3).
