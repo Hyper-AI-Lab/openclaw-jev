@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -44,6 +45,8 @@ def host(tmp_path, monkeypatch):
         monkeypatch.setattr(cr, name, value)
     # The binary's path is the test's own tmp tree: trust this process's uid there, as production trusts root.
     monkeypatch.setattr(cr, "BINARY_OWNER_UID", os.getuid())
+    # This host's real processes are not the test's business; the scan has its own test with a fake /proc.
+    monkeypatch.setattr(cr, "root_processes_running_from", lambda directory: [])
     pinned_sha = hashlib.sha256(b"#!/bin/sh\n").hexdigest()
     monkeypatch.setattr(cr, "get_coding_config", lambda: {"claude_version": "2.1.280", "claude_sha256": pinned_sha,
                                                           "run_timeout_sec": 5400,
@@ -142,6 +145,25 @@ def test_a_binary_that_differs_from_the_pinned_sha256_fails_readiness(host):
     (host.versions / "2.1.280").write_text("#!/bin/sh\necho tampered\n")
     result = cr.check_claude_code()
     assert result.status == "fail" and "differs from the pinned 2.1.280 release" in result.message
+
+
+def test_root_processes_started_from_aura_coders_home_are_found_in_proc(tmp_path):
+    home, proc = tmp_path / "home" / "aura-coder", tmp_path / "proc"
+    (home / ".local" / "bin").mkdir(parents=True)
+    for pid, uids, exe in (("101", "0\t0\t0\t0", home / ".local" / "bin" / "claude"),
+                           ("102", "997\t997\t997\t997", home / ".local" / "bin" / "claude"),
+                           ("103", "0\t0\t0\t0", Path("/opt/claude-code/versions/2.1.288"))):
+        (proc / pid).mkdir(parents=True)
+        (proc / pid / "status").write_text(f"Name:\tclaude\nUid:\t{uids}\n")
+        (proc / pid / "exe").symlink_to(exe)
+    (proc / "self").mkdir()
+    assert cr.root_processes_running_from(home, proc) == [f"pid 101 ({home / '.local' / 'bin' / 'claude'})"]
+
+
+def test_a_root_process_from_aura_coders_home_is_a_readiness_warning(host, monkeypatch):
+    monkeypatch.setattr(cr, "root_processes_running_from", lambda directory: ["pid 7 (/home/aura-coder/.local/bin/claude)"])
+    result = cr.check_claude_code()
+    assert result.status == "warn" and "a root process runs a binary from aura-coder's home" in result.message
 
 
 def test_the_claude_binary_lives_outside_every_path_aura_coder_can_write():

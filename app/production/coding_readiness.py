@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from app.coding import firewall, runner
 from app.coding.credentials import read_meta
-from app.coding.units import CLAUDE_BIN, JOBS_DIR, MANAGED_SETTINGS, RUNS_DIR, TOKEN_ENV_FILE, TOKEN_META_FILE
+from app.coding.units import CLAUDE_BIN, CODER_HOME, JOBS_DIR, MANAGED_SETTINGS, RUNS_DIR, TOKEN_ENV_FILE, TOKEN_META_FILE
 from app.config import RMP_DATA_DIR, RMP_ROOT, get_coding_config
 from app.production.readiness import CheckResult
 
@@ -98,6 +98,28 @@ def unsafe_path_components(path: Path, owner_uid: int = 0, *, lstat=os.lstat, re
     return problems
 
 
+def root_processes_running_from(directory: Path, proc: Path = Path("/proc")) -> List[str]:
+    """Root processes whose executable lives under ``directory``. A process loads its binary once, but Claude Code
+    re-runs its own executable for search tools, so a root process started from a file someone else can replace
+    keeps running whatever is there now."""
+    found: List[str] = []
+    for entry in sorted(proc.iterdir(), key=lambda p: p.name):
+        if not entry.name.isdigit():
+            continue
+        try:
+            uid_line = next(line for line in (entry / "status").read_text().splitlines() if line.startswith("Uid:"))
+            real, effective = uid_line.split()[1:3]
+            exe = os.readlink(entry / "exe")
+        except (OSError, StopIteration, ValueError):
+            continue
+        if "0" not in (real, effective):
+            continue
+        exe_path = Path(exe.removesuffix(" (deleted)"))
+        if exe_path == directory or directory in exe_path.parents:
+            found.append(f"pid {entry.name} ({exe_path})")
+    return found
+
+
 _SHA_CACHE: Dict[tuple, str] = {}
 
 
@@ -140,6 +162,10 @@ def check_claude_code() -> CheckResult:
         unsafe = unsafe_path_components(CLAUDE_BIN, BINARY_OWNER_UID)
         if unsafe:
             problems.append("the claude binary can be replaced by a non-root user: " + "; ".join(unsafe[:3]))
+    stray = root_processes_running_from(CODER_HOME)
+    if stray:
+        warnings.append("a root process runs a binary from aura-coder's home (restart it from "
+                        f"{CLAUDE_BIN}): " + "; ".join(stray[:3]))
     if not TOKEN_ENV_FILE.is_file() or TOKEN_ENV_FILE.stat().st_size == 0 or days is None:
         problems.append("no Claude Code token (run ops/claude_code_login.sh)")
     elif days < 0:
@@ -150,7 +176,7 @@ def check_claude_code() -> CheckResult:
         warnings.append("no smoke run recorded (ops/claude_code_smoke.py)")
     elif not smoke.get("ok"):
         warnings.append("the last smoke run failed")
-    details = {"version": version, "pinned": pinned, "token_days_left": days, "binary_path_unsafe": unsafe,
+    details = {"version": version, "pinned": pinned, "token_days_left": days, "binary_path_unsafe": unsafe, "root_processes_from_coder_home": stray,
                "smoke_at": (smoke or {}).get("at"), "smoke_ok": (smoke or {}).get("ok")}
     status = "fail" if problems else "warn" if warnings else "pass"
     message = "; ".join(problems + warnings) or (
