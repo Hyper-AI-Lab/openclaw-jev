@@ -161,7 +161,7 @@ def test_snapshots_left_by_a_killed_run_are_removed_first_and_a_failed_delete_is
 
 def test_a_failed_postgres_dump_is_reported_not_swallowed(host):
     result, dest, manifest, _ = host.run(FAKE_PGDUMP_FAIL="1")
-    assert result.returncode == 1 and manifest["failures"] == ["postgres", "temporal", "temporal"]
+    assert result.returncode == 1 and manifest["failures"] == ["postgres", "temporal:temporal", "temporal:temporal_visibility"]
     assert (dest / "qdrant-full.snapshot").exists()
 
 
@@ -177,10 +177,13 @@ def test_embedded_mode_archives_the_storage_directory(host):
     assert calls == []
 
 
-def _dated(root, days, old):
+def _dated(root, days, old, failures=(), month="09"):
+    """Dated backups as ops/backup.sh leaves them; ``failures`` marks them failed (unfinished if None)."""
     for day in days:
-        stamp = root / f"202609{day:02d}T031500Z"
+        stamp = root / f"2026{month}{day:02d}T031500Z"
         stamp.mkdir(parents=True)
+        if failures is not None:
+            (stamp / "manifest.json").write_text(json.dumps({"failures": list(failures)}))
         os.utime(stamp, (old + day * 3600, old + day * 3600))
 
 
@@ -195,6 +198,21 @@ def test_pruning_keeps_fourteen_dated_backups_and_never_touches_other_directorie
     dated = sorted(p.name for p in host.backups.iterdir() if p.name[:2] == "20")
     assert len(dated) == 14 and "20260903T031500Z" not in dated and "20260904T031500Z" in dated  # 16 old + 1 new
     assert keep.is_dir(), "a non-dated directory is never pruned by age"
+
+
+def test_failed_backups_never_count_toward_the_fourteen_kept(host):
+    """Five failed nights must not cost five good backups: the first good run prunes only the oldest complete one."""
+    old = time.time() - 40 * 86400
+    _dated(host.backups, range(1, 15), old)                                # 14 complete
+    _dated(host.backups, range(15, 20), old, failures=["qdrant"])           # 5 newer failed
+    _dated(host.backups, range(1, 3), old - 10 * 86400, failures=["qdrant"], month="08")  # 2 failed, oldest of all
+    _dated(host.backups, range(3, 4), old - 10 * 86400, failures=None, month="08")        # 1 unfinished (no manifest)
+    result, _, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout
+    names = {p.name for p in host.backups.iterdir() if p.name[:2] == "20"}
+    assert "20260901T031500Z" not in names and "20260902T031500Z" in names    # 14 newest complete kept, incl. today's
+    assert {f"202609{d:02d}T031500Z" for d in range(15, 20)} <= names         # failed but newer than the oldest kept
+    assert not any(n.startswith("202608") for n in names)                     # failed/unfinished older than it: gone
 
 
 def test_a_failed_run_prunes_nothing(host):

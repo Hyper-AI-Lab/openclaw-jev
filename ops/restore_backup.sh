@@ -55,7 +55,9 @@ if [[ -f "${SRC}/qdrant-full.snapshot" ]]; then
   echo "Restoring Qdrant collections..."
   bash "${RMP_ROOT}/ops/restore_qdrant_snapshot.sh" "${SRC}/qdrant-full.snapshot" || FAILED+=("qdrant")
 elif [[ -f "${SRC}/qdrant.tar.gz" ]]; then
-  # Backups made before 2026-10-08 (or in embedded mode) carry a tar of the embedded storage directory.
+  # Backups made before 2026-10-08 carry a tar of the legacy embedded directory, which was empty in server mode:
+  # it does not restore the Qdrant server (data/qdrant-server). Only embedded-mode backups hold real data in it.
+  echo "WARNING: qdrant.tar.gz restores the embedded store only; it does not restore a Qdrant server."
   echo "Restoring embedded Qdrant data..."
   { rm -rf "${RMP_DATA}/qdrant" && tar -xzf "${SRC}/qdrant.tar.gz" -C "${RMP_DATA}"; } || FAILED+=("qdrant")
 fi

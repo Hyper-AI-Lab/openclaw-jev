@@ -37,6 +37,7 @@ fail() { FAILURES+=("$1"); log "FAIL: $1: $2"; }
 
 # A snapshot this run created is a full copy of the vector store inside the container: remove it however the run ends.
 cleanup() {
+  rm -f "${DEST:-/nonexistent}"/*.partial
   if [[ -n "${QDRANT_SNAP}" ]]; then
     curl -fsS -m 60 -X DELETE "${QDRANT_URL}/snapshots/${QDRANT_SNAP}" >/dev/null 2>>"${LOG}" \
       || log "WARN: could not delete Qdrant snapshot ${QDRANT_SNAP}; the next run removes it"
@@ -65,7 +66,7 @@ for db in ${TEMPORAL_DBS}; do
     mv "${DEST}/${db}.dump.partial" "${DEST}/${db}.dump"
   else
     rm -f "${DEST}/${db}.dump.partial"
-    fail temporal "pg_dump of ${db} failed"
+    fail "temporal:${db}" "pg_dump of ${db} failed"
   fi
 done
 
@@ -89,8 +90,9 @@ qdrant_snapshot() {
   curl -fsS -m 10 --retry 12 --retry-delay 5 --retry-all-errors -o /dev/null "${url}/readyz" 2>>"${LOG}" \
     || { fail qdrant "Qdrant at ${url} is not ready"; return 0; }
   # Full snapshots on the server come only from this script; any found now were left by a run that was killed.
-  for stale in $(curl -fsS -m 30 "${url}/snapshots" 2>>"${LOG}" \
-                 | "${PY}" -c 'import json, sys; print("\n".join(s["name"] for s in json.load(sys.stdin).get("result") or []))' 2>>"${LOG}"); do
+  local listed
+  listed="$(curl -fsS -m 30 "${url}/snapshots" 2>>"${LOG}")" || log "WARN: could not list Qdrant's full snapshots"
+  for stale in $("${PY}" -c 'import json, sys; t = sys.stdin.read().strip(); print("\n".join(s["name"] for s in (json.loads(t).get("result") or []) if t))' <<<"${listed:-}" 2>>"${LOG}"); do
     curl -fsS -m 60 -X DELETE "${url}/snapshots/${stale}" >/dev/null 2>>"${LOG}" \
       && log "removed stale Qdrant snapshot ${stale}" || log "WARN: could not remove stale Qdrant snapshot ${stale}"
   done
@@ -109,7 +111,7 @@ print(r["name"]); print(int(r["size"])); print(r.get("checksum") or "")' <<<"${b
   if ! curl -fsS -m 900 -o "${part}" "${url}/snapshots/${QDRANT_SNAP}" 2>>"${LOG}"; then
     rm -f "${part}"; fail qdrant "the download of ${QDRANT_SNAP} failed"; return 0
   fi
-  got="$(stat -c %s "${part}")"
+  got="$(stat -c %s "${part}" 2>/dev/null || echo 0)"
   if [[ "${got}" != "${meta[1]}" ]]; then
     rm -f "${part}"; fail qdrant "the download is ${got} bytes, Qdrant reported ${meta[1]}"; return 0
   fi
@@ -194,13 +196,26 @@ if (( ${#FAILURES[@]} )); then
   exit 1
 fi
 
-# Retention: keep the newest ${KEEP} dated backups. Only directories named like a backup stamp are pruned, newest
-# first by name, so anything else kept here (an OpenClaw rollback backup, a state copy) is never deleted by age.
-log "Pruning old backups (keep ${KEEP})..."
-shopt -s nullglob
-dated=("${BACKUP_ROOT}"/20[0-9][0-9][01][0-9][0-3][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z/)
-shopt -u nullglob
-if (( ${#dated[@]} > KEEP )); then
-  printf '%s\n' "${dated[@]}" | sort -r | tail -n +$((KEEP + 1)) | xargs -r -d '\n' rm -rf
-fi
+# Retention: keep the newest ${KEEP} *complete* backups (manifest "failures": []), newest first by name. A failed
+# backup never counts toward them, so a run of failures can't push out the last good backups; failed or unfinished
+# backups older than the oldest kept complete one go with it. Only directories named like a backup stamp are
+# touched, so anything else kept here (an OpenClaw rollback backup, a state copy) is never deleted by age.
+log "Pruning old backups (keep ${KEEP} complete)..."
+"${PY}" - "${BACKUP_ROOT}" "${KEEP}" <<'PY' 2>>"${LOG}" | xargs -r -d '\n' rm -rf
+import json, re, sys
+from pathlib import Path
+root, keep = Path(sys.argv[1]), int(sys.argv[2])
+dated = sorted((p for p in root.iterdir() if p.is_dir() and re.fullmatch(r"20\d{6}T\d{6}Z", p.name)), reverse=True)
+def complete(p):
+    try:
+        return json.loads((p / "manifest.json").read_text()).get("failures") == []
+    except (OSError, ValueError):
+        return False
+good = [p for p in dated if complete(p)]
+if len(good) > keep:
+    oldest_kept = good[keep - 1].name
+    for p in dated:
+        if p.name < oldest_kept:
+            print(p)
+PY
 log "Backup complete: ${DEST}"

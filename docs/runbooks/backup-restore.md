@@ -13,7 +13,7 @@ Backups are stored in `/root/.openclaw/rmp/data/backups/<YYYYMMDDTHHMMSSZ>/`. Fi
 | `rmp_db.dump` | RMP's Postgres ledger (`pg_dump -Fc`) |
 | `temporal.dump`, `temporal_visibility.dump` | Temporal's own Postgres databases: open workflows and their histories |
 | `qdrant-full.snapshot` | A full Qdrant snapshot taken through its API. It holds one snapshot per collection plus `config.json`. Its size and checksum are verified against Qdrant's report, and the copy on the server is deleted afterwards |
-| `qdrant.tar.gz` | Embedded-mode Qdrant only, and backups made before 2026-10-08 |
+| `qdrant.tar.gz` | Embedded-mode Qdrant only. **Backups made before 2026-10-08 hold no Qdrant data**: their `qdrant.tar.gz` is a 110-byte tar of an empty directory |
 | `artifacts.tar.gz` | The evidence store |
 | `openclaw-state/` | OpenClaw's agent and state SQLite stores, taken with the backup API and checksummed |
 | `temporal.db` | The legacy Temporal SQLite file from before Temporal moved to Postgres. It is no longer live |
@@ -33,7 +33,12 @@ Check the last run with `systemctl status rmp-backup.service`, then read the new
 jq . "$(ls -1d /root/.openclaw/rmp/data/backups/2*/ | sort | tail -1)manifest.json"
 ```
 
-**Retention:** the newest 14 dated backups are kept. Directories that are not named like a backup stamp are never pruned by age; an OpenClaw rollback backup is one example.
+**Retention:**
+- The newest 14 *complete* backups are kept. A complete backup has a manifest with no failures.
+- Failed or unfinished backups never count toward the 14. They are pruned only once they are older than the oldest complete backup kept.
+- Directories that are not named like a backup stamp are never pruned by age; an OpenClaw rollback backup is one example.
+
+**Qdrant snapshots:** the backup deletes every *full* snapshot it finds on the Qdrant server, because only this script makes them. Keep a hand-made full snapshot elsewhere.
 
 ## Restore
 
@@ -49,6 +54,8 @@ The script does the following:
 5. Restores Qdrant collection by collection into the **running** Qdrant (`ops/restore_qdrant_snapshot.sh`).
 6. Restores artifacts and settings.
 7. Restarts the services.
+
+The OpenClaw stores are restored separately, with the gateway stopped: `ops/backup_openclaw_state.py restore <backup>/openclaw-state --yes`.
 
 If any part fails it prints `Restore INCOMPLETE: not restored: …` and exits 1.
 
