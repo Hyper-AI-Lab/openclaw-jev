@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import stat
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,8 @@ from app.production.readiness import CheckResult
 SMOKE_RECORD = Path(RMP_DATA_DIR) / "coding" / "claude_smoke.json"
 MANAGED_SETTINGS_SOURCE = Path(RMP_ROOT) / "ops" / "aura_coder" / "managed-settings.json"
 TOKEN_WARN_DAYS = 30
+# The only owner (besides root) trusted along the claude binary's path; tests point it at their own uid.
+BINARY_OWNER_UID = 0
 STUCK_MARGIN_SEC = 900
 UNIT = re.compile(r"^aura-(claude|verify|collect|deploy|direct)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
 HOST_POLICY = Path("/etc/claude-code/managed-settings.json")
@@ -49,15 +52,47 @@ def installed_version() -> Optional[str]:
     return CLAUDE_BIN.resolve().name if CLAUDE_BIN.exists() else None
 
 
+def unsafe_path_components(path: Path, owner_uid: int = 0) -> List[str]:
+    """Every component that lets a user other than root or ``owner_uid`` change what ``path`` runs.
+
+    Checks the link itself, the file it resolves to, and every parent directory of both: a component owned by
+    another user, or writable by group or others, can be swapped. Sticky directories such as /tmp only let a
+    user replace their own entries, so their mode is not a finding.
+    """
+    seen: set = set()
+    problems: List[str] = []
+    for start in (path, path.resolve()):
+        for component in (start, *start.parents):
+            if component in seen:
+                continue
+            seen.add(component)
+            try:
+                st = component.lstat()
+            except FileNotFoundError:
+                continue
+            if st.st_uid not in (0, owner_uid):
+                problems.append(f"{component} is owned by uid {st.st_uid}")
+            elif (st.st_mode & 0o022 and not stat.S_ISLNK(st.st_mode)
+                  and not (stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX)):
+                problems.append(f"{component} is writable by group or others")
+    return problems
+
+
 def check_claude_code() -> CheckResult:
     pinned = get_coding_config()["claude_version"]
     version, days = installed_version(), token_days_left()
     smoke = json.loads(SMOKE_RECORD.read_text()) if SMOKE_RECORD.is_file() else None
     problems, warnings = [], []
+    unsafe: List[str] = []
     if version is None:
         problems.append("the claude binary is missing")
-    elif version != pinned:
-        problems.append(f"claude is {version}, pinned {pinned}")
+    else:
+        if version != pinned:
+            problems.append(f"claude is {version}, pinned {pinned}")
+        # Aura's direct turns run this binary as root: nobody but root may be able to replace it.
+        unsafe = unsafe_path_components(CLAUDE_BIN, BINARY_OWNER_UID)
+        if unsafe:
+            problems.append("the claude binary can be replaced by a non-root user: " + "; ".join(unsafe[:3]))
     if not TOKEN_ENV_FILE.is_file() or TOKEN_ENV_FILE.stat().st_size == 0 or days is None:
         problems.append("no Claude Code token (run ops/claude_code_login.sh)")
     elif days < 0:
@@ -68,7 +103,7 @@ def check_claude_code() -> CheckResult:
         warnings.append("no smoke run recorded (ops/claude_code_smoke.py)")
     elif not smoke.get("ok"):
         warnings.append("the last smoke run failed")
-    details = {"version": version, "pinned": pinned, "token_days_left": days,
+    details = {"version": version, "pinned": pinned, "token_days_left": days, "binary_path_unsafe": unsafe,
                "smoke_at": (smoke or {}).get("at"), "smoke_ok": (smoke or {}).get("ok")}
     status = "fail" if problems else "warn" if warnings else "pass"
     message = "; ".join(problems + warnings) or (

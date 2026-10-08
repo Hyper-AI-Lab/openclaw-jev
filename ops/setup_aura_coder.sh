@@ -12,7 +12,12 @@ RMP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${RMP_ROOT}/venv/bin/python"
 CODER=aura-coder
 CODER_HOME=/home/aura-coder
-CLAUDE="${CODER_HOME}/.local/bin/claude"
+# Claude Code runs as root in Aura's direct sessions, so it lives root-owned outside every path aura-coder can
+# write (app/coding/units.py CLAUDE_INSTALL_DIR), installed from Anthropic's release bucket and checked against
+# the release manifest's sha256 before it is used.
+CLAUDE_DIR=/opt/claude-code
+CLAUDE="${CLAUDE_DIR}/bin/claude"
+RELEASES=https://downloads.claude.ai/claude-code-releases
 
 log() { echo "[setup-aura-coder] $*"; }
 die() { echo "[setup-aura-coder] ERROR: $*" >&2; exit 1; }
@@ -44,13 +49,28 @@ install -d -o root -g root -m 700 /etc/aura-coder
 log "directories ready under /srv/aura-code and /etc/aura-coder"
 
 MANAGED=/etc/claude-code/managed-settings.json
-current="$(as_coder "${CLAUDE}" --version 2>/dev/null | awk '{print $1}' || true)"
+install_claude() {
+  local version="$1" platform tmp sum
+  case "$(uname -m)" in x86_64) platform=linux-x64 ;; aarch64) platform=linux-arm64 ;; *) die "unsupported machine $(uname -m)" ;; esac
+  if ldd /bin/ls 2>&1 | grep -q musl; then platform="${platform}-musl"; fi
+  tmp="$(mktemp -d)"
+  curl -fsSL "${RELEASES}/${version}/manifest.json" -o "${tmp}/manifest.json"
+  sum="$("${PY}" -c 'import json, sys; print(json.load(open(sys.argv[1]))["platforms"][sys.argv[2]]["checksum"])' "${tmp}/manifest.json" "${platform}")"
+  [[ "${sum}" =~ ^[a-f0-9]{64}$ ]] || { rm -rf "${tmp}"; die "no checksum for ${platform} in the ${version} manifest"; }
+  curl -fsSL "${RELEASES}/${version}/${platform}/claude" -o "${tmp}/claude"
+  [[ "$(sha256sum "${tmp}/claude" | cut -d' ' -f1)" == "${sum}" ]] || { rm -rf "${tmp}"; die "checksum mismatch for Claude Code ${version}"; }
+  install -d -o root -g root -m 755 "${CLAUDE_DIR}" "${CLAUDE_DIR}/versions" "${CLAUDE_DIR}/bin"
+  install -o root -g root -m 755 "${tmp}/claude" "${CLAUDE_DIR}/versions/${version}"
+  ln -sfn "../versions/${version}" "${CLAUDE}"
+  rm -rf "${tmp}"
+}
+# The version is the versions/<version> name the link points to: the binary is never run to find out.
+installed() { basename "$(readlink "${CLAUDE}" 2>/dev/null || echo none)"; }
+current="$(installed)"
 if [[ "${current}" != "${VERSION}" ]]; then
-  log "installing Claude Code ${VERSION} for ${CODER} (was: ${current:-none})"
-  # The managed settings' DISABLE_UPDATES blocks every install path, the pinned one included.
-  rm -f "${MANAGED}"
-  as_coder bash -c "curl -fsSL https://claude.ai/install.sh | bash -s ${VERSION}"
-  current="$(as_coder "${CLAUDE}" --version 2>/dev/null | awk '{print $1}' || true)"
+  log "installing Claude Code ${VERSION} root-owned at ${CLAUDE_DIR} (was: ${current})"
+  install_claude "${VERSION}"
+  current="$(installed)"
 fi
 
 install -d -o root -g root -m 755 /etc/claude-code
