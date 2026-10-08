@@ -231,3 +231,60 @@ The 0.8 statement "the Kairos daemons did not respawn" was checked before a full
 - root executes only a root-owned binary pinned by sha256;
 - readiness fails on any regression and warns about stray root processes;
 - no root caller remains on the old path (RMP, `claude-team`, claude-jev v1.0.3).
+
+## 2026-10-08 17:18 · Phase 0.7: Tier-2 review round 1, and the fixes
+
+**Review:** Tier-2 review, REQUEST_CHANGES. The core was confirmed correct; 13 issues were raised. I fixed all but #3 in the PR (`d49a39c`):
+
+| # | Issue | Fix |
+|---|---|---|
+| 1 | The new snapshot format could not be restored | New `ops/restore_qdrant_snapshot.sh`: extract the full snapshot, then upload each collection with `POST /collections/<c>/snapshots/upload?priority=snapshot&wait=true`. `ops/restore_backup.sh` calls it, restores Temporal's Postgres dumps, drops the stale-SQLite Temporal restore, and exits 1 with "Restore INCOMPLETE" on any failure. Runbook rewritten; the `--storage-snapshot --force-snapshot` alternative was checked against the real binary's `--help` |
+| 2 | Pruning ran after a failed backup | A failed run prunes nothing |
+| 3 | Nothing watches a failed backup | **Deferred to WP-12** (readiness validates the manifest), as planned |
+| 4 | Server-side snapshots could leak | Stale full snapshots are deleted when the Qdrant step starts; an EXIT trap (and TERM/INT → exit 143) deletes this run's snapshot |
+| 5 | Tests did not run from outside the repo | Tests run from tmp with explicit data, settings and OpenClaw paths; 14 cases |
+| 6 | Partial downloads were trusted | Download to `.partial`, verify Qdrant's reported size and checksum plus the `tar -tf` exit status and a non-empty listing, then `mv` |
+| 7 | Temporal's databases were not backed up | Nightly `pg_dump -Fc` of `temporal` and `temporal_visibility` through `sudo -n -u postgres` |
+| 8 | Some file copies could fail silently | WAL and SHM copies are checked |
+| 9 | Data root tied to the code root | Separate data root (`RMP_DATA_DIR`) and settings path |
+| 10 | Concurrent runs | `flock` run lock |
+| 11 | Qdrant may not be up yet | Wait on `/readyz` before snapshotting |
+| 12 | File modes and pruning order | `umask 077`; pruning sorted by name |
+| 13 | Behaviour change not announced | Noted for the PR body |
+
+**Restore drill (the first proven restore of the vector store):**
+- The 15:15 production backup was restored into a scratch `qdrant:v1.17.0` container (127.0.0.1:16333, 1 GB memory cap).
+- Every collection's point count matches production: `rmp_memories_openai_3small` 2615, `rmp_deep_memory_v1` 1395, `rmp_task_registry_openai_3small` 251, `mem0migrations` 1.
+- The container was removed afterwards.
+
+**The drill caught a real bug:** a freshly started container resets the first connections (curl error 56), which `--retry-connrefused` does not retry. Both scripts now wait with `--retry-all-errors`. The same bug would have failed a backup run right after a reboot.
+
+**Second live production run:** exit 0, failures `[]`. Both Temporal dumps present (1.17 MB and 108 KB). Every file is 0600. No snapshot left on the server.
+
+**Tests:** `test_backup_script` 14/14; with `test_coding_host` and `test_database_url`, 37/37. The full suite is running, and the re-review is in progress.
+
+## 2026-10-08 17:32 · Phase 0.7: re-review APPROVE, final fixes, ready to ship
+
+**Re-review:** APPROVE. All items are fixed or correctly deferred (item 3 goes to WP-12; unit ordering goes to WP-02).
+
+**Non-blocking points applied anyway** (commit `a706772`):
+- **Retention:** now counts only *complete* backups (manifest `failures: []`). After a streak of failed nights, the first good run cannot prune older complete backups. Failed or unfinished backups go only once they are older than the oldest complete backup kept.
+- **Killed runs:** `*.partial` files are removed on any exit.
+- **Legacy Qdrant tars:** the restore warns that a legacy `qdrant.tar.gz` never restored the Qdrant server.
+- **Runbook:** states that backups before 2026-10-08 hold no Qdrant data, explains the stale-snapshot purge, and gives the OpenClaw store restore command.
+- **Smaller fixes:**
+  - `stat` no longer aborts on a missing download;
+  - Temporal failures are named per database (`temporal:<db>`);
+  - a failed snapshot listing is logged as a WARN;
+  - the restore helper is now mode 755.
+
+**Note:** backups made before today have no `failures` key, so they count as incomplete. They will be pruned once 14 complete backups exist (about 2 weeks). That is conservative, and the disk has 106 GB free.
+
+**Tracked for later:**
+- WP-02: a `TimeoutStartSec` on the backup unit, and `pg_dump --lock-wait-timeout`.
+- WP-12: a Temporal `pg_restore` drill, and readiness and alerting on manifest failures.
+
+**Verification:**
+- `test_backup_script`: 15/15.
+- Full sandboxed suite on `a706772`: 1118 passed, 4 skipped; node 59/59.
+- Placeholder grep clean; no new file is ignored; `main` unchanged at `8469be0`; no open PRs.
