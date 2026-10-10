@@ -108,6 +108,12 @@ async def test_main_builds_the_worker_from_the_module_lists(monkeypatch):
 
 
 async def test_the_production_worker_builds_on_a_test_server():
-    """Construction runs the SDK's checks (duplicate names, every workflow validated in the sandbox) without running."""
+    """Construction runs the SDK's checks: duplicate names, and every workflow validated in the sandbox.
+
+    The worker is shut down before the server goes: a worker that was only constructed keeps polling openclaw-tasks
+    on the dead server's port for the rest of the session, where a later test server may listen.
+    """
     async with await WorkflowEnvironment.start_time_skipping() as env:
-        Worker(env.client, task_queue="openclaw-tasks", workflows=worker.WORKFLOWS, activities=worker.ACTIVITIES)
+        async with Worker(env.client, task_queue="openclaw-tasks", workflows=worker.WORKFLOWS,
+                          activities=worker.ACTIVITIES):
+            pass
