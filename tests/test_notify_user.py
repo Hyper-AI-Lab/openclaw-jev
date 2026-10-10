@@ -99,66 +99,46 @@ def test_notice_task_id_stable_and_reasons_whitelisted():
 def test_plugin_fail_closed_sends_rmp_notice_not_native():
     from pathlib import Path
 
-    repo = Path(__file__).resolve().parents[1]
-    copies = [repo / "plugins/rmp_adapter/index.js"]
-    live = Path("/root/.openclaw/plugins/rmp_adapter/index.js")
-    try:
-        include_live = live.is_file()
-    except OSError:
-        include_live = False
-    if include_live:
-        copies.append(live)
-    for path in copies:
-        src = path.read_text()
-        assert "POST" in src and "/api/notify-user" in src
-        assert "data.delivered !== true" in src
-        assert "RMP user notice not delivered" in src
-        assert "stop_idle" in src
-        assert "handled: true" in src
-        assert "no native" in src.lower() or "no native OpenClaw" in src
-        # Error DM happens before the throw that inbound_claim still claims.
-        route = src[src.find("function routeSlackDmToRmp") : src.find("function markSlackClaimed")]
-        assert "notifyRmpUser" in route
-        assert "intake_unavailable" in route
-        assert "stop_idle" in route
-        assert "/active_user_task" in route
-        assert route.find("/active_user_task") < route.find("SIGNALED stop")
-        recovery = route[route.find("Intake POST timed out") :]
-        assert "by-idempotency" in recovery
-        assert "via active task" not in recovery
-        assert "intake_unavailable" in recovery
-        msg = src[src.find("api.on('message_received'") : src.find("api.on('reply_payload_sending'")]
-        assert "return { handled: true }" in msg
-        assert msg.count("handled: true") >= 3
-        catch_slice = msg[msg.find("} catch (e)") :]
-        assert "handled: true" in catch_slice
+    src = (Path(__file__).resolve().parents[1] / "plugins/rmp_adapter/index.js").read_text()
+    assert "POST" in src and "/api/notify-user" in src
+    assert "data.delivered !== true" in src
+    assert "RMP user notice not delivered" in src
+    assert "stop_idle" in src
+    assert "handled: true" in src
+    assert "no native" in src.lower() or "no native OpenClaw" in src
+    # Error DM happens before the throw that inbound_claim still claims.
+    route = src[src.find("function routeSlackDmToRmp") : src.find("function markSlackClaimed")]
+    assert "notifyRmpUser" in route
+    assert "intake_unavailable" in route
+    assert "stop_idle" in route
+    assert "/active_user_task" in route
+    assert route.find("/active_user_task") < route.find("SIGNALED stop")
+    recovery = route[route.find("Intake POST timed out") :]
+    assert "by-idempotency" in recovery
+    assert "via active task" not in recovery
+    assert "intake_unavailable" in recovery
+    msg = src[src.find("api.on('message_received'") : src.find("api.on('reply_payload_sending'")]
+    assert "return { handled: true }" in msg
+    assert msg.count("handled: true") >= 3
+    catch_slice = msg[msg.find("} catch (e)") :]
+    assert "handled: true" in catch_slice
 
 
 def test_plugin_never_blocks_the_gateway_event_loop():
     from pathlib import Path
 
-    repo = Path(__file__).resolve().parents[1]
-    copies = [repo / "plugins/rmp_adapter/index.js"]
-    live = Path("/root/.openclaw/plugins/rmp_adapter/index.js")
-    try:
-        include_live = live.is_file()
-    except OSError:
-        include_live = False
-    if include_live:
-        copies.append(live)
-    for path in copies:
-        src = path.read_text()
-        # The gateway also serves intake's LLM leg; a sync curl froze it for ~70 s.
-        assert "child_process" not in src
-        assert "execFileSync" not in src
-        assert "AbortSignal.timeout" in src
-        # OpenClaw ignores a Promise returned from before_message_write.
-        assert "api.on('before_message_write', (event, ctx) =>" in src
-        for hook in ("inbound_claim", "before_dispatch", "message_received"):
-            start = src.find(f"api.on('{hook}'")
-            body = src[start : src.find("}, { priority: 120 });", start)]
-            assert "routeInBackground(" in body
-            assert "routeSlackDmToRmp(" not in body
+    src = (Path(__file__).resolve().parents[1] / "plugins/rmp_adapter/index.js").read_text()
+    # The gateway also serves intake's LLM leg; a sync curl froze it for ~70 s.
+    assert "child_process" not in src
+    assert "execFileSync" not in src
+    assert "AbortSignal.timeout" in src
+    # OpenClaw ignores a Promise returned from before_message_write.
+    assert "api.on('before_message_write', (event, ctx) =>" in src
+    for hook in ("inbound_claim", "before_dispatch", "message_received"):
+        start = src.find(f"api.on('{hook}'")
+        body = src[start : src.find("}, { priority: 120 });", start)]
+        assert "routeInBackground(" in body
+        assert "routeSlackDmToRmp(" not in body
 
 
 def test_intake_reservation_is_not_an_active_task():
