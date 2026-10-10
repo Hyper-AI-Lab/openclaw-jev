@@ -1,11 +1,11 @@
-"""Hermetic host paths for every test, set before any test imports app.
+"""Hermetic host paths for every test, set before any test imports app, and the production guard.
 
 app.config resolves its paths at import time, so this runs at import, in order: the session guard; the refusal of
 an inherited path variable that points at production; one temp root, ROOT, for everything the suite creates outside
-a test's own tmp_path; and a default under ROOT for each path variable the environment lacks, plus the test
-database. The refusal comes before ROOT exists: pytest runs no unconfigure after a conftest fails to import, so a
-root made first would be left behind. pytest's basetemp is in ROOT unless --basetemp names a directory to keep, and
-ROOT is removed when pytest unconfigures, or at exit when pytest stopped before configuring.
+a test's own tmp_path; a default under ROOT for each path variable the environment lacks, plus the test database;
+and the guard's audit hook. The refusal comes before ROOT exists: pytest runs no unconfigure after a conftest fails to
+import, so a root made first would be left behind. pytest's basetemp is in ROOT unless --basetemp names a directory
+to keep, and ROOT is removed when pytest unconfigures, or at exit when pytest stopped before configuring.
 """
 import atexit
 import os
@@ -43,6 +43,21 @@ for sub in ("openclaw/agents/main/agent", "openclaw/agents/main/sessions", "open
     (ROOT / sub).mkdir(parents=True)
 # npm (ops/openclaw_preflight.py) turns on Node's compile cache, which leaves <tmp>/node-compile-cache behind.
 os.environ.setdefault("NODE_DISABLE_COMPILE_CACHE", "1")
+production_guard.install(GUARD)
+# Violations recorded outside any test: at collection, or in a module or session fixture.
+_OUTSIDE_TESTS = []
+
+
+@pytest.fixture(autouse=True)
+def _production_guard():
+    """A test that touched a production path, this host's services or its service tools fails, even when its code
+    swallowed the refusal. Set up before every fixture the test requests, so their teardowns count too."""
+    _OUTSIDE_TESTS.extend(GUARD.take())
+    yield
+    violations = GUARD.take()
+    if violations:
+        pytest.fail("hermetic tests: this test reached production\n" + production_guard.report(violations),
+                    pytrace=False)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -54,8 +69,24 @@ def pytest_configure(config):
         config.option.basetemp = str(ROOT / "pytest")
 
 
+def pytest_sessionfinish(session):
+    """A violation outside any test fails the run too."""
+    _OUTSIDE_TESTS.extend(GUARD.take())
+    if not _OUTSIDE_TESTS:
+        return
+    if session.exitstatus in (pytest.ExitCode.OK, pytest.ExitCode.NO_TESTS_COLLECTED):
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    text = "hermetic tests: reached production outside any test\n" + production_guard.report(_OUTSIDE_TESTS)
+    if reporter is not None:
+        reporter.write_line(text, red=True)
+    else:
+        print(text)
+
+
 def pytest_unconfigure(config):
     shutil.rmtree(ROOT)
+    GUARD.active = False
 
 
 @pytest.fixture(autouse=True)
