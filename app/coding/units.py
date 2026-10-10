@@ -12,9 +12,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
 
+from app.config import AURA_CODE_ROOT
+
 CODER_USER = "aura-coder"
 CODER_HOME = Path("/home/aura-coder")
-CODE_ROOT = Path("/srv/aura-code")
+CODE_ROOT = Path(AURA_CODE_ROOT)
 JOBS_DIR = CODE_ROOT / "jobs"
 RUNS_DIR = CODE_ROOT / "runs"
 CACHE_DIR = CODE_ROOT / "cache"
