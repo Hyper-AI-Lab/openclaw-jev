@@ -9,12 +9,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      # Keep tests off the real /root layout (not writable on Actions runners).
-      OPENCLAW_HOME: ${{ github.workspace }}/.ci-openclaw
-      RMP_ROOT: ${{ github.workspace }}
-      RMP_DATA_DIR: ${{ github.workspace }}/data
-      RMP_SETTINGS_PATH: ${{ github.workspace }}/settings.json
     steps:
       - uses: actions/checkout@v4
 
@@ -28,16 +22,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Seed writable OpenClaw/RMP layout
-        run: |
-          mkdir -p \
-            "$OPENCLAW_HOME/agents/main/agent" \
-            "$OPENCLAW_HOME/agents/main/sessions" \
-            "$OPENCLAW_HOME/workspace" \
-            "$OPENCLAW_HOME/cron" \
-            "$RMP_DATA_DIR"
-          cp settings.example.json settings.json
 
       - name: Unit tests
         run: python -m pytest tests/ -q --ignore=tests/integration
