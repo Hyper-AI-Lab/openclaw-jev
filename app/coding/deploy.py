@@ -26,8 +26,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from app.coding import github, verify, workspace
 from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
+from app.config import OPENCLAW_HOME
 
-LIVE_REPO = Path("/root/.openclaw/rmp")
+LIVE_REPO = Path(OPENCLAW_HOME) / "rmp"
 BUNDLES_DIR = CODE_ROOT / "bundles"
 CODE_RELOAD_LOCK = Path("/run/rmp-code-reload.lock")
 IDLE_WAIT_SEC = 2 * 3600
