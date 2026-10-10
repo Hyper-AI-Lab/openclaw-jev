@@ -13,13 +13,14 @@ import json
 import socket
 import sys
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import timedelta
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import httpx
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from temporalio import activity, workflow
 from temporalio.client import Client
@@ -273,8 +274,10 @@ def session_users():
     return [m for n, m in list(sys.modules.items()) if n.startswith("app.") and getattr(m, "AsyncSessionLocal", None)]
 
 
-@pytest.fixture
-async def h(tmp_path, monkeypatch):
+@asynccontextmanager
+async def harness_session(tmp_path, monkeypatch):
+    """The harness on a fresh database. However the environment exits, the modules first imported mid-test get
+    the default sessions back and the engine is disposed, so no later test runs on a disposed engine."""
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'rmp.db'}")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -285,19 +288,65 @@ async def h(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setenv("RMP_API_KEY", KEY)
     monkeypatch.setenv("AURA_JEV_MODE", "off")
-    async with await WorkflowEnvironment.start_time_skipping() as env, httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=server.app), base_url="http://rmp", headers={"X-RMP-API-Key": KEY}
-    ) as api:
-        harness = Harness(env, api, sessions)
-        harness.install(monkeypatch)
-        async with Worker(env.client, task_queue="openclaw-tasks", activities=harness.activities(),
-                          workflows=[ScriptedRecall if wf is DeepRecallWorkflow else wf for wf in worker.WORKFLOWS]):
-            yield harness
-    for module in session_users():
-        if module.AsyncSessionLocal is sessions:  # first imported mid-test, so monkeypatch cannot undo it
-            module.AsyncSessionLocal = default
-    await engine.dispose()
+    try:
+        async with await WorkflowEnvironment.start_time_skipping() as env, httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app), base_url="http://rmp", headers={"X-RMP-API-Key": KEY}
+        ) as api:
+            harness = Harness(env, api, sessions)
+            harness.install(monkeypatch)
+            workflows = [ScriptedRecall if wf is DeepRecallWorkflow else wf for wf in worker.WORKFLOWS]
+            async with Worker(env.client, task_queue="openclaw-tasks", activities=harness.activities(),
+                              workflows=workflows):
+                yield harness
+    finally:
+        for module in session_users():
+            if module.AsyncSessionLocal is sessions:  # first imported mid-test, so monkeypatch cannot undo it
+                module.AsyncSessionLocal = default
+        await engine.dispose()
     assert harness.blocked == []
+
+
+@pytest.fixture
+async def h(tmp_path, monkeypatch):
+    async with harness_session(tmp_path, monkeypatch) as harness:
+        yield harness
+
+
+async def test_the_harness_restores_modules_and_disposes_the_engine_when_the_environment_exit_fails(
+        tmp_path, monkeypatch):
+    real_start, real_dispose, disposed = WorkflowEnvironment.start_time_skipping, AsyncEngine.dispose, []
+    default = database.AsyncSessionLocal
+
+    class FailingExit:
+        def __init__(self, env):
+            self.env = env
+
+        async def __aenter__(self):
+            return await self.env.__aenter__()
+
+        async def __aexit__(self, *exc_info):
+            await self.env.__aexit__(*exc_info)
+            raise RuntimeError("environment exit failed")
+
+    async def start_time_skipping(cls, *args, **kwargs):
+        return FailingExit(await real_start(*args, **kwargs))
+
+    async def dispose(engine, *args, **kwargs):
+        disposed.append(engine)
+        return await real_dispose(engine, *args, **kwargs)
+
+    monkeypatch.setattr(WorkflowEnvironment, "start_time_skipping", classmethod(start_time_skipping))
+    monkeypatch.setattr(AsyncEngine, "dispose", dispose)
+    probe = ModuleType("app._mid_test_probe")
+    with pytest.raises(RuntimeError, match="environment exit failed"):
+        async with harness_session(tmp_path, monkeypatch) as harness:
+            probe.AsyncSessionLocal = harness.sessions
+            monkeypatch.setitem(sys.modules, probe.__name__, probe)
+
+    held = [m.__name__ for m in session_users() if m.AsyncSessionLocal is harness.sessions]
+    engine_disposed = any(engine is harness.sessions.kw["bind"] for engine in disposed)
+    # One assertion, so a failure shows every module left on the harness's sessions and whether the engine went.
+    assert (held, probe.AsyncSessionLocal is default, engine_disposed) == ([], True, True)
 
 
 async def invariants_once_settled(monkeypatch):
