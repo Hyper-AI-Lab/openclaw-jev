@@ -68,7 +68,8 @@ def test_a_symlink_from_an_allowed_root_into_a_denied_root_is_denied(tmp_path):
 def test_an_allowed_root_that_contains_a_denied_root_is_refused(which, tmp_path):
     roots = {"repo root": tmp_path / "repo", "prefix": tmp_path / "venv", "temp dir": tmp_path / "tmp"}
     roots[which] = tmp_path / "root"
-    with pytest.raises(pytest.UsageError, match=re.escape(f"{tmp_path / 'root'} contains {tmp_path / 'root/.openclaw'}")):
+    refusal = f"{tmp_path / 'root'} contains {tmp_path / 'root/.openclaw'}"
+    with pytest.raises(pytest.UsageError, match=re.escape(refusal)):
         session_guard(roots["repo root"], prefixes=(roots["prefix"],), tempdir=roots["temp dir"],
                       denied_roots=relocated(tmp_path))
 
