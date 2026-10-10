@@ -86,6 +86,16 @@ def _no_live_obscura(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_host_secrets(monkeypatch):
+    """The coding secret scan reads this host's env files, GitHub token and configs when it is not given known=.
+    Tests get none, as coding units and CI do; a test of host-value detection passes known= itself."""
+    from app.coding import workspace
+
+    monkeypatch.setattr(workspace, "SECRET_FILES", [])
+    monkeypatch.setattr(workspace, "SECRET_CONFIGS", [])
+
+
+@pytest.fixture(autouse=True)
 def _no_live_claude_sessions(monkeypatch, tmp_path_factory):
     """Aura's live Claude sessions: a test that ends or prunes them stops real turns, as one did from a suite
     Claude ran inside a session. Every test gets an empty directory of its own."""
