@@ -17,15 +17,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
-from app.config import AUTH_PROFILES_PATH as _AUTH_PROFILES, RMP_DATA_DIR
+from app.config import (
+    AUTH_PROFILES_PATH as _AUTH_PROFILES,
+    OPENCLAW_ENV_PATH as _OPENCLAW_ENV,
+    OPENCLAW_HOME,
+    RMP_DATA_DIR,
+)
 
 logger = logging.getLogger("rmp.llm_quota")
 
 AUTH_PROFILES_PATH = Path(_AUTH_PROFILES)
 STATE_PATH = Path(RMP_DATA_DIR) / "llm_quota.json"
 LOCK_PATH = STATE_PATH.parent / ".llm_quota.lock"
-OPENCLAW_ENV_PATH = Path("/etc/openclaw/openclaw.env")
-OPENCLAW_STATE_DB = Path("/root/.openclaw/state/openclaw.sqlite")
+OPENCLAW_ENV_PATH = Path(_OPENCLAW_ENV)
+OPENCLAW_STATE_DB = Path(OPENCLAW_HOME) / "state" / "openclaw.sqlite"
 _AUTH_STORE_KEY = "authProfiles.store"
 _AUTH_STATE_KEY = "authProfiles.state"
 # None = auto (SQLite when live OpenClaw 2026.9+ store exists). Tests set False.

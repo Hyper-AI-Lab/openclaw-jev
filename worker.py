@@ -51,7 +51,50 @@ from app.workflows.generic_execute_child import GenericExecuteChildWorkflow
 from app.workflows.generic_task import GenericTaskWorkflow
 from app.workflows.intake_workflow import IntakeWorkflow
 
-logging.basicConfig(level=logging.INFO)
+WORKFLOWS = [
+    GenericTaskWorkflow,
+    CatalogTaskWorkflow,
+    CatalogStepChildWorkflow,
+    GenericExecuteChildWorkflow,
+    IntakeWorkflow,
+    DeepRecallWorkflow,
+    CodingTaskWorkflow,
+]
+ACTIVITIES = [
+    send_to_openclaw,
+    task_actions_digest,
+    validate_openclaw_output,
+    parse_agent_evaluation,
+    update_task_status,
+    notify_slack_user,
+    deliver_reply_files,
+    check_intermediate_updates_enabled,
+    verify_response_quality,
+    ensure_process_run,
+    acquire_process_run_lease,
+    release_process_run_lease,
+    finalize_task_failure,
+    execute_compensation,
+    update_process_state,
+    record_step,
+    record_observation,
+    record_event,
+    confirm_approval_provenance,
+    write_process_memory,
+    read_process_memory,
+    build_process_memory_context,
+    write_episodic_observation,
+    compact_episodic_memory,
+    promote_completion_memory,
+    register_artifact,
+    list_process_artifacts,
+    generate_process_plan,
+    save_process_plan,
+    classify_task_intake_activity,
+    resubmit_user_messages,
+    *RECALL_ACTIVITIES,
+    *CODING_ACTIVITIES,
+]
 
 
 async def main():
@@ -64,54 +107,7 @@ async def main():
     except Exception as exc:
         logging.warning("runtime boot stamp failed: %s", exc)
     client = await connect_temporal_with_retry()
-    worker = Worker(
-        client,
-        task_queue="openclaw-tasks",
-        workflows=[
-            GenericTaskWorkflow,
-            CatalogTaskWorkflow,
-            CatalogStepChildWorkflow,
-            GenericExecuteChildWorkflow,
-            IntakeWorkflow,
-            DeepRecallWorkflow,
-            CodingTaskWorkflow,
-        ],
-        activities=[
-            send_to_openclaw,
-            task_actions_digest,
-            validate_openclaw_output,
-            parse_agent_evaluation,
-            update_task_status,
-            notify_slack_user,
-            deliver_reply_files,
-            check_intermediate_updates_enabled,
-            verify_response_quality,
-            ensure_process_run,
-            acquire_process_run_lease,
-            release_process_run_lease,
-            finalize_task_failure,
-            execute_compensation,
-            update_process_state,
-            record_step,
-            record_observation,
-            record_event,
-            confirm_approval_provenance,
-            write_process_memory,
-            read_process_memory,
-            build_process_memory_context,
-            write_episodic_observation,
-            compact_episodic_memory,
-            promote_completion_memory,
-            register_artifact,
-            list_process_artifacts,
-            generate_process_plan,
-            save_process_plan,
-            classify_task_intake_activity,
-            resubmit_user_messages,
-            *RECALL_ACTIVITIES,
-            *CODING_ACTIVITIES,
-        ],
-    )
+    worker = Worker(client, task_queue="openclaw-tasks", workflows=WORKFLOWS, activities=ACTIVITIES)
     from app.deep_memory.curator import warm_up
 
     warming = asyncio.create_task(warm_up())
@@ -127,4 +123,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())

@@ -1,28 +1,46 @@
-"""Hermetic host paths for every test, as CI sets them.
+"""Hermetic host paths for every test, set before any test imports app.
 
-app.config resolves these at import time, so they are set before any test imports
-app. A local run must never read or write the live settings.json or OpenClaw home.
+app.config resolves its paths at import time, so this runs at import, in order: the session guard; the refusal of
+an inherited path variable that points at production; one temp root, ROOT, for everything the suite creates outside
+a test's own tmp_path; and a default under ROOT for each path variable the environment lacks, plus the test
+database. The refusal comes before ROOT exists: pytest runs no unconfigure after a conftest fails to import, so a
+root made first would be left behind. pytest's basetemp is in ROOT unless --basetemp names a directory to keep, and
+ROOT is removed when pytest unconfigures.
 """
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
 import pytest
 
-if "RMP_SETTINGS_PATH" not in os.environ:
-    _root = Path(tempfile.mkdtemp(prefix="rmp-tests-"))
-    os.environ["OPENCLAW_HOME"] = str(_root / "openclaw")
-    os.environ["RMP_ROOT"] = str(Path(__file__).resolve().parents[1])
-    os.environ["RMP_DATA_DIR"] = str(_root / "data")
-    os.environ["RMP_SETTINGS_PATH"] = str(_root / "settings.json")
-    for sub in ("agents/main/agent", "agents/main/sessions", "workspace", "cron"):
-        (_root / "openclaw" / sub).mkdir(parents=True, exist_ok=True)
-    (_root / "data").mkdir(parents=True, exist_ok=True)
+from tests import production_guard
 
-# The app's default URL, and the one /etc/rmp/rmp.env exports, is the live database on this host.
-os.environ["DATABASE_URL"] = (
-    f"sqlite+aiosqlite:///{Path(tempfile.mkdtemp(prefix='rmp-tests-db-')) / 'unmocked.db'}"
-)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+GUARD = production_guard.session_guard(REPO_ROOT)
+_production = production_guard.production_values(os.environ, GUARD)
+if _production:
+    raise pytest.UsageError("; ".join(
+        f"{name}={value} points at production; unset it or point it at a temporary directory"
+        for name, value in _production))
+ROOT = Path(tempfile.mkdtemp(prefix="rmp-tests-"))
+os.environ.update(production_guard.suite_environment(os.environ, ROOT, REPO_ROOT))
+for sub in ("openclaw/agents/main/agent", "openclaw/agents/main/sessions", "openclaw/workspace", "openclaw/cron",
+            "data", "aura-code"):
+    (ROOT / sub).mkdir(parents=True)
+# npm (ops/openclaw_preflight.py) turns on Node's compile cache, which leaves <tmp>/node-compile-cache behind.
+os.environ.setdefault("NODE_DISABLE_COMPILE_CACHE", "1")
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config):
+    """Before the tmpdir plugin reads it: pytest's temp dirs go in ROOT unless --basetemp names a directory."""
+    if config.option.basetemp is None:
+        config.option.basetemp = str(ROOT / "pytest")
+
+
+def pytest_unconfigure(config):
+    shutil.rmtree(ROOT)
 
 
 @pytest.fixture(autouse=True)

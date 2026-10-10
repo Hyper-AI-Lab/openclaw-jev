@@ -27,9 +27,10 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app import config, openclaw_sessions, temporal_control
-from app.activities import db_activities as db, openclaw_activities as oc, plan_activities
+from app.activities import openclaw_activities as oc, plan_activities
 from app.activities import deep_memory_activities as dm
-from app.activities.intake_activities import resubmit_user_messages
+from app.activities.coding_activities import CODING_ACTIVITIES
+from app.activities.intake_activities import classify_task_intake_activity
 from app.activities.side_effects import SLACK_PART_CHARS
 from app.api import server
 from app.db import database
@@ -44,10 +45,8 @@ from app.production import invariants
 from app.task_registry import intake_runner
 from app.task_registry.intake_decision_engine import apply_intake_policy
 from app.task_registry.retriever import fetch_active_tasks
-from app.workflows.coding_task import CodingTaskWorkflow
-from app.workflows.generic_execute_child import GenericExecuteChildWorkflow
-from app.workflows.generic_task import GenericTaskWorkflow
-from app.workflows.intake_workflow import IntakeWorkflow
+from app.workflows.deep_recall import DeepRecallWorkflow
+import worker
 
 SESSION = "agent:main:slack:channel:d0test"
 KEY = "whole-path-key"
@@ -55,18 +54,10 @@ BOUND = 60
 FACTS = '\n\n```json\n{"facts": {"step_complete": true}}\n```'
 PLAN = {"steps": [{"name": "answer", "kind": "deliver", "predicate_id": "deliver", "prompt": "Answer the user."}]}
 ACCEPT = {"verdict": "accept", "quality": "pass", "reason": "Answers the ask."}
-# worker.py's activities, less the two stubbed ones: Aura (send_to_openclaw) and the intake analyst.
-WORKER_ACTIVITIES = [
-    oc.validate_openclaw_output, oc.parse_agent_evaluation, db.update_task_status, oc.notify_slack_user,
-    oc.task_actions_digest,
-    oc.check_intermediate_updates_enabled, oc.verify_response_quality, db.ensure_process_run,
-    db.acquire_process_run_lease, db.release_process_run_lease, db.finalize_task_failure,
-    db.execute_compensation, db.update_process_state, db.record_step, db.record_observation, db.record_event,
-    db.write_process_memory, db.read_process_memory, db.build_process_memory_context,
-    db.write_episodic_observation, db.compact_episodic_memory, db.promote_completion_memory,
-    db.register_artifact, db.list_process_artifacts, plan_activities.generate_process_plan,
-    plan_activities.save_process_plan, resubmit_user_messages,
-]
+# The boundaries the harness scripts: Aura, the intake analyst and the coding boundaries.
+SCRIPTED = {oc.send_to_openclaw, classify_task_intake_activity, *CODING_ACTIVITIES}
+# worker.py's activities, less the scripted boundaries.
+WORKER_ACTIVITIES = [fn for fn in worker.ACTIVITIES if fn not in SCRIPTED]
 
 
 def rework(command):
@@ -201,9 +192,7 @@ class Harness:
             """The recall's search, finishing once the test lets it."""
             await h.recall_released.wait()
 
-        return [classify_task_intake, send_to_openclaw, recall_script, dm.start_recall_report, dm.read_recall_step,
-                dm.judge_recall_novelty, dm.settle_recall_report, db.confirm_approval_provenance, *WORKER_ACTIVITIES,
-                *coding_boundaries(h)]
+        return [classify_task_intake, send_to_openclaw, recall_script, *WORKER_ACTIVITIES, *coding_boundaries(h)]
 
 
     async def evaluator_turn(self, task_id, prompt, verdict=0):
@@ -302,8 +291,7 @@ async def h(tmp_path, monkeypatch):
         harness = Harness(env, api, sessions)
         harness.install(monkeypatch)
         async with Worker(env.client, task_queue="openclaw-tasks", activities=harness.activities(),
-                          workflows=[GenericTaskWorkflow, GenericExecuteChildWorkflow, IntakeWorkflow,
-                                     ScriptedRecall, CodingTaskWorkflow]):
+                          workflows=[ScriptedRecall if wf is DeepRecallWorkflow else wf for wf in worker.WORKFLOWS]):
             yield harness
     for module in session_users():
         if module.AsyncSessionLocal is sessions:  # first imported mid-test, so monkeypatch cannot undo it

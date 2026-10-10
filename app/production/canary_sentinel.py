@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.config import RMP_ROOT as _RMP_ROOT
+from app.config import RMP_DATA_DIR as _RMP_DATA_DIR, RMP_ROOT as _RMP_ROOT
 from app.production.alerting import send_alert
 from app.production.ops_notify import notify_ops_slack
 from app.llm.quota_broker import reap_stale_llm_slots_sync, seconds_until_any_key_ready
@@ -20,9 +20,10 @@ from app.llm.quota_broker import reap_stale_llm_slots_sync, seconds_until_any_ke
 logger = logging.getLogger("rmp.canary_sentinel")
 
 RMP_ROOT = Path(_RMP_ROOT)
-HEALTH_CANARY_PATH = RMP_ROOT / "data" / "last_health_canary.json"
-MEMORY_CANARY_PATH = RMP_ROOT / "data" / "last_memory_canary.json"
-ALERT_STATE_PATH = RMP_ROOT / "data" / "last_canary_alert.json"
+RMP_DATA_DIR = Path(_RMP_DATA_DIR)
+HEALTH_CANARY_PATH = RMP_DATA_DIR / "last_health_canary.json"
+MEMORY_CANARY_PATH = RMP_DATA_DIR / "last_memory_canary.json"
+ALERT_STATE_PATH = RMP_DATA_DIR / "last_canary_alert.json"
 
 HEALTH_MAX_AGE_HOURS = 2
 MEMORY_MAX_AGE_HOURS = 25
@@ -291,7 +292,7 @@ def _restart_unit(unit: str) -> bool:
 
 RESTART_UNITS_ON_STALE = ("rmp-api", "rmp-worker")
 REMEDIATION_COOLDOWN_MINUTES = 20
-REMEDIATION_STATE_PATH = RMP_ROOT / "data" / "last_canary_remediation.json"
+REMEDIATION_STATE_PATH = RMP_DATA_DIR / "last_canary_remediation.json"
 
 # Soft health_canary failures that often mean "busy / LLM starved", not dead runtime.
 SOFT_HEALTH_STATUSES = frozenset({"timeout", "failed"})

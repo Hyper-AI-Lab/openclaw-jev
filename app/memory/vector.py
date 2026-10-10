@@ -6,14 +6,13 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from app.config import RMP_DATA_DIR
+from app.config import OPENCLAW_ENV_PATH, RMP_DATA_DIR
 from app.memory.mistral_embed import MISTRAL_API_BASE, MistralEmbeddings
 from app.memory.nvidia_embed import NVIDIA_API_BASE, NvidiaEmbeddings
 from app.memory.policy import redact_secrets
 
 logger = logging.getLogger("rmp.vector_memory")
 
-OPENCLAW_ENV_PATH = "/etc/openclaw/openclaw.env"
 DEFAULT_QDRANT_PATH = os.path.join(RMP_DATA_DIR, "qdrant")
 DEFAULT_COLLECTION = "rmp_memories"
 

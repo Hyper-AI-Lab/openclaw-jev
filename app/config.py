@@ -51,6 +51,14 @@ def _auth_profiles_path() -> str:
     )
 
 
+def _openclaw_env_path() -> str:
+    return os.environ.get("OPENCLAW_ENV_PATH", "/etc/openclaw/openclaw.env")
+
+
+def _aura_code_root() -> str:
+    return os.environ.get("AURA_CODE_ROOT", "/srv/aura-code")
+
+
 OPENCLAW_HOME = _openclaw_home()
 RMP_ROOT = _rmp_root()
 OPENCLAW_CONFIG_PATH = _openclaw_config_path()
@@ -58,6 +66,8 @@ SETTINGS_PATH = _settings_path()
 SESSIONS_JSON_PATH = _sessions_json_path()
 AUTH_PROFILES_PATH = _auth_profiles_path()
 RMP_DATA_DIR = _rmp_data_dir()
+OPENCLAW_ENV_PATH = _openclaw_env_path()
+AURA_CODE_ROOT = _aura_code_root()
 
 # PEP 562: resolve path attrs even when a long-lived process imported an older
 # config module that lacked a newly-added name (from app.config import X).
@@ -69,6 +79,8 @@ _PATH_ATTR_RESOLVERS = {
     "OPENCLAW_CONFIG_PATH": _openclaw_config_path,
     "SESSIONS_JSON_PATH": _sessions_json_path,
     "AUTH_PROFILES_PATH": _auth_profiles_path,
+    "OPENCLAW_ENV_PATH": _openclaw_env_path,
+    "AURA_CODE_ROOT": _aura_code_root,
 }
 
 

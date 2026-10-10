@@ -31,7 +31,7 @@ def test_every_coding_unit_is_hardened_limited_and_blind_to_secrets():
                  "/run/dbus", "/run/user"):
         assert f"-{path}" in hidden.split("=", 1)[1].split()
     assert "ReadWritePaths=/srv/aura-code/jobs/t1 /home/aura-coder" in props
-    assert "BindReadOnlyPaths=/srv/aura-code/policy:/etc/claude-code" in props
+    assert f"BindReadOnlyPaths={units.CODING_POLICY_DIR}:/etc/claude-code" in props
     assert "EnvironmentFile=/etc/aura-coder/claude.env" in props
     assert not any(p.startswith("EnvironmentFile=") for p in units.unit_properties(
         writable=["/tmp/x"], memory_max="1G", cpu_quota="100%", tasks_max=10, runtime_max_sec=60))

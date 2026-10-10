@@ -1,5 +1,3 @@
-import os
-import tempfile
 import uuid
 
 import pytest
@@ -10,8 +8,8 @@ from app.db.models import Base, Event, Task
 
 
 @pytest.mark.asyncio
-async def test_task_export_bundle(monkeypatch):
-    db_path = os.path.join(tempfile.mkdtemp(), "export_test.db")
+async def test_task_export_bundle(monkeypatch, tmp_path):
+    db_path = tmp_path / "export_test.db"
     db_url = f"sqlite+aiosqlite:///{db_path}"
     monkeypatch.setenv("DATABASE_URL", db_url)
 
