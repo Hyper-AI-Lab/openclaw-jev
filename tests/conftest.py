@@ -4,9 +4,11 @@ app.config resolves its paths at import time, so this runs at import, in order: 
 an inherited path variable that points at production; one temp root, ROOT, for everything the suite creates outside
 a test's own tmp_path; and a default under ROOT for each path variable the environment lacks, plus the test
 database. The refusal comes before ROOT exists: pytest runs no unconfigure after a conftest fails to import, so a
-root made first would be left behind.
+root made first would be left behind. pytest's basetemp is in ROOT unless --basetemp names a directory to keep, and
+ROOT is removed when pytest unconfigures.
 """
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -26,6 +28,19 @@ os.environ.update(production_guard.suite_environment(os.environ, ROOT, REPO_ROOT
 for sub in ("openclaw/agents/main/agent", "openclaw/agents/main/sessions", "openclaw/workspace", "openclaw/cron",
             "data", "aura-code"):
     (ROOT / sub).mkdir(parents=True)
+# npm (ops/openclaw_preflight.py) turns on Node's compile cache, which leaves <tmp>/node-compile-cache behind.
+os.environ.setdefault("NODE_DISABLE_COMPILE_CACHE", "1")
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config):
+    """Before the tmpdir plugin reads it: pytest's temp dirs go in ROOT unless --basetemp names a directory."""
+    if config.option.basetemp is None:
+        config.option.basetemp = str(ROOT / "pytest")
+
+
+def pytest_unconfigure(config):
+    shutil.rmtree(ROOT)
 
 
 @pytest.fixture(autouse=True)
