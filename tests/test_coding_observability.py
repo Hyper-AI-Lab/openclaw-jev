@@ -184,6 +184,7 @@ def test_isolation_fails_on_a_missing_firewall_an_open_listener_or_changed_manag
 
 
 def test_coding_jobs_warns_about_a_stuck_unit_and_a_checkout_without_a_job(host, monkeypatch):
+    monkeypatch.setattr(cr, "live_units", lambda: [])
     assert cr.check_coding_jobs().status == "pass"
     (host.tmp / "jobs" / "lost-task").mkdir(parents=True)
     monkeypatch.setattr(cr, "_uptime_usec", lambda: 10_000 * 1_000_000)

@@ -22,9 +22,10 @@ REAL_ABORT = openclaw_control.abort_session
 
 @pytest.fixture
 def fake_cli(tmp_path, monkeypatch):
-    """An openclaw executable that logs its arguments and answers like the gateway."""
+    """An openclaw executable that logs its arguments and answers like the gateway. Named apart from openclaw: the
+    suite refuses to run a program named like a host tool from outside the repo."""
     log = tmp_path / "calls.jsonl"
-    script = tmp_path / "openclaw"
+    script = tmp_path / "fake-openclaw"
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys, time\n"
@@ -89,7 +90,7 @@ async def test_sessions_the_gateway_shows_finished_are_not_called(fake_cli, sess
 
 async def test_a_cli_past_its_timeout_is_killed_with_its_children(tmp_path, monkeypatch):
     marker = tmp_path / "late-abort"
-    script = tmp_path / "openclaw"
+    script = tmp_path / "fake-openclaw"
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import subprocess, sys, time\n"
