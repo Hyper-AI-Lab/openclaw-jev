@@ -288,3 +288,210 @@ The 0.8 statement "the Kairos daemons did not respawn" was checked before a full
 - `test_backup_script`: 15/15.
 - Full sandboxed suite on `a706772`: 1118 passed, 4 skipped; node 59/59.
 - Placeholder grep clean; no new file is ignored; `main` unchanged at `8469be0`; no open PRs.
+
+## 2026-10-08 17:35 · Phase 0.9: Slack ingress verified with Kirill's test DM (REPORT §14 Q1 answered)
+
+Kirill sent "ping, ingress test" at 17:34 CEST. The path was traced read-only, using times and statuses only:
+
+| Step | Time (UTC) | Evidence |
+|---|---|---|
+| Claimed by `rmp_adapter` | 15:34:17.730 | `message_received slack DM on agent:main:slack:channel:…`; `before_dispatch` saw it already claimed |
+| Task created | 15:34:35 | `e692a548`, `dedup=false`, `task_type=user` |
+| Request recorded | 15:34:34.8 | `task_messages` |
+| Evaluator verdict | 15:34:55.7 | `task_messages` |
+| Reply recorded and posted to Slack | 15:34:56.4 | `task_messages`; `side_effect_receipts` `slack` at 15:34:56.36 |
+| Task completed | — | status `completed` |
+
+**End to end:** about 39 s.
+
+**Conclusion:** ingress works. The silence since 10-04 was the absence of user DMs, not lost events. The "10 active socket-mode connections" risk (UW-7) still gets its monitoring and spool in WP-11.
+
+## 2026-10-09 06:39 UTC · Phase 0.7: PR #25 merged, deployed and verified through the nightly unit
+
+**Merge:** `origin/main` was unchanged at `8469be0`, #25 was the only open PR, and CI `test` was green. Squash-merged as `5424c02`.
+
+**Deploy:** after CI passed on `main`, `watch_main` deployed `5424c02` (06:32Z). `result.json`: `deployed`, nothing restarted (ops, docs and tests only), health and readiness passed, canary ok. No nondeterminism or sandbox errors in the worker journal.
+
+**Verification through the real unit:** `systemctl start rmp-backup.service` → `Result=success`, 18 s.
+
+| Check | Result |
+|---|---|
+| Manifest `failures` | `[]`; components postgres, temporal, qdrant, artifacts, openclaw-state, settings |
+| `qdrant-full.snapshot` | 88 MB; holds rmp_memories_openai_3small, rmp_deep_memory_v1, rmp_task_registry_openai_3small, mem0migrations and config.json |
+| Server snapshots left | none (`GET /snapshots` → `[]`) |
+| `temporal.dump`, `temporal_visibility.dump` | 1.2 MB, 109 KB |
+| Permissions | directory 0700, files 0600, root |
+| Retention | 15 dated directories kept; nothing pruned (older backups have no `failures` key and count as incomplete) |
+
+**Note:** `cron_jobs.json` is absent because OpenClaw moved its cron jobs into its state database (`cron/jobs.json.migrated`), which `openclaw-state/` already captures. The runbook row and the dead copy go to WP-12 (offrepo-openclaw-home-R6).
+
+**Ledger:**
+- Closed: ops-deploy-R1, ops-deploy-R3, production-R6, docs-vs-code-R2, ops-deploy-R15.
+- Progress noted, still open: ops-deploy-R4 and ops-deploy-R8 (rest in WP-12), authz-secrets-21 (Qdrant auth).
+- Off-host copy (ops-deploy-R2) stays open for WP-12's restic step, under Kirill's accepted local-only exception.
+
+**Rollback:** revert `5424c02` through a PR; no host state changed.
+
+## 2026-10-09 06:43 UTC · Phase 0.10: pre-reboot checks; timers paused; reboot scheduled
+
+**Why reboot:** `/var/run/reboot-required` is set. unattended-upgrades installed kernel `6.8.0-146-generic` this morning (initrd and modules complete); 138 is running. GRUB default 0 boots 146.
+
+**Checks before the reboot:**
+- **SSH:** `ssh.service` is disabled but socket-activated through the enabled `ssh.socket`. Remote access survives.
+- **Enablement:** every runtime unit and every rmp timer is enabled. The only active-but-not-enabled units are `ssh.service` (above) and the stock `systemd-sysext.socket`.
+- **fstab:** `findmnt --verify` reports 0 errors (one benign warning for `/swapfile`).
+- **ExecStartPre proofs:**
+  - `sync_nvidia_keys.py` (rmp-api, rmp-worker, gateway) is local-only and returned `synced: 3` on the last starts;
+  - `wait_temporal.sh` waits 90 s, and the worker restarts after that;
+  - Restart=always with RestartSec 3–5 s cannot reach StartLimitBurst 5 in 10 s.
+- **Docker:** qdrant, phoenix, otel-collector and obscura restart `unless-stopped`; `temporal-server` is re-created by its unit.
+- **Aura idle:** no non-terminal task (631 are `stopped_by_user`, which is terminal), last agent run 06:32:47Z (the deploy canary), no coding units, no other Claude sessions.
+
+**Baselines** in `program/reboot/`: 67 active services, 25 timers, 5 containers, Qdrant counts 2618/1401/252/1, plus `POST-REBOOT-CHECKLIST.md`.
+
+The `/tmp` survivors are cached byte-identical in `/root/.cache/rmp-tests/`.
+
+**Timers:** `rmp-temporal-watchdog.timer` and `rmp-canary-sentinel.timer` are disabled and stopped across the boot.
+**Rollback:** `systemctl enable --now` both. If 146 misbehaves, boot 6.8.0-138 from GRUB's advanced menu (the provider console is needed, since GRUB_TIMEOUT=0).
+
+Reboot scheduled with `shutdown -r +2`, per Kirill's choice "After PR #25 deploys".
+
+## 2026-10-09 07:02 UTC · Phase 0.10: reboot done and verified
+
+The host rebooted at 06:46:56Z into `6.8.0-146-generic`. The session resumed through Kirill's desktop app.
+
+| Check | Result |
+|---|---|
+| `systemctl is-system-running` / `--failed` | `running` / none |
+| Active services vs. baseline | Same, except `fwupd` (D-Bus activated on demand) and `systemd-networkd-wait-online` (boot oneshot) |
+| Containers | Same 5 names and images |
+| Swap, swappiness, gateway OOMPolicy | 4G active, 10, `continue` |
+| Qdrant point counts | Unchanged: 2618/1401/252/1 |
+| RMP `/health` | ok, vector memory ready |
+| Readiness | `production_ready`, score 94, no fail |
+| Slack | socket mode connected 06:49:19Z |
+| Worker journal since boot | no nondeterminism, sandbox errors or tracebacks |
+
+**Readiness warnings:**
+- telemetry: OTLP endpoint not set (WP-03);
+- deep-memory ingest and enrichment: 1 failing `enrich` job (to triage in Phase B).
+
+**Restored:**
+- `/tmp/openclaw-upgrade-backup.path` and `/tmp/temporal-test-server-sdk-python-1.23.0`, byte-identical copies;
+- `rmp-temporal-watchdog.timer` and `rmp-canary-sentinel.timer` re-enabled and active; the timer list matches the baseline.
+
+**Note for WP-11 (UW-7):** right after the reboot, Slack still reported 9 active socket-mode connections for the app, though this host has one. Either stale server-side connections or other consumers of the same app token; WP-11 checks which.
+
+**Phase 0 complete.**
+
+## 2026-10-09 07:15 UTC · Phase 1 start: WP-01 (test hermeticity and replay foundation)
+
+**Clone:** `/root/work/wp-01` on `aura/wp-01-test-hermeticity`, from `main` `5424c02`.
+
+**New verify harness:** `program/bin/verify.sh <clone> [pytest args]`. It is the deterministic verify step for every WP from now on.
+- **Network:** private network namespace, loopback only.
+- **Read-only:** a private mount namespace mounts these directories read-only: `/root/.openclaw`, `/etc/openclaw`, `/etc/rmp`, `/srv/aura-code`, `/root/.claude`, `/root/.claude-team`, `/root/.config`, `/opt/claude-code` and `/opt/claude-jev`.
+- **Private `/tmp`:** an on-disk directory, seeded with the cached Temporal test server.
+- **Resources:** a 2G `MemoryMax` scope with no swap.
+- **Reports:** the files left in the private `/tmp` (TU-1), a placeholder grep of the diff against `origin/main`, and new files hidden by `.gitignore`.
+
+**Smoke test:** `tests/test_database_url.py` plus the node suite passed, but left 76 `rmp-cap-*` directories, which confirms TU-1.
+
+**Baseline:** a full baseline run on `main` is writing to `program/research/wp01-baseline-verify.txt`.
+
+**Workflow `wp01-research-spec`** (run `wf_147687c1-ca0`) runs these agents in order:
+1. a research brief on Temporal replay testing, the `patched` lifecycle, pytest/node hermeticity and CI labels;
+2. the binding spec, `program/specs/WP-01.md`;
+3. an adversarial critic;
+4. a revision.
+
+## 2026-10-09 07:22 UTC · WP-01 baseline on main under the read-only sandbox
+
+**Result:** 1117 passed, 1 failed, 4 skipped; node 59/59; 78 entries left in the private `/tmp` (TU-1).
+
+**The one failure was the harness, not the code:**
+- `test_a_worker_restart_mid_run_reattaches_to_the_same_unit` starts a Temporal *dev* server, which the SDK downloads into the temp dir as `temporal-sdk-python-1.23.0`. The private `/tmp` had no copy, and there was no network.
+- The reboot had also wiped the host's copy.
+- **Fix:** the harness now links a root-only copy of the Temporal CLI 1.6.1 (`/root/.cache/rmp-tests/temporal-sdk-python-1.23.0`, copied from `/root/.temporalio/bin/temporal`) and the test server into each run's `/tmp`.
+- Probe: `start_local()` started offline with the seeded copy. Rerun: 1 passed.
+
+**Effective baseline:** 1118 passed, 4 skipped, 0 failed. With production directories read-only, no test failed, so no test on `main` writes into them.
+
+## 2026-10-09 17:25 UTC · WP-01 spec fixed (binding)
+
+**Workflow `wp01-research-spec`** (run `wf_147687c1-ca0`). It was interrupted once by the usage limit and resumed from cache.
+- **Research brief:** `program/research/temporal-replay-and-test-hermeticity.md`, with sources.
+- **Spec:** `program/specs/WP-01.md`, 37 items in 4 batches (one PR each), 13 deferrals, each to a named WP with a reason.
+
+**Critic verdict: revise, 12 gaps.** All are closed in the revision. The ones that mattered:
+- A batch-1 refusal based on the denied roots alone would have broken every reviewed coding job's verify, because their `TMPDIR` is `/srv/aura-code/cache/tmp`, as well as direct-session clones under `/srv/aura-code/direct` and go-live. The guard's path core, with its allowed roots, now lands in batch 1 (WP01-37).
+- **Shell strings:** `shell=True` and `os.system` commands are now split and checked, including `pkill`, `killall` and `claude`.
+- **Deploy targets:** `/etc/systemd/system`, `/root/.cursor` and `/run/rmp-code-reload.lock` are now denied.
+- **Readiness seal:** it now covers the raw gRPC port probe and the `temporal.service` read.
+- **Refused runs:** they no longer leak their temp root.
+- **Rollback reverts:** a rollback revert of a workflow change waits for the `no-replay-impact` label (D-10).
+- **Fixture base:** the fixtures are recorded on the batch-4 base, not pinned to `5424c02` (D-11).
+- **Export probes:** added for the git-dependent tests.
+- **Node:** `REPO_ROOT` scoping fixed.
+
+**Also in this step:**
+- **New finding (WP01-15):** the coding secret-scan tests load every production secret file into the test process. Conftest blanks the secret-file lists.
+- **`ci.yml` push:** settled. It goes on the current token, which pushed `ci.yml` in `1000f2d`, before WP-16's PAT swap.
+- **Bookkeeping:** WP-01 is placed first in the `work-packages.md` §3 rows for `app/config.py`, `app/memory/vector.py`, `app/production/canary_sentinel.py` and `app/coding/deploy.py`. The `worker.py` row is now `01 → 03 / 04b → 05 → 29`, and a new `.github/workflows/ci.yml` row reads `01 → 26`.
+
+**Review tiers:**
+
+| Batch | Contents | Tier |
+|---|---|---|
+| 1 | `app/`, `worker.py`, CI | 1 |
+| 2 | Tests and CI | 2 |
+| 3 | CI guard, the merge gate | 1 |
+| 4 | Tests and fixtures | 2 |
+
+## 2026-10-10 01:20 UTC · WP-01 batch 1 started; WP01-07 host probe passed
+
+**Harness:** `verify.sh` gained `LAYOUT=coding-job` and `LAYOUT=direct`.
+- **How it works:** a copy of the clone runs under `/srv/aura-code/jobs/…` with `TMPDIR=/srv/aura-code/cache/tmp`, or under `/srv/aura-code/direct/…`.
+- **Isolation:** a scratch directory is mounted over `/srv/aura-code` inside the private namespace only.
+- **Smoke test:** passed, and the real `/srv/aura-code` was untouched.
+
+**Batch 1:**
+- **Branch:** `aura/wp-01-1-paths-and-worker-lists`; git identity HyperAILab, matching earlier PRs.
+- **Workflow:** `wp01-batch` (run `wf_9f9b41e4-646`): implement, then Tier-1 review by a correctness/invariants reviewer and an adversarial-closure reviewer, then at most 2 fix/re-review rounds.
+
+**WP01-07 host probe** (before the batch-1 merge, as the spec requires):
+- A transient unit with the production env files loaded resolved `/root/.openclaw /root/.openclaw/rmp /root/.openclaw/rmp/data None None`, which is the expected result.
+- No `Environment=` override of `OPENCLAW_HOME`, `RMP_ROOT`, `RMP_DATA_DIR`, `OPENCLAW_ENV_PATH` or `AURA_CODE_ROOT` in rmp-api, rmp-worker, rmp-canary-sentinel, rmp-canary, rmp-memory-canary, rmp-janitor, rmp-janitor-frequent, rmp-backup, aura-coder-firewall or rmp-code-watch.
+- Neither env file defines those names (names checked only, no values read out).
+- **Conclusion:** the config-routed defaults resolve to today's literals in production.
+
+## 2026-10-10 05:18 UTC · WP-01 batch 1 implemented, reviewed (Tier 1) and verified
+
+**Workflow `wp01-batch`** (run `wf_9f9b41e4-646`, 9 agents): implement; two Tier-1 reviewers, one for correctness and invariants and one for adversarial closure; 2 fix rounds; re-review. **Approved by both reviewers in every round, with 0 blocking issues.**
+
+**Items:**
+- WP01-01…06: the env file, the coding root, the OpenClaw state DB, the canary-sentinel state paths and deploy's `LIVE_REPO` are read through `app.config`, with today's literals as defaults.
+- WP01-07: `tests/test_production_paths.py` pins all 25 production values in a child interpreter. That child runs an inline audit hook that refuses production paths.
+- WP01-08/09: conftest refuses an inherited production path variable before creating anything, defaults each variable on its own under one temp root, puts pytest's basetemp in that root, removes the root at the end, and turns off Node's compile cache.
+- WP01-10…12: `worker.WORKFLOWS` and `worker.ACTIVITIES` sit at module level, the same 7 + 49 in the same order. `tests/test_worker_registration.py` adds 4 tests, and `test_whole_path` derives its lists from them, so it now also runs `deliver_reply_files`, `confirm_approval_provenance` and the recall activities.
+- WP01-37: the guard's path core (`tests/production_guard.py`, 28 tests), and CI's env block and seed step are gone.
+
+**Deviations:**
+- **WP01-11:** the SDK test starts and shuts the worker down instead of only constructing it. An unclosed worker keeps polling `openclaw-tasks` for the rest of the session, and a later test server on the same port could hand it work.
+- **WP01-04:** a cosmetic module constant.
+
+**Review notes:**
+- **Fixed:** a line-length nit, in 2 commits.
+- **Carried to batch 2:** the conftest root is left behind when pytest exits before `pytest_configure`, after a usage error or with `--version`. This is a new finding outside the spec, and it is not hit by normal runs.
+- **Programme gates:** the host probe was done earlier, and CI green without the env block is shown by the PR's run.
+
+**My deterministic verify on `7a7ade8`:**
+- pytest 1159 passed, 4 skipped (the baseline had 1118: 41 new tests);
+- node 59/59;
+- placeholder grep clean; no ignored new files;
+- 73 leftovers, all `rmp-cap-*` from the node suite (WP01-24, batch 3); a node-only run leaves the same 73;
+- the implementer's `LAYOUT=coding-job` and `LAYOUT=direct` runs: green, with 0 leftovers.
+
+**Unchanged:** `git diff 5424c02 -- app/workflows` is empty, and `requirements.txt` is untouched.
+
+**Deploy restarts:** `rmp-api` and `rmp-worker`.
