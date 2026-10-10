@@ -73,6 +73,19 @@ def _no_live_deep_index(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_obscura(monkeypatch):
+    """obscura_available() asks this host's web stack on 127.0.0.1:8791. Every test gets False, which is what CI,
+    coding jobs and the harness already get; a test's own stub applies on top.
+
+    Workflow code that imports it lazily inside the sandbox gets a fresh module this stub does not reach; only a
+    workflow runner that passes app.orchestrator.web_capability through reaches it, and the guard's socket rule
+    (port 8791) refuses the call either way."""
+    from app.orchestrator import web_capability
+
+    monkeypatch.setattr(web_capability, "obscura_available", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_live_claude_sessions(monkeypatch, tmp_path_factory):
     """Aura's live Claude sessions: a test that ends or prunes them stops real turns, as one did from a suite
     Claude ran inside a session. Every test gets an empty directory of its own."""
