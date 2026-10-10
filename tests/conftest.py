@@ -5,8 +5,9 @@ an inherited path variable that points at production; one temp root, ROOT, for e
 a test's own tmp_path; and a default under ROOT for each path variable the environment lacks, plus the test
 database. The refusal comes before ROOT exists: pytest runs no unconfigure after a conftest fails to import, so a
 root made first would be left behind. pytest's basetemp is in ROOT unless --basetemp names a directory to keep, and
-ROOT is removed when pytest unconfigures.
+ROOT is removed when pytest unconfigures, or at exit when pytest stopped before configuring.
 """
+import atexit
 import os
 import shutil
 import tempfile
@@ -24,6 +25,18 @@ if _production:
         f"{name}={value} points at production; unset it or point it at a temporary directory"
         for name, value in _production))
 ROOT = Path(tempfile.mkdtemp(prefix="rmp-tests-"))
+_CONFIGURED = False
+
+
+@atexit.register
+def _remove_the_root_of_an_unconfigured_run():
+    """pytest can stop after importing this conftest and before configuring: a usage error, or --version. No
+    unconfigure runs then, so ROOT goes here. No test has run on that path; after a configured run this does
+    nothing, and a writer a test left running still shows as a leftover."""
+    if not _CONFIGURED:
+        shutil.rmtree(ROOT)
+
+
 os.environ.update(production_guard.suite_environment(os.environ, ROOT, REPO_ROOT))
 for sub in ("openclaw/agents/main/agent", "openclaw/agents/main/sessions", "openclaw/workspace", "openclaw/cron",
             "data", "aura-code"):
@@ -35,6 +48,8 @@ os.environ.setdefault("NODE_DISABLE_COMPILE_CACHE", "1")
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     """Before the tmpdir plugin reads it: pytest's temp dirs go in ROOT unless --basetemp names a directory."""
+    global _CONFIGURED
+    _CONFIGURED = True
     if config.option.basetemp is None:
         config.option.basetemp = str(ROOT / "pytest")
 
