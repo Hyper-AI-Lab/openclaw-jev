@@ -234,6 +234,7 @@ def test_the_task_run_keys_cover_aura_and_the_evaluator(monkeypatch):
 async def test_stop_cancel_rebuild_and_supersede_abort_the_task(monkeypatch, sessions):
     from httpx import ASGITransport, AsyncClient
 
+    from app.activities import coding_activities
     from app.api import server
     from app.db.database import get_db
 
@@ -242,8 +243,10 @@ async def test_stop_cancel_rebuild_and_supersede_abort_the_task(monkeypatch, ses
             yield db
 
     server.app.dependency_overrides[get_db] = db_override
-    scheduled = []
+    scheduled, stopped = [], []
     monkeypatch.setattr(openclaw_control, "schedule_abort", lambda task_id, reason: scheduled.append((task_id, reason)))
+    # The coding units are systemd units on this host: the recorder stands in for systemctl.
+    monkeypatch.setattr(coding_activities, "stop_task_units", lambda task_id: stopped.append(task_id) or [])
     handle = AsyncMock()
     client = AsyncMock()
     client.get_workflow_handle = lambda wid, **kw: handle
@@ -259,6 +262,7 @@ async def test_stop_cancel_rebuild_and_supersede_abort_the_task(monkeypatch, ses
     server.app.dependency_overrides.pop(get_db, None)
     await temporal_control.terminate_task_workflow(TID, "superseded by intake")
     assert scheduled == [(TID, "stop"), (TID, "cancel"), (TID, "superseded by intake")]
+    assert stopped == [TID]
 
 
 async def test_the_background_abort_logs_a_failure_instead_of_raising(monkeypatch, caplog):
