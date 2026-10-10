@@ -17,7 +17,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
-from app.config import AUTH_PROFILES_PATH as _AUTH_PROFILES, OPENCLAW_ENV_PATH as _OPENCLAW_ENV, OPENCLAW_HOME, RMP_DATA_DIR
+from app.config import (
+    AUTH_PROFILES_PATH as _AUTH_PROFILES,
+    OPENCLAW_ENV_PATH as _OPENCLAW_ENV,
+    OPENCLAW_HOME,
+    RMP_DATA_DIR,
+)
 
 logger = logging.getLogger("rmp.llm_quota")
 
