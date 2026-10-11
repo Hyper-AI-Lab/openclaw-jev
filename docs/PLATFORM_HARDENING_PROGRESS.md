@@ -593,3 +593,75 @@ The host rebooted at 06:46:56Z into `6.8.0-146-generic`. The session resumed thr
 No guard refusal appeared in any run.
 
 **Files:** tests, plus one line each in `CLAUDE.md` and `README.md`. **Deploy restarts:** nothing.
+
+## 2026-10-11 04:35 UTC · WP-01 batch 2 PR opened; Phase A run 2 started
+
+**PR #27** (https://github.com/Hyper-AI-Lab/openclaw-jev/pull/27), head `aura/wp-01-2-production-guard` (`4be4f44` plus the log mirror).
+- `origin/main` was unchanged at `6d74cb5`, and no other PR was open.
+
+**Phase A run 2** (run `wf_0c954ce7-9c7`): themes 5–8 (R-58…R-96), started in the CI wait.
+
+## 2026-10-11 07:55 UTC · WP-01 batch 2 merged and deployed; batch 3 started
+
+**PR #27:** CI green. `origin/main` was unchanged at `6d74cb5`. Squash-merged as `cc9f105`.
+
+**Deploy:** `deployed` at 07:54Z. Nothing restarted; health, readiness and canary ok; 0 worker-journal errors.
+
+**Rollback:** revert `cc9f105` (tests and docs only).
+
+**Batch 3:**
+- **Branch:** `aura/wp-01-3-node-webstack-ci`, from `cc9f105`.
+- **Items:** WP01-24…30: the node temp root, node live copies and the agent store, node git skips, web-stack tests in their own venv, the CI workflow-change guard script and its CI step, and the Makefile.
+- **Review:** Tier 1, because CI is the merge gate.
+
+## 2026-10-11 13:09 UTC · Batch 3 implemented; usage-limit interruption; batch 3 review and Phase A run 2 resumed
+
+**Batch 3 implementer:** done (run `wf_bb003104-ff1`). 7 commits, no deviations.
+- **Default harness:** pytest 1247 passed, 1 skipped (only `test_deep_index_integration`; the 3 bs4 skips are gone because the web-stack tests moved); node 58/58, skipped 0. **Leftover count 0: TU-1 is closed in the default layout.**
+- **CI guard:** 12 cases pass. A mutation probe (merge base replaced by `base.sha`) fails case 11.
+- **Export probe for the node git tests:**
+
+  | Commit | node pass | fail | skipped | Harness exit |
+  |---|---|---|---|---|
+  | `5424c02` | — | 1 | — | 1 |
+  | batch head | 56 | 0 | 2 | 0 |
+
+**Interruption:** the usage limit stopped the Tier-1 correctness reviewer. The batch 3 run and the Phase A run 2 theme-8 skeptic were resumed from cache.
+
+**Phase A run 2 so far:** themes 5, 6 and 7 done.
+- Disagreements: theme 5 R-59, R-60, R-63, R-65; theme 6 R-67, R-68, R-72, R-75; theme 7 none.
+- The theme-8 skeptic is running again.
+
+## 2026-10-11 13:32 UTC · Phase A run 2 complete (themes 5–8)
+
+| Theme | Rows | Skeptic disagreements | New findings |
+|---|---|---|---|
+| 5 | 9 | R-59, R-60, R-63, R-65 | 8 |
+| 6 | 14 | R-67, R-68, R-72, R-75 | 10 |
+| 7 | 8 | none | 9 |
+| 8 | 8 | R-90, R-91, R-92, R-94 | 13 |
+
+Run 3 (themes 9–12) starts in the next CI wait.
+
+## 2026-10-11 18:02 UTC · WP-01 batch 3 reviewed (Tier 1) and verified; spec amendment WP01-38
+
+**Batch 3** (run `wf_bb003104-ff1`): **approved by both Tier-1 reviewers.**
+- One finding in round 1: case 11 pinned the merge base only for the file list. Fixed in `f22f64d`: `main` now retires a patch id and a fixture key after the branch point. Round 2: both reviewers approve with 0 issues.
+- One non-blocking point was rejected as out of scope: timing flakes under CPU contention.
+
+**My verify on `f22f64d`** (runs 2–3× slower than usual because Phase A agents ran at the same time):
+
+| Layout | pytest | node | Leftovers | Result |
+|---|---|---|---|---|
+| Default | 1247 passed, 1 skipped | 58/58, skipped 0 | **0 (TU-1 closed)** | placeholder grep clean, no ignored files, exit 0 |
+| coding-job | 1247 passed, 1 skipped | — | 0 | exit 0 |
+| direct | 1247 passed, 1 skipped | — | 0 | exit 0 |
+| live | 1 failed, 1246 passed | — | 0 | rerun of the file: 5/5, exit 0 |
+
+The live-layout failure was `test_intake_bounded_context.py::test_hybrid_search_runs_legs_concurrently`, `elapsed 0.757 < 0.55`, a wall-clock assertion under load.
+
+**Spec amendment 1, WP01-38 (batch 4):** the nine wall-clock assertions of test-gaps §5.2, plus the two in `test_openai_direct`, become deterministic.
+- Concurrency tests assert that the legs overlap.
+- Timeouts are patched, or the test asserts on the outcome.
+- A concurrency mutation must fail the test, and a full run under CPU load must pass.
+- **Reason:** no WP owned §5.2. Two flakes occurred under contention in this batch, and coding jobs run under a CPU quota, so a flake fails Aura's verify for no code reason.
