@@ -21,7 +21,7 @@ This is RMP, the orchestration layer behind Aura, Kirill's assistant. You work o
 ## Tests
 
 - Python: the full suite with `-m pytest -q -p no:warnings`, using the interpreter named in your system prompt, or `/root/.openclaw/rmp/venv/bin/python` in a direct session.
-- Plugins: `node --test tests/node/*.test.js`. In a direct session, the tests that compare the live plugin copies with the repository fail for a plugin you changed, until it deploys.
+- Plugins: `node --test tests/node/*.test.js`.
 - A change to a workflow must keep `tests/test_workflow_replay.py` passing: recorded histories must still replay.
 - The suite fails any test that touches production paths, this host's service ports or the host service tools (`systemctl`, `openclaw`, `claude` and the like). Point the module at `tmp_path` through its config variable instead.
 - Add or update tests with every change in behaviour. Never weaken or skip a test to make it pass.

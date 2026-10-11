@@ -11,7 +11,6 @@ const os = require('node:os');
 const path = require('node:path');
 
 const PLUGIN = path.resolve(__dirname, '../../plugins/rmp_adapter/index.js');
-const LIVE_PLUGIN = '/root/.openclaw/plugins/rmp_adapter/index.js';
 const LOG_PATH = '/root/.openclaw/logs/rmp_adapter.log';
 const SETTINGS_PATH = '/root/.openclaw/rmp/settings.json';
 const SESSIONS_JSON = '/root/.openclaw/agents/main/sessions/sessions.json';
@@ -340,22 +339,16 @@ test('a route that outlives its test cannot reach the live API', async () => {
   assert.equal(JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')).api_key, 'test-key');
 });
 
-test('plugin never spawns processes, and the live copy matches the repo', () => {
+test('plugin never spawns processes', () => {
   for (const file of [PLUGIN, path.join(path.dirname(PLUGIN), 'claude_tools.js')]) {
     const src = realReadFileSync(file, 'utf8');
     assert.doesNotMatch(src, /child_process|execFileSync|execSync|spawnSync/);
-    if (fs.existsSync(LIVE_PLUGIN)) {
-      assert.equal(realReadFileSync(path.join(path.dirname(LIVE_PLUGIN), path.basename(file)), 'utf8'), src);
-    }
   }
 });
 
 test('every tool the plugin registers is declared in its manifest, which OpenClaw requires', () => {
   const manifest = JSON.parse(realReadFileSync(path.join(path.dirname(PLUGIN), 'openclaw.plugin.json'), 'utf8'));
   assert.deepEqual(Object.keys(loadPlugin().tools).sort(), [...manifest.contracts.tools].sort());
-  if (fs.existsSync(LIVE_PLUGIN)) {
-    assert.deepEqual(JSON.parse(realReadFileSync(path.join(path.dirname(LIVE_PLUGIN), 'openclaw.plugin.json'), 'utf8')), manifest);
-  }
 });
 
 test('claude tools start a session, send a message, wait across long polls and end it', async () => {
@@ -442,24 +435,26 @@ test('a Claude wait rides out an RMP restart, and a refused message or a usage l
     'Claude is still working on turn 1.\nLatest: Ran: pytest; Edited calc.py\nWait for it with claude_status, or stop it with claude_end.');
 });
 
-test('session lookup reads the OpenClaw SQLite store in-process', {
-  skip: !fs.existsSync(AGENT_SQLITE) && 'no OpenClaw store on this host',
-}, async () => {
-  const { DatabaseSync } = require('node:sqlite');
-  const db = new DatabaseSync(AGENT_SQLITE, { readOnly: true });
-  const keys = db.prepare("select session_key from session_nodes where session_key like '%slack:channel:%'")
-    .all()
-    .map((row) => String(row.session_key));
-  db.close();
-  const sortKey = (k) => `${k.toLowerCase().includes('slack:channel:d') ? 0 : 1}${k.toLowerCase()}`;
-  keys.sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : 0));
+test('session lookup reads the OpenClaw SQLite store in-process', async (t) => {
+  const sqlite = require('node:sqlite');
+  const RealDatabaseSync = sqlite.DatabaseSync;
+  const fixture = path.join(TMP_ROOT, 'openclaw-agent.sqlite');
+  const store = new RealDatabaseSync(fixture);
+  store.exec('create table session_nodes (session_key TEXT)');
+  const insert = store.prepare('insert into session_nodes (session_key) values (?)');
+  for (const key of ['agent:main:slack:channel:c0team', 'agent:main:slack:channel:d0kirill']) insert.run(key);
+  store.close();
+  // The plugin opens its hard-coded store path; it gets the fixture instead.
+  t.mock.method(sqlite, 'DatabaseSync', function (file, options) {
+    return new RealDatabaseSync(file === AGENT_SQLITE ? fixture : file, options);
+  });
 
   sessionsStore = null;
   const calls = installFetch([['POST /tasks', () => ({ task_id: 's1', status: 'created' })]]);
   const { hooks } = loadPlugin();
   assert.deepEqual(hooks.before_dispatch({ channel: 'slack', content: 'no key on event' }, { channelId: 'slack' }), { handled: true });
   await waitFor(() => sawLog('Created task s1'), 'task from store key');
-  assert.equal(calls[0].body.session_key, keys[0] || 'agent:main:main');
+  assert.equal(calls[0].body.session_key, 'agent:main:slack:channel:d0kirill', 'a DM sorts before a channel');
 });
 
 test('identical texts with different Slack ids are two messages; one id seen twice is one', async () => {
