@@ -11,6 +11,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const PLUGIN = path.resolve(__dirname, '../../plugins/rmp_adapter/index.js');
+const REPO_ROOT = path.resolve(__dirname, '../..');
 const LOG_PATH = '/root/.openclaw/logs/rmp_adapter.log';
 const SETTINGS_PATH = '/root/.openclaw/rmp/settings.json';
 const SESSIONS_JSON = '/root/.openclaw/agents/main/sessions/sessions.json';
@@ -902,14 +903,13 @@ test('exec cap: the plugin module spawns no process and the repo files stay read
   assert.doesNotMatch(src, /openclaw\.json|settings\.json|process\.env/, 'it reads no config or environment');
 });
 
-test('exec cap: the default directory is the checkout\'s gitignored data/exec-results, and the limits are the documented ones', () => {
+test('exec cap: the default directory is the checkout\'s gitignored data/exec-results, and the limits are the documented ones', { skip: !fs.existsSync(path.join(REPO_ROOT, '.git')) && 'needs the git checkout (.gitignore rules and index)' }, () => {
   const { DEFAULT_DIR, MAX_RESULT_CHARS, UPSTREAM_LIMIT_CHARS } = capModule();
   assert.equal(DEFAULT_DIR, '/root/.openclaw/rmp/data/exec-results');
-  const repoRoot = path.resolve(__dirname, '../..');
   // What the live checkout would hold at DEFAULT_DIR, asked of this clone's git metadata only (no file is read).
   const rel = path.relative('/root/.openclaw/rmp', DEFAULT_DIR);
   assert.equal(rel, path.join('data', 'exec-results'));
-  const git = (...args) => execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8' });
+  const git = (...args) => execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8' });
   const resultFile = path.join(rel, 'exec-1-0123456789abcdef.txt');
   const partialFile = path.join(rel, 'exec-1-0123456789abcdef.partial.txt');
   for (const file of [resultFile, partialFile]) {
@@ -928,17 +928,16 @@ test('exec cap: the default directory is the checkout\'s gitignored data/exec-re
   assert.equal(UPSTREAM_LIMIT_CHARS, 100000);
 });
 
-test('exec cap: results saved by an earlier version at the checkout root exec-results/ are ignored by git too', () => {
-  const repoRoot = path.resolve(__dirname, '../..');
+test('exec cap: results saved by an earlier version at the checkout root exec-results/ are ignored by git too', { skip: !fs.existsSync(path.join(REPO_ROOT, '.git')) && 'needs the git checkout (.gitignore rules and index)' }, () => {
   for (const file of ['exec-results/exec-1-0123456789abcdef.txt', 'exec-results/exec-1-0123456789abcdef.partial.txt']) {
     assert.doesNotThrow(
-      () => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: repoRoot }),
+      () => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: REPO_ROOT }),
       `${file} would be staged by git add -A`,
     );
   }
   // The rule is anchored at the checkout root and for a directory: the same name elsewhere is ordinary tracked code.
   for (const file of ['plugins/exec-results/a.txt', 'tests/exec-results/a.txt', 'exec-results']) {
-    assert.throws(() => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: repoRoot }), `${file} must not be ignored`);
+    assert.throws(() => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: REPO_ROOT }), `${file} must not be ignored`);
   }
 });
 
