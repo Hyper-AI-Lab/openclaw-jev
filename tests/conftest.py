@@ -17,6 +17,10 @@ import pytest
 
 from tests import production_guard
 
+# The web-stack tests import the web stack's own app package, so they run on their own in its venv
+# (tests/web_stack/pytest.ini), never in RMP's run.
+collect_ignore = ["web_stack"]
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GUARD = production_guard.session_guard(REPO_ROOT)
 _production = production_guard.production_values(os.environ, GUARD)

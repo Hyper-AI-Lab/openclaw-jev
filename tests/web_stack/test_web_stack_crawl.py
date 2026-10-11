@@ -1,11 +1,5 @@
 """Bounded crawl honors max_pages."""
 import asyncio
-import sys
-
-import pytest
-
-pytest.importorskip("bs4")
-sys.path.insert(0, "/root/.openclaw/web-stack/backends")
 
 from app.adapters import crawl4ai_adapter as crawl
 from app.adapters.status import probe_backends
