@@ -495,3 +495,101 @@ The host rebooted at 06:46:56Z into `6.8.0-146-generic`. The session resumed thr
 **Unchanged:** `git diff 5424c02 -- app/workflows` is empty, and `requirements.txt` is untouched.
 
 **Deploy restarts:** `rmp-api` and `rmp-worker`.
+
+## 2026-10-10 05:20 UTC · WP-01 batch 1 PR opened; Phase A started in the CI wait
+
+**PR #26** (https://github.com/Hyper-AI-Lab/openclaw-jev/pull/26), branch `aura/wp-01-1-paths-and-worker-lists`, head `19e723e` (`7a7ade8` plus the log mirror).
+- `origin/main` was unchanged at `5424c02`, and no other PR was open.
+- The push included `.github/workflows/ci.yml` and was accepted, so the current token can push CI changes. This settles the spec's former open question.
+
+**Phase A run 1** (workflow `phaseA-conformance`, run `wf_a60254b5-a3d`): themes 1–4 (R-01…R-57).
+- **Order:** auditor then skeptic per theme, sequential.
+- **Scope:** read-only, against a separate clone `/root/work/audit-main` at `5424c02`.
+- **Outputs:** `program/phaseA/theme-NN.json` and `theme-NN-skeptic.json`.
+- Themes 5–8 and 9–12 follow in two more runs. A synthesis step then reconciles disagreements, runs a completeness critic over the founding sources, and writes `VISION_CONFORMANCE.md`.
+
+## 2026-10-10 16:53 UTC · WP-01 batch 1 merged and deployed
+
+**PR #26:** CI `test` was green, which proves CI runs without its env block (WP01-37's exit check). `origin/main` was unchanged at `5424c02`, and #26 was the only open PR.
+- Squash-merged as `6d74cb5`.
+
+**Deploy:** `watch_main` deployed `6d74cb5` (`result.json`: `deployed`).
+- `rmp-api` and `rmp-worker` restarted at 16:52Z.
+- Health, readiness and canary ok.
+- 0 nondeterminism, sandbox or traceback lines in the worker journal.
+
+**Rollback:** revert `6d74cb5` through a PR. Production paths are identical, so there is no data effect.
+
+**Phase A run 1:**
+- Theme 1: done (13 rows, 2 skeptic disagreements, R-01 and R-08).
+- Theme 2: the skeptic was interrupted by the usage limit, and the run was resumed from cache.
+
+## 2026-10-10 16:54 UTC · WP-01 batch 2 started
+
+**Branch:** `aura/wp-01-2-production-guard`, from `main` `6d74cb5`.
+
+**Workflow:** `wp01-batch` (run `wf_aa36799b-040`), Tier 2 (one combined reviewer).
+
+**Items:**
+- WP01-13…23: the production guard and the host-independent Python tests.
+- WP01-09b: carried from the batch-1 review. When pytest exits before `pytest_configure`, the conftest root is now removed.
+
+## 2026-10-10 21:42 UTC · Usage-limit interruption: batch 2 and Phase A resumed
+
+**Batch 2:** the implementer (run `wf_aa36799b-040`) stalled at 17:14Z when the usage limit hit. It left uncommitted work in `tests/conftest.py`, `tests/production_guard.py` and `tests/test_production_guard.py` (+744/−11).
+- I stopped the run and saved the partial work as a patch in `/root/.cache/wp01-b2-wip-*.patch`.
+- The implementer prompt now tells it to review that work critically and continue from it.
+- Restarted as run `wf_08aa7840-175`.
+
+**Phase A run 1:** resumed (`wf_a60254b5-a3d`).
+- Themes 1–3: done. Skeptic disagreements: theme 1 R-01, R-08; theme 2 R-14, R-16, R-18, R-26, R-27; theme 3 R-30, R-31, R-35, R-37, R-40.
+- Theme 4: its skeptic was cut off by the usage limit and is running again.
+
+## 2026-10-11 02:43 UTC · Batch 2 resumed again; harness gains LAYOUT=live
+
+**Batch 2** (run `wf_08aa7840-175`):
+- **Implementer:** done. 13 commits; harness default, coding-job and direct runs all green; pytest 1229 passed, 4 skipped; node 59/59.
+- **Combined reviewer:** changes, with one blocking finding. In the go-live consumer (`make test` and `ops/go_live.sh` run the suite inside `/root/.openclaw/rmp`), `test_database_url`'s repo scan opens the root `settings.json` and `settings.json.lock`, which the guard refuses. Two non-blocking findings: shell reserved words before a host tool, and unused `Guard` parameters.
+- **Fixer:** committed all three fixes (`d693a9d`, `3a86ed5`, `0be1fc3`), then the usage limit stopped it before verification. Resumed from cache; the fixer's verification and the re-review run again.
+
+**Harness `LAYOUT=live`:** reproduces go-live and `make test`, which batch 1's reviewers could not run.
+- Inside the private namespace only, a copy of the clone is mounted with `--rbind` over `/root/.openclaw/rmp`.
+- The real venv is bound read-only inside the copy, with stand-in `settings.json`, `settings.json.lock` and `data/`.
+- **Smoke test** on `main`'s code: passed, and the host's real `settings.json` was untouched.
+- From now on every batch's deterministic verify runs four layouts: default, coding-job, direct and live.
+
+## 2026-10-11 04:34 UTC · WP-01 batch 2 implemented, reviewed (Tier 2) and verified in four layouts
+
+**Workflow `wp01-batch`** (run `wf_08aa7840-175`, resumed twice after usage limits). **Approved in round 3.**
+
+**Items:**
+- **WP01-13, the production guard** (`tests/production_guard.py`).
+  - An audit hook plus a `Client.connect` wrapper.
+  - Rules: paths across 26 events; SQLite; processes, including shell strings split with `shlex` and reserved words; loopback service ports from `blocked_tcp_ports`, with the `RMP_QDRANT_IT` opt-in for 6333–6334; Temporal targets.
+  - A violation fails its test at teardown, and one recorded outside any test fails the session.
+- WP01-14: `obscura_available` is stubbed for every test.
+- WP01-15: the coding secret scan's host files are blanked. Before this, `test_coding_workspace` loaded every production secret file.
+- WP01-16…20: `test_run_all_checks_structure` runs sealed and asserts each probe was refused. The api-key and dev-mode checks are pinned both ways. The vector timeout is patched (about 20 s faster). `test_intake_models` covers both key states. `/health` and `systemctl` are stubbed.
+- WP01-21: the live-copy comparisons leave the suite, and `test_rule_copies.py` is deleted (deploy refuses drifted mirrors; WP-02 adds the readiness check).
+- WP01-22: `_rmp_commit` is stubbed, gets its own test, and has an export probe.
+- WP01-23: `whole_path`'s teardown restores modules in a `finally`.
+- WP01-09b: the conftest root is also removed when pytest exits before `pytest_configure`, without hiding late writers.
+- Three tests the guard caught outside the listed items were fixed in place: the `openclaw` CLI fakes were renamed, and `live_units` is stubbed.
+
+**Review:**
+- **Round 1:** one blocking finding. The guard broke go-live's suite run in the live checkout, because the password scan opened the root `settings.json`. Two non-blocking findings: shell reserved words, and unused `Guard` parameters. All fixed.
+- **Round 2:** one blocking finding. WP01-07's child must install the full guard hook in batch 2. Fixed in `4be4f44`.
+- **Round 3:** approve. One non-blocking point left as is: the refusal's `PermissionError` carries the target in its message rather than as the filename argument. It is a reported deviation, and the message already names the target.
+
+**My deterministic verify on `4be4f44`** (all `verify: exit 0`, placeholder grep clean, no ignored new files):
+
+| Layout | pytest | node | Leftovers |
+|---|---|---|---|
+| Default | 1235 passed, 4 skipped | 59/59 | 73, all node `rmp-cap-*` (batch 3) |
+| `LAYOUT=live` (go-live) | 1235 passed, 4 skipped | — | 0 |
+| `LAYOUT=coding-job` | 1235 passed, 4 skipped | — | 0, and `/srv/aura-code/cache/tmp` empty |
+| `LAYOUT=direct` | 1235 passed, 4 skipped | — | 0 |
+
+No guard refusal appeared in any run.
+
+**Files:** tests, plus one line each in `CLAUDE.md` and `README.md`. **Deploy restarts:** nothing.
