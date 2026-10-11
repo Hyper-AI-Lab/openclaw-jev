@@ -133,12 +133,15 @@ def test_the_label_passes(repo):
            "Passes: the pull request carries the no-replay-impact label")
 
 
-def test_a_patch_id_main_gained_after_the_branch_does_not_let_the_branch_through(repo):
+def test_patch_ids_and_fixture_keys_main_changed_after_the_branch_do_not_let_the_branch_through(repo):
     git(repo.path, "checkout", "-q", "-b", "aura/change")
     head = commit(repo.path, {W: CHANGED_W}, "the branch's command-order change")
     git(repo.path, "checkout", "-q", "main")
-    main = commit(repo.path, {"app/workflows/u.py": workflow('if workflow.patched("main-only"):', '    return "m"')},
-                  "main gains a patch of its own")
+    commit(repo.path, {"app/workflows/u.py": workflow('if workflow.patched("main-only"):', '    return "m"')},
+           "main gains a patch of its own")
+    # Compared with main rather than the merge base, the branch's unchanged patched("old") and old-path would be new.
+    main = commit(repo.path, {W: workflow('workflow.deprecate_patch("old")', 'return "b"'),
+                              FIXTURE: histories("new-path")}, "main retires the old patch and its fixture key")
     message = refused(guard(repo, base=main, head=head), W)
     assert "u.py" not in message, "the comparison starts at the merge base, not at main"
 
