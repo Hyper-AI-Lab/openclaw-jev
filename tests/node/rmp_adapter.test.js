@@ -1,12 +1,13 @@
 'use strict';
 
-const { test, mock, beforeEach, afterEach } = require('node:test');
+const { test, mock, after, beforeEach, afterEach } = require('node:test');
 // The plugin talks to the live RMP API on this host. Background routes can outlive a
 // failed test, so the real fetch and real settings are never put back in this process.
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const PLUGIN = path.resolve(__dirname, '../../plugins/rmp_adapter/index.js');
@@ -16,6 +17,9 @@ const SETTINGS_PATH = '/root/.openclaw/rmp/settings.json';
 const SESSIONS_JSON = '/root/.openclaw/agents/main/sessions/sessions.json';
 const AGENT_SQLITE = '/root/.openclaw/agents/main/agent/openclaw-agent.sqlite';
 const SLACK_KEY = 'agent:main:slack:channel:dtest';
+// Every directory the tests create is inside TMP_ROOT, which goes when the file's tests end, failed or not.
+const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'rmp-adapter-test-'));
+after(() => fs.rmSync(TMP_ROOT, { recursive: true, force: true }));
 
 const realReadFileSync = fs.readFileSync.bind(fs);
 const realAppendFileSync = fs.appendFileSync.bind(fs);
@@ -582,8 +586,6 @@ test('an RMP run cannot wait on a tool prompt Kirill never sees', () => {
 
 // ---- exec result cap: a task session's exec output never holds more than 12,000 characters ----
 
-const os = require('node:os');
-
 const CAP_MODULE = path.resolve(__dirname, '../../plugins/rmp_adapter/exec_result_cap.js');
 const TASK_UUID = '3f2a9c1e-5b7d-4e8a-9c0b-1d2e3f4a5b6c';
 const TASK_KEY = `agent:main:rmp_task_${TASK_UUID}`;
@@ -623,7 +625,7 @@ function execDetails(extra = {}) {
 }
 
 function tmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'rmp-cap-'));
+  return fs.mkdtempSync(path.join(TMP_ROOT, 'rmp-cap-'));
 }
 
 /** A cap handler writing into a fresh private directory, plus the directory it uses. */
