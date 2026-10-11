@@ -45,41 +45,25 @@ PRODUCTION = {
     "app.coding.direct.DIRECT_DIR": "/srv/aura-code/direct",
     "app.coding.deploy.LIVE_REPO": "/root/.openclaw/rmp",
 }
-# Run with every production default in effect, so an audit hook refuses and records any touch of a production path
-# while the modules import: a later import-time settings read would otherwise read, and could write, the live ones.
+# Run with every production default in effect, so the guard's audit hook refuses and records any touch of a production
+# path, database, process or service while the modules import: a later import-time settings read would otherwise read,
+# and could write, the live ones.
 CHILD = r"""
-import importlib, json, os, sys
+import importlib, json, sys
 from tests.production_guard import DENIED_ROOTS, Guard
 
 repo, tmp, names = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
 guard = Guard(DENIED_ROOTS, (repo, sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix, tmp), repo)
-PATH_ARGS = {"open": (0,), "os.listdir": (0,), "os.scandir": (0,), "os.mkdir": (0,), "os.remove": (0,),
-             "os.rename": (0, 1), "os.rmdir": (0,), "sqlite3.connect": (0,)}
-violations = []
-
-
-def hook(event, args):
-    for position in PATH_ARGS.get(event, ()):
-        path = args[position]
-        if path is None or isinstance(path, int):
-            continue
-        path = os.fsdecode(path)
-        if event == "sqlite3.connect":
-            path = path.removeprefix("file:").split("?")[0]
-        if guard.denies(path):
-            violations.append(f"{event} {path}")
-            raise PermissionError(f"hermetic tests: production path {path}")
-
-
-sys.addaudithook(hook)
+# Not install(), which imports app.config before the hook is in place; a socket event loads the ports on first use.
+sys.addaudithook(guard.hook)
 values = {}
 try:
     for name in names:
         module, _, attr = name.rpartition(".")
         values[name] = str(getattr(importlib.import_module(module), attr))
 finally:
-    print(json.dumps({"values": values, "violations": violations}))
-sys.exit(1 if violations else 0)
+    print(json.dumps({"values": values, "violations": [f"{v.event} {v.target}" for v in guard.violations]}))
+sys.exit(1 if guard.violations else 0)
 """
 
 
