@@ -1,28 +1,101 @@
 import asyncio
+import builtins
+import errno
 import json
+import subprocess
 
+import httpx
 import pytest
+from temporalio.client import Client
 
 from app.production.readiness import (
+    CheckResult,
     check_api_key,
     check_artifact_store,
     check_development_mode,
     run_all_checks,
 )
 
-
-def test_api_key_check():
-    r = check_api_key()
-    assert r.status in ("pass", "fail")
+TEMPORAL_UNIT = "/etc/systemd/system/temporal.service"
 
 
-def test_development_mode_warns_when_on():
-    r = check_development_mode()
-    assert r.status in ("pass", "warn")
+@pytest.mark.parametrize("env_key, status", [(None, "pass"), ("short", "fail")], ids=["generated", "short"])
+def test_api_key_check(env_key, status, tmp_path, monkeypatch):
+    import app.config as config
+
+    settings = tmp_path / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_PATH", str(settings))
+    if env_key is None:
+        monkeypatch.delenv("RMP_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("RMP_API_KEY", env_key)
+    assert check_api_key().status == status
+    if env_key is None:
+        # Without RMP_API_KEY a key is generated into the settings file.
+        assert len(json.loads(settings.read_text())["api_key"]) == 64
+
+
+@pytest.mark.parametrize("stored, status", [({"development_mode": True}, "warn"), ({}, "pass")], ids=["on", "off"])
+def test_development_mode_warns_when_on(stored, status, tmp_path, monkeypatch):
+    _stored_settings(tmp_path, monkeypatch, stored)
+    assert check_development_mode().status == status
 
 
 @pytest.mark.asyncio
-async def test_run_all_checks_structure():
+async def test_run_all_checks_structure(tmp_path, monkeypatch):
+    from app.coding import workspace
+    from app.production import coding_readiness, readiness as rd
+    from app.task_registry import vector_store
+
+    # Sealed: every probe of this host's services, tools and unit files is recorded and refused.
+    probes = []
+
+    def no_process(argv, *args, **kwargs):
+        probes.append(("process", argv))
+        raise FileNotFoundError(errno.ENOENT, "sealed test: no processes", str(argv))
+
+    async def no_async_http(transport, request):
+        probes.append(("http", str(request.url)))
+        raise httpx.ConnectError("sealed test: no network", request=request)
+
+    def no_http(transport, request):
+        probes.append(("http", str(request.url)))
+        raise httpx.ConnectError("sealed test: no network", request=request)
+
+    async def no_temporal(target_host, *args, **kwargs):
+        probes.append(("temporal", target_host))
+        raise RuntimeError("sealed test: no Temporal")
+
+    def no_grpc(host, port, timeout=0.5):
+        probes.append(("grpc", (host, port)))
+        return False
+
+    real_open = builtins.open
+
+    def no_unit_file(path, *args, **kwargs):
+        if str(path) == TEMPORAL_UNIT:
+            probes.append(("open", str(path)))
+            raise FileNotFoundError(errno.ENOENT, "sealed test: no unit files", str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", no_process)
+    monkeypatch.setattr(subprocess, "check_output", no_process)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", no_async_http)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", no_http)
+    monkeypatch.setattr(Client, "connect", no_temporal)
+    # gateway_process_pids reads systemctl and /proc.
+    monkeypatch.setattr(rd, "gateway_process_pids", lambda: [])
+    # The coding checks have their own tests, against an injected host.
+    monkeypatch.setattr(coding_readiness, "run_coding_checks", lambda: [CheckResult("coding", "pass", "stubbed")])
+    # The Qdrant client's gRPC probe is a raw socket to 6334; with the cached client reset, it runs every time.
+    monkeypatch.setattr(vector_store, "_client", None)
+    monkeypatch.setattr(vector_store, "_grpc_port_open", no_grpc)
+    # Without the password the Postgres check returns before psycopg2, which connects in C where no hook sees it.
+    monkeypatch.delenv("TEMPORAL_POSTGRES_PWD", raising=False)
+    monkeypatch.setattr(builtins, "open", no_unit_file)
+    # The main_deployed invariant asks GitHub with this host's token; tests have none, as CI and coding units.
+    monkeypatch.setattr(workspace, "TOKEN_FILE", tmp_path / "github_pat")
+
     result = await run_all_checks()
     assert "checks" in result
     assert "summary" in result
@@ -33,6 +106,14 @@ async def test_run_all_checks_structure():
     assert "openai_key" in names
     assert "slack_sockets" in names
     assert "safe_harbor" in names
+    # Each probe was refused, and the check that made it reports the service as out of reach.
+    statuses = {c["name"]: c["status"] for c in result["checks"]}
+    assert {name: statuses[name] for name in ("systemd_services", "rmp_health", "temporal", "temporal_persistence",
+                                              "task_registry_vector", "stuck_workflows")} == {
+        "systemd_services": "fail", "rmp_health": "fail", "temporal": "fail", "temporal_persistence": "warn",
+        "task_registry_vector": "fail", "stuck_workflows": "warn"}
+    assert {kind for kind, _ in probes} == {"process", "http", "temporal", "grpc", "open"}
+    assert ("grpc", ("127.0.0.1", 6334)) in probes and ("open", TEMPORAL_UNIT) in probes
 
 
 def test_slack_sockets_single_is_pass(monkeypatch):

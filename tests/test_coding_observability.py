@@ -184,6 +184,7 @@ def test_isolation_fails_on_a_missing_firewall_an_open_listener_or_changed_manag
 
 
 def test_coding_jobs_warns_about_a_stuck_unit_and_a_checkout_without_a_job(host, monkeypatch):
+    monkeypatch.setattr(cr, "live_units", lambda: [])
     assert cr.check_coding_jobs().status == "pass"
     (host.tmp / "jobs" / "lost-task").mkdir(parents=True)
     monkeypatch.setattr(cr, "_uptime_usec", lambda: 10_000 * 1_000_000)
@@ -269,9 +270,6 @@ async def test_the_coding_api_shows_a_job_and_refuses_a_path_outside_the_runs_di
 
 async def test_the_coding_status_names_the_short_rmp_commit_and_open_direct_sessions_alongside_the_existing_fields(
         host, monkeypatch):
-    import subprocess
-    from pathlib import Path
-
     from app.activities import coding_activities
     from app.coding import direct
 
@@ -289,17 +287,26 @@ async def test_the_coding_status_names_the_short_rmp_commit_and_open_direct_sess
     assert [s["running"] for s in direct.sessions()] == [False, True, False, False]
     monkeypatch.setattr(direct, "running_units", lambda: ["aura-direct-task-a-00000001-1"])
     monkeypatch.setenv("RMP_API_KEY", "k")
+    monkeypatch.setattr(server, "_rmp_commit", lambda: "abc1234")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://rmp",
                                  headers={"X-RMP-API-Key": "k"}) as api:
         response = await api.get("/api/coding/status")
-    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=Path(server.__file__).parent,
-                          capture_output=True, text=True, check=True).stdout.strip()
     status = response.json()
-    assert response.status_code == 200 and status["rmp_commit"] == head and len(head) >= 7
+    assert response.status_code == 200 and status["rmp_commit"] == "abc1234"
     assert {"enabled", "claude_version", "pinned", "token_days_left", "slot_holder", "live_units", "repositories",
             "jobs", "direct_sessions_open", "direct_turn_models"} <= status.keys()
     assert status["enabled"] is True and status["pinned"] == "2.1.280" and status["repositories"] == {}
     assert status["direct_sessions_open"] == 2 and status["direct_turns_running"] == 1
+
+
+def test_rmp_commit_is_the_checkouts_short_head_or_none_outside_git():
+    repo = Path(server.__file__).resolve().parents[2]
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+    if head.returncode == 0:
+        assert server._rmp_commit() == head.stdout.strip()
+    else:
+        # A git archive export has no commit to name.
+        assert server._rmp_commit() is None
 
 
 async def test_the_coding_status_counts_the_direct_turns_running_now_from_their_systemd_units(host, monkeypatch):

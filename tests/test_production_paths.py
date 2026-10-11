@@ -45,41 +45,25 @@ PRODUCTION = {
     "app.coding.direct.DIRECT_DIR": "/srv/aura-code/direct",
     "app.coding.deploy.LIVE_REPO": "/root/.openclaw/rmp",
 }
-# Run with every production default in effect, so an audit hook refuses and records any touch of a production path
-# while the modules import: a later import-time settings read would otherwise read, and could write, the live ones.
+# Run with every production default in effect, so the guard's audit hook refuses and records any touch of a production
+# path, database, process or service while the modules import: a later import-time settings read would otherwise read,
+# and could write, the live ones.
 CHILD = r"""
-import importlib, json, os, sys
+import importlib, json, sys
 from tests.production_guard import DENIED_ROOTS, Guard
 
 repo, tmp, names = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
 guard = Guard(DENIED_ROOTS, (repo, sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix, tmp), repo)
-PATH_ARGS = {"open": (0,), "os.listdir": (0,), "os.scandir": (0,), "os.mkdir": (0,), "os.remove": (0,),
-             "os.rename": (0, 1), "os.rmdir": (0,), "sqlite3.connect": (0,)}
-violations = []
-
-
-def hook(event, args):
-    for position in PATH_ARGS.get(event, ()):
-        path = args[position]
-        if path is None or isinstance(path, int):
-            continue
-        path = os.fsdecode(path)
-        if event == "sqlite3.connect":
-            path = path.removeprefix("file:").split("?")[0]
-        if guard.denies(path):
-            violations.append(f"{event} {path}")
-            raise PermissionError(f"hermetic tests: production path {path}")
-
-
-sys.addaudithook(hook)
+# Not install(), which imports app.config before the hook is in place; a socket event loads the ports on first use.
+sys.addaudithook(guard.hook)
 values = {}
 try:
     for name in names:
         module, _, attr = name.rpartition(".")
         values[name] = str(getattr(importlib.import_module(module), attr))
 finally:
-    print(json.dumps({"values": values, "violations": violations}))
-sys.exit(1 if violations else 0)
+    print(json.dumps({"values": values, "violations": [f"{v.event} {v.target}" for v in guard.violations]}))
+sys.exit(1 if guard.violations else 0)
 """
 
 
@@ -145,3 +129,57 @@ def test_a_production_value_is_refused_before_anything_is_created(tmp_path):
     assert proc.returncode == 4, output
     assert "OPENCLAW_HOME=/root/.openclaw points at production" in output
     assert list(tmp_path.iterdir()) == []
+
+
+# pytest in a child that names the root its conftest made, then exits with pytest's code.
+STOPPED_EARLY = "import sys, pytest; code = pytest.main(sys.argv[1:]); print(sys.modules['tests.conftest'].ROOT); " \
+                "sys.exit(code)"
+# A test that leaves a thread running, which writes into the root once pytest has removed it.
+WRITER = '''
+import threading
+import time
+
+from tests.conftest import ROOT
+
+
+def test_leaves_a_writer_running():
+    def write_once_the_root_is_gone():
+        deadline = time.monotonic() + 30
+        while ROOT.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        (ROOT / "late").mkdir(parents=True)
+
+    threading.Thread(target=write_once_the_root_is_gone).start()
+'''
+
+
+# pytest 9 answers a single --version before it imports a conftest. Given twice, it imports them and stops before
+# configuring, as a single --version does on pytest 8.
+@pytest.mark.parametrize("args, code", [(["--version", "--version"], 0), (["--no-such-option"], 4)],
+                         ids=["version", "usage-error"])
+def test_the_root_is_removed_when_pytest_stops_before_configuring(args, code, tmp_path):
+    env = {name: value for name, value in os.environ.items() if name not in PATH_VARIABLES}
+    env["TMPDIR"] = str(tmp_path)
+    proc = subprocess.run([sys.executable, "-c", STOPPED_EARLY, "-p", "no:cacheprovider", *args], cwd=REPO, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == code, proc.stdout + proc.stderr
+    # The conftest made its root in the child's temp dir, and nothing is left there.
+    assert Path(proc.stdout.splitlines()[-1]).parent == tmp_path
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_writer_left_running_by_a_test_still_leaves_the_root_behind(tmp_path):
+    # The child's test is inside its temp dir: in a coding job tmp_path is under /srv/aura-code, where the child's
+    # guard allows only its own temp dir.
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "test_writer.py").write_text(WRITER)
+    env = {name: value for name, value in os.environ.items() if name not in PATH_VARIABLES}
+    env["TMPDIR"] = str(tmp_path)
+    proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "tests.conftest",
+                           "--rootdir", str(run), str(run)], cwd=REPO, env=env, capture_output=True, text=True,
+                          timeout=120)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # The removal at exit is only for a run that never configured: this leak stays visible.
+    [root] = [path for path in tmp_path.iterdir() if path != run]
+    assert root.name.startswith("rmp-tests-") and [p.name for p in root.iterdir()] == ["late"]

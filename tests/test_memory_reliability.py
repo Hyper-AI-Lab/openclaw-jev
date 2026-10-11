@@ -5,15 +5,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.activities.db_activities import build_process_memory_context, write_process_memory
-from app.memory.router import MemoryRouter, VECTOR_SEARCH_TIMEOUT_SEC, _vector_search_bounded
+from app.memory.router import MemoryRouter, _vector_search_bounded
 
 
 @pytest.mark.asyncio
-async def test_vector_search_timeout_fail_soft():
+async def test_vector_search_timeout_fail_soft(monkeypatch):
+    monkeypatch.setattr("app.memory.router.VECTOR_SEARCH_TIMEOUT_SEC", 0.05)
     svc = MagicMock()
 
     async def slow_search(*args, **kwargs):
-        await asyncio.sleep(VECTOR_SEARCH_TIMEOUT_SEC + 5)
+        await asyncio.sleep(1.0)
         return [{"content": "never", "source": "vector"}]
 
     with patch("app.memory.router.asyncio.to_thread", side_effect=slow_search):

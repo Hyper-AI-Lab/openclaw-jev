@@ -143,6 +143,7 @@ node --test tests/node/*.test.js                     # plugin tests
 ## Testing
 
 - **Unit and integration tests** for intake, workflows, the evaluator, memory, delivery, the quota broker, readiness and the invariants. Tests always run on a private SQLite database.
+- **Production guard** (`tests/production_guard.py`): the suite fails any test that touches this host's production paths, its service ports or its service tools (`systemctl`, `openclaw`, `claude` and the like); point the module at `tmp_path` through its config variable instead.
 - **Whole-path harness** (`tests/test_whole_path.py`): a Slack message goes through `POST /tasks`, intake, the task workflows, the real activities and evaluator code, and Slack delivery on a time-skipping Temporal server. Only the models, Aura's session and Slack's HTTP API are stubbed, and any other network access fails the test.
 - **Two-phase harness** (`tests/test_two_phase_answering.py`): deep recall ready before the judgment, adds, corrects, nothing new, failure, timeouts, a stop or a message during the wait, internal tasks and the kill switches. Recorded workflow histories must replay on the current code (`tests/test_workflow_replay.py`).
 - **Plugin tests** call every OpenClaw tool the way OpenClaw 2026.9 does.
