@@ -257,7 +257,8 @@ def test_check_finds_the_program_behind_assignments_and_wrappers(tmp_path):
 @pytest.mark.parametrize("script", [
     "systemctl --version", "true /etc/rmp", "pkill -f x", CONFIG_RESTART, "true && (journalctl -n1)",
     "echo $(systemctl x)", "echo `nft list ruleset`", "FOO=1 nohup openclaw gateway", "bash -c 'systemctl x'",
-    "echo ok # a comment\nkillall x", "echo 'unclosed",
+    "echo ok # a comment\nkillall x", "echo 'unclosed", "if systemctl is-active x; then :; fi",
+    "if true; then systemctl restart x; fi", "until true; do killall x; done", "! { time -p journalctl -n1; }",
 ])
 def test_a_shell_string_that_reaches_production_is_refused(script, tmp_path, monkeypatch):
     guard = checking(tmp_path)
@@ -267,7 +268,9 @@ def test_a_shell_string_that_reaches_production_is_refused(script, tmp_path, mon
     assert guard.check("os.system", (os.fsencode(script),)) is not None
 
 
-@pytest.mark.parametrize("script", ["echo systemctl", "true; echo ok", "ls /tmp", "sh script.sh"])
+@pytest.mark.parametrize("script", [
+    "echo systemctl", "true; echo ok", "ls /tmp", "sh script.sh", "if true; then echo systemctl; fi",
+])
 def test_a_shell_string_that_stays_off_the_host_is_allowed(script, tmp_path, monkeypatch):
     guard = checking(tmp_path)
     monkeypatch.setenv("PATH", f"{fakes(tmp_path / 'host')}{os.pathsep}{os.environ['PATH']}")

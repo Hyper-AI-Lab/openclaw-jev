@@ -111,6 +111,8 @@ WRAPPERS = {
              "--other-user"),
     "timeout": ("-s", "--signal", "-k", "--kill-after"),
 }
+# Shell reserved words a command follows, as in "if true; then systemctl x; fi"; bash's time takes -p.
+RESERVED_WORDS = frozenset({"!", "{", "do", "elif", "else", "if", "then", "time", "until", "while"})
 SHELLS = frozenset({"sh", "bash", "dash", "zsh"})
 SHELL_PUNCTUATION = ";&|()<>`\n"
 # A token made only of these separates two simple commands: ; && || | & subshells, $( ) and backquotes, newlines.
@@ -185,14 +187,15 @@ def _host_port(target: str) -> Tuple[Optional[str], Optional[int]]:
 
 
 def _program_index(words: Sequence[str]) -> Optional[int]:
-    """Where a command's program is: after leading NAME=value words and wrappers with their options."""
+    """Where a command's program is: after leading NAME=value words, reserved words and wrappers with their
+    options."""
     i = 0
     while i < len(words):
         name = os.path.basename(words[i])
         if _ASSIGNMENT.match(words[i]):
             i += 1
             continue
-        if name not in WRAPPERS:
+        if name not in WRAPPERS and name not in RESERVED_WORDS:
             return i
         i += 1
         while i < len(words) and words[i].startswith("-"):
@@ -200,7 +203,7 @@ def _program_index(words: Sequence[str]) -> Optional[int]:
             i += 1
             if option == "--":
                 break
-            if option in WRAPPERS[name]:
+            if option in WRAPPERS.get(name, ()):
                 i += 1
         if name == "timeout":
             i += 1  # the duration
