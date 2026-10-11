@@ -248,14 +248,12 @@ class Guard:
     audit hook cannot be removed.
     """
 
-    def __init__(self, denied_roots: Iterable[PathArg], allowed_roots: Iterable[PathArg], repo_root: PathArg, *,
-                 service_ports: Optional[Iterable[int]] = None, host_tools: Iterable[str] = HOST_TOOLS):
+    def __init__(self, denied_roots: Iterable[PathArg], allowed_roots: Iterable[PathArg], repo_root: PathArg):
         self.denied_roots = _forms(denied_roots)
         self.allowed_roots = _forms(allowed_roots)
         self.repo_roots = _forms((repo_root,))
         self.always_denied = _forms(os.path.join(os.fsdecode(repo_root), name) for name in ALWAYS_DENIED)
-        self.host_tools = frozenset(host_tools)
-        self.service_ports = None if service_ports is None else frozenset(service_ports)
+        self.service_ports: Optional[FrozenSet[int]] = None
         self.violations: List[Violation] = []
         self.active = True
         self._lock = threading.Lock()
@@ -355,7 +353,7 @@ class Guard:
             return None
         program = words[index]
         name = os.path.basename(program)
-        if name in self.host_tools:
+        if name in HOST_TOOLS:
             found = _which(program, path=search_path)
             if found is not None and not self._in_repo(found):
                 return f"host tool {found}"
