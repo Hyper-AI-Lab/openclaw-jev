@@ -1,4 +1,5 @@
-"""Temporal for the tests: the test environments every Temporal test starts from.
+"""Temporal for the tests: the test environments every Temporal test starts from, and the sandbox runner the
+replays share.
 
 The SDK runs the server binary it finds under a fixed name in the temp dir, and downloads it there when there is none.
 ``cached_binary`` hands the SDK a cached binary only when root or this user owns both the name and the file it points
@@ -12,12 +13,30 @@ import tempfile
 from typing import Any, Optional
 
 from temporalio.testing import WorkflowEnvironment
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
 
 # The client identity, which the workers reuse: recorded histories carry it instead of the recording host's pid@name.
 IDENTITY = "rmp-tests"
 VERSION = importlib.metadata.version("temporalio")
 # The temp dir shared by every user, searched after this process's own.
 SHARED_TMP = "/tmp"
+
+WORKFLOW_RUNNER = SandboxedWorkflowRunner(
+    restrictions=SandboxRestrictions.default.with_passthrough_modules("app.orchestrator.web_capability"))
+"""The default sandbox, with app.orchestrator.web_capability passed through.
+
+Why: CatalogStepChildWorkflow builds its prompt with app/orchestrator/prompt_policy.py, whose
+build_catalog_step_prompt imports obscura_available inside the function. That lazy import is a fresh sandbox import,
+which asks this host's web stack over HTTP while a test records or replays, out of the conftest stub's reach. Passed
+through, it is the host module the stub patches.
+
+What it does not change: commands. The workflows issue the same commands with it or without it, so replays match
+the same way.
+
+Who removes it: WP-25, together with that I/O, under Option B of D-5, which K-6 chose. Under Option A, WP-28 deletes
+the catalog classes, their fixtures, their EXPECTED rows in tests/test_workflow_replay.py and this passthrough
+together.
+"""
 
 
 def acceptable(lst: Any, st: Any, uid: int) -> bool:
