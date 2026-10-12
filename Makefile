@@ -1,7 +1,8 @@
 .PHONY: test backup readiness production-check go-live rollback verify-patch canary memory-canary janitor observability seed-vector-memory ensure-skills restart-rmp install-code-reload upgrade-openclaw
 
+PYTHON ?= /root/.openclaw/rmp/venv/bin/python
 test:
-	cd /root/.openclaw/rmp && ./venv/bin/pytest tests/ -q
+	cd "$(CURDIR)" && $(PYTHON) -m pytest tests/ -q
 
 backup:
 	bash /root/.openclaw/rmp/ops/backup.sh

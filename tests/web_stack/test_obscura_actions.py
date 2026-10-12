@@ -1,11 +1,5 @@
 """Obscura click uses Playwright when CDP is configured."""
 import asyncio
-import sys
-
-import pytest
-
-pytest.importorskip("bs4")
-sys.path.insert(0, "/root/.openclaw/web-stack/backends")
 
 from app.adapters import obscura_adapter as ob
 

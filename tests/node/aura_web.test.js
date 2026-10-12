@@ -2,11 +2,9 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
 const path = require('node:path');
 
 const PLUGIN_DIR = path.resolve(__dirname, '../../plugins/aura_web');
-const LIVE_DIR = '/root/.openclaw/plugins/aura_web';
 const CLIENT = path.join(PLUGIN_DIR, 'lib/client.js');
 
 const calls = [];
@@ -57,13 +55,4 @@ test('every tool reads its arguments the way OpenClaw passes them: execute(toolC
     ['post', '/v1/browser-use', { task: 'find the price', start_url: url }],
     ['post', '/v1/obscura', { url, action: 'fetch', selector: '', text: '', key: '' }],
   ]);
-});
-
-test('the live plugin copy matches the repo', () => {
-  for (const file of ['index.js', 'lib/client.js']) {
-    const live = path.join(LIVE_DIR, file);
-    if (fs.existsSync(live)) {
-      assert.equal(fs.readFileSync(live, 'utf8'), fs.readFileSync(path.join(PLUGIN_DIR, file), 'utf8'), file);
-    }
-  }
 });

@@ -1,21 +1,25 @@
 'use strict';
 
-const { test, mock, beforeEach, afterEach } = require('node:test');
+const { test, mock, after, beforeEach, afterEach } = require('node:test');
 // The plugin talks to the live RMP API on this host. Background routes can outlive a
 // failed test, so the real fetch and real settings are never put back in this process.
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const PLUGIN = path.resolve(__dirname, '../../plugins/rmp_adapter/index.js');
-const LIVE_PLUGIN = '/root/.openclaw/plugins/rmp_adapter/index.js';
+const REPO_ROOT = path.resolve(__dirname, '../..');
 const LOG_PATH = '/root/.openclaw/logs/rmp_adapter.log';
 const SETTINGS_PATH = '/root/.openclaw/rmp/settings.json';
 const SESSIONS_JSON = '/root/.openclaw/agents/main/sessions/sessions.json';
 const AGENT_SQLITE = '/root/.openclaw/agents/main/agent/openclaw-agent.sqlite';
 const SLACK_KEY = 'agent:main:slack:channel:dtest';
+// Every directory the tests create is inside TMP_ROOT, which goes when the file's tests end, failed or not.
+const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'rmp-adapter-test-'));
+after(() => fs.rmSync(TMP_ROOT, { recursive: true, force: true }));
 
 const realReadFileSync = fs.readFileSync.bind(fs);
 const realAppendFileSync = fs.appendFileSync.bind(fs);
@@ -336,22 +340,16 @@ test('a route that outlives its test cannot reach the live API', async () => {
   assert.equal(JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')).api_key, 'test-key');
 });
 
-test('plugin never spawns processes, and the live copy matches the repo', () => {
+test('plugin never spawns processes', () => {
   for (const file of [PLUGIN, path.join(path.dirname(PLUGIN), 'claude_tools.js')]) {
     const src = realReadFileSync(file, 'utf8');
     assert.doesNotMatch(src, /child_process|execFileSync|execSync|spawnSync/);
-    if (fs.existsSync(LIVE_PLUGIN)) {
-      assert.equal(realReadFileSync(path.join(path.dirname(LIVE_PLUGIN), path.basename(file)), 'utf8'), src);
-    }
   }
 });
 
 test('every tool the plugin registers is declared in its manifest, which OpenClaw requires', () => {
   const manifest = JSON.parse(realReadFileSync(path.join(path.dirname(PLUGIN), 'openclaw.plugin.json'), 'utf8'));
   assert.deepEqual(Object.keys(loadPlugin().tools).sort(), [...manifest.contracts.tools].sort());
-  if (fs.existsSync(LIVE_PLUGIN)) {
-    assert.deepEqual(JSON.parse(realReadFileSync(path.join(path.dirname(LIVE_PLUGIN), 'openclaw.plugin.json'), 'utf8')), manifest);
-  }
 });
 
 test('claude tools start a session, send a message, wait across long polls and end it', async () => {
@@ -438,24 +436,26 @@ test('a Claude wait rides out an RMP restart, and a refused message or a usage l
     'Claude is still working on turn 1.\nLatest: Ran: pytest; Edited calc.py\nWait for it with claude_status, or stop it with claude_end.');
 });
 
-test('session lookup reads the OpenClaw SQLite store in-process', {
-  skip: !fs.existsSync(AGENT_SQLITE) && 'no OpenClaw store on this host',
-}, async () => {
-  const { DatabaseSync } = require('node:sqlite');
-  const db = new DatabaseSync(AGENT_SQLITE, { readOnly: true });
-  const keys = db.prepare("select session_key from session_nodes where session_key like '%slack:channel:%'")
-    .all()
-    .map((row) => String(row.session_key));
-  db.close();
-  const sortKey = (k) => `${k.toLowerCase().includes('slack:channel:d') ? 0 : 1}${k.toLowerCase()}`;
-  keys.sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : 0));
+test('session lookup reads the OpenClaw SQLite store in-process', async (t) => {
+  const sqlite = require('node:sqlite');
+  const RealDatabaseSync = sqlite.DatabaseSync;
+  const fixture = path.join(TMP_ROOT, 'openclaw-agent.sqlite');
+  const store = new RealDatabaseSync(fixture);
+  store.exec('create table session_nodes (session_key TEXT)');
+  const insert = store.prepare('insert into session_nodes (session_key) values (?)');
+  for (const key of ['agent:main:slack:channel:c0team', 'agent:main:slack:channel:d0kirill']) insert.run(key);
+  store.close();
+  // The plugin opens its hard-coded store path; it gets the fixture instead.
+  t.mock.method(sqlite, 'DatabaseSync', function (file, options) {
+    return new RealDatabaseSync(file === AGENT_SQLITE ? fixture : file, options);
+  });
 
   sessionsStore = null;
   const calls = installFetch([['POST /tasks', () => ({ task_id: 's1', status: 'created' })]]);
   const { hooks } = loadPlugin();
   assert.deepEqual(hooks.before_dispatch({ channel: 'slack', content: 'no key on event' }, { channelId: 'slack' }), { handled: true });
   await waitFor(() => sawLog('Created task s1'), 'task from store key');
-  assert.equal(calls[0].body.session_key, keys[0] || 'agent:main:main');
+  assert.equal(calls[0].body.session_key, 'agent:main:slack:channel:d0kirill', 'a DM sorts before a channel');
 });
 
 test('identical texts with different Slack ids are two messages; one id seen twice is one', async () => {
@@ -582,8 +582,6 @@ test('an RMP run cannot wait on a tool prompt Kirill never sees', () => {
 
 // ---- exec result cap: a task session's exec output never holds more than 12,000 characters ----
 
-const os = require('node:os');
-
 const CAP_MODULE = path.resolve(__dirname, '../../plugins/rmp_adapter/exec_result_cap.js');
 const TASK_UUID = '3f2a9c1e-5b7d-4e8a-9c0b-1d2e3f4a5b6c';
 const TASK_KEY = `agent:main:rmp_task_${TASK_UUID}`;
@@ -623,7 +621,7 @@ function execDetails(extra = {}) {
 }
 
 function tmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'rmp-cap-'));
+  return fs.mkdtempSync(path.join(TMP_ROOT, 'rmp-cap-'));
 }
 
 /** A cap handler writing into a fresh private directory, plus the directory it uses. */
@@ -905,14 +903,13 @@ test('exec cap: the plugin module spawns no process and the repo files stay read
   assert.doesNotMatch(src, /openclaw\.json|settings\.json|process\.env/, 'it reads no config or environment');
 });
 
-test('exec cap: the default directory is the checkout\'s gitignored data/exec-results, and the limits are the documented ones', () => {
+test('exec cap: the default directory is the checkout\'s gitignored data/exec-results, and the limits are the documented ones', { skip: !fs.existsSync(path.join(REPO_ROOT, '.git')) && 'needs the git checkout (.gitignore rules and index)' }, () => {
   const { DEFAULT_DIR, MAX_RESULT_CHARS, UPSTREAM_LIMIT_CHARS } = capModule();
   assert.equal(DEFAULT_DIR, '/root/.openclaw/rmp/data/exec-results');
-  const repoRoot = path.resolve(__dirname, '../..');
   // What the live checkout would hold at DEFAULT_DIR, asked of this clone's git metadata only (no file is read).
   const rel = path.relative('/root/.openclaw/rmp', DEFAULT_DIR);
   assert.equal(rel, path.join('data', 'exec-results'));
-  const git = (...args) => execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8' });
+  const git = (...args) => execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8' });
   const resultFile = path.join(rel, 'exec-1-0123456789abcdef.txt');
   const partialFile = path.join(rel, 'exec-1-0123456789abcdef.partial.txt');
   for (const file of [resultFile, partialFile]) {
@@ -931,17 +928,16 @@ test('exec cap: the default directory is the checkout\'s gitignored data/exec-re
   assert.equal(UPSTREAM_LIMIT_CHARS, 100000);
 });
 
-test('exec cap: results saved by an earlier version at the checkout root exec-results/ are ignored by git too', () => {
-  const repoRoot = path.resolve(__dirname, '../..');
+test('exec cap: results saved by an earlier version at the checkout root exec-results/ are ignored by git too', { skip: !fs.existsSync(path.join(REPO_ROOT, '.git')) && 'needs the git checkout (.gitignore rules and index)' }, () => {
   for (const file of ['exec-results/exec-1-0123456789abcdef.txt', 'exec-results/exec-1-0123456789abcdef.partial.txt']) {
     assert.doesNotThrow(
-      () => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: repoRoot }),
+      () => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: REPO_ROOT }),
       `${file} would be staged by git add -A`,
     );
   }
   // The rule is anchored at the checkout root and for a directory: the same name elsewhere is ordinary tracked code.
   for (const file of ['plugins/exec-results/a.txt', 'tests/exec-results/a.txt', 'exec-results']) {
-    assert.throws(() => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: repoRoot }), `${file} must not be ignored`);
+    assert.throws(() => execFileSync('git', ['check-ignore', '-q', '--no-index', file], { cwd: REPO_ROOT }), `${file} must not be ignored`);
   }
 });
 

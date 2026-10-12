@@ -1,11 +1,5 @@
 """Missing LLM key must not look like a successful extract."""
 import asyncio
-import sys
-
-import pytest
-
-pytest.importorskip("bs4")
-sys.path.insert(0, "/root/.openclaw/web-stack/backends")
 
 from app.adapters.scrapegraph_adapter import scrapegraph_extract
 

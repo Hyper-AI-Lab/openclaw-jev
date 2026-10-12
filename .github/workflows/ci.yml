@@ -5,12 +5,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -18,18 +21,28 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Workflow changes carry a patch, a new replay fixture or the no-replay-impact label
+        run: python .github/scripts/workflow_change_guard.py
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Unit tests
-        run: python -m pytest tests/ -q --ignore=tests/integration
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
+      - name: Unit tests
+        run: python -m pytest tests/ -q
+
       - name: Plugin tests (node:test)
         run: node --test tests/node/*.test.js
+
+      - name: Web-stack tests
+        working-directory: tests/web_stack
+        run: |
+          python -m venv "$RUNNER_TEMP/web-stack-venv"
+          "$RUNNER_TEMP/web-stack-venv/bin/pip" install -r ../../web-stack/backends/requirements.txt pytest
+          "$RUNNER_TEMP/web-stack-venv/bin/python" -m pytest -q
