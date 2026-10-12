@@ -7,7 +7,6 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.activities import deep_memory_activities
@@ -18,6 +17,7 @@ from app.db.models import (
 from app.deep_memory import index, recall
 from app.task_registry import messages
 from app.workflows.deep_recall import DeepRecallWorkflow, recall_workflow_id
+from tests import temporal_env
 
 T0 = datetime(2026, 9, 20, 23, 30)
 QUEUE = "deep-recall-test"
@@ -303,7 +303,7 @@ def steps(monkeypatch):
 async def run_recall(maker):
     await seed(maker)
     payload = {"task_id": "t-now", "query": "What's my code word?", "session_key": "s1"}
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[DeepRecallWorkflow], activities=RECALL_ACTIVITIES):
             result = await env.client.execute_workflow(
                 DeepRecallWorkflow.run, payload, id=recall_workflow_id("t-now"), task_queue=QUEUE

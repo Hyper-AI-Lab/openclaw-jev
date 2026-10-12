@@ -9,12 +9,12 @@ from typing import Any, Dict
 
 import pytest
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.orchestrator.process_brief import with_catchup
 from app.workflows.approval import gate_decision
 from app.workflows.catalog_task import CatalogTaskWorkflow
+from tests import temporal_env
 from tests.test_two_phase_answering import ON, QUEUE, CatalogRun, ScriptedRecall, ScriptedStep
 
 BRIEF = "USER CATCH-UP (attach/rebuild):\nKirill said ok to the vendor list, and asked to stop the old order."
@@ -66,7 +66,7 @@ async def _at_gate(rec: GateRun, script) -> Dict[str, Any]:
                "session_key": "agent:main:slack:channel:d0test", "task_type": "procurement", "tags": ["user-request"],
                "rework_max_attempts": 20, "strategy_change_attempt": 10, "escalate_user_attempt": 20,
                "deep_recall": {**ON, "enabled": False}}
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[CatalogTaskWorkflow, ScriptedStep, ScriptedRecall],
                           activities=rec.activities()):
             handle = await env.client.start_workflow(CatalogTaskWorkflow.run, payload, id=rec.parent_id, task_queue=QUEUE)

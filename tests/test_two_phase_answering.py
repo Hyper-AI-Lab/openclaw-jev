@@ -10,12 +10,12 @@ from typing import Any, Dict
 
 from temporalio import activity, workflow
 from temporalio.exceptions import ApplicationError
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.orchestrator.completion_rework import RECALL_NOTICE, RECALL_UNCONFIRMED_NOTICE
 from app.workflows.catalog_task import CatalogTaskWorkflow
 from app.workflows.generic_task import GenericTaskWorkflow
+from tests import temporal_env
 from tests.test_generic_workflow_judgment import Recorder
 
 QUEUE = "two-phase-tests"
@@ -113,7 +113,7 @@ async def _run(rec: TwoPhase, **overrides) -> Dict[str, Any]:
                "recovered_draft": DRAFT, "rework_max_attempts": 20, "strategy_change_attempt": 10,
                "escalate_user_attempt": 20, "deep_recall": ON}
     payload.update(overrides)
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[GenericTaskWorkflow, ScriptedRecall],
                           activities=rec.activities()):
             return await env.client.execute_workflow(
@@ -299,7 +299,7 @@ async def _run_catalog(rec: CatalogRun, **overrides) -> Dict[str, Any]:
                "rework_max_attempts": 20, "strategy_change_attempt": 10, "escalate_user_attempt": 20,
                "deep_recall": ON}
     payload.update(overrides)
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[CatalogTaskWorkflow, ScriptedStep, ScriptedRecall],
                           activities=rec.activities()):
             return await env.client.execute_workflow(

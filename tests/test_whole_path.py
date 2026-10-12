@@ -47,6 +47,7 @@ from app.task_registry import intake_runner
 from app.task_registry.intake_decision_engine import apply_intake_policy
 from app.task_registry.retriever import fetch_active_tasks
 from app.workflows.deep_recall import DeepRecallWorkflow
+from tests import temporal_env
 import worker
 
 SESSION = "agent:main:slack:channel:d0test"
@@ -289,7 +290,7 @@ async def harness_session(tmp_path, monkeypatch):
     monkeypatch.setenv("RMP_API_KEY", KEY)
     monkeypatch.setenv("AURA_JEV_MODE", "off")
     try:
-        async with await WorkflowEnvironment.start_time_skipping() as env, httpx.AsyncClient(
+        async with await temporal_env.time_skipping() as env, httpx.AsyncClient(
             transport=httpx.ASGITransport(app=server.app), base_url="http://rmp", headers={"X-RMP-API-Key": KEY}
         ) as api:
             harness = Harness(env, api, sessions)

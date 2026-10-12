@@ -5,10 +5,10 @@ from typing import Any, Dict, List
 import pytest
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.workflows.generic_task import GenericTaskWorkflow
+from tests import temporal_env
 
 QUEUE = "judgment-tests"
 
@@ -154,7 +154,7 @@ async def _run(recorder: Recorder, **overrides) -> Dict[str, Any]:
                "tags": ["user-request"], "recovered_draft": "Pack layers and a light rain jacket.",
                "rework_max_attempts": 20, "strategy_change_attempt": 10, "escalate_user_attempt": 20}
     payload.update(overrides)
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[GenericTaskWorkflow],
                           activities=recorder.activities()):
             return await env.client.execute_workflow(

@@ -15,12 +15,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock
 
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.coding import prompts
 from app.orchestrator.process_brief import with_catchup
 from app.workflows.coding_task import CodingTaskWorkflow
+from tests import temporal_env
 
 QUEUE = "coding-harness"
 STREAMS = Path(__file__).resolve().parent / "fixtures" / "claude_streams"
@@ -245,7 +245,7 @@ async def until(predicate, timeout: float = 30.0) -> None:
 
 async def drive(rec: CodingRun, script=None, payload=None, *, record: Optional[str] = None) -> Dict[str, Any]:
     payload = payload or PAYLOAD
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[CodingTaskWorkflow], activities=rec.activities(),
                           max_heartbeat_throttle_interval=timedelta(milliseconds=100)):
             handle = await env.client.start_workflow(CodingTaskWorkflow.run, payload, id=f"workflow-{payload['task_id']}",
@@ -564,7 +564,7 @@ async def test_a_worker_restart_mid_run_reattaches_to_the_same_unit(tmp_path, mo
 
     rec = CodingRun(real_activities=[coding_activities.run_claude_round])
     # A real dev server: the time-skipping one never retries an attempt whose worker shut down.
-    async with await WorkflowEnvironment.start_local() as env:
+    async with await temporal_env.local() as env:
         kwargs = dict(task_queue=QUEUE, workflows=[CodingTaskWorkflow], activities=rec.activities(),
                       max_heartbeat_throttle_interval=timedelta(milliseconds=100))
         first = Worker(env.client, **kwargs)
@@ -588,7 +588,7 @@ async def test_a_worker_restart_mid_run_reattaches_to_the_same_unit(tmp_path, mo
 async def test_a_self_deploy_hands_off_keeps_the_slot_and_the_report_run_replies():
     handed = {"status": "handed_off", "unit": "aura-deploy-t1", "summary": "RMP's full suite passed on cccccccccccc."}
     rec = CodingRun(shipping=[handed])
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[CodingTaskWorkflow], activities=rec.activities()):
             first = await env.client.start_workflow(CodingTaskWorkflow.run, PAYLOAD, id="workflow-t1", task_queue=QUEUE)
             await approve_first_card(env, first, rec)
