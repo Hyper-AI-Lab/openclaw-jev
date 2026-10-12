@@ -350,9 +350,10 @@ class RealStepRun(CatalogRun):
                 record_observation, release_process_run_lease, write_episodic_observation]
 
 
-async def _run_catalog(rec: CatalogRun, *, real_steps=False, **overrides) -> Dict[str, Any]:
+async def _run_catalog(rec: CatalogRun, *, record=None, real_steps=False, **overrides) -> Dict[str, Any]:
     """The login template on the time-skipping server, its steps run by ScriptedStep or, with ``real_steps``, by the
-    real step child."""
+    real step child. With ``record``, the run is recorded under that scenario name, with its step children when they
+    are real."""
     payload = {"task_id": "t1", "intent": "Log in to my example-shop.com account.", "process_type": "login",
                "session_key": "agent:main:slack:channel:d0test", "task_type": "login", "tags": ["user-request"],
                "rework_max_attempts": 20, "strategy_change_attempt": 10, "escalate_user_attempt": 20,
@@ -362,13 +363,17 @@ async def _run_catalog(rec: CatalogRun, *, real_steps=False, **overrides) -> Dic
     async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[CatalogTaskWorkflow, step, ScriptedRecall],
                           activities=rec.activities(), workflow_runner=temporal_env.WORKFLOW_RUNNER):
-            return await env.client.execute_workflow(
+            result = await env.client.execute_workflow(
                 CatalogTaskWorkflow.run, payload, id=rec.parent_id, task_queue=QUEUE)
+            if record:
+                await temporal_env.record_run(env.client, record, rec.parent_id,
+                                              children=(CatalogStepChildWorkflow,) if real_steps else ())
+            return result
 
 
 async def test_a_catalog_task_reads_the_recall_from_the_next_step_boundary():
     rec = CatalogRun(verdicts=["accept"], recall_delay=0, recall_during_first_step=True)
-    result = await _run_catalog(rec)
+    result = await _run_catalog(rec, record="recall_at_step_boundary")
     assert result["status"] == "completed"
     assert list(rec.step_memory) == ["inspect_login", "submit_login", "verify_session"]
     assert "DEEP RECALL" not in rec.step_memory["inspect_login"]
@@ -380,7 +385,7 @@ async def test_a_catalog_task_reads_the_recall_from_the_next_step_boundary():
 
 async def test_a_catalog_task_lets_a_late_recall_go_without_a_follow_up():
     rec = CatalogRun(verdicts=["accept"], recall_delay=600, novelty=ADDS)
-    result = await _run_catalog(rec, deep_recall={**ON, "deadline_sec": 900})
+    result = await _run_catalog(rec, record="late_recall_let_go", deep_recall={**ON, "deadline_sec": 900})
     assert result["status"] == "completed" and rec.kinds == ["reply"]
     assert not any("DEEP RECALL" in m for m in rec.step_memory.values())
     assert rec.novelty_asked == [] and rec.settled == [{"consumed_by": "none", "status": "cancelled"}]
@@ -388,7 +393,7 @@ async def test_a_catalog_task_lets_a_late_recall_go_without_a_follow_up():
 
 async def test_a_catalog_task_runs_each_step_in_the_real_step_child():
     rec = RealStepRun(verdicts=["accept"])
-    result = await _run_catalog(rec, real_steps=True, deep_recall={**ON, "enabled": False})
+    result = await _run_catalog(rec, record="real_step_children", real_steps=True, deep_recall={**ON, "enabled": False})
     assert result["status"] == "completed"
     assert rec.steps == [("inspect_login", "started"), ("inspect_login", "completed"),
                          ("submit_login", "started"), ("submit_login", "completed"),

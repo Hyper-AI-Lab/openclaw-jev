@@ -47,6 +47,7 @@ from app.task_registry import intake_runner
 from app.task_registry.intake_decision_engine import apply_intake_policy
 from app.task_registry.retriever import fetch_active_tasks
 from app.workflows.deep_recall import DeepRecallWorkflow
+from app.workflows.generic_execute_child import GenericExecuteChildWorkflow
 from tests import temporal_env
 import worker
 
@@ -129,6 +130,7 @@ class Harness:
         self.env, self.api, self.sessions = env, api, sessions
         self.asgi = httpx.ASGITransport(app=server.app)
         self.intake, self.drafts, self.verdicts, self.during = [], [], [], {}
+        self.intake_ids = []  # the intake runs' workflow ids, random per message
         self.prompts, self.plans, self.judged = [], [], []
         self.sessions_used, self.verdict_sessions = [], []
         self.bare = set()  # dispatch numbers whose draft comes back without its facts block
@@ -152,8 +154,16 @@ class Harness:
         active = (await self.api.get(f"/sessions/{SESSION}/active_user_task")).json()["active_task"]
         await self.api.post(f"/tasks/{active['id']}/signal", json={"signal_type": "user_input", "message": "stop"})
 
-    async def finish(self, task_id):
-        return await asyncio.wait_for(self.env.client.get_workflow_handle(f"workflow-{task_id}").result(), BOUND)
+    async def finish(self, task_id, record=None):
+        """The task's result, once its workflow returned. With ``record``, the run, its execute children and the
+        intake runs so far are recorded under that scenario name."""
+        result = await asyncio.wait_for(self.env.client.get_workflow_handle(f"workflow-{task_id}").result(), BOUND)
+        if record:
+            await temporal_env.record_run(self.env.client, record, f"workflow-{task_id}",
+                                          children=(GenericExecuteChildWorkflow,))
+            for n, intake_id in enumerate(self.intake_ids, start=1):
+                await temporal_env.record(self.env.client, f"{record}/{n}", intake_id)
+        return result
 
     async def rows(self, model, *where, order=None):
         async with self.sessions() as s:
@@ -176,6 +186,7 @@ class Harness:
         @activity.defn(name="classify_task_intake")
         async def classify_task_intake(payload):
             """The analyst's answer is scripted; the active tasks it sees and the policy it answers to are real."""
+            h.intake_ids.append(activity.info().workflow_id)
             context = {**payload, "active_tasks": await fetch_active_tasks(session_key=payload["session_key"])}
             answer = {"confidence": 90, "execution_mode": "conversational", **h.intake.pop(0)}
             return {**apply_intake_policy(answer, context, tags=payload["tags"]), "request_hash": payload["intent"][:40]}
@@ -364,7 +375,7 @@ async def test_a_new_request_is_reworked_and_only_the_accepted_draft_reaches_sla
     h.drafts, h.verdicts = [first, second], [rework("Say which shoes to bring."), ACCEPT]
 
     tid = (await h.send(ask, "1790000001.000100"))["task_id"]
-    result = await h.finish(tid)
+    result = await h.finish(tid, record="rework_then_accept")
 
     assert result == {"status": "completed", "task_id": tid, "final_result": second}
     assert h.slack == [second] and h.channels == {config.get_slack_owner_user_id()}
@@ -394,7 +405,7 @@ async def test_a_follow_up_sent_while_aura_works_is_folded_into_the_one_judged_r
 
     h.intake, h.drafts, h.during = [{"decision": "create_fresh"}], [first, folded], {1: follow_up_arrives}
     tid = (await h.send(ask, "1790000002.000100"))["task_id"]
-    result = await h.finish(tid)
+    result = await h.finish(tid, record="follow_up_folded_in")
 
     assert attached["intake_action"] == "attach_active" and attached["attached_task_ids"] == [tid]
     assert len(h.prompts) == 2 and follow_up in h.prompts[1] and first in h.prompts[1]
@@ -484,7 +495,7 @@ async def test_stop_during_a_task_ends_it_without_delivering_the_draft(h):
     h.intake, h.drafts, h.during = [{"decision": "create_fresh"}], [draft], {1: lambda payload: h.stop()}
 
     tid = (await h.send(ask, "1790000004.000100"))["task_id"]
-    result = await h.finish(tid)
+    result = await h.finish(tid, record="stop_during_task")
 
     assert result == {"status": "stopped_by_user", "task_id": tid}
     assert h.slack == [f"Task {tid[:8]} stopped as requested."]
@@ -640,7 +651,7 @@ async def test_a_reconciler_nudge_is_neither_folded_in_nor_resubmitted(h):
     h.intake, h.drafts, h.during = [{"decision": "create_fresh"}], [reply], {1: nudge}
     tid = (await h.send(ask, "1790000008.000100"))["task_id"]
 
-    assert (await h.finish(tid))["final_result"] == reply and h.slack == [reply]
+    assert (await h.finish(tid, record="reconciler_nudge"))["final_result"] == reply and h.slack == [reply]
     assert len(h.prompts) == 1 and [t.id for t in await h.rows(Task, Task.status != "cancelled")] == [tid]
     assert "task.messages_resubmitted" not in await h.events(tid)
 
@@ -666,7 +677,7 @@ async def test_a_recall_that_adds_after_the_reply_is_noticed_refined_judged_and_
     monkeypatch.setattr(recall, "judge_novelty", novelty)
     h.intake, h.drafts, h.while_posting = [{"decision": "create_fresh"}], [reply, refined], release_the_recall
     tid = (await h.send(ask, "1790000013.000100"))["task_id"]
-    result = await h.finish(tid)
+    result = await h.finish(tid, record="recall_adds_after_reply")
 
     assert result == {"status": "completed", "task_id": tid, "final_result": reply, "followup": refined}
     assert h.slack == [reply, RECALL_NOTICE, refined]

@@ -5,8 +5,6 @@ Code returned, what RMP's own test run showed, what Aura and the evaluator said,
 replied in Slack.
 """
 import asyncio
-import json
-import os
 import threading
 import time
 from datetime import timedelta
@@ -41,7 +39,6 @@ HEAD = "c" * 40
 FAILING_TAIL = "FAILED tests/test_greeting.py::test_hello - AssertionError: assert 'hi' == 'hello'\n1 failed, 11 passed"
 READY = {"verdict": "ready", "feedback": [], "reply": "I changed the greeting to say hello, and RMP's tests pass (12 passed)."}
 FINAL = "Done: the greeting now says hello. It is deployed and verified."
-RECORDED: Dict[str, Any] = {}
 
 
 def claude(kind: str = "success", session: str = "sess-1", **extra: Any) -> Dict[str, Any]:
@@ -253,12 +250,8 @@ async def drive(rec: CodingRun, script=None, payload=None, *, record: Optional[s
             if script:
                 await script(env, handle)
             result = await handle.result()
-            if record and os.environ.get("RECORD_CODING_HISTORIES"):
-                history = await handle.fetch_history()
-                RECORDED[record] = {"workflow_id": handle.id, "history": json.loads(history.to_json())}
-                path = Path(os.environ["RECORD_CODING_HISTORIES"])
-                saved = json.loads(path.read_text()) if path.exists() else {}
-                path.write_text(json.dumps({**saved, record: RECORDED[record]}, separators=(",", ":")) + "\n")
+            if record:
+                await temporal_env.record(env.client, record, handle.id)
             return result
 
 
