@@ -1,7 +1,9 @@
+import asyncio
 import json
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -380,6 +382,13 @@ async def test_canary_reserve_does_not_wait_1800s(monkeypatch, tmp_path):
             }
         )
     )
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    # The broker's sleeps are recorded instead of slept; only the broker module sees the change.
+    monkeypatch.setattr(qb, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
     settings = {"llm_quota": {"max_concurrent": 3, "min_interval_sec": 0, "max_wait_sec": 1800}}
     # Refused at once: a canary's first failed attempt raises this before any wait, and a wait that ran out would
     # raise "no slot/profile available within ..." instead.
@@ -390,6 +399,7 @@ async def test_canary_reserve_does_not_wait_1800s(monkeypatch, tmp_path):
             tags=["canary"],
             task_type="canary",
         )
+    assert slept == [], "a canary is refused without waiting"
 
 
 def test_user_reserve_cancels_canary_task(monkeypatch, tmp_path):
