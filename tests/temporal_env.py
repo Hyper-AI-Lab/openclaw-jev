@@ -33,13 +33,15 @@ WORKFLOW_RUNNER = SandboxedWorkflowRunner(
 
 Why: CatalogStepChildWorkflow builds its prompt with app/orchestrator/prompt_policy.py, whose
 build_catalog_step_prompt imports obscura_available inside the function. That lazy import is a fresh sandbox import,
-which asks this host's web stack over HTTP while a test records or replays, out of the conftest stub's reach. Passed
-through, it is the host module the stub patches.
+out of the conftest stub's reach. On temporalio 1.23.0 its request never leaves the sandbox: the sandbox refuses
+httpx's read of os.environ, and obscura_available returns False without asking the web stack. Passed through, the
+module is the host module the stub patches, so the step child reads the stub instead of depending on the sandbox's
+restriction list.
 
 What it does not change: commands. The workflows issue the same commands with it or without it, so replays match
 the same way.
 
-Who removes it: WP-25, together with that I/O, under Option B of D-5, which K-6 chose. Under Option A, WP-28 deletes
+Who removes it: WP-25, together with that request, under Option B of D-5, which K-6 chose. Under Option A, WP-28 deletes
 the catalog classes, their fixtures, their EXPECTED rows in tests/test_workflow_replay.py and this passthrough
 together.
 """
