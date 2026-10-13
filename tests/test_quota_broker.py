@@ -381,15 +381,15 @@ async def test_canary_reserve_does_not_wait_1800s(monkeypatch, tmp_path):
         )
     )
     settings = {"llm_quota": {"max_concurrent": 3, "min_interval_sec": 0, "max_wait_sec": 1800}}
-    t0 = time.time()
-    with pytest.raises(TimeoutError, match="canary"):
+    # Refused at once: a canary's first failed attempt raises this before any wait, and a wait that ran out would
+    # raise "no slot/profile available within ..." instead.
+    with pytest.raises(TimeoutError, match="canary/heartbeat slot unavailable"):
         await qb.reserve_profile(
             session_key="agent:main:rmp_task_canary_second",
             settings=settings,
             tags=["canary"],
             task_type="canary",
         )
-    assert time.time() - t0 < 5
 
 
 def test_user_reserve_cancels_canary_task(monkeypatch, tmp_path):
