@@ -56,13 +56,18 @@ def acceptable(lst: Any, st: Any, uid: int) -> bool:
 def cached_binary(name: str) -> Optional[str]:
     """The first ``name`` in this process's temp dir, then in the shared one; None when neither holds it.
 
-    Raises RuntimeError when that file fails ``acceptable``: the SDK would run it."""
+    Raises RuntimeError when that file fails ``acceptable``, because the SDK would run it, and when it is a link
+    whose target cannot be checked."""
     for path in dict.fromkeys(os.path.join(directory, name) for directory in (tempfile.gettempdir(), SHARED_TMP)):
         try:
             lst = os.lstat(path)
         except FileNotFoundError:
             continue
-        if acceptable(lst, os.stat(path), os.getuid()):
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            raise RuntimeError(f"{path} is a link whose target cannot be checked ({exc.strerror}); remove it") from exc
+        if acceptable(lst, st, os.getuid()):
             return path
         raise RuntimeError(f"{path} is owned by another user or writable by others, and the Temporal SDK would run "
                            "it; remove it, or make it owned by root or this user and writable by its owner only")

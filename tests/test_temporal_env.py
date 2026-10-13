@@ -75,5 +75,13 @@ def test_a_group_writable_binary_fails_with_its_path(temp_dirs):
         cached_binary("server")
 
 
+def test_a_link_to_a_missing_file_fails_with_its_path(temp_dirs):
+    own, shared = temp_dirs
+    (own / "server").symlink_to(own / "missing")
+    binary(shared / "server")
+    with pytest.raises(RuntimeError, match=re.escape(str(own / "server"))):
+        cached_binary("server")
+
+
 def test_no_cached_binary_leaves_the_download_to_the_sdk(temp_dirs):
     assert cached_binary("server") is None
