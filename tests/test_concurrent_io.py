@@ -50,7 +50,8 @@ async def test_read_ordered_runs_scopes_concurrently(monkeypatch):
     from app.memory import router
     from app.memory.router import MemoryRouter
 
-    cap = router.MEMORY_READ_CONCURRENCY
+    # Five scopes (test_read_ordered_preserves_merge_priority), as many read at once as the cap allows.
+    batch = min(router.MEMORY_READ_CONCURRENCY, 5)
     reading, most = 0, 0
     full = asyncio.Event()
 
@@ -62,7 +63,7 @@ async def test_read_ordered_runs_scopes_concurrently(monkeypatch):
         nonlocal reading, most
         reading += 1
         most = max(most, reading)
-        if reading == cap:
+        if reading == batch:
             full.set()
         try:
             await asyncio.wait_for(full.wait(), 10)
@@ -79,8 +80,8 @@ async def test_read_ordered_runs_scopes_concurrently(monkeypatch):
         process_type="generic",
         task_id="t-1",
     )
-    # Five scopes, read as many at once as the cap allows, which is more than one, and never more.
-    assert cap > 1 and most == cap
+    # As many at once as the cap allows, which is more than one, and never more.
+    assert batch > 1 and most == batch
 
 
 def test_nvidia_embed_cache_singleflight():
