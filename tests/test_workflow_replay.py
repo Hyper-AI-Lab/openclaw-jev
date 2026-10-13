@@ -12,10 +12,9 @@ The histories are synthetic, recorded by the test harnesses:
   catalog_step_child by the catalog tests of tests/test_two_phase_answering.py and the gate tests of
   tests/test_approval_gate.py; deep_recall by tests/test_deep_recall.py.
 
-To record, run a scenario's test with RECORD_HISTORIES=<repo>/tests/fixtures, on the host through the verify harness.
-tests/temporal_env.py saves the run under the scenario's key in the file of its workflow type, and each child or
-intake run it records under <key>/<n>. Re-recording replaces the history under a key; a new key goes into EXPECTED in
-the same change.
+To record, run a scenario's test with RECORD_HISTORIES=<repo>/tests/fixtures. tests/temporal_env.py saves the run
+under the scenario's key in the file of its workflow type, and each child or intake run it records under <key>/<n>.
+Re-recording replaces the history under a key; a new key goes into EXPECTED in the same change.
 """
 import json
 from pathlib import Path
