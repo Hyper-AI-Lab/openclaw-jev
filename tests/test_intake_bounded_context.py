@@ -1,9 +1,14 @@
 """Bounded intake context — vector leg deadline + concurrent retrieval."""
 import asyncio
+import threading
 import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
+
+# How long a leg waits for the others: far past any scheduling delay on a loaded host, and how long a run that awaits
+# the legs one at a time takes to fail.
+TOGETHER_SEC = 10.0
 
 
 def _slow_vector_search(*args, **kwargs):
@@ -40,39 +45,51 @@ async def test_hybrid_search_bounded_skips_vector_on_timeout():
 async def test_hybrid_search_runs_legs_concurrently():
     from app.task_registry.retriever import hybrid_search_bounded
 
-    async def slow_active(**kwargs):
-        await asyncio.sleep(0.15)
+    # Each leg returns only once all three have started, so every leg starts before any finishes; legs awaited one
+    # at a time never get past the first. The vector leg's thread runs under the search's 2 s deadline; it starts
+    # after the other two, so it finds them started and does not wait.
+    started, all_started = [], threading.Event()
+
+    def start(leg):
+        started.append(leg)
+        if len(started) == 3:
+            all_started.set()
+
+    def wait_for_the_others():
+        assert all_started.wait(TOGETHER_SEC), f"only {started} started"
+
+    async def active(**kwargs):
+        start("active")
+        await asyncio.to_thread(wait_for_the_others)
         return [{"task_id": "a1"}]
 
-    async def slow_recent(**kwargs):
-        await asyncio.sleep(0.15)
+    async def recent(**kwargs):
+        start("recent")
+        await asyncio.to_thread(wait_for_the_others)
         return [{"task_id": "r1", "task_ended_at": None}]
 
-    def slow_vector(*args, **kwargs):
-        time.sleep(0.15)
+    def vector(*args, **kwargs):
+        start("vector")
+        wait_for_the_others()
         return [{"task_id": "v1", "score": 0.9}]
 
     with patch(
         "app.task_registry.retriever.fetch_active_tasks",
-        new=AsyncMock(side_effect=slow_active),
+        new=AsyncMock(side_effect=active),
     ):
         with patch(
             "app.task_registry.retriever.fetch_recent_registry",
-            new=AsyncMock(side_effect=slow_recent),
+            new=AsyncMock(side_effect=recent),
         ):
             with patch(
                 "app.task_registry.retriever.search_similar_tasks",
-                side_effect=slow_vector,
+                side_effect=vector,
             ):
-                started = time.monotonic()
                 result = await hybrid_search_bounded("hello", deadline_sec=2.0)
-                elapsed = time.monotonic() - started
 
     assert result["active_tasks"][0]["task_id"] == "a1"
     assert result["recent_registry"][0]["task_id"] == "r1"
     assert result["vector_similar"][0]["task_id"] == "v1"
-    # Serial would be ~0.45s; concurrent should finish near the slowest leg.
-    assert elapsed < 0.55
 
 
 @pytest.mark.asyncio
@@ -85,8 +102,11 @@ async def test_assemble_intake_context_loads_messages_concurrently():
             self.content = content
             self.source = source
 
-    async def slow_messages(tid, limit=5):
-        await asyncio.sleep(0.12)
+    # Each task's messages arrive only once all three loads are running.
+    together = asyncio.Barrier(3)
+
+    async def messages(tid, limit=5):
+        await asyncio.wait_for(together.wait(), TOGETHER_SEC)
         return [Msg("user", f"msg-{tid}", "slack")]
 
     retrieval = {
@@ -104,37 +124,34 @@ async def test_assemble_intake_context_loads_messages_concurrently():
     ):
         with patch(
             "app.task_registry.intake_context.list_task_messages",
-            new=AsyncMock(side_effect=slow_messages),
+            new=AsyncMock(side_effect=messages),
         ):
-            started = time.monotonic()
             result = await assemble_intake_context("hello", session_key="s1")
-            elapsed = time.monotonic() - started
 
     assert set(result["supplementary_messages"]) == {"t1", "t2", "t3"}
-    assert elapsed < 0.30
 
 
 @pytest.mark.asyncio
 async def test_intake_reads_the_dialogue_beside_retrieval_once():
     from app.task_registry.intake_context import assemble_intake_context
 
-    async def slow_retrieval(*args, **kwargs):
-        await asyncio.sleep(0.15)
+    # Retrieval and the dialogue each return only once both are running.
+    together = asyncio.Barrier(2)
+
+    async def retrieval(*args, **kwargs):
+        await asyncio.wait_for(together.wait(), TOGETHER_SEC)
         return {"active_tasks": [], "recent_registry": [], "vector_similar": []}
 
-    async def slow_dialogue(session_key):
-        await asyncio.sleep(0.15)
+    async def recent_dialogue(session_key):
+        await asyncio.wait_for(together.wait(), TOGETHER_SEC)
         return "RECENT DIALOGUE (same Slack session — continue this conversation):\n[21:03] Kirill: hi\n[21:04] Aura: Hello!"
 
-    with patch("app.task_registry.intake_context.hybrid_search_bounded", new=AsyncMock(side_effect=slow_retrieval)), \
-         patch("app.task_registry.intake_context.recent_session_dialogue_block", new=AsyncMock(side_effect=slow_dialogue)) as dialogue:
-        started = time.monotonic()
+    with patch("app.task_registry.intake_context.hybrid_search_bounded", new=AsyncMock(side_effect=retrieval)), \
+         patch("app.task_registry.intake_context.recent_session_dialogue_block", new=AsyncMock(side_effect=recent_dialogue)) as dialogue:
         result = await assemble_intake_context("Which one?", session_key="s1")
-        elapsed = time.monotonic() - started
 
     assert result["recent_dialogue"] == ["[21:03] Kirill: hi", "[21:04] Aura: Hello!"]
     dialogue.assert_awaited_once_with("s1")
-    assert elapsed < 0.28
 
 
 @pytest.mark.asyncio
