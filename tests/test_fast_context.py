@@ -161,6 +161,8 @@ async def test_budgets_cut_low_priority_sections_and_the_dialogue_keeps_its_newe
 async def test_a_leg_over_the_deadline_is_left_out_and_the_rest_arrive(sessions, monkeypatch):
     searching, released = threading.Event(), threading.Event()
     read_run = curator._run_memory
+    legs = ("_dialogue", "_facts", "_linked", "_run_memory", "_procedures")
+    edges = []
 
     def search_until_released(*args, **kwargs):
         searching.set()
@@ -171,23 +173,41 @@ async def test_a_leg_over_the_deadline_is_left_out_and_the_rest_arrive(sessions,
         await asyncio.to_thread(searching.wait, 60)
         return await read_run(process_run_id)
 
+    def recorded(name, leg):
+        async def run(*args):
+            edges.append((name, "start"))
+            try:
+                return await leg(*args)
+            finally:
+                edges.append((name, "end"))
+
+        return run
+
     # The fact search does not end before the block is back, so the block comes back only because the deadline left
-    # the search out. The run's notes are read only while the search runs, so the block holds them only when the legs
-    # run at once: legs awaited one at a time leave the run leg waiting until the deadline.
+    # the search out, and the run's notes are read only while the search runs. Every leg records its start and end:
+    # each one reads SQLite or waits on a thread before it can end (the intake decision makes the linked leg read
+    # too), so legs run at once all start before any ends, and legs awaited one at a time, in any order, do not.
     monkeypatch.setattr(index, "search", search_until_released)
     monkeypatch.setattr(curator, "_run_memory", read_run_once_the_search_runs)
+    for leg in legs:
+        monkeypatch.setattr(curator, leg, recorded(leg, getattr(curator, leg)))
     # SQLite legs on a loaded host take a few hundred ms; the deadline leaves them room.
     monkeypatch.setattr(curator, "get_deep_memory_config",
                         lambda: {**config.DEFAULT_DEEP_MEMORY, "fast_context_deadline_sec": 2.0})
     await seed(
         sessions,
-        Task(id="t2", goal="Where do I live?", task_type="user", openclaw_session_key=SESSION),
+        TaskIntakeDecision(id="d2", decision="create_guided", similar_task_ids=[]),
+        Task(id="t2", goal="Where do I live?", task_type="user", openclaw_session_key=SESSION,
+             intake_decision_id="d2"),
         MemoryItem(id="w1", scope_type="process", scope_id="r2", memory_type="working", content="Run note."),
     )
     try:
         block = await assemble("Where do I live?")
     finally:
+        searching.set()
         released.set()
+    first_end = next(i for i, (_, edge) in enumerate(edges) if edge == "end")
+    assert {leg for leg, _ in edges[:first_end]} == set(legs), f"a leg ended before every leg started: {edges}"
     assert "Run note." in block and "late fact" not in block
 
 
