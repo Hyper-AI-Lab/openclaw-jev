@@ -85,7 +85,8 @@ def main() -> int:
     checked = logs(merge_base)
     found = rewrites(merge_base, head, checked)
     if not found:
-        print("Progress logs unchanged or appended to since the merge base: " + ", ".join(checked))
+        print("Progress logs unchanged or appended to since the merge base: " + ", ".join(checked) if checked
+              else "No progress logs at the merge base")
         return 0
     if LABEL not in {label["name"] for label in pr["labels"]}:
         print(refusal(found))

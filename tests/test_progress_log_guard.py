@@ -162,6 +162,13 @@ def test_files_outside_the_two_globs_are_not_checked(repo):
     assert OTHER not in message and NESTED_LOG not in message
 
 
+def test_a_merge_base_without_progress_logs_passes(repo):
+    git(repo.path, "checkout", "-q", "--orphan", "bare")
+    git(repo.path, "rm", "-rqf", "docs")
+    head = commit(repo.path, {"app/x.py": "X = 2\n"}, "no progress logs")
+    passed(guard(repo, base=head, head=head), "No progress logs at the merge base\n")
+
+
 def test_a_revert_of_an_append_is_refused_and_names_the_rollback_case(repo):
     appended = commit(repo.path, {LOG: BASE_LOG + entry("batch 2"), "app/x.py": "X = 2\n"}, "a change and its entry")
     git(repo.path, "-c", "user.name=t", "-c", "user.email=t@t", "revert", "--no-edit", appended)
