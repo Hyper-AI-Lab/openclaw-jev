@@ -65,6 +65,11 @@ def refusal(found: list[str]) -> str:
         "append new entries at the end of the file. A new progress log is fine.",
         f"A deliberate rewrite, such as a redaction, needs the {LABEL} label on the pull request. Adding it starts a "
         "new run of this check.",
+        "",
+        "Rollback reverts: a revert of commits that appended progress entries, including RMP's automatic rollback "
+        "pull request (aura/revert-<sha>), is refused like any other rewrite. Once the live checkout already runs the "
+        f"revert, a reviewer adds the {LABEL} label and merges it with a merge commit (aura-github gh pr merge <n> "
+        "--merge), not a squash: until GitHub's main contains the live revert, nothing deploys.",
     ])
 
 

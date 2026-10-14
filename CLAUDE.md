@@ -42,7 +42,7 @@ This is RMP, the orchestration layer behind Aura, Kirill's assistant. You work o
 ## Commits
 
 - Small, focused commits. The message is one line in plain English saying what changed and why.
-- Leave the history in `docs/*_PROGRESS.md` as it is; those logs are append-only. CI refuses a rewrite unless the PR carries the `progress-log-rewrite` label.
+- Leave the history in `docs/*_PROGRESS.md` as it is; those logs are append-only. CI refuses a rewrite unless the PR carries the `progress-log-rewrite` label. RMP's rollback revert (`aura/revert-<sha>`) of a change that appended to a log removes those entries, so it waits for that label and a manual merge with a merge commit (`aura-github gh pr merge <n> --merge`, not `--squash`). Until it merges, nothing deploys.
 
 ## Pull requests (direct sessions)
 
