@@ -42,7 +42,7 @@ This is RMP, the orchestration layer behind Aura, Kirill's assistant. You work o
 ## Commits
 
 - Small, focused commits. The message is one line in plain English saying what changed and why.
-- Leave the history in `docs/*_PROGRESS.md` as it is; those logs are append-only.
+- Leave the history in `docs/*_PROGRESS.md` as it is; those logs are append-only. CI refuses a rewrite unless the PR carries the `progress-log-rewrite` label.
 
 ## Pull requests (direct sessions)
 
