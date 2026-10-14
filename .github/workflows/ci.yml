@@ -24,6 +24,9 @@ jobs:
       - name: Workflow changes carry a patch, a new replay fixture or the no-replay-impact label
         run: python .github/scripts/workflow_change_guard.py
 
+      - name: Progress logs are append-only, or the PR carries the progress-log-rewrite label
+        run: python .github/scripts/progress_log_guard.py
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
