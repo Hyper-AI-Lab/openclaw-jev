@@ -107,7 +107,9 @@ def test_a_new_progress_log_passes(repo):
 
 def test_an_edited_line_is_refused_and_named(repo):
     head = commit(repo.path, {LOG: BASE_LOG.replace("abc1234", "def5678") + entry("batch 2")}, "a corrected sha")
-    message = refused(guard(repo, head=head), f"{LOG}: line 5 is the first line that differs from the merge base")
+    # Another label does not let the rewrite through.
+    message = refused(guard(repo, head=head, labels=["documentation"]),
+                      f"{LOG}: line 5 is the first line that differs from the merge base")
     assert HISTORY_LOG not in message
     assert "keep every existing line as it is and append new entries at the end of the file" in message
     assert "needs the progress-log-rewrite label on the pull request" in message
@@ -116,6 +118,14 @@ def test_an_edited_line_is_refused_and_named(repo):
 def test_a_removed_line_is_refused(repo):
     head = commit(repo.path, {HISTORY_LOG: BASE_HISTORY_LOG.replace("## Step 1\n\n", "")}, "a heading dropped")
     refused(guard(repo, head=head), f"{HISTORY_LOG}: line 3 is the first line that differs from the merge base")
+
+
+def test_an_entry_put_before_the_old_ones_is_refused_and_each_rewritten_log_is_named(repo):
+    # The log keeps every old line, but after the new entry rather than as its start.
+    head = commit(repo.path, {LOG: "## 2026-10-14 · batch 2\n\nPut first.\n\n" + BASE_LOG,
+                              HISTORY_LOG: BASE_HISTORY_LOG.replace("Done.", "Done twice.")}, "newest first")
+    refused(guard(repo, head=head), f"{LOG}: line 1 is the first line that differs from the merge base",
+            f"{HISTORY_LOG}: line 5 is the first line that differs from the merge base")
 
 
 def test_a_deleted_progress_log_is_refused(repo):
@@ -161,3 +171,9 @@ def test_a_revert_of_an_append_is_refused_and_names_the_rollback_case(repo):
     assert "RMP's automatic rollback pull request (aura/revert-<sha>), is refused like any other rewrite" in message
     assert ("a reviewer adds the progress-log-rewrite label and merges it with a merge commit (aura-github gh pr "
             "merge <n> --merge), not a squash") in message
+
+
+def test_a_git_error_fails_closed(repo):
+    # A head the checkout lacks, as in a shallow clone, stops the step rather than passing it.
+    result = guard(repo, head="0" * 40)
+    assert result.returncode == 1 and "CalledProcessError" in result.stderr, result.stdout + result.stderr
