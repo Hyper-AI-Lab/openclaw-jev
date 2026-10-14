@@ -47,26 +47,41 @@ async def test_read_ordered_preserves_merge_priority(monkeypatch):
 async def test_read_ordered_runs_scopes_concurrently(monkeypatch):
     import asyncio
 
+    from app.memory import router
     from app.memory.router import MemoryRouter
 
-    async def slow_read(
+    # Five scopes (test_read_ordered_preserves_merge_priority), as many read at once as the cap allows.
+    batch = min(router.MEMORY_READ_CONCURRENCY, 5)
+    reading, most = 0, 0
+    full = asyncio.Event()
+
+    async def read_together(
         scope_type, scope_id, memory_type=None, limit=20, query=None, **kwargs
     ):
-        await asyncio.sleep(0.12)
+        # A read ends only once a full batch of reads has run at the same time, and it yields once more before it
+        # ends, so reads past the cap would start meanwhile; read one by one, each times out.
+        nonlocal reading, most
+        reading += 1
+        most = max(most, reading)
+        if reading == batch:
+            full.set()
+        try:
+            await asyncio.wait_for(full.wait(), 10)
+            await asyncio.sleep(0)
+        finally:
+            reading -= 1
         return []
 
-    monkeypatch.setattr(MemoryRouter, "read", staticmethod(slow_read))
+    monkeypatch.setattr(MemoryRouter, "read", staticmethod(read_together))
     monkeypatch.setattr("app.memory.graph.query_links", AsyncMock(return_value=[]))
 
-    started = time.monotonic()
     await MemoryRouter.read_ordered(
         process_run_id="pr-1",
         process_type="generic",
         task_id="t-1",
     )
-    elapsed = time.monotonic() - started
-    # 6 scopes * 0.12s serial ~= 0.72s; with concurrency=3 expect ~0.24–0.40s.
-    assert elapsed < 0.55
+    # As many at once as the cap allows, which is more than one, and never more.
+    assert batch > 1 and most == batch
 
 
 def test_nvidia_embed_cache_singleflight():

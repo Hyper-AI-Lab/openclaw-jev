@@ -1,3 +1,7 @@
+import asyncio
+import time
+from types import SimpleNamespace
+
 import pytest
 
 from app.llm import quota_broker as qb
@@ -74,6 +78,21 @@ def full_broker(broker_env, monkeypatch):
     return _fill
 
 
+@pytest.fixture
+def broker_clock(monkeypatch):
+    """The broker's own clock, moved only by the broker's sleeps: its waits read the same however slowly the host
+    runs. Only the broker module sees it."""
+    clock = SimpleNamespace(now=time.time(), slept=[])
+
+    async def sleep(seconds):
+        clock.slept.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(qb, "time", SimpleNamespace(**{**vars(time), "time": lambda: clock.now}))
+    monkeypatch.setattr(qb, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
+    return clock
+
+
 @pytest.mark.asyncio
 async def test_release_is_not_blocked_by_a_waiting_reserve(full_broker):
     import asyncio
@@ -91,18 +110,18 @@ async def test_release_is_not_blocked_by_a_waiting_reserve(full_broker):
 
 
 @pytest.mark.asyncio
-async def test_reserve_gives_up_at_the_callers_deadline(full_broker, caplog):
+async def test_reserve_gives_up_at_the_callers_deadline(full_broker, broker_clock, caplog):
     import logging
-    import time
 
     await full_broker()
-    t0 = time.time()
+    t0 = broker_clock.now
     with caplog.at_level(logging.WARNING, logger="rmp.llm_quota"):
         with pytest.raises(TimeoutError, match="user slots full"):
             await qb.reserve_profile(
                 session_key="agent:main:three", settings=FULL, deadline=t0 + 1.0
             )
-    assert time.time() - t0 < 2.0
+    # It waited, and gave up when its clock reached the caller's deadline, not before and not after.
+    assert broker_clock.slept and broker_clock.now - t0 == pytest.approx(1.0)
     assert "LLM reserve gave up after" in caplog.text
     assert "user slots full (2/2, 2/3 total)" in caplog.text
 

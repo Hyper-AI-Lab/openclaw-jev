@@ -37,6 +37,16 @@ def spec(fakes, prompt, number=1, **kw):
     return runner.RunSpec(task_id="t-0001", number=number, job_dir=fakes.job, prompt=prompt, **kw)
 
 
+def first_line(run, timeout=30.0):
+    """Until the fake run wrote its first line: by then it handles SIGINT the way its prompt asked."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if run.stream_file.exists() and run.stream_file.read_text():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{run.unit} wrote nothing")
+
+
 def ended(run, timeout=20.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -115,19 +125,21 @@ def test_starting_again_returns_the_same_run_while_it_runs_and_after_it_ended(fa
 
 
 def test_a_stop_ends_the_run_within_seconds_and_reads_as_stopped(fakes, monkeypatch):
-    monkeypatch.setenv("FAKE_CLAUDE_DELAY", "0.5")
+    # Its lines five seconds apart, so the run is still going when the stop comes, however slow the host.
+    monkeypatch.setenv("FAKE_CLAUDE_DELAY", "5")
     run = runner.start(spec(fakes, "fixture:interrupted"), CFG, root=fakes.root)
-    time.sleep(0.6)
+    first_line(run)
     done = runner.stop(run, grace_sec=5)
-    assert done["was_active"] and not done["active"] and done["seconds"] < 5
+    assert done["was_active"] and not done["active"] and done["seconds"] < 60
     assert ended(run) == "success exited 0"
     assert runner.finish(run).kind == "stopped"
 
 
 def test_a_run_that_ignores_sigint_is_stopped_with_its_whole_unit(fakes, monkeypatch):
-    monkeypatch.setenv("FAKE_CLAUDE_DELAY", "0.5")
+    # Its lines five seconds apart, so the run is still going when the stop comes, however slow the host.
+    monkeypatch.setenv("FAKE_CLAUDE_DELAY", "5")
     run = runner.start(spec(fakes, "fixture:interrupted stubborn"), CFG, root=fakes.root)
-    time.sleep(0.6)
+    first_line(run)
     done = runner.stop(run, grace_sec=0.5)
     assert not done["active"] and ended(run) == "signal killed TERM"
     assert runner.finish(run).kind == "stopped"

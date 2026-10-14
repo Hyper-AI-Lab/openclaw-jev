@@ -5,8 +5,6 @@ Code returned, what RMP's own test run showed, what Aura and the evaluator said,
 replied in Slack.
 """
 import asyncio
-import json
-import os
 import threading
 import time
 from datetime import timedelta
@@ -15,12 +13,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock
 
 from temporalio import activity
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.coding import prompts
 from app.orchestrator.process_brief import with_catchup
 from app.workflows.coding_task import CodingTaskWorkflow
+from tests import temporal_env
 
 QUEUE = "coding-harness"
 STREAMS = Path(__file__).resolve().parent / "fixtures" / "claude_streams"
@@ -41,7 +39,6 @@ HEAD = "c" * 40
 FAILING_TAIL = "FAILED tests/test_greeting.py::test_hello - AssertionError: assert 'hi' == 'hello'\n1 failed, 11 passed"
 READY = {"verdict": "ready", "feedback": [], "reply": "I changed the greeting to say hello, and RMP's tests pass (12 passed)."}
 FINAL = "Done: the greeting now says hello. It is deployed and verified."
-RECORDED: Dict[str, Any] = {}
 
 
 def claude(kind: str = "success", session: str = "sess-1", **extra: Any) -> Dict[str, Any]:
@@ -245,7 +242,7 @@ async def until(predicate, timeout: float = 30.0) -> None:
 
 async def drive(rec: CodingRun, script=None, payload=None, *, record: Optional[str] = None) -> Dict[str, Any]:
     payload = payload or PAYLOAD
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[CodingTaskWorkflow], activities=rec.activities(),
                           max_heartbeat_throttle_interval=timedelta(milliseconds=100)):
             handle = await env.client.start_workflow(CodingTaskWorkflow.run, payload, id=f"workflow-{payload['task_id']}",
@@ -253,12 +250,8 @@ async def drive(rec: CodingRun, script=None, payload=None, *, record: Optional[s
             if script:
                 await script(env, handle)
             result = await handle.result()
-            if record and os.environ.get("RECORD_CODING_HISTORIES"):
-                history = await handle.fetch_history()
-                RECORDED[record] = {"workflow_id": handle.id, "history": json.loads(history.to_json())}
-                path = Path(os.environ["RECORD_CODING_HISTORIES"])
-                saved = json.loads(path.read_text()) if path.exists() else {}
-                path.write_text(json.dumps({**saved, record: RECORDED[record]}, separators=(",", ":")) + "\n")
+            if record:
+                await temporal_env.record(env.client, record, handle.id)
             return result
 
 
@@ -564,7 +557,7 @@ async def test_a_worker_restart_mid_run_reattaches_to_the_same_unit(tmp_path, mo
 
     rec = CodingRun(real_activities=[coding_activities.run_claude_round])
     # A real dev server: the time-skipping one never retries an attempt whose worker shut down.
-    async with await WorkflowEnvironment.start_local() as env:
+    async with await temporal_env.local() as env:
         kwargs = dict(task_queue=QUEUE, workflows=[CodingTaskWorkflow], activities=rec.activities(),
                       max_heartbeat_throttle_interval=timedelta(milliseconds=100))
         first = Worker(env.client, **kwargs)
@@ -588,7 +581,7 @@ async def test_a_worker_restart_mid_run_reattaches_to_the_same_unit(tmp_path, mo
 async def test_a_self_deploy_hands_off_keeps_the_slot_and_the_report_run_replies():
     handed = {"status": "handed_off", "unit": "aura-deploy-t1", "summary": "RMP's full suite passed on cccccccccccc."}
     rec = CodingRun(shipping=[handed])
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[CodingTaskWorkflow], activities=rec.activities()):
             first = await env.client.start_workflow(CodingTaskWorkflow.run, PAYLOAD, id="workflow-t1", task_queue=QUEUE)
             await approve_first_card(env, first, rec)

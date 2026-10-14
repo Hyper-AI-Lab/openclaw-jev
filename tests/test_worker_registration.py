@@ -4,10 +4,10 @@ import importlib
 from pathlib import Path
 
 from temporalio import workflow
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 import worker
+from tests import temporal_env
 
 REPO = Path(__file__).resolve().parents[1]
 ACTIVITY_CALLS = {"execute_activity", "start_activity", "execute_local_activity", "start_local_activity"}
@@ -113,7 +113,7 @@ async def test_the_production_worker_builds_on_a_test_server():
     The worker is shut down before the server goes: a worker that was only constructed keeps polling openclaw-tasks
     on the dead server's port for the rest of the session, where a later test server may listen.
     """
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue="openclaw-tasks", workflows=worker.WORKFLOWS,
                           activities=worker.ACTIVITIES):
             pass

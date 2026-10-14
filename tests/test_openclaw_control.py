@@ -4,7 +4,6 @@ import json
 import shutil
 import stat
 import sys
-import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -166,9 +165,10 @@ async def test_a_refused_or_lost_helper_call_falls_back_to_the_cli_and_the_helpe
 async def test_a_helper_slow_to_start_is_not_waited_for_past_its_limit(fake_helper, fake_cli, monkeypatch):
     fake_helper.args.append("slow")
     monkeypatch.setattr(openclaw_control, "HELPER_READY_SEC", 0.5)
-    started = time.monotonic()
     result = await REAL_ABORT(f"agent:main:rmp_task_{TID}")
-    assert result["status"] == "aborted" and time.monotonic() - started < 2.5
+    # The helper is ready only after 3 s, so an abort that waited for it past the limit would have gone through it:
+    # the CLI aborted instead.
+    assert result["status"] == "aborted"
     assert len(fake_cli.read_text().splitlines()) == 1
 
 

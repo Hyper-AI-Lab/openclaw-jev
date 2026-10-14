@@ -23,6 +23,7 @@ This is RMP, the orchestration layer behind Aura, Kirill's assistant. You work o
 - Python: the full suite with `-m pytest -q -p no:warnings`, using the interpreter named in your system prompt, or `/root/.openclaw/rmp/venv/bin/python` in a direct session.
 - Plugins: `node --test tests/node/*.test.js`.
 - Workflow command-order changes go behind `workflow.patched("<new id>")` with a recorded fixture. CI refuses a diff under `app/workflows` without a new patch id, a new fixture key or the `no-replay-impact` label.
+  - Record fixtures with `RECORD_HISTORIES=<repo>/tests/fixtures` by running the scenarios `tests/test_workflow_replay.py` names; re-recording replaces the history under a key.
   - The guard sees only `app/workflows/**`. The helpers the workflow files import also decide command order: `app/orchestrator/step_predicates.py`, `process_brief.py`, `decision_engine.py`, `completion_rework.py` and `app/notification_policy.py`. A change there needs the same patch and fixture; only `tests/test_workflow_replay.py` catches a miss there, and only on recorded paths.
   - The label is an auditable decision, not a security control: Aura's GitHub identity can add labels.
   - RMP's rollback revert of a workflow change (`aura/revert-<sha>`) waits for the `no-replay-impact` label and a manual merge with a merge commit (`aura-github gh pr merge <n> --merge`, the method RMP's revert uses). Until it merges, nothing deploys.

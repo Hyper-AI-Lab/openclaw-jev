@@ -7,7 +7,6 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.activities import deep_memory_activities
@@ -18,6 +17,7 @@ from app.db.models import (
 from app.deep_memory import index, recall
 from app.task_registry import messages
 from app.workflows.deep_recall import DeepRecallWorkflow, recall_workflow_id
+from tests import temporal_env
 
 T0 = datetime(2026, 9, 20, 23, 30)
 QUEUE = "deep-recall-test"
@@ -300,20 +300,22 @@ def steps(monkeypatch):
     return s
 
 
-async def run_recall(maker):
+async def run_recall(maker, record=None):
     await seed(maker)
     payload = {"task_id": "t-now", "query": "What's my code word?", "session_key": "s1"}
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[DeepRecallWorkflow], activities=RECALL_ACTIVITIES):
             result = await env.client.execute_workflow(
                 DeepRecallWorkflow.run, payload, id=recall_workflow_id("t-now"), task_queue=QUEUE
             )
+        if record:
+            await temporal_env.record(env.client, record, recall_workflow_id("t-now"))
     async with maker() as db:
         return result, await db.get(DeepContextReport, result["report_id"])
 
 
 async def test_a_recall_persists_its_plan_candidates_report_and_latency(sessions, steps):
-    result, row = await run_recall(sessions)
+    result, row = await run_recall(sessions, record="ready")
     assert result["status"] == "ready" and result["report"] == READY_REPORT
     assert row.task_id == "t-now" and row.trigger == "task_start" and row.status == "ready"
     assert row.queries["sub_queries"] == [{"query": "code word", "levels": ["fact"]}]
@@ -331,21 +333,21 @@ async def test_a_recall_persists_its_plan_candidates_report_and_latency(sessions
 
 async def test_a_request_that_needs_no_memory_skips_the_search(sessions, steps):
     steps.plan = recall.RecallPlan(needed=False, reason="a greeting", sub_queries=[], entities=[], since=None, until=None)
-    result, row = await run_recall(sessions)
+    result, row = await run_recall(sessions, record="needs_no_memory")
     assert result["status"] == row.status == "skipped" and row.report == {"reason": "a greeting"}
     assert [c[0] for c in steps.calls] == ["dialogue", "plan"]
 
 
 async def test_nothing_found_closes_the_report_as_empty(sessions, steps):
     steps.evidence = []
-    result, row = await run_recall(sessions)
+    result, row = await run_recall(sessions, record="nothing_found")
     assert result["status"] == row.status == "empty" and row.report == {"reason": "nothing in memory matched"}
     assert "read" not in [c[0] for c in steps.calls]
 
 
 async def test_an_irrelevant_report_is_empty(sessions, steps):
     steps.report = {**READY_REPORT, "relevant": False, "facts": []}
-    result, row = await run_recall(sessions)
+    result, row = await run_recall(sessions, record="irrelevant")
     assert result["status"] == row.status == "empty" and row.report["relevant"] is False
 
 
@@ -408,7 +410,7 @@ async def test_the_report_row_takes_the_tasks_id_and_records_how_the_task_used_i
 
 async def test_a_failed_read_is_retried_once_then_closes_the_report_as_failed(sessions, steps):
     steps.read_error = RuntimeError("the model is unavailable")
-    result, row = await run_recall(sessions)
+    result, row = await run_recall(sessions, record="read_failed_then_retried")
     assert result["status"] == row.status == "failed"
     assert "the model is unavailable" in result["reason"] and row.report["reason"] == result["reason"]
     assert [c[0] for c in steps.calls].count("read") == 2 and row.completed_at is not None

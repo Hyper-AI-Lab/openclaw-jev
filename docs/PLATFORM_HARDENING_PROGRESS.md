@@ -665,3 +665,271 @@ The live-layout failure was `test_intake_bounded_context.py::test_hybrid_search_
 - Timeouts are patched, or the test asserts on the outcome.
 - A concurrency mutation must fail the test, and a full run under CPU load must pass.
 - **Reason:** no WP owned §5.2. Two flakes occurred under contention in this batch, and coding jobs run under a CPU quota, so a flake fails Aura's verify for no code reason.
+
+## 2026-10-12 02:19 UTC · WP-01 batch 3 merged; label created; Phase A audits complete; synthesis started
+
+**PR #28:** CI green. The job log confirms the new steps:
+- the guard printed "no change under app/workflows";
+- unit tests: 1247 passed, 1 skipped;
+- node: 56 pass, 2 skipped (the root-only exec-cap ownership tests, which skip on the non-root runner);
+- **web-stack tests: 5 passed in their own venv.**
+
+`origin/main` was unchanged at `cc9f105`. Squash-merged as `434538a`.
+
+**WP01-28 host step:** label `no-replay-impact` created through `aura-github gh label create`.
+
+**Phase A run 3:** themes 9–12 done.
+- Disagreements: theme 9 R-97, R-100, R-108; theme 10 R-115, R-122; theme 11 R-123, R-128, R-134, R-136, R-137; theme 12 R-142, R-143, R-144.
+
+**Phase A raw tally** over all 144 rows (skeptic-corrected where disputed):
+
+| | Phase A | Preliminary inventory |
+|---|---|---|
+| MATCH | 28 | 37 |
+| PARTIAL | 103 | 87 |
+| MISMATCH | 5 | 6 |
+| MISSING | 2 | 3 |
+| SUPERSEDED | 6, plus 2 proposed (R-22, R-98) | 8 |
+| UNVERIFIED | — | 3 |
+
+- 38 disputed rows.
+- 48 rows with a gap no WP owns.
+- 123 raw new findings.
+
+**Phase A synthesis** (workflow `phaseA-synthesis`, run `wf_48d73e2a-2d2`):
+1. 4 adjudicators, each covering 3 themes;
+2. a completeness critic over the founding sources;
+3. triage that dedupes the findings and maps every gap to a WP (or proposes new WPs);
+4. a writer that produces `VISION_CONFORMANCE.md`, `final.json` and `CHECKPOINT.md` for Kirill.
+
+## 2026-10-12 14:03 UTC · Batch 3 deployed; batch 4 and Phase A synthesis started and resumed
+
+**Batch 3:** `434538a` deployed (`result.json`: `deployed`). Nothing restarted; health, readiness and canary ok. **Rollback:** revert `434538a`, plus delete the label if wanted.
+
+**Batch 4:**
+- **Branch:** `aura/wp-01-4-replay-foundation`, from `434538a`. `git diff 5424c02 434538a -- app/workflows` is empty, so the fixtures are recorded on `434538a` (D-11).
+- **Items:** WP01-31…36 and WP01-38 (amendment 1).
+- **Review:** raised to Tier 1, because the fixtures become the safety net for every later workflow change.
+- **Interruption:** the first launch (run `wf_e34aefbc-3b8`) hit the usage limit before its first tool call; the clone stayed clean. Resumed.
+
+**Phase A synthesis:** the usage limit stopped its first adjudicator. Resumed.
+
+## 2026-10-13 00:37 UTC · Incident: OpenAI credits exhausted (reported by Kirill from Aura's alerts); batch 4 and synthesis resumed
+
+**Kirill forwarded** Aura's "RMP invariant broken" alerts (01:33 and 05:34 CEST): `vector_sync`, 1 then 5 failing rows, "Error code: 429 … You have no credits remaining".
+
+**Read-only triage:**
+
+| Area | Finding |
+|---|---|
+| Start and rate | First credit error at 2026-10-12 16:07Z. About 6 per hour since: 17 in `rmp-worker` and 40 in the gateway over 48h, 0 in `rmp-api`. A steady low rate, not a retry storm. RMP's embedding volume is about 30–45 per day, so RMP did not use up the credits. |
+| Aura's model | `openclaw.json` sets `agents.defaults.model.primary` and `subagents.model` to `openai/gpt-6-luna`. Each Aura turn fails on it and falls back to `nvidia/openai/gpt-oss-20b`, which succeeds: 10 of 10 fallback decisions in 30h. Aura works, but on the weaker fallback model and with extra latency per turn. |
+| Memory | Embeddings fail. `vector_outbox` has 9 `memory` rows (oldest 16:07Z) and 113 `deep` rows pending. Backoff is capped at 3600 s, with no attempt cap, so nothing is lost and the outbox drains once credits return. Deep-fact search and task-registry vector search fail soft (7 and 10 warnings). |
+| Tasks | The last 36h hold only canary tasks: 41, all completed. No user task was affected. |
+| Alerting gap | Only the `vector_sync` invariant fired. Nothing names billing exhaustion or the sustained model fallback. New ledger item `OPS-2026-10-12-credits` (high, home WP-03). |
+
+**Owner action:** top up the OpenAI account; auto-recharge is advisable. No code change is needed for recovery.
+
+**Batch 4 cleanup:**
+- The usage limit interrupted the implementer (run `wf_e34aefbc-3b8`) **in the middle of mutation probes for WP01-38**. Eight `app/` files were left deliberately broken in the clone's working tree: serialised `gather`, removed timeouts, a disabled breaker, and `systemctl` calls removed.
+- Nothing was committed or pushed, and production was never touched.
+- I saved the tree as `/root/.cache/wp01-b4-wip-*.patch` and restored `app/` to the base: `git diff 434538a -- app/` is empty. The 8 test files of WP01-38 were kept.
+- **Process fix:** the batch script now requires mutation probes and experiments to run in a throwaway copy (`/root/.cache/wp-scratch.*`), never in the clone.
+- Batch 4 was relaunched as run `wf_46c97127-932`, reusing the 5 commits already made (WP01-31…35).
+
+**Phase A synthesis:** adjudication of themes 1–9 is done; resumed for themes 10–12, the completeness critic, triage and the writer.
+
+## 2026-10-13 10:08 UTC · Phase A triage surfaced three live issues; all checked and acted on
+
+**1. The credit incident note needed a correction.** RMP itself used up the OpenAI credits. `data/llm_usage.json` shows `memory_llm` (deep-memory enrichment) on `openai:default`:
+
+| Days | Requests per day | Tokens per day |
+|---|---|---|
+| 10-05 to 10-11 | 831–887 | 2.13–2.27M |
+| 10-12 | 575 | 1.47M |
+
+Embeddings used about 500 tokens a day.
+- **Driver:** a single poison job, `enrich 4af6639b…`. The journal has about 24 failures a day (188 logged since 10-05; attempt 43 failed on a partial context, attempt 230 on a ReadTimeout). With the backoff capped at 3600 s and no attempt cap, every retry re-ran the document's whole LLM enrichment.
+- **The earlier statement** ("RMP did not use up the credits") was wrong and is corrected here and to Kirill.
+- **Now:** readiness is at 98, with only the telemetry warning; the job is no longer failing, and the vector outbox has drained (credits restored).
+- **Homes:** the poison-job cap is WP-05; per-provider spend alerting goes to WP-03 (ledger `OPS-2026-10-12-credits`).
+
+**2. The Temporal watchdog had been dead since the reboot. My mistake.**
+- The timer has only `OnBootSec=2min` and `OnUnitActiveSec=5min`. I re-enabled it after boot+2min, while the service had not run since boot, so it never armed again (`NextElapse=infinity`).
+- The watchdog does nothing while Temporal is healthy.
+- **Re-armed** with one `systemctl start rmp-temporal-watchdog.service`: "Temporal health: ok". The next run is now scheduled every 5 minutes.
+- WP-08 makes the timer self-arming and adds a readiness check that every rmp timer has a next elapse (ledger `OPS-2026-10-13-watchdog`).
+
+**3. K-3 was not in effect.** Aura's notes never said that merges are paused.
+- **Done:** a bullet was added just before "Review before you approve a merge" in `/root/.openclaw/workspace/AGENTS.md` and `TOOLS.md`. Aura may still branch, push and open PRs, but does not merge; she tells Kirill the URL; the programme merges between WPs after the same checks.
+- **Backup:** `/root/.openclaw/archive/workspace-notes-20261013T100818Z`. **Rollback:** copy the two files back.
+- Direct turns stay enabled (K-5, keep powers). Aura has had no direct turn since 10-04.
+
+**Open for Kirill (TRI-129):** the K-10 interim. Should the Jev and TypeSafe Claude Code plugins load in Aura's direct sessions (`/root/.claude`) before WP-20's redaction fixes land?
+
+## 2026-10-13 11:18 UTC · K-10 interim decided by Kirill: Jev off in Aura's direct sessions until WP-20
+
+**Kirill's answer:** "Disable until WP-20".
+- **Change:** `/root/.claude/settings.json` `enabledPlugins` now has `jev@jev-local` and `typesafe@jev-local` set to `false`. A two-line `sed` edit; the rest of the file is unchanged.
+- **Backup:** `/root/.openclaw/archive/claude-settings.json.bak-20261013T111825Z`. **Rollback:** copy it back.
+- **Scope:** only Aura's direct sessions (`CLAUDE_CONFIG_DIR=/root/.claude`). The programme session uses `/root/.claude-team`.
+- **Later:** WP-20 re-enables the plugins together with the redaction fixes and the plugin-set readiness check.
+- Ledger `TRI-129` closed.
+
+## 2026-10-13 11:19 UTC · Phase A synthesis complete; checkpoint ready for Kirill
+
+**Workflow `phaseA-synthesis`** (run `wf_48d73e2a-2d2`, 7 agents, resumed twice). Outputs in `program/phaseA/`:
+- `VISION_CONFORMANCE.md`: 149 rows;
+- `final.json`;
+- `triage.json`: 135 items, 39 duplicates of ledger or findings ids, and 2 proposed WPs (WP-38 governance, WP-39 step-level judgment and bounded re-plan);
+- `CHECKPOINT.md`: 35 questions, each with a recommendation.
+
+**Final counts** (149 rows):
+
+| Verdict | Count |
+|---|---|
+| MATCH | 31 |
+| PARTIAL | 104 |
+| MISMATCH | 5 |
+| MISSING | 3 |
+| SUPERSEDED | 6 (R-98 and R-108 proposed; R-22's suspend-all part proposed) |
+| UNVERIFIED | 0 |
+
+- 19 verdicts moved against the preliminary inventory.
+- 5 new rows come from the completeness critic (R-145…R-149).
+
+**Status since the checkpoint was written** (now at the top of `CHECKPOINT.md`):
+- OpenAI credits are restored: outbox drained, 0 credit errors in 6h.
+- Q32: notes done; the wrapper brake is not recommended.
+- Q33: decided.
+- Q34: watchdog re-armed, and Kirill decides on or off.
+
+## 2026-10-13 11:50 UTC · Kirill's Phase A checkpoint answers; A3 integration started
+
+**Kirill's answers:**
+- **Checkpoint:** accept all recommendations.
+  - Q32: Aura's notes were updated; the aura-github merge brake is not adopted, and the hard gate is WP-16's recorded-approval merge.
+  - Q33: decided earlier.
+- **Watchdog:** keep it on until WP-08.
+
+**A3 workflow** (`phaseA-a3-integrate`, run `wf_88f75f35-c5a`):
+1. Record Q1–Q35 in `decisions.md` and update `final.json` and `VISION_CONFORMANCE.md`.
+2. Integrate the 135 triage items, WP-38, WP-39, the spec corrections and the ordering proposals into `work-packages.md` and `ordering.md`.
+3. An adversarial completeness critic checks the result, followed by a fix pass if it finds gaps.
+
+**Backups** of the three plan files were taken before the change (`.work-packages.bak-preA3-*` and the like).
+
+## 2026-10-13 17:15 UTC · Usage-limit interruption; batch 4 fix round and A3 integration resumed
+
+**Batch 4** (run `wf_46c97127-932`):
+- **Implementer:** done. 8 commits for WP01-31…38.
+  - The 15 mutation probes, all in scratch copies, fail for the intended reason.
+  - A full run under CPU load (4 busy loops in the harness scope): 1301 passed, 1 skipped, node 58/58, leftovers 0.
+- **Correctness reviewer:** approve, with 3 non-blocking points.
+- **Closure reviewer:** changes, with one blocking finding. The fast-context concurrency test missed serialised legs awaited in another order.
+- **Fixer:** committed six fixes (`e485237`, `7fd4aae`, `10521f9`, `4f94101`, `f3e50a0`, `5bde670`), including the blocking one, before the usage limit stopped it. The tree is clean, and `git diff 434538a -- app/` is empty. Resumed for its verification and the re-review.
+- **Open:** the correctness reviewer could not run `LAYOUT=live` (the permission classifier refused it as a production read). My deterministic verify will run it.
+
+**A3:**
+- **Decisions agent:** done. Q1–Q35 are recorded as K-13…K-34 (scope or behaviour) and D-15…D-27 (minor rulings).
+  - Verdict totals unchanged: R-100 went from MATCH to PARTIAL (K-29, WP-06), and R-106 from PARTIAL to MATCH (D-18 waiver).
+  - All 6 SUPERSEDED rows now rest on Kirill's decisions.
+- **Integrate agent:** interrupted. Resumed.
+
+## 2026-10-13 18:16 UTC · A3 complete and verified; WP-38 finished; WP-17/18 order made consistent
+
+**A3** (run `wf_88f75f35-c5a`, 5 agents):
+
+| Step | Result |
+|---|---|
+| Decisions | K-13…K-34 and D-15…D-27 |
+| Integration | All 133 triage items placed under "Phase A additions (A3)" in their WPs; full sections for WP-31a…WP-39; spec corrections (WP-03, 04a, 16, 23, 27, 36); retirements in WP-29; 25 new shared-file rows; ordering rules 21–35 |
+| Critic | 8 gaps: 15 non-MATCH rows not named in their home WP, 3 scope extensions not recorded, stale gap text, WP-38 status, the Phase 0 `direct_max_running` text, rule 35's ambiguity, and rule 22 not reflected |
+| Fix, then re-verify | complete |
+
+**Every** PARTIAL, MISMATCH and MISSING row now has a written home that names it.
+
+**WP-38's last step:** Aura's `TOOLS.md` and `AGENTS.md` said that a deploy "sends Kirill a note with the link". That has been false since PR #19 (`150126b`): a successful deploy records its result silently, and only rolled-back, blocked, failed or postponed deploys tell Kirill. The sentence now says exactly that. Backup: `/root/.openclaw/archive/workspace-notes-20261013T181519Z`. WP-38 is done.
+
+**WP-17/WP-18 order:** the integration flagged that rule 9 (WP-18, the single `openclaw.json` writer, before WP-17; plan hard-ordering rule 7) conflicted with the Phase 3 list, the §3 rows and the summary rows. All of them now follow rule 9:
+- the Phase 3 list puts WP-18 before WP-17;
+- §3: `index.js` 11 → 18 → 17 → …; `upgrade_openclaw.sh` 18 → 17; host `openclaw.json` 18 (writer) → 17 → 27;
+- WP-17's dependencies now include WP-18, and WP-18 no longer depends on WP-17.
+
+This follows the approved plan, so it is not a new decision for Kirill.
+
+## 2026-10-13 18:16 UTC · Ledger synced with Phase A
+
+**Requirements:** all 149 rows carry their Phase A verdict and home WP. 5 new (R-145…R-149).
+
+| Status | Count |
+|---|---|
+| closed-match | 31 |
+| closed-superseded | 6 |
+| open | 112 |
+
+The 45 former `pending-confirmation` rows were preliminary MATCH and SUPERSEDED verdicts. Phase A settled them: 25 MATCH, 6 SUPERSEDED, and 14 reopened as gaps.
+
+**Triage:** 135 `TRI-*` items added, each with its owner WP.
+- TRI-128, TRI-129 and TRI-130 are closed.
+- 57 seed risks are absorbed into their triage item's home WP.
+
+**Ledger totals:**
+
+| Status | Count |
+|---|---|
+| Total items | 572 |
+| open | 510 |
+| closed | 11 |
+| closed-match | 31 |
+| closed-superseded | 6 |
+| closed-no-action | 13 |
+| closed-refuted | 1 |
+
+Next: Phase B, the complementary code audit (read-only), in CI and deploy waits, and the docs PR for `VISION_CONFORMANCE.md` after WP-01.
+
+## 2026-10-13 22:31 UTC · WP-01 batch 4 approved (Tier 1, round 2); orphaned test server stopped; harness hardened
+
+**Batch 4** (run `wf_46c97127-932`):
+
+| Round | Correctness reviewer | Closure reviewer | Fixer |
+|---|---|---|---|
+| 1 | approve, 3 non-blocking | changes: 1 blocking (fast-context serialised legs missed in another order), 4 non-blocking | 6 fixes: `e485237`, `7fd4aae`, `10521f9`, `4f94101`, `f3e50a0`, `5bde670` |
+| 2 | approve, non-blocking only | approve, non-blocking only | no code change; deferred 3 programme-level points to me |
+
+The round-3 re-review was cut off by the usage limit. It would have reviewed unchanged code, so the batch counts as approved at round 2.
+
+**The 3 deferred points, all handled:**
+1. **`LAYOUT=live` was never run by an agent.** The permission classifier refused it as a production read. I run it in my deterministic verify.
+2. **An orphaned Temporal test server**, pid 200460, had been running for 3 d 20 h in a private-netns harness scope (`run-re142a05….scope`) left over from an agent's interrupted run. That scope was stopped.
+3. **A side finding for WP-25:** in production, `obscura_available()` inside the catalog step child always returns False (the sandbox refuses httpx's environment read). Ledger item `WP01-sidefinding-obscura-sandbox` (home WP-25). Spec D-7's premise was corrected in the runner's docstring (`7fd4aae`).
+
+**Harness hardening (`verify.sh`):**
+- Each run uses a named scope (`rmp-verify-<pid>-<rand>`), and the scope is stopped on any exit. Processes a run leaves behind are listed, killed, and fail the run.
+- A failing test run now still prints the leftover, placeholder and ignored-file reports. Before, `set -e` stopped the script at the failing `systemd-run` status, which is why batch 3's failing live run printed no `verify:` line.
+- Probed on a scratch copy with a deliberately failing test: full report, `verify: exit 1`.
+
+**My four-layout verify of batch 4 is running.**
+
+## 2026-10-13 23:12 UTC · WP-01 batch 4 verified in four layouts
+
+**My deterministic verify on `5bde670`:**
+
+| Layout | pytest | node | Leftovers | Stray processes | Placeholder grep | Ignored files | Result |
+|---|---|---|---|---|---|---|---|
+| Default | 1302 passed, 1 skipped (opt-in Qdrant only) | 58/58 | 0 | none | clean | none | exit 0 |
+| `LAYOUT=live` (go-live) | 1302 passed, 1 skipped | — | 0 | none | clean | none | exit 0 |
+| `LAYOUT=coding-job` | 1302 passed, 1 skipped | — | 0 | none | clean | none | exit 0 |
+| `LAYOUT=direct` | 1302 passed, 1 skipped | — | 0 | none | clean | none | exit 0 |
+
+`git diff 434538a -- app/` is empty: no production code changes, so the deploy restarts nothing.
+
+**Test counts across WP-01:**
+
+| Point | pytest |
+|---|---|
+| Baseline | 1118 passed, 4 skipped |
+| After batch 1 | 1159 |
+| After batch 2 | 1235 |
+| After batch 3 | 1247 (web-stack tests moved out) |
+| After batch 4 | 1302 |

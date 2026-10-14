@@ -6,16 +6,18 @@ reply is judged for novelty, and only an accepted follow-up reaches Kirill.
 import asyncio
 import uuid
 from datetime import timedelta
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 from temporalio import activity, workflow
 from temporalio.exceptions import ApplicationError
-from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from app.orchestrator.completion_rework import RECALL_NOTICE, RECALL_UNCONFIRMED_NOTICE
+from app.workflows.catalog import get_template
+from app.workflows.catalog_step_child import CatalogStepChildWorkflow
 from app.workflows.catalog_task import CatalogTaskWorkflow
 from app.workflows.generic_task import GenericTaskWorkflow
+from tests import temporal_env
 from tests.test_generic_workflow_judgment import Recorder
 
 QUEUE = "two-phase-tests"
@@ -113,7 +115,7 @@ async def _run(rec: TwoPhase, **overrides) -> Dict[str, Any]:
                "recovered_draft": DRAFT, "rework_max_attempts": 20, "strategy_change_attempt": 10,
                "escalate_user_attempt": 20, "deep_recall": ON}
     payload.update(overrides)
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    async with await temporal_env.time_skipping() as env:
         async with Worker(env.client, task_queue=QUEUE, workflows=[GenericTaskWorkflow, ScriptedRecall],
                           activities=rec.activities()):
             return await env.client.execute_workflow(
@@ -293,22 +295,85 @@ class CatalogRun(TwoPhase):
                 register_artifact]
 
 
-async def _run_catalog(rec: CatalogRun, **overrides) -> Dict[str, Any]:
+# Aura's draft for each step of the login template, and the facts block its predicates read.
+STEP_DRAFTS = {
+    "inspect_login": "The sign-in page at example-shop.com/login asks for an email and a password, with no CAPTCHA.",
+    "submit_login": "Submitted the sign-in form with the saved email and password, and the site accepted them.",
+    "verify_session": "Logged in: the account dashboard shows the order history, and a session cookie is set.",
+}
+STEP_FACTS = '\n\n```json\n{"facts": {"step_complete": true}}\n```'
+
+
+class RealStepRun(CatalogRun):
+    """The catalog run with the real step child: the activities it calls are scripted, and Aura answers each step."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.steps: List[Tuple[str, str]] = []
+
+    def activities(self):
+        rec = self
+
+        @activity.defn(name="record_step")
+        async def record_step(payload: Dict[str, Any]) -> str:
+            rec.steps.append((payload["step_name"], payload.get("status", "started")))
+            return f"step-{payload['step_name']}"
+
+        @activity.defn(name="acquire_process_run_lease")
+        async def acquire_process_run_lease(payload: Dict[str, Any]) -> Dict[str, Any]:
+            return {"acquired": True, "lease_owner": payload["owner"]}
+
+        @activity.defn(name="send_to_openclaw")
+        async def send_to_openclaw(payload: Dict[str, Any]) -> Dict[str, Any]:
+            rec.prompts.append(payload["message"])
+            step, _status = rec.steps[-1]
+            return {"result": {"payloads": [{"text": STEP_DRAFTS[step] + STEP_FACTS}]}}
+
+        @activity.defn(name="validate_openclaw_output")
+        async def validate_openclaw_output(payload: Dict[str, Any]) -> Dict[str, Any]:
+            return {"is_valid": True, "text": payload["text"]}
+
+        @activity.defn(name="record_observation")
+        async def record_observation(payload: Dict[str, Any]) -> str:
+            return "o1"
+
+        @activity.defn(name="release_process_run_lease")
+        async def release_process_run_lease(payload: Dict[str, Any]) -> Dict[str, Any]:
+            return {"released": True}
+
+        @activity.defn(name="write_episodic_observation")
+        async def write_episodic_observation(payload: Dict[str, Any]) -> str:
+            return ""
+
+        kept = [fn for fn in super().activities() if fn.__name__ != "send_to_openclaw"]
+        return [*kept, record_step, acquire_process_run_lease, send_to_openclaw, validate_openclaw_output,
+                record_observation, release_process_run_lease, write_episodic_observation]
+
+
+async def _run_catalog(rec: CatalogRun, *, record=None, real_steps=False, **overrides) -> Dict[str, Any]:
+    """The login template on the time-skipping server, its steps run by ScriptedStep or, with ``real_steps``, by the
+    real step child. With ``record``, the run is recorded under that scenario name, with its step children when they
+    are real."""
     payload = {"task_id": "t1", "intent": "Log in to my example-shop.com account.", "process_type": "login",
                "session_key": "agent:main:slack:channel:d0test", "task_type": "login", "tags": ["user-request"],
                "rework_max_attempts": 20, "strategy_change_attempt": 10, "escalate_user_attempt": 20,
                "deep_recall": ON}
     payload.update(overrides)
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        async with Worker(env.client, task_queue=QUEUE, workflows=[CatalogTaskWorkflow, ScriptedStep, ScriptedRecall],
-                          activities=rec.activities()):
-            return await env.client.execute_workflow(
+    step = CatalogStepChildWorkflow if real_steps else ScriptedStep
+    async with await temporal_env.time_skipping() as env:
+        async with Worker(env.client, task_queue=QUEUE, workflows=[CatalogTaskWorkflow, step, ScriptedRecall],
+                          activities=rec.activities(), workflow_runner=temporal_env.WORKFLOW_RUNNER):
+            result = await env.client.execute_workflow(
                 CatalogTaskWorkflow.run, payload, id=rec.parent_id, task_queue=QUEUE)
+            if record:
+                await temporal_env.record_run(env.client, record, rec.parent_id,
+                                              children=(CatalogStepChildWorkflow,) if real_steps else ())
+            return result
 
 
 async def test_a_catalog_task_reads_the_recall_from_the_next_step_boundary():
     rec = CatalogRun(verdicts=["accept"], recall_delay=0, recall_during_first_step=True)
-    result = await _run_catalog(rec)
+    result = await _run_catalog(rec, record="recall_at_step_boundary")
     assert result["status"] == "completed"
     assert list(rec.step_memory) == ["inspect_login", "submit_login", "verify_session"]
     assert "DEEP RECALL" not in rec.step_memory["inspect_login"]
@@ -320,7 +385,19 @@ async def test_a_catalog_task_reads_the_recall_from_the_next_step_boundary():
 
 async def test_a_catalog_task_lets_a_late_recall_go_without_a_follow_up():
     rec = CatalogRun(verdicts=["accept"], recall_delay=600, novelty=ADDS)
-    result = await _run_catalog(rec, deep_recall={**ON, "deadline_sec": 900})
+    result = await _run_catalog(rec, record="late_recall_let_go", deep_recall={**ON, "deadline_sec": 900})
     assert result["status"] == "completed" and rec.kinds == ["reply"]
     assert not any("DEEP RECALL" in m for m in rec.step_memory.values())
     assert rec.novelty_asked == [] and rec.settled == [{"consumed_by": "none", "status": "cancelled"}]
+
+
+async def test_a_catalog_task_runs_each_step_in_the_real_step_child():
+    rec = RealStepRun(verdicts=["accept"])
+    result = await _run_catalog(rec, record="real_step_children", real_steps=True, deep_recall={**ON, "enabled": False})
+    assert result["status"] == "completed"
+    assert rec.steps == [("inspect_login", "started"), ("inspect_login", "completed"),
+                         ("submit_login", "started"), ("submit_login", "completed"),
+                         ("verify_session", "started"), ("verify_session", "completed")]
+    login = get_template("login").steps
+    assert len(rec.prompts) == len(login) == 3
+    assert [step.prompt in prompt for step, prompt in zip(login, rec.prompts)] == [True, True, True]

@@ -1,5 +1,6 @@
 """Direct memory-model client: streaming, timeouts, fallback, breaker, budget, lane, ledger."""
 import asyncio
+import dataclasses
 import json
 from typing import List
 
@@ -26,6 +27,8 @@ FAST = od.LanePolicy(
     nvidia_gap_sec=0.2,
     breaker_cooldown_sec=30.0,
 )
+# A first-output budget no host is slow enough to miss; the 0.2 s gap still applies once output has started.
+PATIENT = dataclasses.replace(FAST, openai_first_output_sec=30.0)
 
 
 class _Stream(httpx.AsyncByteStream):
@@ -150,9 +153,11 @@ async def test_openai_structured_success_records_ledger_and_frees_lane(env):
 
 
 @pytest.mark.asyncio
-async def test_reasoning_silence_before_output_is_within_first_output_budget(env):
+async def test_reasoning_silence_before_output_is_within_first_output_budget(env, monkeypatch):
+    monkeypatch.setattr(od, "lane_policy", lambda: PATIENT)
+
     async def handler(request):
-        # 0.25 s of silence after the lifecycle events: longer than the 0.2 s gap, inside 0.3 s.
+        # 0.25 s of silence after the lifecycle events: longer than the 0.2 s gap, inside the first-output budget.
         return httpx.Response(200, stream=openai_stream(json.dumps(GOOD), delay_before_output=0.25))
 
     install(handler)
@@ -161,9 +166,12 @@ async def test_reasoning_silence_before_output_is_within_first_output_budget(env
 
 
 @pytest.mark.asyncio
-async def test_silence_while_the_model_reasons_is_within_the_first_output_budget(env):
+async def test_silence_while_the_model_reasons_is_within_the_first_output_budget(env, monkeypatch):
+    monkeypatch.setattr(od, "lane_policy", lambda: PATIENT)
+
     async def handler(request):
-        # The reasoning item opens at once, then 0.25 s of thinking: longer than the 0.2 s gap, inside 0.3 s.
+        # The reasoning item opens at once, then 0.25 s of thinking: longer than the 0.2 s gap, inside the
+        # first-output budget.
         return httpx.Response(200, stream=openai_stream(json.dumps(GOOD), reasoning=0.25))
 
     install(handler)
@@ -248,7 +256,10 @@ async def test_non_retryable_openai_error_skips_second_attempt(env):
 
 
 @pytest.mark.asyncio
-async def test_breaker_opens_after_repeated_outages_and_fails_fast(env):
+async def test_breaker_opens_after_repeated_outages_and_fails_fast(env, monkeypatch):
+    # No pacing between NVIDIA dispatches: each call's NVIDIA attempt is sent at once, never cut off by the call's
+    # deadline while it waits for its turn.
+    monkeypatch.setattr(qb, "DEFAULT_MIN_INTERVAL_SEC", 0.0)
     calls = []
 
     async def handler(request):
