@@ -1,6 +1,7 @@
 """Session discovery on the API path, as in production: a DM that arrives on agent:main:main belongs to the Slack DM
 conversation in OpenClaw's session store, and the main session's active-task lookup finds it there."""
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from app.api import server
 from app.db.models import Base, Task
 from app.task_registry.session_identity import MAIN_SESSION
 
+REPO = Path(__file__).resolve().parents[1]
 DM = "agent:main:slack:channel:d0seeded"
 KEY = "session-identity-key"
 
@@ -74,3 +76,12 @@ async def test_a_dm_on_the_main_session_is_stored_under_the_slack_dm_and_main_fi
 
     active = (await client.get(f"/sessions/{MAIN_SESSION}/active_task")).json()["active_task"]
     assert active == {"id": task_id, "status": "created", "goal": "What is on my calendar today?"}
+
+
+def test_no_app_module_reads_pytest_current_test():
+    """Production code runs the same under pytest: no module under app/ asks whether a test is running."""
+    modules = sorted(REPO.glob("app/**/*.py"))
+    assert REPO / "app" / "api" / "server.py" in modules
+    readers = [path.relative_to(REPO).as_posix() for path in modules
+               if "PYTEST_CURRENT_TEST" in path.read_text(encoding="utf-8")]
+    assert readers == []
