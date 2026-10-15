@@ -1,6 +1,6 @@
 """Session discovery on the API path, as in production: a DM that arrives on agent:main:main belongs to the Slack DM
-conversation in OpenClaw's session store, not to a Slack channel there, and the main session's active-task lookup finds
-it."""
+conversation in OpenClaw's session store, not to a Slack channel there, and the main session's active-task lookups, the
+API's and intake's, find it."""
 import json
 from pathlib import Path
 
@@ -14,6 +14,7 @@ from app import config, openclaw_sessions
 from app.activities import db_activities
 from app.api import server
 from app.db.models import Base, Task
+from app.task_registry import retriever
 from app.task_registry.session_identity import MAIN_SESSION
 from tests.openclaw97 import Store97
 
@@ -84,6 +85,10 @@ async def test_a_dm_on_the_main_session_is_stored_under_the_slack_dm_and_main_fi
 
     active = (await client.get(f"/sessions/{MAIN_SESSION}/active_task")).json()["active_task"]
     assert active == {"id": task_id, "status": "created", "goal": "What is on my calendar today?"}
+    assert (await client.get(f"/sessions/{MAIN_SESSION}/active_user_task")).json()["active_task"] == active
+    async with factory() as s:
+        snapshot = await retriever.fetch_active_tasks(session_key=MAIN_SESSION, db=s)
+    assert [row["task_id"] for row in snapshot] == [task_id]
 
 
 def test_no_app_module_reads_pytest_current_test():
