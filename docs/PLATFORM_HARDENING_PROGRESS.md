@@ -933,3 +933,144 @@ The round-3 re-review was cut off by the usage limit. It would have reviewed unc
 | After batch 2 | 1235 |
 | After batch 3 | 1247 (web-stack tests moved out) |
 | After batch 4 | 1302 |
+
+## 2026-10-13 23:14 UTC · WP-01 batch 4 PR opened; Phase B discovery started
+
+**PR #29** (https://github.com/Hyper-AI-Lab/openclaw-jev/pull/29), head `aura/wp-01-4-replay-foundation`.
+- `origin/main` was unchanged at `434538a`, and no other PR was open.
+- Fixture key counts: generic_task 5, generic_execute_child 5, intake_workflow 6, catalog_task 6, catalog_step_child 3, deep_recall 5, coding_task 6 (existing), generic before_two_phase 4 (existing).
+
+**Phase B discovery** (workflow `phaseB-find`, run `wf_c76aa674-bd6`), started in the CI wait:
+- **Scope:** 7 read-only agents in sequence, auditing `/root/work/audit-main`, which now sits at `434538a`.
+- **Agents:**
+  - B1: placeholders, stubs and dead flags;
+  - B2a: settings and status vocabularies;
+  - B2b: routes, registrations, manifests and units;
+  - B3a: untested app modules;
+  - B3b: untested ops tools;
+  - B4a and B4b: triage of the 76 open seed risks homed in "Phase B4 triage".
+- **Outputs:** `program/phaseB/candidates-*.json`.
+- **Next:** two-skeptic verification of these candidates and of Phase A's 130 open triage candidates.
+
+**Ledger state before Phase B:**
+
+| Kind | Open |
+|---|---|
+| Findings | 81 |
+| Second-pass items | 54 |
+| Seed risks | 133 (76 still awaiting triage) |
+| Phase A triage items | 130 |
+| Requirements | 112 |
+| Incident findings | 1 |
+
+## 2026-10-14 03:12 UTC · WP-01 batch 4 merged; spec amendment 2 (WP01-39, TRI-001) as batch 5
+
+**PR #29:** CI green, and the job log confirms the run:
+- the guard printed "no change under app/workflows";
+- unit tests: 1302 passed, 1 skipped;
+- node: 56 pass, 2 skipped (the root-only tests on the non-root runner);
+- web-stack: 5 passed.
+
+`origin/main` was unchanged at `434538a`. Squash-merged as `b8d064a`; the deploy is being watched.
+
+**Spec amendment 2 (WP01-39):** A3 placed TRI-001 in WP-01, and Kirill adopted it (D-25b). A tested CI guard, `progress_log_guard.py`, refuses any PR that rewrites, removes or renames existing lines of `docs/*_PROGRESS.md` or `docs/history/*_PROGRESS.md`, unless the PR carries the `progress-log-rewrite` label. The comparison starts at the merge base. This is **batch 5**, Tier 1. WP-01 closes after it.
+
+## 2026-10-14 03:17 UTC · WP-01 batch 4 deployed; batch 5 started
+
+**Batch 4:** `b8d064a` deployed at 03:17Z. Nothing restarted; health, readiness and canary ok. **Rollback:** revert `b8d064a`.
+
+**Batch 5:**
+- **Branch:** `aura/wp-01-5-progress-log-guard`, from `b8d064a`.
+- **Workflow:** `wp01-batch` (run `wf_643dcfa1-a11`), Tier 1.
+- **Item:** WP01-39, the progress-log append-only guard.
+
+## 2026-10-14 08:12 UTC · Usage-limit interruption; batch 5 and Phase B discovery resumed
+
+**Batch 5:** the implementer had committed `89b4f81` (the guard and its tests), `7366ca2` (the CI step) and `8b1aac2` (the `CLAUDE.md` line) before the limit hit. The tree is clean, and `app/` is unchanged. Resumed (run `wf_643dcfa1-a11`).
+
+**Phase B discovery:** 6 of 7 agents done. Raw candidate findings: B1 11, B2a 5, B2b 4, B3a 2, B3b 8, B4a 18. B4b (second half of the seed risks) is resumed.
+
+## 2026-10-14 08:52 UTC · Phase B discovery complete; one high finding confirmed; verification started
+
+**Discovery** (run `wf_c76aa674-bd6`, 7 agents): 62 candidates (1 high, 12 med, 49 low).
+
+| Agent | Candidates |
+|---|---|
+| B1 | 11 |
+| B2a | 5 |
+| B2b | 4 |
+| B3a | 2 |
+| B3b | 8 |
+| B4a | 18 |
+| B4b | 14 |
+
+**High: B3b-01, confirmed by me read-only.** `ops/restore_backup.sh:38-40` restores `rmp_db` as the `rmp` role with `dropdb`, then `createdb`, then `pg_restore`.
+- `pg_roles` shows `rmp` with `rolcreatedb=false` and `rolsuper=false`, and `rmp` owns `rmp_db`.
+- So `dropdb` succeeds and `createdb` fails: the documented restore leaves RMP with **no database**.
+- Nobody has run that path; the PR #25 drill covered Qdrant only.
+- Ledger `B3b-01` (home WP-12), set as the **first item of WP-12**: restore `rmp_db` through the postgres superuser with `pg_restore --clean --if-exists`, as for the Temporal databases, proven by a scratch restore drill.
+
+**Verification** (workflow `phaseB-verify`, run `wf_3a966276-a4b`): 5 batches, each checked by two independent skeptics (one reproduces the claim; one checks impact, duplicates and home WP). A candidate is confirmed only if both uphold it.
+- A first launch (`w15uu3c3c`) went out with placeholder arguments. I stopped it and relaunched with the real batch list (`phaseB/verify-batches-phaseB.json`).
+
+The Phase A finding candidates (about 86 TRI items carrying new findings or completeness rows) follow in a second verification run.
+
+## 2026-10-15 03:25 UTC · Batch 5 round 1 fixed (rollback-revert case); Phase B verification half done; both resumed
+
+**Batch 5** (run `wf_643dcfa1-a11`):
+- **Implementer:** 3 commits, 8 mutation probes in scratch copies, harness green in default, coding-job and direct layouts (1313 passed, 1 skipped).
+- **Round 1, correctness reviewer: one blocking finding.** RMP's automatic rollback revert (`deploy.py:403-409`, `_publish_revert`) removes the progress-log lines the reverted PRs appended. Every programme PR appends one, so the new guard would refuse the revert PR with no guidance. Reproduced on a scratch rollback of `b8d064a`.
+- **Round 1, closure reviewer:** approve, with test-strength points.
+- **Fix:**
+  - `922e409`: the refusal and `CLAUDE.md` name the rollback case. The revert PR needs the `progress-log-rewrite` label and a merge commit, not a squash, so that `watch_main` resumes. This follows the D-10 pattern, and a test covers it.
+  - `e8e5831`: tests pin fail-closed, the byte-prefix rule, every file named, and an unrelated label.
+  - `f9b495b`: pass-message wording.
+- **Round 2:** the correctness reviewer approves (non-blocking: a revert of a workflow-changing programme PR needs both labels). The closure re-review was cut off by the usage limit, and the run is resumed.
+
+**Phase B verification** (run `wf_3a966276-a4b`):
+- **B01:** 11 confirmed, 1 possible (B1-11, which overlaps debt-scalability-17).
+- **B02:** 12 confirmed. Severity corrected for B3b-01 (med, already set as WP-12's first item) and for B2b-01, B2b-02 and B3a-01 (med). Homes corrected (WP-08, WP-09, WP-12, WP-17, WP-31b, WP-34), with ordering notes.
+- **B03:** the impact skeptic was cut off. The run is resumed for B03–B05.
+
+## 2026-10-15 04:31 UTC · Phase B verification complete; findings in the ledger; spec amendment 3
+
+**Phase B verification** (run `wf_3a966276-a4b`, 10 agents, two independent skeptics per batch):
+- 62 candidates → **60 confirmed, 2 possible** (B1-11, which overlaps debt-scalability-17; B4-intake-R6, which overlaps R-44), **0 refuted**.
+- Severity after verification: 8 med and 54 low. B3b-01 stays high, as the programme's own check showed.
+- Output: `phaseB/findings-phaseB.json`. All 62 are now ledger items (`phaseB-finding`), each with the skeptics' home WP.
+
+| Home WP | Findings |
+|---|---|
+| WP-29 | 10 |
+| WP-09 | 7 |
+| WP-12, WP-17, WP-34 | 5 each |
+| WP-08 | 4 |
+| WP-31b, WP-24, WP-33 | 3 each |
+| Others | 1–2 each |
+
+- **Seed risks:** the 30 confirmed by B4 point to their finding (`absorbed_by`). The other open "Phase B4 triage" seed risks were refuted or merged in B4's coverage notes; they are closed when the Phase B integration runs.
+
+**Spec amendment 3 (WP01-40, from B1-04):** production code turns session discovery off under pytest (`PYTEST_CURRENT_TEST` at `server.py:499,1132,1156` and `retriever.py:83`), so no API or intake test runs the production branch. The checks are removed, with a seeded-store API test and a grep test. This is **batch 6**, Tier 1, and restarts api and worker.
+
+**Next:** finish batch 5 (my four-layout verify is running), then batch 6, then close WP-01. Phase B findings are integrated into `work-packages.md` as "Phase B additions" per WP.
+
+## 2026-10-15 04:37 UTC · WP-01 batch 5 approved (Tier 1, round 3) and verified in four layouts
+
+**Review** (run `wf_643dcfa1-a11`):
+
+| Round | Correctness | Closure | Fixes |
+|---|---|---|---|
+| 1 | changes: the rollback-revert case | approve | `922e409`, `e8e5831`, `f9b495b` |
+| 2 | approve | approve | non-blocking: `a5f6cc2` (`CLAUDE.md`: a rollback revert of a change that also touched `app/workflows` needs both labels) |
+| 3 | approve, 0 issues | approve, 0 issues | — |
+
+**My verify on `a5f6cc2`** (all `verify: exit 0`):
+
+| Layout | pytest | node | Leftovers | Placeholder grep | Ignored files |
+|---|---|---|---|---|---|
+| Default | 1317 passed, 1 skipped | 58/58 | 0 | clean | none |
+| live | 1317 passed, 1 skipped | — | 0 | clean | none |
+| coding-job | 1317 passed, 1 skipped | — | 0 | clean | none |
+| direct | 1317 passed, 1 skipped | — | 0 | clean | none |
+
+No `app/` change, so the deploy restarts nothing.
