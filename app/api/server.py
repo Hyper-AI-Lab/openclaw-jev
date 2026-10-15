@@ -496,7 +496,6 @@ async def create_task(
     request.session_key = persist_user_session_key(
         request.session_key,
         task_type=task_type,
-        discover=not os.environ.get("PYTEST_CURRENT_TEST"),
     )
 
     from app.task_registry.recurrence import derive_recurrence_key, derive_task_kind
@@ -1128,9 +1127,7 @@ async def approve_task(task_id: str, signal: SignalRequest):
 async def get_active_task(session_key: str, db: AsyncSession = Depends(get_db)):
     from app.task_registry.session_identity import active_task_lookup_keys
 
-    lookup = active_task_lookup_keys(
-        session_key, discover=not os.environ.get("PYTEST_CURRENT_TEST")
-    ) or [session_key]
+    lookup = active_task_lookup_keys(session_key) or [session_key]
     result = await db.execute(
         select(Task)
         .where(
@@ -1152,9 +1149,7 @@ async def get_active_task(session_key: str, db: AsyncSession = Depends(get_db)):
 async def get_active_user_task(session_key: str, db: AsyncSession = Depends(get_db)):
     from app.task_registry.session_identity import active_task_lookup_keys
 
-    lookup = active_task_lookup_keys(
-        session_key, discover=not os.environ.get("PYTEST_CURRENT_TEST")
-    ) or [session_key]
+    lookup = active_task_lookup_keys(session_key) or [session_key]
     result = await db.execute(
         select(Task)
         .where(
