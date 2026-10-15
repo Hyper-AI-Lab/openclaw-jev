@@ -1,5 +1,6 @@
 """Session discovery on the API path, as in production: a DM that arrives on agent:main:main belongs to the Slack DM
-conversation in OpenClaw's session store, and the main session's active-task lookup finds it there."""
+conversation in OpenClaw's session store, not to a Slack channel there, and the main session's active-task lookup finds
+it."""
 import json
 from pathlib import Path
 
@@ -18,18 +19,21 @@ from tests.openclaw97 import Store97
 
 REPO = Path(__file__).resolve().parents[1]
 DM = "agent:main:slack:channel:d0seeded"
+CHANNEL = "agent:main:slack:channel:c0seeded"
 KEY = "session-identity-key"
 
 
 @pytest.fixture
 def seeded_dm():
-    """The Slack DM session in OpenClaw's SQLite agent store, the format production reads (it has no sessions.json),
-    under the suite's temporary OPENCLAW_HOME, which is empty until a test seeds it."""
+    """The Slack DM session, next to a Slack channel that sorts before it, in OpenClaw's SQLite agent store, the format
+    production reads (it has no sessions.json), under the suite's temporary OPENCLAW_HOME, which is empty until a test
+    seeds it."""
     db = openclaw_sessions.AGENT_DB_PATH
     assert not openclaw_sessions.SESSIONS_JSON_PATH.exists() and not db.exists()
     db.parent.mkdir(parents=True, exist_ok=True)
     store = Store97(db)
     store.session(MAIN_SESSION, "main-session")
+    store.session(CHANNEL, "channel-session")
     store.session(DM, "dm-session")
     store.con.close()
     yield DM
