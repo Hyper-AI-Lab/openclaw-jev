@@ -1074,3 +1074,113 @@ The Phase A finding candidates (about 86 TRI items carrying new findings or comp
 | direct | 1317 passed, 1 skipped | — | 0 | clean | none |
 
 No `app/` change, so the deploy restarts nothing.
+
+## 2026-10-15 05:06 UTC · Phase B integrated into the plan (B5)
+
+**Workflow `phaseB-integrate`** (run `wf_97bebc76-9cd`): integrate, critic, fix.
+
+**Plan:** all 62 findings are in `work-packages.md` under "Phase B additions (B5)" in their home WP. B3b-01 is first in WP-12, and B1-04 points to WP01-40.
+
+| Home WP | Findings |
+|---|---|
+| WP-29 | 10 |
+| WP-09 | 7 |
+| WP-12, WP-17, WP-34 | 5 each |
+| WP-08 | 4 |
+| WP-24, WP-31b, WP-33 | 3 each |
+| Others | 1–2 each |
+
+- Sub-part bullets were added where a finding spans two WPs.
+- `ordering.md` gains **rules 36–42** (B2b-01 before Qdrant auth and WP-10's limit; B2b-02 before the config-writing tickets that ship through `self_deploy`; the fail-level readiness rule until B2b-03; key-rotation prerequisites; 04a before B2a-05; WP-01 before B1-01; canary_sentinel order).
+- The §3 shared-file rows were completed after the critic: `coding_task.py` now includes 16, for B1-01's `patched` gate, and 29.
+
+**Seed risks:** all 58 still homed in "Phase B4 triage" are settled.
+
+| Disposition | Count |
+|---|---|
+| closed-refuted, with reasons | 23 |
+| closed-merged, with `merged_into` | 20 |
+| confirmed, homed from their finding | 15 |
+
+No seed risk remains without a home.
+
+**For Kirill at the next checkpoint:** B4-deep-memory-R15 (under R-74). After its fix, Aura refuses to store an access code even when Kirill asks her to keep it. This needs his ruling before WP-20.
+
+**Ledger:**
+
+| Measure | Count |
+|---|---|
+| Total items | 635 |
+| Open | 530 |
+| closed-match | 31 |
+| closed-refuted | 24 |
+| closed-merged | 20 |
+| closed-no-action | 13 |
+| closed | 11 |
+| closed-superseded | 6 |
+
+Open by kind: Phase A triage 130, requirements 112, seed risks 90 (all with a home), findings 81, Phase B findings 62, second-pass 54, incident 1.
+
+**Phase B is complete.**
+
+## 2026-10-15 05:12 UTC · WP-01 batch 5 merged and deployed; batch 6 started
+
+**PR #30:** CI green. The job log shows the new step on the PR itself: "Progress logs unchanged or appended to since the merge base: …", which covers the programme's own append. The workflow guard printed "no change under app/workflows". Unit tests: 1317 passed. Node: 56 pass. Web-stack: 5 passed.
+- `origin/main` was unchanged at `b8d064a`. Squash-merged as `ac45721`.
+
+**WP01-39 host step:** label `progress-log-rewrite` created.
+
+**Deploy:** `ac45721` deployed; nothing restarted; health, readiness and canary ok. **Rollback:** revert `ac45721`.
+
+**Batch 6:** branch `aura/wp-01-6-no-test-mode-in-app` from `ac45721`. Item WP01-40 (amendment 3, Phase B B1-04), Tier 1.
+
+## 2026-10-15 05:13 UTC · WP-02 spec started in parallel with WP-01 batch 6
+
+**WP-01 batch 6:** WP01-40, run `wf_3e48058f-101`, Tier 1.
+
+**WP-02 spec:** a reusable workflow `wp-spec` (run `wf_851d285f-c75`) runs a spec writer, an adversarial critic and a revision. It writes `program/specs/WP-02.md`, Systemd units and mirror convergence.
+- Ledger items homed in WP-02: debt-scalability-07, ops-deploy-R11, TRI-002 (pointer; moved to WP-08 by K-34), B4b-02.
+- Plus every bullet, A3/B5 addition and conformance row in its section.
+
+**After WP-01 closes:** the docs-only PR with `VISION_CONFORMANCE.md` (Phase A deliverable A2), then WP-02.
+
+## 2026-10-15 08:21 UTC · Usage-limit interruption; batch 6 and WP-02 spec resumed
+
+Both runs hit the usage limit before making any change (the batch-6 clone is clean, and `git diff ac45721 -- app/` is empty). Both are resumed: batch 6 as `wf_3e48058f-101`, the WP-02 spec as `wf_851d285f-c75`.
+
+## 2026-10-15 09:28 UTC · WP-02 spec written, critiqued and revised
+
+**`program/specs/WP-02.md`** (run `wf_851d285f-c75`): 17 items in 4 batches. No open questions.
+
+**Deferrals,** each to the WP whose scope owns it: TRI-002 → WP-08; TRI-045 → WP-17; TRI-026 and B2b-01 → WP-12; B4b-01 and TRI-024 → WP-09; memory drop-ins → WP-10; the web-backends user → WP-19; retention timer → WP-27; the `aura_web` start hint → WP-25; and others.
+
+**Critic: revise.** Gaps closed in the revision:
+- WP-15 interaction: after deploys stop installing units, a firewall unit change needs an explicit idle-window restart.
+- WP-02 holds the queue from batch 1's merge until batch 3's host steps are logged, with a pre-merge blob and mode comparison of every mirrored file. If a plugin file differs, Kirill is asked (gateway restart, K-4).
+- Newly added units get a logged start step.
+- Disable rule.
+- Unit changes merge and install before the code that needs them.
+- The install command prints each changed unit's last commit, and the operator reviews the diff before `--apply` (AS-04).
+- The §8 serialisation row now includes WP-03, WP-05, WP-15 and WP-29.
+
+I review the spec before WP-02's batch 1.
+
+## 2026-10-15 16:37 UTC · WP-01 batch 6 approved (Tier 1) and verified in four layouts
+
+**Batch 6** (run `wf_3e48058f-101`, WP01-40):
+- **Implementer:** the four `PYTEST_CURRENT_TEST` switches are gone (`server.py` and `retriever.py`, 3+/11−). New `tests/test_session_identity_api.py` and a grep test.
+- **Round 1, closure reviewer: one blocking finding.** The test seeded a legacy `sessions.json`, but production reads OpenClaw's SQLite agent store.
+- **Fixes:** the test now seeds the SQLite agent store (`1111e48`), adds a channel key so discovery's DM preference is checked end to end (`f211c00`), checks `active_user_task` and the intake snapshot (`8fe4964`), and cleans up a partly seeded store (`0a6a6a6`).
+- **Rounds 2 and 3:** both reviewers approve.
+- **Rejected as out of scope:** the now-orphaned `discover` parameter in `session_identity`. Ledger `WP01-40-orphan-discover`, home WP-29.
+
+**My verify on `0a6a6a6`** (all `verify: exit 0`):
+
+| Layout | pytest | node | Leftovers | Placeholder grep | Ignored files |
+|---|---|---|---|---|---|
+| Default | 1319 passed, 1 skipped | 58/58 | 0 | clean | none |
+| live | 1319 passed, 1 skipped | — | 0 | clean | none |
+| coding-job | 1319 passed, 1 skipped | — | 0 | clean | none |
+| direct | 1319 passed, 1 skipped | — | 0 | clean | none |
+
+**Deploy:** restarts `rmp-api` and `rmp-worker`. Production behaviour is unchanged, because discovery was always on there.
