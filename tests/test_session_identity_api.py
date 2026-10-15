@@ -32,13 +32,15 @@ def seeded_dm():
     db = openclaw_sessions.AGENT_DB_PATH
     assert not openclaw_sessions.SESSIONS_JSON_PATH.exists() and not db.exists()
     db.parent.mkdir(parents=True, exist_ok=True)
-    store = Store97(db)
-    store.session(MAIN_SESSION, "main-session")
-    store.session(CHANNEL, "channel-session")
-    store.session(DM, "dm-session")
-    store.con.close()
-    yield DM
-    db.unlink()
+    try:
+        store = Store97(db)
+        store.session(MAIN_SESSION, "main-session")
+        store.session(CHANNEL, "channel-session")
+        store.session(DM, "dm-session")
+        store.con.close()
+        yield DM
+    finally:
+        db.unlink(missing_ok=True)
 
 
 @pytest.fixture
