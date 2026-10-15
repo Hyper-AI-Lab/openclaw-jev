@@ -14,6 +14,7 @@ from app.activities import db_activities
 from app.api import server
 from app.db.models import Base, Task
 from app.task_registry.session_identity import MAIN_SESSION
+from tests.openclaw97 import Store97
 
 REPO = Path(__file__).resolve().parents[1]
 DM = "agent:main:slack:channel:d0seeded"
@@ -22,14 +23,17 @@ KEY = "session-identity-key"
 
 @pytest.fixture
 def seeded_dm():
-    """The Slack DM session in the session store under the suite's temporary OPENCLAW_HOME, which is empty until a
-    test seeds it."""
-    store = openclaw_sessions.SESSIONS_JSON_PATH
-    assert not store.exists()
-    store.parent.mkdir(parents=True, exist_ok=True)
-    store.write_text(json.dumps({MAIN_SESSION: {"sessionId": "main-session"}, DM: {"sessionId": "dm-session"}}))
+    """The Slack DM session in OpenClaw's SQLite agent store, the format production reads (it has no sessions.json),
+    under the suite's temporary OPENCLAW_HOME, which is empty until a test seeds it."""
+    db = openclaw_sessions.AGENT_DB_PATH
+    assert not openclaw_sessions.SESSIONS_JSON_PATH.exists() and not db.exists()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    store = Store97(db)
+    store.session(MAIN_SESSION, "main-session")
+    store.session(DM, "dm-session")
+    store.con.close()
     yield DM
-    store.unlink()
+    db.unlink()
 
 
 @pytest.fixture
