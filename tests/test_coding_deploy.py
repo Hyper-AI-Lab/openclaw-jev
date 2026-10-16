@@ -336,6 +336,18 @@ def test_a_live_main_with_commits_github_lacks_is_never_deployed_over(repos):
     assert result["status"] == "blocked" and "lacks" in result["summary"] and git(repos.live, "rev-parse", "main") == local
 
 
+def test_a_hand_edit_in_any_mirror_blocks_a_deploy_of_githubs_main(repos):
+    rule = repos.mirror[".cursor/rules/"] / "r.mdc"
+    rule.write_text("edited by hand\n")
+    head = repos.change({"app/a.py": "A = 2\n"})
+    git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "blocked" and ".cursor/rules/r.mdc" in result["summary"]
+    assert git(repos.live, "rev-parse", "main") == repos.old and rule.read_text() == "edited by hand\n"
+    assert not [c for c in host.calls if c[0] == "systemctl"]
+
+
 def test_a_reviewed_change_whose_pull_request_fails_ci_deploys_nothing(repos):
     head = repos.change({"app/a.py": "A = 2\n"})
     host = FakeHost(repos.live, lands=["failure"])
