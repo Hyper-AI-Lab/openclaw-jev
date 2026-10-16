@@ -238,6 +238,23 @@ def test_a_reconcile_restores_a_mirror_files_mode(repos):
                                                                "rmp-worker")]
 
 
+def test_an_executable_mirror_file_lands_at_0755_and_is_then_left_alone(repos):
+    write(repos.live, {"web-stack/run-local.sh": "#!/bin/sh\n"})
+    (repos.live / "web-stack" / "run-local.sh").chmod(0o755)
+    repos.old = commit(repos.live, "an executable the mirror never got")
+    head = repos.change({"app/a.py": "A = 2\n"})
+    assert deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)["status"] == "deployed"
+    script = repos.mirror["web-stack/"] / "run-local.sh"
+    assert oct(script.stat().st_mode & 0o777) == oct(0o755) and script.read_text() == "#!/bin/sh\n"
+
+    repos.old = head
+    head = repos.change({"app/a.py": "A = 3\n"})
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
+    assert oct(script.stat().st_mode & 0o777) == oct(0o755)
+    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "rmp-api", "rmp-worker")]
+
+
 def test_a_missing_mirror_file_is_restored_not_refused(repos):
     index = repos.mirror["plugins/"] / "p" / "index.js"
     index.unlink()
