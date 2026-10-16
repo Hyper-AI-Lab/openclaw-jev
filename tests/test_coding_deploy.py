@@ -17,8 +17,8 @@ from app.coding import deploy, verify, workspace
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = {"app/a.py": "A = 1\n", "worker.py": "W = 1\n", "requirements.txt": "x==1\n", "plugins/p/index.js": "v1\n",
-        "plugins/p/old.js": "gone soon\n", "web-stack/backends/w.py": "W = 1\n", "systemd/aura-x.service": "[Service]\n",
-        ".cursor/rules/r.mdc": "rule v1\n", "docs/d.md": "docs\n"}
+        "plugins/p/old.js": "gone soon\n", "web-stack/backends/w.py": "W = 1\n",
+        "ops/systemd/aura-x.service": "[Service]\n", ".cursor/rules/r.mdc": "rule v1\n", "docs/d.md": "docs\n"}
 
 
 def git(cwd, *args):
@@ -50,11 +50,13 @@ def repos(tmp_path, monkeypatch):
     git(live, "push", "-q", "origin", "main")
     git(tmp_path, "clone", "-q", "--bare", str(live), str(review))
     mirrors = []
-    for prefix in ("plugins/", "web-stack/", "systemd/", ".cursor/rules/"):
+    for prefix in ("plugins/", "web-stack/", ".cursor/rules/"):
         target = tmp_path / "mirror" / prefix.strip("/").replace("/", "_")
         for path, text in BASE.items():
             if path.startswith(prefix):
                 write(target, {path[len(prefix):]: text})
+                # The committed mode, whatever the umask: RMP's own test runs use 0077.
+                (target / path[len(prefix):]).chmod(0o644)
         mirrors.append((prefix, target))
     monkeypatch.setattr(deploy, "MIRRORS", tuple(mirrors))
 
@@ -136,13 +138,52 @@ def test_a_reviewed_change_lands_through_a_pull_request_then_syncs_and_restarts_
     assert ("checks", services, ("telemetry",)) in host.calls
 
 
-def test_requirements_and_units_are_installed_before_the_restart(repos):
-    head = repos.change({"requirements.txt": "x==2\n", "systemd/aura-x.service": "[Service]\nNice=5\n"})
+def test_requirements_are_installed_before_the_restart_and_unit_files_are_not(repos):
+    head = repos.change({"requirements.txt": "x==2\n", "ops/systemd/aura-x.service": "[Service]\nNice=5\n"})
     host = FakeHost(repos.live)
     assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
     assert [c for c in host.calls if c[0] in ("systemctl", "pip")] == [
-        ("pip",), ("systemctl", "daemon-reload"), ("systemctl", "restart", "aura-x", "rmp-api", "rmp-worker")]
-    assert (repos.mirror["systemd/"] / "aura-x.service").read_text() == "[Service]\nNice=5\n"
+        ("pip",), ("systemctl", "restart", "rmp-api", "rmp-worker")]
+
+
+def test_a_unit_file_change_is_never_installed_or_restarted(repos, monkeypatch):
+    target = repos.tmp / "etc-systemd-system"
+    target.mkdir()
+    monkeypatch.setattr(deploy, "UNIT_TARGET", target)
+    head = repos.change({"ops/systemd/aura-x.service": "[Service]\nNice=5\n", "systemd/aura-y.service": "[Service]\n"})
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
+    assert list(target.iterdir()) == []
+    assert not [c for c in host.calls if c[0] == "systemctl"]
+
+
+def test_a_deploy_that_changes_a_unit_file_names_it(repos):
+    head = repos.change({"ops/systemd/aura-x.service": "[Service]\nNice=5\n"})
+    result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed" and result["units"] == ["aura-x.service"]
+    assert result["summary"].endswith("Files under ops/systemd/ changed (aura-x.service): the deploy does not "
+                                      "install them; an operator reviews them and runs ops/install_units.py, then "
+                                      "with --apply, in an idle window.")
+
+    repos.old = head
+    head = repos.change({"ops/systemd/enabled-units.txt": "aura-x.service\n"})
+    result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed" and result["units"] == ["enabled-units.txt"]
+    assert "(enabled-units.txt)" in result["summary"]
+
+    repos.old = head
+    head = repos.change({"ops/systemd/z.service": "[Service]\n", "ops/systemd/a.service.d/10-x.conf": "[Service]\n"},
+                        deletes=["ops/systemd/aura-x.service"])
+    result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed"
+    assert result["units"] == ["a.service.d/10-x.conf", "aura-x.service", "z.service"]
+
+    repos.old = head
+    head = repos.change({"ops/systemd/aura-x.service": "[Service]\nNice=10\n"})
+    host = FakeHost(repos.live, checks=[{"failure": "health failed", "canary": None},
+                                        {"failure": None, "canary": "ok"}])
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and "units" not in result and "ops/systemd/" not in result["summary"]
 
 
 def test_a_hand_edited_mirror_blocks_the_deploy_before_main_moves(repos):
@@ -162,6 +203,72 @@ def test_a_mirror_that_is_only_behind_is_updated(repos):
     head = repos.change({"web-stack/backends/w.py": "W = 3\n"})
     result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
     assert result["status"] == "deployed" and (repos.mirror["web-stack/"] / "backends" / "w.py").read_text() == "W = 3\n"
+
+
+def test_a_full_reconcile_converges_a_stale_mirror_file_outside_the_change(repos):
+    write(repos.live, {"web-stack/backends/w.py": "W = 2\n"})
+    repos.old = commit(repos.live, "a change the mirror never got")
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert result["status"] == "deployed"
+    assert (repos.mirror["web-stack/"] / "backends" / "w.py").read_text() == "W = 2\n"
+    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "aura-web-backends", "rmp-api",
+                                                               "rmp-worker")]
+
+
+def test_a_hand_edit_in_a_mirror_the_change_does_not_touch_blocks_the_deploy(repos):
+    (repos.mirror[".cursor/rules/"] / "r.mdc").write_text("edited by hand\n")
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert result["status"] == "blocked" and ".cursor/rules/r.mdc" in result["summary"]
+    assert git(repos.live, "rev-parse", "main") == repos.old == git(repos.origin, "rev-parse", "main")
+    assert not [c for c in host.calls if c[0] in ("systemctl", "land")]
+
+
+def test_a_reconcile_restores_a_mirror_files_mode(repos):
+    index = repos.mirror["plugins/"] / "p" / "index.js"
+    index.chmod(0o600)
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
+    assert oct(index.stat().st_mode & 0o777) == oct(0o644) and index.read_text() == "v1\n"
+    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "openclaw-gateway", "rmp-api",
+                                                               "rmp-worker")]
+
+
+def test_an_executable_mirror_file_lands_at_0755_and_is_then_left_alone(repos):
+    write(repos.live, {"web-stack/run-local.sh": "#!/bin/sh\n"})
+    (repos.live / "web-stack" / "run-local.sh").chmod(0o755)
+    repos.old = commit(repos.live, "an executable the mirror never got")
+    head = repos.change({"app/a.py": "A = 2\n"})
+    assert deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)["status"] == "deployed"
+    script = repos.mirror["web-stack/"] / "run-local.sh"
+    assert oct(script.stat().st_mode & 0o777) == oct(0o755) and script.read_text() == "#!/bin/sh\n"
+
+    repos.old = head
+    head = repos.change({"app/a.py": "A = 3\n"})
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
+    assert oct(script.stat().st_mode & 0o777) == oct(0o755)
+    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "rmp-api", "rmp-worker")]
+
+
+def test_a_missing_mirror_file_is_restored_not_refused(repos):
+    index = repos.mirror["plugins/"] / "p" / "index.js"
+    index.unlink()
+    (repos.mirror["plugins/"] / "p" / "notes.txt").write_text("the host's own file\n")
+    head = repos.change({"plugins/p/old.js": "still here\n"})
+    result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed" and index.read_text() == "v1\n"
+    assert (repos.mirror["plugins/"] / "p" / "old.js").read_text() == "still here\n"
+    assert (repos.mirror["plugins/"] / "p" / "notes.txt").read_text() == "the host's own file\n"
+
+
+def test_a_live_copy_git_cannot_read_fails_with_gits_reason(repos):
+    with pytest.raises(RuntimeError, match="^git hash-object --no-filters failed: .*absent"):
+        deploy.blob_ids(repos.live, [repos.tmp / "absent"])
 
 
 def test_failed_checks_revert_main_at_once_restore_the_mirrors_restart_and_land_the_revert_by_merge_commit(repos):
@@ -212,6 +319,7 @@ def test_a_deploy_of_githubs_main_ships_the_commit_ci_passed_and_then_finds_noth
     host = FakeHost(repos.live)
     result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
     assert result["status"] == "deployed" and result["commits"] == ["the approved change"] and "pr" not in result
+    assert result["units"] == [] and "ops/systemd/" not in result["summary"]
     assert git(repos.live, "rev-parse", "main") == head and not [c for c in host.calls if c[0] == "land"]
     assert [c for c in host.calls if c[:2] == ("systemctl", "restart")] == [("systemctl", "restart", "rmp-api", "rmp-worker")]
 
@@ -226,6 +334,18 @@ def test_a_live_main_with_commits_github_lacks_is_never_deployed_over(repos):
     local = commit(repos.live, "a commit only the live repo has")
     result = deploy.self_deploy(main_spec(head), FakeHost(repos.live), log=lambda m: None)
     assert result["status"] == "blocked" and "lacks" in result["summary"] and git(repos.live, "rev-parse", "main") == local
+
+
+def test_a_hand_edit_in_any_mirror_blocks_a_deploy_of_githubs_main(repos):
+    rule = repos.mirror[".cursor/rules/"] / "r.mdc"
+    rule.write_text("edited by hand\n")
+    head = repos.change({"app/a.py": "A = 2\n"})
+    git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "blocked" and ".cursor/rules/r.mdc" in result["summary"]
+    assert git(repos.live, "rev-parse", "main") == repos.old and rule.read_text() == "edited by hand\n"
+    assert not [c for c in host.calls if c[0] == "systemctl"]
 
 
 def test_a_reviewed_change_whose_pull_request_fails_ci_deploys_nothing(repos):
@@ -402,14 +522,16 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
     assert db.get.return_value.supplementary_context == {"a": 1, "coding_deploy": payload["report"]["shipped"]}
 
 
-def run_github_unit(tmp_path, monkeypatch, status):
-    """Run the deploy unit for a deploy of GitHub's main that ends in ``status``; what it recorded, said and started."""
+def run_github_unit(tmp_path, monkeypatch, status, **fields):
+    """Run the deploy unit for a deploy of GitHub's main that ends in ``status``, with any further result ``fields``;
+    what it recorded, said and started."""
     module_spec = importlib.util.spec_from_file_location("coding_deploy", ROOT / "ops" / "coding_deploy.py")
     unit = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(unit)
     monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
     monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
-        "status": status, "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Deployed cccccccccccc."})
+        "status": status, "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Deployed cccccccccccc.",
+        **fields})
     monkeypatch.setattr(unit.deploy, "Host", lambda: None)
     added = []
     db = SimpleNamespace(add=added.append, get=AsyncMock(return_value=None), commit=AsyncMock())
@@ -439,9 +561,21 @@ def run_github_unit(tmp_path, monkeypatch, status):
     return code, notes
 
 
-@pytest.mark.parametrize("status, code", [("deployed", 0), ("unchanged", 1)])
-def test_a_deploy_of_githubs_main_that_is_live_is_recorded_without_telling_kirill(tmp_path, monkeypatch, status, code):
-    assert run_github_unit(tmp_path, monkeypatch, status) == (code, [])
+@pytest.mark.parametrize("status, code, fields", [("deployed", 0, {}), ("deployed", 0, {"units": []}),
+                                                  ("unchanged", 1, {})])
+def test_a_deploy_of_githubs_main_that_is_live_is_recorded_without_telling_kirill(tmp_path, monkeypatch, status, code,
+                                                                                  fields):
+    assert run_github_unit(tmp_path, monkeypatch, status, **fields) == (code, [])
+
+
+def test_a_live_deploy_that_changed_unit_files_still_tells_kirill(tmp_path, monkeypatch):
+    summary = ("Deployed cccccccccccc. Files under ops/systemd/ changed (aura-x.service): the deploy does not install "
+               "them; an operator reviews them and runs ops/install_units.py, then with --apply, in an idle window.")
+    code, notes = run_github_unit(tmp_path, monkeypatch, "deployed", units=["aura-x.service"], summary=summary)
+    assert code == 0 and len(notes) == 1
+    note, incident = notes[0]
+    assert note.startswith("Aura's change is live.") and "aura-x.service" in note
+    assert incident == "deploy:main:cccccccccccc"
 
 
 @pytest.mark.parametrize("status, headline", [
