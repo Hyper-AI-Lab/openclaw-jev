@@ -40,7 +40,8 @@ import pytest
 PathArg = Union[str, bytes, os.PathLike]
 
 # Any access, read or write: the host's production state and secrets, and the live targets of a deploy
-# (deploy.MIRRORS writes unit files and Cursor rules; deploy.CODE_RELOAD_LOCK is the host's code-reload lock).
+# (deploy.MIRRORS writes plugins, web-stack and Cursor rules; /etc/systemd/system is deploy.UNIT_TARGET, which no
+# deploy writes; deploy.CODE_RELOAD_LOCK is the host's code-reload lock).
 DENIED_ROOTS = (
     "/root/.openclaw",
     "/etc/openclaw",

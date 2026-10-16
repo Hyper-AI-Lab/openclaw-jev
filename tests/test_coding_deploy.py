@@ -17,7 +17,7 @@ from app.coding import deploy, verify, workspace
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = {"app/a.py": "A = 1\n", "worker.py": "W = 1\n", "requirements.txt": "x==1\n", "plugins/p/index.js": "v1\n",
-        "plugins/p/old.js": "gone soon\n", "web-stack/backends/w.py": "W = 1\n", "systemd/aura-x.service": "[Service]\n",
+        "plugins/p/old.js": "gone soon\n", "web-stack/backends/w.py": "W = 1\n", "ops/systemd/aura-x.service": "[Service]\n",
         ".cursor/rules/r.mdc": "rule v1\n", "docs/d.md": "docs\n"}
 
 
@@ -50,7 +50,7 @@ def repos(tmp_path, monkeypatch):
     git(live, "push", "-q", "origin", "main")
     git(tmp_path, "clone", "-q", "--bare", str(live), str(review))
     mirrors = []
-    for prefix in ("plugins/", "web-stack/", "systemd/", ".cursor/rules/"):
+    for prefix in ("plugins/", "web-stack/", ".cursor/rules/"):
         target = tmp_path / "mirror" / prefix.strip("/").replace("/", "_")
         for path, text in BASE.items():
             if path.startswith(prefix):
@@ -136,13 +136,23 @@ def test_a_reviewed_change_lands_through_a_pull_request_then_syncs_and_restarts_
     assert ("checks", services, ("telemetry",)) in host.calls
 
 
-def test_requirements_and_units_are_installed_before_the_restart(repos):
-    head = repos.change({"requirements.txt": "x==2\n", "systemd/aura-x.service": "[Service]\nNice=5\n"})
+def test_requirements_are_installed_before_the_restart_and_unit_files_are_not(repos):
+    head = repos.change({"requirements.txt": "x==2\n", "ops/systemd/aura-x.service": "[Service]\nNice=5\n"})
     host = FakeHost(repos.live)
     assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
     assert [c for c in host.calls if c[0] in ("systemctl", "pip")] == [
-        ("pip",), ("systemctl", "daemon-reload"), ("systemctl", "restart", "aura-x", "rmp-api", "rmp-worker")]
-    assert (repos.mirror["systemd/"] / "aura-x.service").read_text() == "[Service]\nNice=5\n"
+        ("pip",), ("systemctl", "restart", "rmp-api", "rmp-worker")]
+
+
+def test_a_unit_file_change_is_never_installed_or_restarted(repos, monkeypatch):
+    target = repos.tmp / "etc-systemd-system"
+    target.mkdir()
+    monkeypatch.setattr(deploy, "UNIT_TARGET", target)
+    head = repos.change({"ops/systemd/aura-x.service": "[Service]\nNice=5\n", "systemd/aura-y.service": "[Service]\n"})
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
+    assert list(target.iterdir()) == []
+    assert not [c for c in host.calls if c[0] == "systemctl"]
 
 
 def test_a_hand_edited_mirror_blocks_the_deploy_before_main_moves(repos):

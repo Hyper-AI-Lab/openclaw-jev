@@ -88,7 +88,7 @@ def test_the_review_shows_rmps_evidence_and_cuts_a_long_diff():
     (["worker.py", "requirements.txt"], ["rmp-api", "rmp-worker"]),
     (["plugins/aura_web/index.js"], ["openclaw-gateway"]),
     (["web-stack/server.py", "docs/CONCEPT_TREE.md"], ["aura-web-backends"]),
-    (["systemd/aura-coder-firewall.service", "systemd/rmp-janitor.timer"], ["aura-coder-firewall", "rmp-janitor.timer"]),
+    (["ops/systemd/aura-coder-firewall.service", "systemd/rmp-janitor.timer"], []),
     (["docs/x.md", "tests/test_x.py", "ops/x.sh", ".cursor/rules/rmp-architecture.mdc", "application.md"], []),
 ])
 def test_a_deploy_restarts_only_what_the_change_touches(paths, services):

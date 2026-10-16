@@ -21,7 +21,7 @@ import subprocess
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from app.coding import github, verify, workspace
@@ -46,18 +46,18 @@ SERVICE_PATHS = (
 MIRRORS = (
     ("plugins/", Path("/root/.openclaw/plugins")),
     ("web-stack/", Path("/root/.openclaw/web-stack")),
-    ("systemd/", Path("/etc/systemd/system")),
     (".cursor/rules/", Path("/root/.cursor/rules")),
 )
+# The tracked unit files and where systemd reads them. No deploy writes there: an operator installs them.
+UNIT_DIR = "ops/systemd/"
+UNIT_TARGET = Path("/etc/systemd/system")
 
 
 def restarts_for(paths: Iterable[str]) -> List[str]:
-    """The services a deploy restarts: the API and worker for app code, a changed unit under systemd/ itself."""
+    """The services a deploy restarts: the API and worker for app code, the gateway for plugins, the web backends for
+    the web stack. A unit file restarts nothing: the deploy never installs one."""
     services = set()
     for path in paths:
-        if path.startswith("systemd/") and path.endswith((".service", ".timer")):
-            name = PurePosixPath(path).name
-            services.add(name.removesuffix(".service"))
         for prefix, units in SERVICE_PATHS:
             if path == prefix or (prefix.endswith("/") and path.startswith(prefix)):
                 services.update(units)
@@ -334,8 +334,6 @@ def _apply(host: Host, old: str, new: str, changed: List[Tuple[str, str]]) -> Li
     if "requirements.txt" in paths:
         host.pip_install()
     services = restarts_for(paths)
-    if any(path.startswith("systemd/") for path in paths):
-        host.systemctl("daemon-reload")
     if services:
         host.systemctl("restart", *services)
     return services
