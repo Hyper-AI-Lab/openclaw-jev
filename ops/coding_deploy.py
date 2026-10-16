@@ -5,8 +5,8 @@ Started with a spec in the task's runs directory: by the coding workflow's deplo
 job's approved commit, or by RMP's watcher (``aura-deploy-main``) for a commit of GitHub's main that CI
 passed. It holds the code-reload lock for the whole deploy, runs ``app.coding.deploy.self_deploy`` and
 records the result. Then a reviewed job gets a fresh run of its workflow, which sends Aura's judged reply on
-the new code; a deploy of GitHub's main sends Kirill a note with its pull requests' links only when it did not
-go live (rolled back, blocked, failed, postponed).
+the new code; a deploy of GitHub's main sends Kirill a note with its pull requests' links when it did not go
+live (rolled back, blocked, failed, postponed) or when it changed files under ``ops/systemd/``, which it never installs.
 """
 import asyncio
 import fcntl
@@ -28,7 +28,8 @@ from app.production.ops_notify import notify_ops_slack  # noqa: E402
 from app.temporal_control import connect_temporal  # noqa: E402
 
 TASK_QUEUE = "openclaw-tasks"
-QUIET = ("deployed", "unchanged")  # a deploy of GitHub's main that is live needs no note; the Event records it
+# A deploy of GitHub's main that is live needs no note, unless it changed unit files; the Event records it.
+QUIET = ("deployed", "unchanged")
 
 
 def log(message: str) -> None:
@@ -36,7 +37,8 @@ def log(message: str) -> None:
 
 
 async def finish(spec: dict, result: dict) -> None:
-    """Record the result on the task, then start the run that replies, or tell Kirill when Aura's own deploy is not live."""
+    """Record the result on the task, then start the run that replies, or tell Kirill when Aura's own deploy is not live
+    or changed unit files."""
     task_id = spec["task_id"]
     try:
         async with AsyncSessionLocal() as db:
@@ -49,7 +51,7 @@ async def finish(spec: dict, result: dict) -> None:
     finally:
         await engine.dispose()
     if spec.get("source") == "github":
-        if result["status"] not in QUIET:
+        if result["status"] not in QUIET or result.get("units"):
             note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
             await notify_ops_slack(note, incident_id=f"deploy:{task_id}:{(result.get('head') or '')[:12]}")
             log("told Kirill")

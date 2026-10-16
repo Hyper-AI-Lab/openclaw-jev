@@ -155,6 +155,27 @@ def test_a_unit_file_change_is_never_installed_or_restarted(repos, monkeypatch):
     assert not [c for c in host.calls if c[0] == "systemctl"]
 
 
+def test_a_deploy_that_changes_a_unit_file_names_it(repos):
+    head = repos.change({"ops/systemd/aura-x.service": "[Service]\nNice=5\n"})
+    result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed" and result["units"] == ["aura-x.service"]
+    assert result["summary"].endswith("Files under ops/systemd/ changed (aura-x.service): the deploy does not install "
+                                      "them; an operator reviews them and runs ops/install_units.py, then with --apply, "
+                                      "in an idle window.")
+
+    repos.old = head
+    head = repos.change({"ops/systemd/enabled-units.txt": "aura-x.service\n"})
+    result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed" and result["units"] == ["enabled-units.txt"]
+    assert "(enabled-units.txt)" in result["summary"]
+
+    repos.old = head
+    head = repos.change({"ops/systemd/aura-x.service": "[Service]\nNice=10\n"})
+    host = FakeHost(repos.live, checks=[{"failure": "health failed", "canary": None}, {"failure": None, "canary": "ok"}])
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and "units" not in result and "ops/systemd/" not in result["summary"]
+
+
 def test_a_hand_edited_mirror_blocks_the_deploy_before_main_moves(repos):
     (repos.mirror["plugins/"] / "p" / "index.js").write_text("patched by hand\n")
     head = repos.change({"plugins/p/index.js": "v2\n"})
@@ -222,6 +243,7 @@ def test_a_deploy_of_githubs_main_ships_the_commit_ci_passed_and_then_finds_noth
     host = FakeHost(repos.live)
     result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
     assert result["status"] == "deployed" and result["commits"] == ["the approved change"] and "pr" not in result
+    assert result["units"] == [] and "ops/systemd/" not in result["summary"]
     assert git(repos.live, "rev-parse", "main") == head and not [c for c in host.calls if c[0] == "land"]
     assert [c for c in host.calls if c[:2] == ("systemctl", "restart")] == [("systemctl", "restart", "rmp-api", "rmp-worker")]
 
@@ -412,14 +434,16 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
     assert db.get.return_value.supplementary_context == {"a": 1, "coding_deploy": payload["report"]["shipped"]}
 
 
-def run_github_unit(tmp_path, monkeypatch, status):
-    """Run the deploy unit for a deploy of GitHub's main that ends in ``status``; what it recorded, said and started."""
+def run_github_unit(tmp_path, monkeypatch, status, **fields):
+    """Run the deploy unit for a deploy of GitHub's main that ends in ``status``, with any further result ``fields``;
+    what it recorded, said and started."""
     module_spec = importlib.util.spec_from_file_location("coding_deploy", ROOT / "ops" / "coding_deploy.py")
     unit = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(unit)
     monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
     monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
-        "status": status, "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Deployed cccccccccccc."})
+        "status": status, "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Deployed cccccccccccc.",
+        **fields})
     monkeypatch.setattr(unit.deploy, "Host", lambda: None)
     added = []
     db = SimpleNamespace(add=added.append, get=AsyncMock(return_value=None), commit=AsyncMock())
@@ -449,9 +473,21 @@ def run_github_unit(tmp_path, monkeypatch, status):
     return code, notes
 
 
-@pytest.mark.parametrize("status, code", [("deployed", 0), ("unchanged", 1)])
-def test_a_deploy_of_githubs_main_that_is_live_is_recorded_without_telling_kirill(tmp_path, monkeypatch, status, code):
-    assert run_github_unit(tmp_path, monkeypatch, status) == (code, [])
+@pytest.mark.parametrize("status, code, fields", [("deployed", 0, {}), ("deployed", 0, {"units": []}),
+                                                  ("unchanged", 1, {})])
+def test_a_deploy_of_githubs_main_that_is_live_is_recorded_without_telling_kirill(tmp_path, monkeypatch, status, code,
+                                                                                  fields):
+    assert run_github_unit(tmp_path, monkeypatch, status, **fields) == (code, [])
+
+
+def test_a_live_deploy_that_changed_unit_files_still_tells_kirill(tmp_path, monkeypatch):
+    summary = ("Deployed cccccccccccc. Files under ops/systemd/ changed (aura-x.service): the deploy does not install "
+               "them; an operator reviews them and runs ops/install_units.py, then with --apply, in an idle window.")
+    code, notes = run_github_unit(tmp_path, monkeypatch, "deployed", units=["aura-x.service"], summary=summary)
+    assert code == 0 and len(notes) == 1
+    note, incident = notes[0]
+    assert note.startswith("Aura's change is live.") and "aura-x.service" in note
+    assert incident == "deploy:main:cccccccccccc"
 
 
 @pytest.mark.parametrize("status, headline", [

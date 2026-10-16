@@ -394,9 +394,12 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
                **({"pr": landed["pr"]} if landed else {})}
     if failure is None:
         canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
-        return {"status": "deployed", **shipped, "canary": checked["canary"],
+        units = sorted(path[len(UNIT_DIR):] for _, path in changed if path.startswith(UNIT_DIR))
+        installs = (f" Files under {UNIT_DIR} changed ({', '.join(units)}): the deploy does not install them; an operator "
+                    "reviews them and runs ops/install_units.py, then with --apply, in an idle window." if units else "")
+        return {"status": "deployed", **shipped, "canary": checked["canary"], "units": units,
                 "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
-                f"readiness passed and {canary}."}
+                f"readiness passed and {canary}.{installs}"}
     log(f"verification failed: {failure}; reverting")
     _git(live, "revert", "--no-edit", "--no-commit", f"{old}..{head}")
     _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit", "--quiet",
