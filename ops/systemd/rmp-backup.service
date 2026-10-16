@@ -1,0 +1,11 @@
+[Unit]
+Description=RMP daily backup
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /root/.openclaw/rmp/ops/backup.sh
+User=root
+
+[Install]
+WantedBy=multi-user.target

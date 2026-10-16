@@ -1,0 +1,17 @@
+[Unit]
+Description=Aura web-stack FastAPI backends (local venv)
+After=network.target aura-obscura.service
+Wants=aura-obscura.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/web-stack/backends
+EnvironmentFile=-/etc/openclaw/openclaw.env
+Environment=PYTHONPATH=/root/.openclaw/web-stack/backends
+Environment=OBSCURA_CDP_URL=http://127.0.0.1:9222
+ExecStart=/root/.openclaw/web-stack/backends/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8791
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

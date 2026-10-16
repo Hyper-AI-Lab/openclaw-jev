@@ -1,0 +1,11 @@
+[Unit]
+Description=RMP canary failure sentinel
+After=network.target rmp-api.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/rmp/rmp.env
+ExecStart=/bin/bash /root/.openclaw/rmp/ops/canary_sentinel.sh scheduled
+
+[Install]
+WantedBy=multi-user.target

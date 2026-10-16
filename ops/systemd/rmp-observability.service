@@ -1,0 +1,14 @@
+[Unit]
+Description=RMP observability stack (OTel Collector + Phoenix)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/root/.openclaw/rmp/ops/start_observability.sh
+ExecStop=/root/.openclaw/rmp/ops/stop_observability.sh
+
+[Install]
+WantedBy=multi-user.target

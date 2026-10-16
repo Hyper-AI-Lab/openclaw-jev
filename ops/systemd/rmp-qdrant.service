@@ -1,0 +1,14 @@
+[Unit]
+Description=RMP Qdrant vector store (Docker)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/root/.openclaw/rmp/ops/start_qdrant.sh
+ExecStop=/root/.openclaw/rmp/ops/stop_qdrant.sh
+
+[Install]
+WantedBy=multi-user.target
