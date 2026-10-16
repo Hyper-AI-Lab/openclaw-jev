@@ -55,6 +55,8 @@ def repos(tmp_path, monkeypatch):
         for path, text in BASE.items():
             if path.startswith(prefix):
                 write(target, {path[len(prefix):]: text})
+                # The committed mode, whatever the umask: RMP's own test runs use 0077.
+                (target / path[len(prefix):]).chmod(0o644)
         mirrors.append((prefix, target))
     monkeypatch.setattr(deploy, "MIRRORS", tuple(mirrors))
 
@@ -193,6 +195,49 @@ def test_a_mirror_that_is_only_behind_is_updated(repos):
     head = repos.change({"web-stack/backends/w.py": "W = 3\n"})
     result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
     assert result["status"] == "deployed" and (repos.mirror["web-stack/"] / "backends" / "w.py").read_text() == "W = 3\n"
+
+
+def test_a_full_reconcile_converges_a_stale_mirror_file_outside_the_change(repos):
+    write(repos.live, {"web-stack/backends/w.py": "W = 2\n"})
+    repos.old = commit(repos.live, "a change the mirror never got")
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and (repos.mirror["web-stack/"] / "backends" / "w.py").read_text() == "W = 2\n"
+    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "aura-web-backends", "rmp-api",
+                                                               "rmp-worker")]
+
+
+def test_a_hand_edit_in_a_mirror_the_change_does_not_touch_blocks_the_deploy(repos):
+    (repos.mirror[".cursor/rules/"] / "r.mdc").write_text("edited by hand\n")
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert result["status"] == "blocked" and ".cursor/rules/r.mdc" in result["summary"]
+    assert git(repos.live, "rev-parse", "main") == repos.old == git(repos.origin, "rev-parse", "main")
+    assert not [c for c in host.calls if c[0] in ("systemctl", "land")]
+
+
+def test_a_reconcile_restores_a_mirror_files_mode(repos):
+    index = repos.mirror["plugins/"] / "p" / "index.js"
+    index.chmod(0o600)
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
+    assert oct(index.stat().st_mode & 0o777) == oct(0o644) and index.read_text() == "v1\n"
+    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "openclaw-gateway", "rmp-api",
+                                                               "rmp-worker")]
+
+
+def test_a_missing_mirror_file_is_restored_not_refused(repos):
+    index = repos.mirror["plugins/"] / "p" / "index.js"
+    index.unlink()
+    (repos.mirror["plugins/"] / "p" / "notes.txt").write_text("the host's own file\n")
+    head = repos.change({"plugins/p/old.js": "still here\n"})
+    result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed" and index.read_text() == "v1\n"
+    assert (repos.mirror["plugins/"] / "p" / "old.js").read_text() == "still here\n"
+    assert (repos.mirror["plugins/"] / "p" / "notes.txt").read_text() == "the host's own file\n"
 
 
 def test_failed_checks_revert_main_at_once_restore_the_mirrors_restart_and_land_the_revert_by_merge_commit(repos):

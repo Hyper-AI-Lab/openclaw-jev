@@ -6,10 +6,11 @@ job's approved commit: the worker fetches it into the live repo, checks it fast-
 the full suite on that exact commit as aura-coder, then hands off; the unit lands it through a pull request.
 
 The detached root unit (``ops/coding_deploy.py``) holds the code-reload lock, waits until no user task is
-active, refuses mirrors that drifted, fast-forwards the live ``main`` to GitHub's, syncs the mirrors,
-restarts only what changed and checks health, readiness and a canary. On failure it reverts the live
-``main`` and restarts at once; the revert reaches GitHub as a pull request of its own. It records the
-result, then a reviewed job's workflow replies on the new code, or Kirill gets a note for Aura's own.
+active, refuses mirrors edited by hand, fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in
+full, restarts what changed or what the reconcile wrote and checks health, readiness and a canary. It never
+installs a unit file; the result names the changed ones. On failure it reverts the live ``main`` and restarts
+at once; the revert reaches GitHub as a pull request of its own. It records the result, then a reviewed job's
+workflow replies on the new code, or Kirill gets a note for Aura's own.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from dataclasses import asdict
@@ -73,46 +75,65 @@ def changes(repo: Path, old: str, new: str) -> List[Tuple[str, str]]:
     return [tuple(line.split("\t", 1)) for line in out.splitlines()]
 
 
+def tracked_files(repo: Path, commit: str, prefix: str) -> List[Tuple[str, str, str]]:
+    """Every file under ``prefix`` at ``commit`` as (mode, blob, path), from one ``ls-tree``."""
+    files = []
+    for entry in _git(repo, "ls-tree", "-r", "-z", commit, "--", prefix).split("\0"):
+        if entry:
+            meta, path = entry.split("\t", 1)
+            mode, _, blob = meta.split()
+            files.append((mode, blob, path))
+    return files
+
+
+def blob_ids(repo: Path, files: List[Path]) -> List[str]:
+    """The blob id of each file's bytes as they are (no filters), from one ``hash-object``."""
+    if not files:
+        return []
+    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "hash-object", "--no-filters", "--stdin-paths"],
+                          cwd=repo, input="".join(f"{path}\n" for path in files), capture_output=True, text=True,
+                          check=True).stdout.split()
+
+
 def drifted(repo: Path, old: str, prefix: str, target: Path) -> List[str]:
     """Tracked files of a mirror whose live copy matches no committed version: someone edited the live copy.
 
-    A live copy that is merely behind (an earlier committed version) is not drift; the sync updates it.
+    A live copy that is missing or merely behind (an earlier committed version) is not drift; the reconcile writes it.
     """
+    files = [(blob, path, target / path[len(prefix):]) for _, blob, path in tracked_files(repo, old, prefix)]
+    present = [(blob, path, live) for blob, path, live in files if live.is_file()]
     found = []
-    for path in _git(repo, "ls-tree", "-r", "--name-only", old, "--", prefix).splitlines():
-        live = target / path[len(prefix):]
-        if not live.is_file():
-            found.append(f"{path} (missing)")
-            continue
-        blob = _git(repo, "hash-object", str(live)).strip()
-        if blob == _git(repo, "rev-parse", f"{old}:{path}").strip():
-            continue
-        history = _git(repo, "log", "--format=", "--raw", "--no-abbrev", old, "--", path).split()
-        if blob not in history:
+    for (blob, path, _), now in zip(present, blob_ids(repo, [live for _, _, live in present])):
+        if now != blob and now not in _git(repo, "log", "--format=", "--raw", "--no-abbrev", old, "--", path).split():
             found.append(path)
     return found
 
 
-def sync(repo: Path, new: str, changed: List[Tuple[str, str]], prefix: str, target: Path) -> List[str]:
-    """Write the commit's version of each changed file under ``prefix`` into the mirror; delete removed ones."""
-    written = []
+def reconcile(repo: Path, commit: str, changed: List[Tuple[str, str]], prefix: str, target: Path) -> List[str]:
+    """Make the mirror of ``prefix`` match ``commit``: delete the live copy of each file the range deleted, then write
+    every tracked file whose live copy is missing or has other bytes or permission bits. Files the commit does not track
+    are never touched. The repo paths deleted or written."""
+    done = []
     for status, path in changed:
-        if not path.startswith(prefix):
+        if status == "D" and path.startswith(prefix):
+            (target / path[len(prefix):]).unlink(missing_ok=True)
+            done.append(path)
+    files = [(mode, blob, path, target / path[len(prefix):]) for mode, blob, path in tracked_files(repo, commit, prefix)]
+    present = [dest for _, _, _, dest in files if dest.is_file()]
+    current = dict(zip(present, blob_ids(repo, present)))
+    for mode, blob, path, dest in files:
+        want = 0o755 if mode == "100755" else 0o644
+        if current.get(dest) == blob and stat.S_IMODE(dest.stat().st_mode) == want:
             continue
-        dest = target / path[len(prefix):]
-        if status == "D":
-            dest.unlink(missing_ok=True)
-        else:
-            mode = _git(repo, "ls-tree", new, "--", path).split()[0]
-            data = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "show", f"{new}:{path}"], cwd=repo,
-                                  capture_output=True, check=True).stdout
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dest.with_name(f".{dest.name}.aura-deploy")
-            tmp.write_bytes(data)
-            os.chmod(tmp, 0o755 if mode == "100755" else 0o644)
-            os.replace(tmp, dest)
-        written.append(path)
-    return written
+        data = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "cat-file", "blob", blob], cwd=repo,
+                              capture_output=True, check=True).stdout
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(f".{dest.name}.aura-deploy")
+        tmp.write_bytes(data)
+        os.chmod(tmp, want)
+        os.replace(tmp, dest)
+        done.append(path)
+    return done
 
 
 def fetch_approved(job: workspace.Job, head: str, *, live: Path = LIVE_REPO) -> Dict[str, Any]:
@@ -327,13 +348,15 @@ class Host:
 
 
 def _apply(host: Host, old: str, new: str, changed: List[Tuple[str, str]]) -> List[str]:
-    """Sync the mirrors, install requirements and restart what changed between two commits; the services restarted."""
+    """Reconcile every mirror to ``new``, install requirements and restart what changed between two commits or what the
+    reconcile wrote; the services restarted."""
     paths = [path for _, path in changed]
+    written = []
     for prefix, target in MIRRORS:
-        sync(host.live, new, changed, prefix, target)
+        written += reconcile(host.live, new, changed, prefix, target)
     if "requirements.txt" in paths:
         host.pip_install()
-    services = restarts_for(paths)
+    services = restarts_for(paths + written)
     if services:
         host.systemctl("restart", *services)
     return services
@@ -366,7 +389,7 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     else:
         if old != spec["old"]:
             return {"status": "failed", "summary": "main moved while the deploy waited, so nothing was deployed. Ask me again."}
-        blocked = _drift(live, old, changes(live, old, spec["head"]))
+        blocked = _drift(live, old)
         if blocked:
             return blocked
         landed = host.land(spec["head"], spec["branch"], spec["title"], spec["body"], "squash")
@@ -376,7 +399,7 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         head = host.fetch_main()
         log(f"landed {landed['pr']['url']} as {head[:12]}")
     changed = changes(live, old, head)
-    blocked = _drift(live, old, changed)
+    blocked = _drift(live, old)
     if blocked:
         return blocked
     baseline = host.readiness_baseline()
@@ -420,13 +443,13 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
             f"{', '.join(restarted) or 'nothing'}; {health}; {github_now}."}
 
 
-def _drift(live: Path, old: str, changed: List[Tuple[str, str]]) -> Optional[Dict[str, Any]]:
+def _drift(live: Path, old: str) -> Optional[Dict[str, Any]]:
+    """A blocked result when any mirror holds a hand edit, whether or not the change touches that mirror."""
     for prefix, target in MIRRORS:
-        if any(path.startswith(prefix) for _, path in changed):
-            drift = drifted(live, old, prefix, target)
-            if drift:
-                return {"status": "blocked", "summary": f"The live copy of {prefix} was edited by hand ({', '.join(drift[:5])}), "
-                        "so nothing was deployed; main is unchanged."}
+        drift = drifted(live, old, prefix, target)
+        if drift:
+            return {"status": "blocked", "summary": f"The live copy of {prefix} was edited by hand ({', '.join(drift[:5])}), "
+                    "so nothing was deployed; main is unchanged."}
     return None
 
 
