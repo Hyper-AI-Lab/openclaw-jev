@@ -1229,3 +1229,57 @@ I review the spec before WP-02's batch 1.
 **Harness:** `docs/VISION_CONFORMANCE.md` is now excluded from the diff's placeholder grep, like the progress log. It quotes requirement text verbatim: R-111's "a later phase" and R-137's "no-placeholder" row.
 
 **Deploy:** restarts nothing.
+
+## 2026-10-16 05:40 UTC · WP-02 start: pre-batch bookkeeping, mirror probe 1 of 2, batch 1 started
+
+**Docs PR #32** (https://github.com/Hyper-AI-Lab/openclaw-jev/pull/32) opened. One commit was added per WP-02 spec §8: R-89's closing test now names the scheduled patch audit (D-9), not a start-time one. Its CI is running.
+
+**WP-02 §8 "before batch 1" bookkeeping:** delegated to one agent (TRI-002 home → WP-08; §3 rows for `ops/systemd/`, `setup_aura_coder.sh`, `coding_deploy.py` and `backup.sh`; WP-15's unit path and restart rule; §4 rows; the install rule).
+
+**WP02-18 mirror probe, run 1** (read-only, live checkout at `8676b78`), output:
+```
+BEHIND web-stack/backends/app/adapters/crawl4ai_adapter.py
+checked
+```
+This is exactly the allowed result: no `plugins/` file differs, so the first full reconcile will not restart the gateway. Batch 1 may merge.
+
+**Batch 1:**
+- **Branch:** `aura/wp-02-1-deploy-stops-installing-units`, from `8676b78`.
+- **Items:** WP02-01…04, Tier 1.
+- **Workflow:** the generic `wp-batch`, now at `program/bin/wp-batch.workflow.js`.
+- **The hold starts when batch 1 merges.**
+
+## 2026-10-16 05:42 UTC · WP-02 pre-batch bookkeeping applied
+
+All five edits of WP-02 spec §8 "before batch 1" are applied: ledger TRI-002 → WP-08 with its note; §3 rows for `ops/systemd/`, `ops/setup_aura_coder.sh`, `ops/coding_deploy.py` and `ops/backup.sh`; WP-15's unit path and restart rule; §4's TRI-045 row and two new split rows; the install rule in "Rules for all phases".
+- Backups: `.work-packages.bak-wp02pre-20261016T054110Z` and `.ledger.bak-wp02pre-20261016T054110Z`.
+- The agent flagged that the spec also requires WP-02's and WP-17's TRI-045 bullets to say the same. Both now state D-9: no `ExecStartPre=` audit; WP-17 runs it from a timer whose unit lands in `ops/systemd/`.
+
+## 2026-10-16 09:20 UTC · Docs PR merged; WP-02 batch 1 approved (Tier 1) and verified; mirror probe before merge
+
+**PR #32** (`VISION_CONFORMANCE.md`): CI green. Squash-merged as `ab0098a` and deployed; nothing restarted; canary ok.
+
+**WP-02 batch 1** (run `wf_05a6091d-749`, items WP02-01…04): **approved by both Tier-1 reviewers in every round.**
+- **Commits:** 6 implementation commits plus 5 test-strengthening fixes (`54e9a1a`, `b4d7b5d`, `b592bbb`, `d2d8c4d`, `59de352`). Rebased onto `ab0098a`.
+- **Deviations:**
+  1. The deploy-test fixture sets mirror files to 0644. Otherwise, under the coding unit's `UMask=0077`, the new permission-bit reconcile would rewrite every fixture file and break the restart assertions in reviewed coding jobs (probe: 7 failures without it).
+  2. One WP02-01 proof test also passes on the base code, because the base never treated `ops/systemd/` as a unit path. The legacy-path test that does fail on the base covers it.
+- **Rejected points with homes:**
+  - The restart residual when pip or `systemctl` fails after the reconcile → WP-09 (split row already added).
+  - `.cursor/rules/rmp-intake-catalog.mdc:14` tells agents to hand-edit a mirror → new ledger item `WP02-b1-cursor-rule-handedit` (WP-30).
+  - `LAYOUT=live` → run here.
+
+**My verify on `4465708`** (all `verify: exit 0`):
+
+| Layout | pytest | node | Leftovers | Placeholder grep | Ignored files |
+|---|---|---|---|---|---|
+| Default | 1330 passed, 1 skipped | 58/58 | 0 | clean | none |
+| live | 1330 passed, 1 skipped | — | 0 | clean | none |
+| coding-job | 1330 passed, 1 skipped | — | 0 | clean | none |
+| direct | 1330 passed, 1 skipped | — | 0 | clean | none |
+
+**WP02-18 mirror probe, run 1b** (live at `ab0098a`, right before the merge): `BEHIND web-stack/backends/app/adapters/crawl4ai_adapter.py`, then `checked`. Unchanged and allowed.
+
+**The hold starts with this merge.** Nothing but WP-02's batches merges until batch 3's host steps are logged.
+
+**Deploy:** batch 1 is deployed by the current (old) deploy code and restarts `rmp-api` and `rmp-worker`. Its own code takes effect at the next deploy (D-6), which is batch 2's.
