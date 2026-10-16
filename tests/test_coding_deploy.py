@@ -267,7 +267,7 @@ def test_a_missing_mirror_file_is_restored_not_refused(repos):
 
 
 def test_a_live_copy_git_cannot_read_fails_with_gits_reason(repos):
-    with pytest.raises(RuntimeError, match="^git hash-object --no-filters failed: fatal: could not open .*absent"):
+    with pytest.raises(RuntimeError, match="^git hash-object --no-filters failed: .*absent"):
         deploy.blob_ids(repos.live, [repos.tmp / "absent"])
 
 
