@@ -121,7 +121,8 @@ def reconcile(repo: Path, commit: str, changed: List[Tuple[str, str]], prefix: s
         if status == "D" and path.startswith(prefix):
             (target / path[len(prefix):]).unlink(missing_ok=True)
             done.append(path)
-    files = [(mode, blob, path, target / path[len(prefix):]) for mode, blob, path in tracked_files(repo, commit, prefix)]
+    files = [(mode, blob, path, target / path[len(prefix):])
+             for mode, blob, path in tracked_files(repo, commit, prefix)]
     present = [dest for _, _, _, dest in files if dest.is_file()]
     current = dict(zip(present, blob_ids(repo, present)))
     for mode, blob, path, dest in files:
@@ -421,8 +422,9 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     if failure is None:
         canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
         units = sorted(path[len(UNIT_DIR):] for _, path in changed if path.startswith(UNIT_DIR))
-        installs = (f" Files under {UNIT_DIR} changed ({', '.join(units)}): the deploy does not install them; an operator "
-                    "reviews them and runs ops/install_units.py, then with --apply, in an idle window." if units else "")
+        installs = (f" Files under {UNIT_DIR} changed ({', '.join(units)}): the deploy does not install them; an "
+                    "operator reviews them and runs ops/install_units.py, then with --apply, in an idle window."
+                    if units else "")
         return {"status": "deployed", **shipped, "canary": checked["canary"], "units": units,
                 "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
                 f"readiness passed and {canary}.{installs}"}

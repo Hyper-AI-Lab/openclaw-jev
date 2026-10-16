@@ -17,8 +17,8 @@ from app.coding import deploy, verify, workspace
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = {"app/a.py": "A = 1\n", "worker.py": "W = 1\n", "requirements.txt": "x==1\n", "plugins/p/index.js": "v1\n",
-        "plugins/p/old.js": "gone soon\n", "web-stack/backends/w.py": "W = 1\n", "ops/systemd/aura-x.service": "[Service]\n",
-        ".cursor/rules/r.mdc": "rule v1\n", "docs/d.md": "docs\n"}
+        "plugins/p/old.js": "gone soon\n", "web-stack/backends/w.py": "W = 1\n",
+        "ops/systemd/aura-x.service": "[Service]\n", ".cursor/rules/r.mdc": "rule v1\n", "docs/d.md": "docs\n"}
 
 
 def git(cwd, *args):
@@ -161,9 +161,9 @@ def test_a_deploy_that_changes_a_unit_file_names_it(repos):
     head = repos.change({"ops/systemd/aura-x.service": "[Service]\nNice=5\n"})
     result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
     assert result["status"] == "deployed" and result["units"] == ["aura-x.service"]
-    assert result["summary"].endswith("Files under ops/systemd/ changed (aura-x.service): the deploy does not install "
-                                      "them; an operator reviews them and runs ops/install_units.py, then with --apply, "
-                                      "in an idle window.")
+    assert result["summary"].endswith("Files under ops/systemd/ changed (aura-x.service): the deploy does not "
+                                      "install them; an operator reviews them and runs ops/install_units.py, then "
+                                      "with --apply, in an idle window.")
 
     repos.old = head
     head = repos.change({"ops/systemd/enabled-units.txt": "aura-x.service\n"})
@@ -173,7 +173,8 @@ def test_a_deploy_that_changes_a_unit_file_names_it(repos):
 
     repos.old = head
     head = repos.change({"ops/systemd/aura-x.service": "[Service]\nNice=10\n"})
-    host = FakeHost(repos.live, checks=[{"failure": "health failed", "canary": None}, {"failure": None, "canary": "ok"}])
+    host = FakeHost(repos.live, checks=[{"failure": "health failed", "canary": None},
+                                        {"failure": None, "canary": "ok"}])
     result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
     assert result["status"] == "rolled_back" and "units" not in result and "ops/systemd/" not in result["summary"]
 
@@ -203,7 +204,8 @@ def test_a_full_reconcile_converges_a_stale_mirror_file_outside_the_change(repos
     head = repos.change({"app/a.py": "A = 2\n"})
     host = FakeHost(repos.live)
     result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
-    assert result["status"] == "deployed" and (repos.mirror["web-stack/"] / "backends" / "w.py").read_text() == "W = 2\n"
+    assert result["status"] == "deployed"
+    assert (repos.mirror["web-stack/"] / "backends" / "w.py").read_text() == "W = 2\n"
     assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "aura-web-backends", "rmp-api",
                                                                "rmp-worker")]
 
