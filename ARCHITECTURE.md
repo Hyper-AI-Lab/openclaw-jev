@@ -586,9 +586,11 @@ Claude Code is Aura's tool in any task (direct sessions, the default). When Kiri
 - **Merge.** Claude merges it with `aura-github gh pr merge --squash` once Aura approves; the protection makes GitHub take it only after the `test` check passed.
 - **Watcher.** Every minute the reconciler loop's `watch_main` looks at GitHub's `main`. Once it moved past the live `main` and CI's `test` check passed on that commit, it starts the deploy unit `aura-deploy-main` for exactly that commit. A commit whose deploy was blocked or rolled back is not tried again; a later one is.
 - **Deploy.** The unit waits until no user task is active, then:
+  - refuses to deploy when a tracked file in `plugins/`, `web-stack/` or `.cursor/rules/` was edited by hand on the host;
   - fast-forwards the live `main` to GitHub's;
-  - syncs `plugins/`, `web-stack/`, `systemd/` and `.cursor/rules/`;
-  - restarts only what changed, and checks health, readiness and a canary;
+  - reconciles `plugins/`, `web-stack/` and `.cursor/rules/` in full: it writes every tracked file whose live copy is missing, behind or at the wrong mode, deletes only what the range deleted, and never touches untracked files. A deleted live file comes back at the next deploy, so switch a plugin off in `openclaw.json` or through the repo, never by deleting its files;
+  - never installs a unit file: it names the changed `ops/systemd/` files in its result and in Kirill's note, and an operator installs them (§"systemd services");
+  - restarts what changed or what the reconcile wrote, and checks health, readiness and a canary;
   - on failure, reverts the live code at once and lands the revert as a pull request.
 
   Then it sends Kirill a note with the links.
