@@ -266,6 +266,11 @@ def test_a_missing_mirror_file_is_restored_not_refused(repos):
     assert (repos.mirror["plugins/"] / "p" / "notes.txt").read_text() == "the host's own file\n"
 
 
+def test_a_live_copy_git_cannot_read_fails_with_gits_reason(repos):
+    with pytest.raises(RuntimeError, match="^git hash-object --no-filters failed: fatal: could not open .*absent"):
+        deploy.blob_ids(repos.live, [repos.tmp / "absent"])
+
+
 def test_failed_checks_revert_main_at_once_restore_the_mirrors_restart_and_land_the_revert_by_merge_commit(repos):
     head = repos.change({"app/a.py": "A = 2\n", "plugins/p/index.js": "v2\n"}, deletes=["plugins/p/old.js"])
     host = FakeHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}, {"failure": None, "canary": "ok"}])

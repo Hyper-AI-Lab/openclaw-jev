@@ -73,6 +73,15 @@ def _git(repo: Path, *args: str, env: Optional[Dict[str, str]] = None) -> str:
     return workspace.git(*args, cwd=repo, env=env)
 
 
+def _git_bytes(repo: Path, *args: str, stdin: bytes = b"") -> bytes:
+    """``_git`` with bytes in and out; it fails as ``workspace.git`` does, after 900 s at most and with git's reason."""
+    run = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *args], cwd=repo, input=stdin, capture_output=True,
+                         timeout=900)
+    if run.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args[:2])} failed: {run.stderr.decode(errors='replace').strip()[-400:]}")
+    return run.stdout
+
+
 def changes(repo: Path, old: str, new: str) -> List[Tuple[str, str]]:
     out = _git(repo, "diff", "--name-status", "--no-renames", old, new)
     return [tuple(line.split("\t", 1)) for line in out.splitlines()]
@@ -93,9 +102,8 @@ def blob_ids(repo: Path, files: List[Path]) -> List[str]:
     """The blob id of each file's bytes as they are (no filters), from one ``hash-object``."""
     if not files:
         return []
-    return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "hash-object", "--no-filters", "--stdin-paths"],
-                          cwd=repo, input="".join(f"{path}\n" for path in files), capture_output=True, text=True,
-                          check=True).stdout.split()
+    return _git_bytes(repo, "hash-object", "--no-filters", "--stdin-paths",
+                      stdin=b"".join(os.fsencode(path) + b"\n" for path in files)).decode().split()
 
 
 def drifted(repo: Path, old: str, prefix: str, target: Path) -> List[str]:
@@ -129,8 +137,7 @@ def reconcile(repo: Path, commit: str, changed: List[Tuple[str, str]], prefix: s
         want = 0o755 if mode == "100755" else 0o644
         if current.get(dest) == blob and stat.S_IMODE(dest.stat().st_mode) == want:
             continue
-        data = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "cat-file", "blob", blob], cwd=repo,
-                              capture_output=True, check=True).stdout
+        data = _git_bytes(repo, "cat-file", "blob", blob)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(f".{dest.name}.aura-deploy")
         tmp.write_bytes(data)
