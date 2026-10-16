@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -79,9 +78,7 @@ async def fetch_active_tasks(
     async def _query(session: AsyncSession) -> List[Dict[str, Any]]:
         q = select(Task).where(Task.status.in_(list(ACTIVE_STATUSES)))
         if session_key and not host_wide:
-            keys = active_task_lookup_keys(
-                session_key, discover=not os.environ.get("PYTEST_CURRENT_TEST")
-            )
+            keys = active_task_lookup_keys(session_key)
             if keys:
                 q = q.where(Task.openclaw_session_key.in_(keys))
         if recurrence_key:
