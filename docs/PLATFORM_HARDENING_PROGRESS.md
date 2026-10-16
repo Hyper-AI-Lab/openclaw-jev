@@ -1184,3 +1184,48 @@ I review the spec before WP-02's batch 1.
 | direct | 1319 passed, 1 skipped | — | 0 | clean | none |
 
 **Deploy:** restarts `rmp-api` and `rmp-worker`. Production behaviour is unchanged, because discovery was always on there.
+
+## 2026-10-16 05:38 UTC · WP-01 complete: batch 6 merged and deployed; ledger closed out
+
+**PR #31:** CI green. `origin/main` was unchanged at `ac45721`. Squash-merged as `8676b78`.
+
+**Deploy:** `deployed`. `rmp-api` and `rmp-worker` restarted; health, readiness and canary ok; 0 worker-journal errors. **Rollback:** revert `8676b78`.
+
+**WP-01 summary:**
+
+| Batch | PR | Merge | Contents |
+|---|---|---|---|
+| 1 | #26 | `6d74cb5` | paths through config, worker lists, guard path core |
+| 2 | #27 | `cc9f105` | production guard |
+| 3 | #28 | `434538a` | node, web-stack, CI workflow-change guard |
+| 4 | #29 | `b8d064a` | replay fixtures for every workflow type, deterministic timing tests |
+| 5 | #30 | `ac45721` | progress-log guard |
+| 6 | #31 | `8676b78` | no test mode in `app/` |
+
+- pytest went from 1118 to 1319 tests. Every harness layout leaves 0 temp entries.
+- Spec amendments 1–3 are logged.
+- Labels created: `no-replay-impact`, `progress-log-rewrite`.
+
+**Ledger:**
+- **Closed:** TU-1, debt-scalability-06 (with its residual split items), TRI-001, B1-04.
+- **Progress noted:** temporal-determinism-04 (home now WP-09 for the rest; WP-28 holds the template freeze), R-06, R-141.
+- **WP states:** WP-01 done, Phase B done.
+
+**Next:**
+1. The docs-only PR with `docs/VISION_CONFORMANCE.md` (Phase A deliverable A2; Tier 3).
+2. WP-02 batch 1, after the read-only mirror probe (WP02-18).
+
+## 2026-10-16 05:38 UTC · Docs PR: VISION_CONFORMANCE.md into the repo (Phase A deliverable A2)
+
+**Branch:** `aura/docs-vision-conformance`, from `8676b78`.
+
+**Contents:**
+- `docs/VISION_CONFORMANCE.md`: 149 rows with evidence, proof and home WP; Kirill's decisions applied.
+- Its "after 5424c02" line now says that all of WP-01 has merged and changes no verdict.
+- `docs/CONSTITUTION_MATCH.md` gains a superseded note; it is kept as history.
+
+**Review:** Tier 3, a light review. The content went through auditor, skeptic, adjudicator, completeness critic and the A3 critic.
+
+**Harness:** `docs/VISION_CONFORMANCE.md` is now excluded from the diff's placeholder grep, like the progress log. It quotes requirement text verbatim: R-111's "a later phase" and R-137's "no-placeholder" row.
+
+**Deploy:** restarts nothing.
