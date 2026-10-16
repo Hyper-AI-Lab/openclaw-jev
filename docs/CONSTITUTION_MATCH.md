@@ -1,5 +1,7 @@
 # Constitution match audit
 
+> **Superseded (2026-10-16):** `docs/VISION_CONFORMANCE.md` is the current conformance record (149 requirements, audited at `5424c02`). This file is kept as history and is no longer updated.
+
 **Date:** 2026-09-05  
 **Scope:** Original concept-tree plan (`concept_tree_constitution_e7a112e8`) + founding `request.txt` / `request_2` (after later Kirill stones) vs live Slack path.  
 **Classes:** MATCH | MISMATCH | SUPERSEDED | PRODUCT-RISK  
