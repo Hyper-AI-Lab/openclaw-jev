@@ -45,10 +45,13 @@ SERVICE_PATHS = (
     ("web-stack/", ("aura-web-backends",)),
 )
 # Repo directories with a live copy elsewhere on the host.
+PLUGINS_MIRROR = Path(OPENCLAW_HOME) / "plugins"
+WEB_STACK_MIRROR = Path(OPENCLAW_HOME) / "web-stack"
+CURSOR_RULES_MIRROR = Path("/root/.cursor/rules")
 MIRRORS = (
-    ("plugins/", Path("/root/.openclaw/plugins")),
-    ("web-stack/", Path("/root/.openclaw/web-stack")),
-    (".cursor/rules/", Path("/root/.cursor/rules")),
+    ("plugins/", PLUGINS_MIRROR),
+    ("web-stack/", WEB_STACK_MIRROR),
+    (".cursor/rules/", CURSOR_RULES_MIRROR),
 )
 # The tracked unit files and where systemd reads them. No deploy writes there: an operator installs them.
 UNIT_DIR = "ops/systemd/"

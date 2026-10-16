@@ -44,6 +44,8 @@ PRODUCTION = {
     "app.coding.workspace.REVIEW_DIR": "/srv/aura-code/review",
     "app.coding.direct.DIRECT_DIR": "/srv/aura-code/direct",
     "app.coding.deploy.LIVE_REPO": "/root/.openclaw/rmp",
+    "app.coding.deploy.PLUGINS_MIRROR": "/root/.openclaw/plugins",
+    "app.coding.deploy.WEB_STACK_MIRROR": "/root/.openclaw/web-stack",
 }
 # Run with every production default in effect, so the guard's audit hook refuses and records any touch of a production
 # path, database, process or service while the modules import: a later import-time settings read would otherwise read,
@@ -100,6 +102,10 @@ def test_under_the_test_environment_nothing_resolves_to_production(monkeypatch):
         assert path.parent == Path(config.RMP_DATA_DIR)
         assert not path.is_relative_to(REPO)
     assert deploy.LIVE_REPO == Path(config.OPENCLAW_HOME) / "rmp"
+    assert deploy.PLUGINS_MIRROR == Path(config.OPENCLAW_HOME) / "plugins"
+    assert deploy.WEB_STACK_MIRROR == Path(config.OPENCLAW_HOME) / "web-stack"
+    assert [target for _, target in deploy.MIRRORS] == [deploy.PLUGINS_MIRROR, deploy.WEB_STACK_MIRROR,
+                                                        deploy.CURSOR_RULES_MIRROR]
 
 
 @pytest.mark.parametrize("inherited", ["OPENCLAW_HOME", "RMP_ROOT", "RMP_DATA_DIR", "RMP_SETTINGS_PATH",
