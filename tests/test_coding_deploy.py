@@ -172,6 +172,13 @@ def test_a_deploy_that_changes_a_unit_file_names_it(repos):
     assert "(enabled-units.txt)" in result["summary"]
 
     repos.old = head
+    head = repos.change({"ops/systemd/z.service": "[Service]\n", "ops/systemd/a.service.d/10-x.conf": "[Service]\n"},
+                        deletes=["ops/systemd/aura-x.service"])
+    result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed"
+    assert result["units"] == ["a.service.d/10-x.conf", "aura-x.service", "z.service"]
+
+    repos.old = head
     head = repos.change({"ops/systemd/aura-x.service": "[Service]\nNice=10\n"})
     host = FakeHost(repos.live, checks=[{"failure": "health failed", "canary": None},
                                         {"failure": None, "canary": "ok"}])
