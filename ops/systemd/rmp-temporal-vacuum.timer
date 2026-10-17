@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly Temporal SQLite VACUUM for RMP
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

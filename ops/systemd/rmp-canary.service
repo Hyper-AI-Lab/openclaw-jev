@@ -1,0 +1,11 @@
+[Unit]
+Description=RMP hourly canary task
+After=network.target rmp-api.service rmp-worker.service openclaw-gateway.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/rmp/rmp.env
+ExecStart=/bin/bash /root/.openclaw/rmp/ops/canary.sh
+
+[Install]
+WantedBy=multi-user.target

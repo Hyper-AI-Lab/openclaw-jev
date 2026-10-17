@@ -98,7 +98,7 @@ as_coder git config --global user.email "aura-coder@aura.local"
 as_coder git config --global init.defaultBranch main
 as_coder git config --global advice.detachedHead false
 
-install -o root -g root -m 644 "${RMP_ROOT}/systemd/aura-coder-firewall.service" /etc/systemd/system/aura-coder-firewall.service
+install -o root -g root -m 644 "${RMP_ROOT}/ops/systemd/aura-coder-firewall.service" /etc/systemd/system/aura-coder-firewall.service
 systemctl daemon-reload
 systemctl enable aura-coder-firewall.service >/dev/null 2>&1
 systemctl restart aura-coder-firewall.service

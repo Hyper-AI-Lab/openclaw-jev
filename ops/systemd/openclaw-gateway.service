@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenClaw gateway
+After=rmp-api.service network-online.target
+Wants=rmp-api.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=-/etc/openclaw/openclaw.env
+ExecStartPre=/root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/sync_nvidia_keys.py
+ExecStart=/usr/bin/openclaw gateway --force
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

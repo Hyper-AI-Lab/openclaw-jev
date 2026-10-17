@@ -1283,3 +1283,94 @@ All five edits of WP-02 spec §8 "before batch 1" are applied: ledger TRI-002 �
 **The hold starts with this merge.** Nothing but WP-02's batches merges until batch 3's host steps are logged.
 
 **Deploy:** batch 1 is deployed by the current (old) deploy code and restarts `rmp-api` and `rmp-worker`. Its own code takes effect at the next deploy (D-6), which is batch 2's.
+
+## 2026-10-16 11:54 UTC · WP-02 batch 1 merged (the hold starts); WP-12 spec started
+
+**PR #33:** CI green. `origin/main` was unchanged at `ab0098a`. Squash-merged as `45f3aff`; the deploy is being watched.
+
+**Hold (WP02-18):** in effect from this merge until batch 3's host steps are logged.
+
+**WP-12 spec:** `wp-spec` run `wf_a4ed295e-317`, in parallel.
+- **First item:** B3b-01, the restore of `rmp_db` through the postgres superuser, proven by a scratch restore drill.
+- **K-7:** restic is built and tested against a local repository, with off-host switched off at warn.
+- Unit changes follow WP-02's install convention.
+
+## 2026-10-16 11:57 UTC · WP-02 batch 1 deployed; secret check of the units to import; batch 2 started
+
+**Batch 1:** `45f3aff` deployed by the previous deploy code (D-6), so `result.json` carries no `units` key yet. `rmp-api` and `rmp-worker` restarted; health, readiness and canary ok; 0 worker-journal errors; all five services active. **Rollback:** revert `45f3aff`.
+
+**Pre-import secret check:** the 16 host-only units and the gateway drop-in that batch 2 imports byte for byte into a public GitHub repo were read with names only.
+- The only inline `Environment=` lines are in `aura-web-backends.service`: `PYTHONPATH=/root/.openclaw/web-stack/backends`, and `OBSCURA_CDP_URL`, whose shape is `http://127.0.0.1:9222` (no path, no query, no userinfo).
+- No other key, token, secret or password text appears; `openclaw-gateway.service:10` matched only the `sync_nvidia_keys.py` script name.
+- **Safe to import.**
+
+**Batch 2:**
+- **Branch:** `aura/wp-02-2-one-unit-directory`, from `45f3aff`.
+- **Items:** WP02-05…10, Tier 1.
+- Mirror probe run 2 happens right before the merge, as WP02-18 requires.
+
+## 2026-10-16 13:42 UTC · WP-02 batch 2 approved (Tier 1, round 1); WP-12 spec in revision
+
+**Batch 2** (run `wf_2e63ff1a-8c3`, items WP02-05…10): 5 commits.
+- `1d4a0b3`: the two units moved into `ops/systemd/`.
+- `dd0be59`: 16 units and the drop-in imported. `sha256sum -c` against the spec table: 17/17 OK.
+- `34a2e78`: `enabled-units.txt`, 18 units.
+- `353d495`: `temporal-dev` and `aura-web-stack` units retired.
+- `7b8e8d8`: `tests/test_systemd_units.py`, 5 tests.
+
+**Deviation:** test 5 also matches file paths. The retired units do not name themselves in their content, so a content-only check could not fail while they exist.
+
+**Review:** both Tier-1 reviewers **approve in round 1**. Their only note: the implementer did not report `LAYOUT=live`, which one reviewer then ran (1335 passed). There was nothing to fix, so the fix loop (interrupted by the usage limit) is not resumed. I run all four layouts myself.
+
+**WP-12 spec** (run `wf_a4ed295e-317`): 19 items in 8 batches. The critic asked for revisions; the revision step was interrupted by the usage limit and is resumed. The critic's gaps:
+- the drill's scratch Qdrant port must sit inside `blocked_tcp_ports`, with a per-drill API key and an idle check;
+- the safe append of `QDRANT_API_KEY` to `/etc/rmp/rmp.env`, with count-only checks;
+- runtime-masking the units after a partial restore;
+- the timer check waiting for an in-flight run;
+- the sentinel and backup timers during a whole-store rebuild;
+- the DM dedupe claim.
+
+## 2026-10-16 14:01 UTC · WP-12 spec complete (revised after the critic)
+
+**`program/specs/WP-12.md`** (run `wf_a4ed295e-317`): 19 items in 8 batches, all Tier 1.
+
+| Batch | Contents | Prerequisites and host steps |
+|---|---|---|
+| 1 | the restore: `rmp_db` through postgres, `--clean --if-exists` (B3b-01 first) | — |
+| 2 | the scratch restore drill | — |
+| 3 | one Qdrant container (B2b-01) | `systemctl restart rmp-qdrant` with **Kirill's OK**, idle |
+| 4 | what a backup holds, format-2 manifest | — |
+| 5 | restic, built and tested against a local repository, off-host switched off (K-7) | — |
+| 6 | the `OnFailure=` alert unit (TRI-026), installed by `install_units.py` | — |
+| 7 | readiness | waits for the `readiness.py` row: WP-02, 03, 04b, 08, 10, 11 |
+| 8 | the Qdrant API key | waits for rule 36 and the `vector.py` row: WP-03, 20, 25 |
+
+**Critic: revise.** All gaps are closed (with 3 "Reviewer point considered" notes):
+- the drill's Qdrant listens on a port inside `blocked_tcp_ports` (18890 or 6936–6938), with a per-drill API key passed by name and an idle precondition;
+- the `/etc/rmp/rmp.env` append starts with a newline, runs under umask 077, and is checked with counts only;
+- a partial restore runtime-masks rmp-api, rmp-worker, temporal and the gateway, so a waiting deploy cannot restart them onto a half-restored database;
+- the post-restore timer check waits for an in-flight timer run;
+- the whole-store runbook stops the sentinel and backup timers;
+- the ops-DM dedupe claim is corrected.
+
+**Deferrals:** WP-08 and WP-09 (lock honouring), WP-10 (Qdrant memory limit), WP-03 (alert webhook and ping), WP-25 (readiness off the event loop), WP-27 (`temporal-*.db` copies), WP-29 (settings schema, the migration tool), WP-30 (docs), WP-22 (Safe Harbor).
+
+## 2026-10-16 14:18 UTC · WP-02 batch 2 verified in four layouts; mirror probe 2 passed
+
+**My verify on `7b8e8d8`** (all `verify: exit 0`):
+
+| Layout | pytest | node | Leftovers | Placeholder grep | Ignored files |
+|---|---|---|---|---|---|
+| Default | 1335 passed, 1 skipped | 58/58 | 0 | clean | none |
+| live | 1335 passed, 1 skipped | — | 0 | clean | none |
+| coding-job | 1335 passed, 1 skipped | — | 0 | clean | none |
+| direct | 1335 passed, 1 skipped | — | 0 | clean | none |
+
+**WP02-18 mirror probe, run 2** (live at `45f3aff`, batch 1's head): `BEHIND web-stack/backends/app/adapters/crawl4ai_adapter.py`, then `checked`. This is the allowed result.
+
+**Batch 2's deploy** is the first full reconcile, on batch 1's code:
+- it writes only that adapter and deletes the two `web-stack/*.service` mirror copies;
+- it restarts only `aura-web-backends`;
+- the gateway is not touched.
+
+**After the deploy:** WP02-10's host steps and the WP02-09 host moves, inside the WP02-19 timer check.

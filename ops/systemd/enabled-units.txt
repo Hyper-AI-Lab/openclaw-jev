@@ -1,0 +1,20 @@
+# Units that must be enabled on this host. ops/install_units.py --apply enables any that is not.
+# To disable a unit, remove it here, then disable it on the host after the deploy.
+aura-coder-firewall.service
+aura-obscura.service
+aura-web-backends.service
+openclaw-gateway.service
+rmp-api.service
+rmp-backup.timer
+rmp-canary-sentinel.timer
+rmp-canary.timer
+rmp-code-watch.service
+rmp-janitor-frequent.timer
+rmp-janitor.timer
+rmp-memory-canary.timer
+rmp-observability.service
+rmp-qdrant.service
+rmp-temporal-vacuum.timer
+rmp-temporal-watchdog.timer
+rmp-worker.service
+temporal.service
