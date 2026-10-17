@@ -29,7 +29,8 @@ first. --apply installs every new and changed file at once; <sha> is the commit 
 It also refuses while a user task is active or a deploy or code reload holds the code-reload lock. It installs that
 commit's bytes, never the working tree, backs up every file it replaces, runs one daemon-reload and enables each
 listed unit that is not enabled. It never starts, restarts, disables or deletes a unit: it prints a start: line for
-each unit it enabled, to start in an idle window, and a rollback: line that undoes the install.
+each unit it enabled, to start in an idle window, and a rollback: line that undoes the install. A failure after the
+backup directory exists stops there, prints failed:, what was done so far and the rollback: line, and exits 1.
 """
 import argparse
 import fcntl
@@ -39,9 +40,10 @@ import shutil
 import stat
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Collection, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Collection, Dict, Iterator, List, Optional, Sequence, Tuple
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
@@ -141,53 +143,94 @@ def _directory_like(directory: Path, original: Path) -> None:
     os.chmod(directory, stat.S_IMODE(original.stat().st_mode))
 
 
-def apply(repo: Path, head: str, target: Path, backup_root: Path, systemctl: Systemctl) -> int:
-    """Back up, install ``head``'s unit files, reload and enable; the caller holds the lock, checked that ``head`` is
-    the reviewed commit and saw Aura idle."""
-    plan = Plan(repo, head, target, systemctl)
-    print(f"head: {head}")
+def _backup_directory(backup_root: Path, target: Path) -> Path:
+    """A new directory for this run's backups, named by the UTC time, with ``-<n>`` added when that name is taken. The
+    lock keeps a second run from taking it in between."""
     backup_root.mkdir(parents=True, exist_ok=True)
     os.chmod(backup_root, 0o700)
-    backup = backup_root / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup, n = backup_root / stamp, 0
+    while backup.exists():
+        n += 1
+        backup = backup_root / f"{stamp}-{n}"
     _directory_like(backup, target)
-    for name in plan.files:
-        if name in plan.new:
-            continue
-        if not (backup / name).parent.is_dir():
-            _directory_like((backup / name).parent, (target / name).parent)
-        shutil.copy2(target / name, backup / name)
-    done: Dict[str, List[str]] = {"installed": [], "enabled": [], "left": plan.left}
-    for name in plan.files:
-        dest = target / name
-        if not dest.parent.is_dir():
-            dest.parent.mkdir()
-            os.chmod(dest.parent, 0o755)
-        tmp = dest.with_name(f".{dest.name}.rmp-install")
-        tmp.write_bytes(deploy._git_bytes(repo, "cat-file", "blob", f"{plan.head}:{deploy.UNIT_DIR}{name}"))
-        os.chmod(tmp, 0o644)
+    return backup
+
+
+@contextmanager
+def _replacing(dest: Path) -> Iterator[Path]:
+    """A temp file beside ``dest`` that replaces it once written. A failure leaves ``dest`` as it was and no temp file,
+    so the rollback's ``cp -a`` never copies a part-written backup."""
+    tmp = dest.with_name(f".{dest.name}.rmp-install")
+    try:
+        yield tmp
         os.replace(tmp, dest)
-        done["installed"].append(name)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _succeeded(result: Tuple[int, str]) -> None:
+    if result[0] != 0:
+        raise RuntimeError(f"exit {result[0]}")
+
+
+def apply(repo: Path, head: str, target: Path, backup_root: Path, systemctl: Systemctl) -> int:
+    """Back up, install ``head``'s unit files, reload and enable; the caller holds the lock, checked that ``head`` is
+    the reviewed commit and saw Aura idle. Once the backup directory exists, any failure (a systemctl call that exits
+    non-zero, raises or times out, or an error while backing up or writing) stops the install: it prints ``failed:``,
+    the lines for what was done and the rollback line, and makes no further systemctl call."""
+    plan = Plan(repo, head, target, systemctl)
+    print(f"head: {head}")
+    backup = _backup_directory(backup_root, target)
+    done: Dict[str, List[str]] = {"installed": [], "enabled": [], "left": plan.left}
+    step = ""
+
+    def call(*args: str) -> Tuple[int, str]:
+        nonlocal step
+        step = f"systemctl {' '.join(args)}"
+        return systemctl(*args)
+
     failed = None
-    if done["installed"]:
-        code, _ = systemctl("daemon-reload")
-        if code != 0:
-            failed = f"daemon-reload (exit {code})"
-    if failed is None:
-        not_enabled, done["left"] = enablement(plan.listed, plan.new, systemctl)
+    try:
+        for name in plan.files:
+            if name in plan.new:
+                continue
+            step = f"backing up {name}"
+            if not (backup / name).parent.is_dir():
+                _directory_like((backup / name).parent, (target / name).parent)
+            with _replacing(backup / name) as tmp:
+                shutil.copy2(target / name, tmp)
+        for name in plan.files:
+            step = f"writing {name}"
+            dest = target / name
+            if not dest.parent.is_dir():
+                dest.parent.mkdir()
+                os.chmod(dest.parent, 0o755)
+            with _replacing(dest) as tmp:
+                tmp.write_bytes(deploy._git_bytes(repo, "cat-file", "blob", f"{plan.head}:{deploy.UNIT_DIR}{name}"))
+                os.chmod(tmp, 0o644)
+            done["installed"].append(name)
+        if done["installed"]:
+            _succeeded(call("daemon-reload"))
+        not_enabled, done["left"] = enablement(plan.listed, plan.new, call)
         for unit in not_enabled:
-            code, _ = systemctl("enable", unit)
-            if code != 0:
-                failed = f"enable {unit} (exit {code})"
-                break
+            _succeeded(call("enable", unit))
             done["enabled"].append(unit)
+    except Exception as exc:
+        reason = (f"timed out after {exc.timeout:g} s" if isinstance(exc, subprocess.TimeoutExpired)
+                  else str(exc) or type(exc).__name__)
+        failed = f"{step} ({reason})"
     if failed:
-        print(f"failed: systemctl {failed}")
-    _report(done, plan.new, backup, target)
+        print(f"failed: {failed}")
+    _report(done, plan, backup, target)
     return 1 if failed else 0
 
 
-def _report(done: Dict[str, List[str]], new: Collection[str], backup: Path, target: Path) -> None:
-    print(f"installed: {', '.join(done['installed'])}" if done["installed"] else "nothing to install")
+def _report(done: Dict[str, List[str]], plan: Plan, backup: Path, target: Path) -> None:
+    if done["installed"]:
+        print(f"installed: {', '.join(done['installed'])}")
+    elif not plan.files:
+        print("nothing to install")
     if done["enabled"]:
         print(f"enabled: {', '.join(done['enabled'])}")
     for unit in done["enabled"]:
@@ -197,7 +240,7 @@ def _report(done: Dict[str, List[str]], new: Collection[str], backup: Path, targ
     print(f"backup: {backup}")
     steps = [f"systemctl disable {' '.join(done['enabled'])}"] if done["enabled"] else []
     steps.append(f"cp -a {backup}/. {target}/")
-    added = [str(target / name) for name in done["installed"] if name in new]
+    added = [str(target / name) for name in done["installed"] if name in plan.new]
     if added:
         steps.append(f"rm -f {' '.join(added)}")
     steps.append("systemctl daemon-reload")

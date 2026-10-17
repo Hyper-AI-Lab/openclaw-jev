@@ -3,11 +3,14 @@
 git runs for real on a repo in tmp_path; the unit target, the backup root and the code-reload lock are in tmp_path too,
 and systemctl is a recording fake.
 """
+import errno
 import fcntl
 import importlib.util
 import os
 import shlex
+import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,15 +63,19 @@ def install(target: Path, name: str, text: str) -> None:
 
 class FakeSystemctl:
     """is-enabled answers from a table, not-found for a unit it lacks; daemon-reload applies the states the reload
-    shows, and enable marks its unit enabled. Every call is recorded; a call in ``failing`` exits 1."""
+    shows, and enable marks its unit enabled. Every call is recorded; a call in ``failing`` exits 1, and one in
+    ``timing_out`` raises what the real wrapper's subprocess.run raises after its 300 s."""
 
-    def __init__(self, states=STATES, *, reloaded=None, failing=()):
+    def __init__(self, states=STATES, *, reloaded=None, failing=(), timing_out=()):
         self.states, self.reloaded, self.failing, self.calls = dict(states), dict(reloaded or {}), set(failing), []
+        self.timing_out = set(timing_out)
 
     def __call__(self, *args):
         self.calls.append(args)
         if args in self.failing:
             return 1, ""
+        if args in self.timing_out:
+            raise subprocess.TimeoutExpired(["systemctl", *args], 300)
         if args[0] == "is-enabled":
             state = self.states.get(args[1], "not-found")
             return (0 if state == "enabled" else 1), f"{state}\n"
@@ -105,9 +112,9 @@ def host(tmp_path):
                            commits=commits, head=git(repo, "rev-parse", "HEAD"))
 
 
-def run(host, *argv, systemctl, active_user_tasks=lambda: 0):
-    return load().main(list(argv), repo=host.repo, target=host.target, backup_root=host.backups, lock=host.lock,
-                       systemctl=systemctl, active_user_tasks=active_user_tasks)
+def run(host, *argv, systemctl, active_user_tasks=lambda: 0, module=None):
+    return (module or load()).main(list(argv), repo=host.repo, target=host.target, backup_root=host.backups,
+                                   lock=host.lock, systemctl=systemctl, active_user_tasks=active_user_tasks)
 
 
 def snapshot(root: Path) -> dict:
@@ -127,6 +134,14 @@ def snapshot(root: Path) -> dict:
 def committed(host, name: str) -> bytes:
     return subprocess.run(["git", "show", f"HEAD:ops/systemd/{name}"], cwd=host.repo, check=True,
                           capture_output=True).stdout
+
+
+def roll_back(out: list) -> None:
+    """Run the file steps of the printed rollback: line; the systemctl steps are the operator's."""
+    rollback = next(line for line in out if line.startswith("rollback: "))
+    for step in rollback.removeprefix("rollback: ").split(" && "):
+        if not step.startswith("systemctl "):
+            subprocess.run(shlex.split(step), check=True)
 
 
 def test_a_dry_run_names_each_file_with_its_commit_and_each_unit_to_enable_and_writes_nothing(host, capsys):
@@ -190,10 +205,7 @@ def test_apply_installs_heads_bytes_backs_up_reloads_once_and_enables_without_st
 def test_the_rollback_line_puts_back_every_file_and_mode_it_replaced(host, capsys):
     before = snapshot(host.target)
     assert run(host, "--apply", "--head", host.head, systemctl=FakeSystemctl()) == 0
-    rollback = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("rollback: "))
-    for step in rollback.removeprefix("rollback: ").split(" && "):
-        if not step.startswith("systemctl "):
-            subprocess.run(shlex.split(step), check=True)
+    roll_back(capsys.readouterr().out.splitlines())
     # The drop-in directory the install created stays, empty.
     assert snapshot(host.target) == {**before, "rmp-c.service.d": ("dir", 0o755)}
 
@@ -302,6 +314,91 @@ def test_a_failing_enable_stops_there_and_its_rollback_disables_what_was_enabled
     assert "enabled: rmp-b.timer" in out and "start: rmp-b.timer" in out and "start: rmp-d.service" not in out
     assert next(line for line in out if line.startswith("rollback: ")).startswith(
         "rollback: systemctl disable rmp-b.timer && cp -a ")
+
+
+def test_a_systemctl_timeout_stops_there_and_prints_the_rollback(host, capsys):
+    before = snapshot(host.target)
+    systemctl = FakeSystemctl(timing_out=[("daemon-reload",)])
+    assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 1
+    assert systemctl.calls[-1] == ("daemon-reload",)
+    out = capsys.readouterr().out.splitlines()
+    assert out[:3] == [f"head: {host.head}", "failed: systemctl daemon-reload (timed out after 300 s)",
+                       "installed: rmp-a.service, rmp-b.service, rmp-b.timer, rmp-c.service.d/10-limits.conf, "
+                       "rmp-d.service.d/05-nice.conf"]
+    roll_back(out)
+    assert snapshot(host.target) == {**before, "rmp-c.service.d": ("dir", 0o755)}
+
+
+def torn_backup(monkeypatch, host):
+    """The disk fills while rmp-d.service.d/05-nice.conf is backed up, halfway through the copy."""
+    copy2 = shutil.copy2
+
+    def copy(src, dst, **kwargs):
+        if Path(src) == host.target / "rmp-d.service.d" / "05-nice.conf":
+            Path(dst).write_bytes(Path(src).read_bytes()[:4])
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return copy2(src, dst, **kwargs)
+
+    monkeypatch.setattr(shutil, "copy2", copy)
+
+
+def failed_write(monkeypatch, host):
+    """rmp-b.timer's temp file is written, and putting it in place fails."""
+    replace = os.replace
+
+    def put(src, dst, **kwargs):
+        if Path(dst) == host.target / "rmp-b.timer":
+            raise OSError(errno.EIO, "Input/output error")
+        return replace(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "replace", put)
+
+
+@pytest.mark.parametrize("fault, lines, rollback", [
+    (torn_backup, ["failed: backing up rmp-d.service.d/05-nice.conf ([Errno 28] No space left on device)"],
+     "cp -a {backup}/. {target}/ && systemctl daemon-reload"),
+    (failed_write, ["failed: writing rmp-b.timer ([Errno 5] Input/output error)",
+                    "installed: rmp-a.service, rmp-b.service"],
+     "cp -a {backup}/. {target}/ && rm -f {target}/rmp-b.service && systemctl daemon-reload"),
+], ids=["backing-up", "writing"])
+def test_a_failure_while_backing_up_or_writing_prints_a_rollback_that_restores_every_file(host, capsys, monkeypatch,
+                                                                                         fault, lines, rollback):
+    before = snapshot(host.target)
+    systemctl = FakeSystemctl()
+    with monkeypatch.context() as patched:
+        fault(patched, host)
+        assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 1
+    assert [call for call in systemctl.calls if call[0] != "is-enabled"] == []
+    out = capsys.readouterr().out.splitlines()
+    [backup] = host.backups.iterdir()
+    assert out == [f"head: {host.head}", *lines, f"backup: {backup}",
+                   f"rollback: {rollback.format(backup=backup, target=host.target)}",
+                   "Each changed unit takes effect at its next start; restart one now only in an idle window. Start "
+                   "each unit on a start: line in an idle window."]
+    # The rollback puts back the file written before the failure, and copies no part-written backup or temp file.
+    roll_back(out)
+    assert snapshot(host.target) == before
+
+
+def test_a_backup_directory_never_reuses_an_earlier_runs_stamp(host, capsys, monkeypatch):
+    install_units = load()
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 17, 3, 4, 5, tzinfo=tz)
+
+    monkeypatch.setattr(install_units, "datetime", Frozen)
+    earlier = {}
+    for name in ("20261017T030405Z", "20261017T030405Z-1"):
+        (host.backups / name).mkdir(parents=True)
+        (host.backups / name / "rmp-a.service").write_text(f"{name}'s backup\n")
+        earlier[name] = snapshot(host.backups / name)
+    assert run(host, "--apply", "--head", host.head, systemctl=FakeSystemctl(), module=install_units) == 0
+    backup = host.backups / "20261017T030405Z-2"
+    assert f"backup: {backup}" in capsys.readouterr().out.splitlines()
+    assert (backup / "rmp-a.service").read_text() == unit("a")
+    assert {name: snapshot(host.backups / name) for name in earlier} == earlier
 
 
 def test_the_defaults_are_the_hosts_and_the_guard_denies_each():
