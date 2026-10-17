@@ -1,9 +1,10 @@
 [Unit]
 Description=RMP daily backup
-After=network.target postgresql.service
+After=network.target postgresql.service rmp-qdrant.service
 
 [Service]
 Type=oneshot
+TimeoutStartSec=1h
 ExecStart=/bin/bash /root/.openclaw/rmp/ops/backup.sh
 User=root
 

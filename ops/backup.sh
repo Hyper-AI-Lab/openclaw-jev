@@ -50,10 +50,11 @@ trap 'exit 143' TERM INT
 log "Starting RMP backup → ${DEST}"
 
 # Postgres: the RMP ledger. The rmp role's password lives only in DATABASE_URL (environment or /etc/rmp/rmp.env).
+# Every dump waits at most 5 minutes for its table locks, then fails, instead of holding the backup lock all night.
 PG_PASSWORD="${PGPASSWORD:-$("${PY}" -c 'from sqlalchemy.engine import make_url; from app.db.database import DATABASE_URL; print(make_url(DATABASE_URL).password or "")' 2>>"${LOG}" || true)}"
 if command -v pg_dump >/dev/null 2>&1; then
   log "Dumping PostgreSQL ${PG_DB}..."
-  PGPASSWORD="${PG_PASSWORD}" pg_dump -U "${PG_USER}" -h localhost -Fc "${PG_DB}" -f "${DEST}/rmp_db.dump" 2>>"${LOG}" \
+  PGPASSWORD="${PG_PASSWORD}" pg_dump -U "${PG_USER}" -h localhost --lock-wait-timeout=5min -Fc "${PG_DB}" -f "${DEST}/rmp_db.dump" 2>>"${LOG}" \
     || fail postgres "pg_dump failed (check credentials)"
 else
   fail postgres "pg_dump not found"
@@ -62,7 +63,7 @@ fi
 # Postgres: Temporal's own databases (the live workflow store), through the postgres superuser's peer login.
 for db in ${TEMPORAL_DBS}; do
   log "Dumping Temporal database ${db}..."
-  if sudo -n -u postgres pg_dump -Fc "${db}" > "${DEST}/${db}.dump.partial" 2>>"${LOG}" && [[ -s "${DEST}/${db}.dump.partial" ]]; then
+  if sudo -n -u postgres pg_dump --lock-wait-timeout=5min -Fc "${db}" > "${DEST}/${db}.dump.partial" 2>>"${LOG}" && [[ -s "${DEST}/${db}.dump.partial" ]]; then
     mv "${DEST}/${db}.dump.partial" "${DEST}/${db}.dump"
   else
     rm -f "${DEST}/${db}.dump.partial"

@@ -1,5 +1,6 @@
 """The tracked unit directory, ops/systemd/: every RMP unit of this host has its file there and nowhere else, each file
-has its sections, every timer is enabled, and no code names a retired unit. Reads repo files only, never git."""
+has its sections, every timer is enabled, no key sync can block a start, the backup is bounded and ordered, and no code
+names a retired unit. Reads repo files only, never git."""
 import os
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -147,6 +148,14 @@ def test_no_key_sync_or_patch_audit_can_block_a_start():
                 syncs[unit] = syncs.get(unit, 0) + 1
     assert blocking == []
     assert {unit: syncs.get(unit, 0) for unit in KEY_SYNC_UNITS} == dict.fromkeys(KEY_SYNC_UNITS, 1)
+
+
+def test_the_backup_is_bounded_and_starts_after_its_stores():
+    """A oneshot waits forever by default, and backup.sh holds a lock; a run the timer catches up at boot needs Qdrant."""
+    sections = _sections("rmp-backup.service")
+    after = {unit for key, value in sections["Unit"] if key == "After" for unit in value.split()}
+    assert {"postgresql.service", "rmp-qdrant.service"} <= after
+    assert dict(sections["Service"]).get("TimeoutStartSec") == "1h"
 
 
 def test_no_code_names_a_retired_unit():
