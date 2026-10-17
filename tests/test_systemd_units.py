@@ -10,6 +10,8 @@ ENABLED = "enabled-units.txt"
 UNIT_SUFFIXES = (".service", ".timer", ".path", ".socket")
 TYPE_SECTIONS = {".service": "Service", ".timer": "Timer", ".path": "Path"}
 RETIRED = ("temporal-dev", "aura-web-stack.service")
+# The units that sync the LLM keys into OpenClaw's auth store before each start.
+KEY_SYNC_UNITS = ("openclaw-gateway.service", "rmp-api.service", "rmp-worker.service")
 # Runtime content that .gitignore keeps out of the repo.
 RUNTIME_DIRS = {"__pycache__", "node_modules", ".venv", "venv"}
 
@@ -129,6 +131,22 @@ def test_every_timer_starts_a_tracked_service_and_is_enabled():
         elif "Install" not in _sections(unit):
             problems.append(f"{unit} is listed but has no [Install] section, so it is static and cannot be enabled")
     assert problems == []
+
+
+def test_no_key_sync_or_patch_audit_can_block_a_start():
+    """A failed key sync is logged and never stops a unit (B4b-02); a start-time patch audit could not stop one either."""
+    blocking, syncs = [], {}
+    for name in _unit_files():
+        unit = Path(name).parent.name[:-2] if _is_drop_in(name) else name
+        for key, value in _sections(name).get("Service", []):
+            if key != "ExecStartPre" or not ("sync_nvidia_keys.py" in value or "openclaw_patch_audit.py" in value):
+                continue
+            if not value.startswith("-"):
+                blocking.append(f"{name}: ExecStartPre={value}")
+            if "sync_nvidia_keys.py" in value:
+                syncs[unit] = syncs.get(unit, 0) + 1
+    assert blocking == []
+    assert {unit: syncs.get(unit, 0) for unit in KEY_SYNC_UNITS} == dict.fromkeys(KEY_SYNC_UNITS, 1)
 
 
 def test_no_code_names_a_retired_unit():
