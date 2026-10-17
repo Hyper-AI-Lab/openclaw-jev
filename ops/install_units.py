@@ -27,7 +27,8 @@ first. --apply installs every new and changed file at once; <sha> is the full sh
       /root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/install_units.py --apply --head <sha>
 
 --apply refuses unless HEAD is still that commit, so a deploy that lands after the review installs nothing unreviewed.
-It also refuses while a user task is active or a deploy or code reload holds the code-reload lock. It installs that
+It also refuses while the checkout has a git replace ref, which could make that sha stand for other files (the dry run
+warns of one), while a user task is active or while a deploy or code reload holds the code-reload lock. It installs that
 commit's bytes, never the working tree, backs up every file it replaces, never writes, backs up or removes anything
 at an installed path that is not a regular file or through a <unit>.d/ that is not a real directory, runs one
 daemon-reload and enables each listed unit that is not enabled. It never starts, restarts, disables or deletes a unit:
@@ -82,6 +83,15 @@ def _head(repo: Path) -> str:
     return deploy._git(repo, "rev-parse", "HEAD").strip()
 
 
+def _replaced(repo: Path) -> Optional[str]:
+    """Why the checkout's git replace refs make a sha unreliable, or None when it has none. A replace ref makes git
+    read another object wherever a commit or tree id names the one it replaces."""
+    refs = deploy._git(repo, "for-each-ref", "--format=%(refname)", "refs/replace").split()
+    if not refs:
+        return None
+    return f"git replace refs exist ({', '.join(refs)}); the reviewed sha would not mean the reviewed tree"
+
+
 class Plan:
     """What commit ``head`` asks of this host's units: the new and changed unit files, those whose installed path is
     not a regular file and stays as it is, the host-only ones, and the listed units that are not enabled or are left
@@ -125,6 +135,9 @@ def enablement(units: Sequence[str], new: Collection[str], systemctl: Systemctl)
 def dry_run(repo: Path, target: Path, systemctl: Systemctl) -> int:
     plan = Plan(repo, _head(repo), target, systemctl)
     print(f"head: {plan.head}")
+    replaced = _replaced(repo)
+    if replaced:
+        print(f"warning: {replaced}")
     for name in plan.files:
         commit = deploy._git(repo, "log", "-1", "--format=%h %s", plan.head, "--", f"{deploy.UNIT_DIR}{name}").strip()
         print(f"{'new' if name in plan.new else 'changed'}: {name} ({commit})")
@@ -288,6 +301,10 @@ def main(argv: Optional[Sequence[str]] = None, *, repo: Optional[Path] = None, t
         head = _head(repo)
         if args.head != head:
             print(f"refused: HEAD is {head}, the reviewed dry run was {args.head}")
+            return 2
+        replaced = _replaced(repo)
+        if replaced:
+            print(f"refused: {replaced}")
             return 2
         try:
             busy = (active_user_tasks or _active_user_tasks)()

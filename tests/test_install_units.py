@@ -266,6 +266,23 @@ def test_apply_installs_only_the_reviewed_commit(host, capsys, given):
     assert host.lock.exists() == (given == "stale")
 
 
+def test_apply_refuses_while_a_git_replace_ref_exists_and_the_dry_run_warns(host, capsys):
+    """A replace ref makes git read the first commit wherever the reviewed sha names a commit, so that sha no longer
+    pins the reviewed files."""
+    first = git(host.repo, "rev-list", "--max-parents=0", "HEAD")
+    git(host.repo, "replace", host.head, first)
+    message = f"git replace refs exist (refs/replace/{host.head}); the reviewed sha would not mean the reviewed tree"
+    before = snapshot(host.target)
+    assert run(host, systemctl=FakeSystemctl()) == 0
+    assert capsys.readouterr().out.splitlines()[:2] == [f"head: {host.head}", f"warning: {message}"]
+
+    systemctl, counted = FakeSystemctl(), []
+    assert run(host, "--apply", "--head", host.head, systemctl=systemctl,
+               active_user_tasks=lambda: counted.append(1) or 0) == 2
+    assert capsys.readouterr().out.splitlines() == [f"refused: {message}"]
+    assert snapshot(host.target) == before and not host.backups.exists() and systemctl.calls == [] and counted == []
+
+
 def test_nothing_to_install_reloads_nothing(host, capsys):
     for name in ("rmp-a.service", "rmp-b.service", "rmp-b.timer", "rmp-c.service.d/10-limits.conf",
                  "rmp-d.service.d/05-nice.conf"):
