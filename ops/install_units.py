@@ -19,7 +19,7 @@ Before --apply, review each new or changed file with
 
 (/dev/null for a new file's installed copy), and check the commit the dry run names. Install only changes that trace
 to a reviewed programme PR. A unit change from any other source (Aura's PRs, a coding job) needs Kirill's explicit OK
-first. --apply installs every new and changed file at once; <sha> is the commit on the reviewed dry run's head: line:
+first. --apply installs every new and changed file at once; <sha> is the full sha on the reviewed dry run's head: line:
 
     systemd-run --wait --pipe --collect --unit=rmp-install-units -p WorkingDirectory=/root/.openclaw/rmp \
       -p Environment=PYTHONPATH=/root/.openclaw/rmp -p EnvironmentFile=-/etc/rmp/rmp.env \
@@ -56,9 +56,10 @@ BACKUP_ROOT = Path("/var/backups/rmp-units")
 ENABLED_LIST = "enabled-units.txt"
 AFTERWARDS = ("Each changed unit takes effect at its next start; restart one now only in an idle window. Start each "
               "unit on a start: line in an idle window.")
-USAGE = "usage: install_units.py [--apply --head <sha>], <sha> being the commit on the reviewed dry run's head: line"
-# A commit id, whole or abbreviated. A name such as HEAD or main would follow a later deploy, not the reviewed commit.
-SHA = re.compile(r"[0-9a-f]{7,64}")
+USAGE = "usage: install_units.py [--apply --head <sha>], <sha> being the full sha on the reviewed dry run's head: line"
+# A whole commit id, SHA-1 or SHA-256, compared with HEAD's as a string. A name such as HEAD or main, or an abbreviated
+# id that a hex-named branch answers for, could follow a later deploy instead of naming the reviewed commit.
+SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 # systemctl with its arguments: its exit code and its output.
 Systemctl = Callable[..., Tuple[int, str]]
@@ -77,14 +78,6 @@ def _active_user_tasks() -> int:
 
 def _head(repo: Path) -> str:
     return deploy._git(repo, "rev-parse", "HEAD").strip()
-
-
-def _commit(repo: Path, sha: str) -> Optional[str]:
-    """The full id of the commit ``sha`` names, or None when it names none."""
-    try:
-        return deploy._git(repo, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}").strip()
-    except RuntimeError:
-        return None
 
 
 class Plan:
@@ -264,7 +257,7 @@ def main(argv: Optional[Sequence[str]] = None, *, repo: Optional[Path] = None, t
     parser.add_argument("--apply", action="store_true",
                         help="install the new and changed files, back up those replaced, daemon-reload and enable")
     parser.add_argument("--head", metavar="SHA",
-                        help="the commit on the reviewed dry run's head: line; --apply needs it and installs only it")
+                        help="the full sha on the reviewed dry run's head: line; --apply needs it and installs only it")
     args = parser.parse_args(argv)
     repo = repo or REPO
     target = target or deploy.UNIT_TARGET
@@ -283,7 +276,7 @@ def main(argv: Optional[Sequence[str]] = None, *, repo: Optional[Path] = None, t
             return 2
         # Under the lock, so no deploy moves HEAD between this check and the install.
         head = _head(repo)
-        if _commit(repo, args.head) != head:
+        if args.head != head:
             print(f"refused: HEAD is {head}, the reviewed dry run was {args.head}")
             return 2
         try:

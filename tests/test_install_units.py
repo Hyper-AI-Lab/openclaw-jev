@@ -237,19 +237,24 @@ def test_apply_refuses_while_a_deploy_or_code_reload_holds_the_lock(host, capsys
     assert snapshot(host.target) == before and not host.backups.exists() and systemctl.calls == [] and counted == []
 
 
-USAGE = "usage: install_units.py [--apply --head <sha>], <sha> being the commit on the reviewed dry run's head: line"
+USAGE = "usage: install_units.py [--apply --head <sha>], <sha> being the full sha on the reviewed dry run's head: line"
 
 
-@pytest.mark.parametrize("given", ["missing", "a name", "stale"])
+@pytest.mark.parametrize("given", ["missing", "a name", "a hex-named branch", "stale"])
 def test_apply_installs_only_the_reviewed_commit(host, capsys, given):
     """A deploy lands between the reviewed dry run and --apply: --apply refuses without the dry run's head, with a
-    name that follows HEAD, and with the reviewed head once HEAD has moved on."""
+    name that follows HEAD, with an abbreviated id that a hex-named branch at the new HEAD answers for, and with the
+    reviewed head once HEAD has moved on."""
     reviewed = host.head
     commit(host.repo, {"rmp-a.service": unit("a, changed after the review")}, "Change a after the review")
     head = git(host.repo, "rev-parse", "HEAD")
+    if given == "a hex-named branch":
+        # git resolves a ref before an abbreviated id, so this name would lead to the unreviewed HEAD.
+        git(host.repo, "branch", reviewed[:12], head)
     argv, refusal = {
         "missing": (["--apply"], USAGE),
         "a name": (["--apply", "--head", "HEAD"], USAGE),
+        "a hex-named branch": (["--apply", "--head", reviewed[:12]], USAGE),
         "stale": (["--apply", "--head", reviewed], f"refused: HEAD is {head}, the reviewed dry run was {reviewed}"),
     }[given]
     before = snapshot(host.target)
@@ -271,8 +276,7 @@ def test_nothing_to_install_reloads_nothing(host, capsys):
     assert capsys.readouterr().out == f"head: {host.head}\nnothing to install\n"
 
     systemctl = FakeSystemctl(states)
-    # An abbreviated id of the reviewed commit names it as well as the whole one.
-    assert run(host, "--apply", "--head", host.head[:12], systemctl=systemctl) == 0
+    assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 0
     assert [call for call in systemctl.calls if call[0] != "is-enabled"] == []
     [backup] = host.backups.iterdir()
     assert list(backup.iterdir()) == []
