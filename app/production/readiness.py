@@ -37,6 +37,8 @@ SYSTEMD_UNITS = [
     "openclaw-gateway.service",
     "rmp-qdrant.service",
 ]
+# Inactive, these only warn: Aura stays online without them.
+WARN_UNITS = ["aura-web-backends.service"]
 BACKUP_ROOT = os.path.join(RMP_DATA_DIR, "backups")
 MEMORY_CANARY_RESULT_PATH = os.path.join(RMP_DATA_DIR, "last_memory_canary.json")
 HEALTH_CANARY_RESULT_PATH = os.path.join(RMP_DATA_DIR, "last_health_canary.json")
@@ -71,13 +73,21 @@ def _read_json(path: str) -> dict:
 
 
 async def check_systemd_services() -> CheckResult:
-    missing = [u for u in SYSTEMD_UNITS if not _systemd_active(u)]
-    if missing:
+    inactive = [u for u in SYSTEMD_UNITS + WARN_UNITS if not _systemd_active(u)]
+    core = [u for u in inactive if u in SYSTEMD_UNITS]
+    if core:
         return CheckResult(
             "systemd_services",
             "fail",
-            f"Inactive units: {', '.join(missing)}",
-            {"inactive": missing},
+            f"Inactive units: {', '.join(core)}",
+            {"inactive": inactive},
+        )
+    if inactive:
+        return CheckResult(
+            "systemd_services",
+            "warn",
+            f"Inactive units: {', '.join(inactive)} (web tools unavailable)",
+            {"inactive": inactive},
         )
     return CheckResult("systemd_services", "pass", "All core systemd units active")
 

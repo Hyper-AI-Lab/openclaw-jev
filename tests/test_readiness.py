@@ -117,6 +117,24 @@ async def test_run_all_checks_structure(tmp_path, monkeypatch):
     assert ("grpc", ("127.0.0.1", 6334)) in probes and ("open", TEMPORAL_UNIT) in probes
 
 
+@pytest.mark.asyncio
+async def test_an_inactive_web_backend_warns_and_an_inactive_core_unit_still_fails(monkeypatch):
+    from app.production import readiness as rd
+
+    inactive = set()
+    monkeypatch.setattr(rd, "_systemd_active", lambda unit: unit not in inactive)
+    r = await rd.check_systemd_services()
+    assert (r.status, r.details) == ("pass", {})
+    inactive.add("aura-web-backends.service")
+    r = await rd.check_systemd_services()
+    assert (r.status, r.message) == ("warn", "Inactive units: aura-web-backends.service (web tools unavailable)")
+    assert r.details == {"inactive": ["aura-web-backends.service"]}
+    inactive.add("rmp-api.service")
+    r = await rd.check_systemd_services()
+    assert (r.status, r.message) == ("fail", "Inactive units: rmp-api.service")
+    assert r.details == {"inactive": ["rmp-api.service", "aura-web-backends.service"]}
+
+
 def host_files(tmp_path, monkeypatch):
     """A committed unit, its drop-in, the enabled list and two plugin files, each installed as committed, with the
     deploy's unit target and mirror pointed here. Beside them in the target: another unit and its drop-in, a .wants/
