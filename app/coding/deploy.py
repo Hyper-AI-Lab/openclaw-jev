@@ -499,8 +499,8 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
         units = sorted(path[len(UNIT_DIR):] for _, path in changed if path.startswith(UNIT_DIR))
         installs = (f" Files under {UNIT_DIR} changed ({', '.join(units)}): the deploy does not install them; an "
-                    "operator reviews them, runs ops/install_units.py, then --apply --head <the sha it printed> in an "
-                    "idle window." if units else "")
+                    "operator reviews them, runs ops/install_units.py, then --apply --head with the sha it printed, in "
+                    "an idle window." if units else "")
         return {"status": "deployed", **shipped, "canary": checked["canary"], "units": units,
                 "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
                 f"readiness passed and {canary}.{installs}"}
