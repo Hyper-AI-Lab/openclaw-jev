@@ -366,15 +366,18 @@ def test_a_failing_daemon_reload_stops_before_any_enable(host, capsys):
     assert (host.target / "rmp-b.timer").read_bytes() == committed(host, "rmp-b.timer")
 
 
-def test_a_failing_enable_stops_there_and_its_rollback_disables_what_was_enabled(host, capsys):
-    systemctl = FakeSystemctl(reloaded={"rmp-b.timer": "disabled"}, failing=[("enable", "rmp-d.service")])
+@pytest.mark.parametrize("fault, reason", [("failing", "exit 1"), ("timing_out", "timed out after 300 s")],
+                         ids=["exit", "timeout"])
+def test_a_failed_enable_stops_there_and_its_rollback_disables_that_unit_too(host, capsys, fault, reason):
+    systemctl = FakeSystemctl(reloaded={"rmp-b.timer": "disabled"}, **{fault: [("enable", "rmp-d.service")]})
     assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 1
     assert systemctl.calls[-2:] == [("enable", "rmp-b.timer"), ("enable", "rmp-d.service")]
     out = capsys.readouterr().out.splitlines()
-    assert out[:2] == [f"head: {host.head}", "failed: systemctl enable rmp-d.service (exit 1)"]
+    assert out[:2] == [f"head: {host.head}", f"failed: systemctl enable rmp-d.service ({reason})"]
     assert "enabled: rmp-b.timer" in out and "start: rmp-b.timer" in out and "start: rmp-d.service" not in out
+    # The failed enable may have enabled rmp-d.service all the same.
     assert next(line for line in out if line.startswith("rollback: ")).startswith(
-        "rollback: systemctl disable rmp-b.timer && cp -a ")
+        "rollback: systemctl disable rmp-b.timer rmp-d.service && cp -a ")
 
 
 def test_a_systemctl_timeout_stops_there_and_prints_the_rollback(host, capsys):

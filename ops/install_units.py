@@ -182,7 +182,7 @@ def apply(repo: Path, head: str, target: Path, backup_root: Path, systemctl: Sys
     plan = Plan(repo, head, target, systemctl)
     print(f"head: {head}")
     backup = _backup_directory(backup_root, target)
-    done: Dict[str, List[str]] = {"installed": [], "enabled": [], "left": plan.kept + plan.left}
+    done: Dict[str, List[str]] = {"installed": [], "enabled": [], "left": plan.kept + plan.left, "disable": []}
     step = ""
 
     def call(*args: str) -> Tuple[int, str]:
@@ -215,6 +215,9 @@ def apply(repo: Path, head: str, target: Path, backup_root: Path, systemctl: Sys
         not_enabled, left = enablement(plan.listed, plan.new, call)
         done["left"] = plan.kept + left
         for unit in not_enabled:
+            # An enable that exits non-zero or times out may have enabled its unit all the same, so the rollback
+            # disables it too; disabling a unit that is not enabled changes nothing.
+            done["disable"].append(unit)
             _succeeded(call("enable", unit))
             done["enabled"].append(unit)
     except Exception as exc:
@@ -239,7 +242,7 @@ def _report(done: Dict[str, List[str]], plan: Plan, backup: Path, target: Path) 
     for unit in done["left"]:
         print(f"left as is: {unit}")
     print(f"backup: {backup}")
-    steps = [f"systemctl disable {' '.join(done['enabled'])}"] if done["enabled"] else []
+    steps = [f"systemctl disable {' '.join(done['disable'])}"] if done["disable"] else []
     steps.append(f"cp -a {backup}/. {target}/")
     added = [str(target / name) for name in done["installed"] if name in plan.new]
     if added:
