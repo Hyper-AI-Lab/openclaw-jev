@@ -43,6 +43,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,9 +162,13 @@ def _backup_directory(backup_root: Path, target: Path) -> Path:
 
 @contextmanager
 def _replacing(dest: Path) -> Iterator[Path]:
-    """A temp file beside ``dest`` that replaces it once written. A failure leaves ``dest`` as it was and no temp file,
-    so the rollback's ``cp -a`` never copies a part-written backup."""
-    tmp = dest.with_name(f".{dest.name}.rmp-install")
+    """A temp file beside ``dest`` that replaces it once written. It is a new file under a name of its own, created
+    with ``O_EXCL``, so nothing already there, a link left at a temp name for example, is written through or moved onto
+    ``dest``. A failure leaves ``dest`` as it was and no temp file, so the rollback's ``cp -a`` never copies a
+    part-written backup."""
+    fd, name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".rmp-install", dir=dest.parent)
+    os.close(fd)
+    tmp = Path(name)
     try:
         yield tmp
         os.replace(tmp, dest)

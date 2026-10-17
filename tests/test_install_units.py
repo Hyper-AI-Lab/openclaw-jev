@@ -412,6 +412,26 @@ def test_a_drop_in_directory_linked_out_of_the_target_is_never_read_or_written_t
     assert {"target": snapshot(host.target), "outside": snapshot(outside)} == before
 
 
+def test_a_link_left_at_a_temp_files_name_is_neither_written_through_nor_installed(host, tmp_path, capsys):
+    """A link to a file outside the target sits where a temp file for rmp-a.service could be named. Each temp file is
+    created afresh under a name of its own, so the install writes rmp-a.service and never the file the link leads to,
+    and the link stays a link beside it."""
+    outside = tmp_path / "outside"
+    install(outside.parent, "outside/kept.conf", "[Service]\nNice=15\n")
+    (host.target / ".rmp-a.service.rmp-install").symlink_to(outside / "kept.conf")
+    # The new drop-in's directory is there already, so the rollback leaves the whole target as it was.
+    (host.target / "rmp-c.service.d").mkdir()
+    (host.target / "rmp-c.service.d").chmod(0o755)
+    before = {"target": snapshot(host.target), "outside": snapshot(outside)}
+    assert run(host, "--apply", "--head", host.head, systemctl=FakeSystemctl()) == 0
+    assert not (host.target / "rmp-a.service").is_symlink()
+    assert (host.target / "rmp-a.service").read_bytes() == committed(host, "rmp-a.service")
+    assert os.readlink(host.target / ".rmp-a.service.rmp-install") == str(outside / "kept.conf")
+    assert snapshot(outside) == before["outside"]
+    roll_back(capsys.readouterr().out.splitlines())
+    assert {"target": snapshot(host.target), "outside": snapshot(outside)} == before
+
+
 def test_a_failing_daemon_reload_stops_before_any_enable(host, capsys):
     systemctl = FakeSystemctl(failing=[("daemon-reload",)])
     assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 1
