@@ -296,6 +296,60 @@ def test_a_masked_static_or_not_found_listed_unit_is_left_as_it_is(host, capsys)
     assert [line for line in capsys.readouterr().out.splitlines() if line.startswith("left as is: ")] == left
 
 
+def test_a_masks_link_to_dev_null_stays_in_place_through_the_dry_run_apply_and_rollback(host, capsys):
+    """systemctl mask put a link to /dev/null where rmp-a.service's file was. Writing over the link would unmask the
+    unit, and the rollback could not bring the link back, so the install never writes, backs up or removes it."""
+    (host.target / "rmp-a.service").unlink()
+    (host.target / "rmp-a.service").symlink_to("/dev/null")
+    # The new drop-in's directory is there already, so the rollback leaves the whole target as it was.
+    (host.target / "rmp-c.service.d").mkdir()
+    (host.target / "rmp-c.service.d").chmod(0o755)
+    before = snapshot(host.target)
+    assert before["rmp-a.service"] == ("link", "/dev/null")
+    states = {**STATES, "rmp-a.service": "masked"}
+    left = ["left as is: rmp-a.service (not a regular file)", "left as is: rmp-a.service (masked)"]
+    assert run(host, systemctl=FakeSystemctl(states)) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"head: {host.head}",
+        f"new: rmp-b.service ({host.commits['b']})",
+        f"new: rmp-b.timer ({host.commits['b']})",
+        f"new: rmp-c.service.d/10-limits.conf ({host.commits['c']})",
+        f"changed: rmp-d.service.d/05-nice.conf ({host.commits['d']})",
+        "host-only: rmp-old.service",
+        "not enabled: rmp-b.timer",
+        "not enabled: rmp-d.service",
+        *left,
+    ]
+    assert snapshot(host.target) == before
+
+    systemctl = FakeSystemctl(states, reloaded={"rmp-b.timer": "disabled"})
+    assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 0
+    assert os.readlink(host.target / "rmp-a.service") == "/dev/null"
+    assert [call for call in systemctl.calls if call[0] == "enable"] == [("enable", "rmp-b.timer"),
+                                                                         ("enable", "rmp-d.service")]
+    [backup] = host.backups.iterdir()
+    assert sorted(path.relative_to(backup).as_posix() for path in backup.rglob("*")) == [
+        "rmp-d.service.d", "rmp-d.service.d/05-nice.conf"]
+    target = host.target
+    out = capsys.readouterr().out.splitlines()
+    assert out == [
+        f"head: {host.head}",
+        "installed: rmp-b.service, rmp-b.timer, rmp-c.service.d/10-limits.conf, rmp-d.service.d/05-nice.conf",
+        "enabled: rmp-b.timer, rmp-d.service",
+        "start: rmp-b.timer",
+        "start: rmp-d.service",
+        *left,
+        f"backup: {backup}",
+        f"rollback: systemctl disable rmp-b.timer rmp-d.service && cp -a {backup}/. {target}/ && rm -f "
+        f"{target}/rmp-b.service {target}/rmp-b.timer {target}/rmp-c.service.d/10-limits.conf "
+        "&& systemctl daemon-reload",
+        "Each changed unit takes effect at its next start; restart one now only in an idle window. Start each unit on "
+        "a start: line in an idle window.",
+    ]
+    roll_back(out)
+    assert snapshot(host.target) == before
+
+
 def test_a_failing_daemon_reload_stops_before_any_enable(host, capsys):
     systemctl = FakeSystemctl(failing=[("daemon-reload",)])
     assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 1

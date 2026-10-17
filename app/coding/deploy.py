@@ -59,8 +59,10 @@ UNIT_TARGET = Path("/etc/systemd/system")
 UNIT_SUFFIXES = (".service", ".timer", ".path", ".socket")
 # The units of this host that are RMP's, by name; an installed one the repo does not track is host-only.
 RMP_UNIT_PREFIXES = ("rmp-", "aura-", "openclaw-", "temporal.", "temporal-")
-# Marks a tracked unit file with no installed copy.
+# Marks a tracked unit file with no installed copy, and one whose installed path is not a regular file: a symlink, such
+# as a mask's link to /dev/null, or anything else that no install writes over.
 MISSING = " (missing)"
+NOT_REGULAR = " (not a regular file)"
 
 
 def restarts_for(paths: Iterable[str]) -> List[str]:
@@ -189,14 +191,17 @@ def _installed_rmp_unit_files(target: Path) -> List[str]:
 
 def unit_drift(repo: Path, commit: str, target: Path) -> Dict[str, List[str]]:
     """How the unit files installed in ``target`` differ from ``commit``'s, by name relative to both: ``units``, the
-    tracked unit files whose installed copy is missing (marked ``MISSING``) or has other bytes; ``host_only_units``,
-    RMP's unit files installed there that ``commit`` does not track."""
+    tracked unit files whose installed copy is missing (marked ``MISSING``), is not a regular file (marked
+    ``NOT_REGULAR``, and never read through a symlink) or has other bytes; ``host_only_units``, RMP's unit files
+    installed there that ``commit`` does not track."""
     tracked = {path[len(UNIT_DIR):]: blob for _, blob, path in tracked_files(repo, commit, UNIT_DIR)
                if is_unit_file(path[len(UNIT_DIR):])}
-    present = [name for name in sorted(tracked) if (target / name).is_file()]
+    names = sorted(tracked)
+    present = [name for name in names if (target / name).is_file() and not (target / name).is_symlink()]
+    other = {name for name in names if name not in present and os.path.lexists(target / name)}
     current = dict(zip(present, blob_ids(repo, [target / name for name in present])))
-    units = [name if name in current else f"{name}{MISSING}"
-             for name in sorted(tracked) if current.get(name) != tracked[name]]
+    units = [f"{name}{NOT_REGULAR}" if name in other else name if name in current else f"{name}{MISSING}"
+             for name in names if current.get(name) != tracked[name]]
     host_only = [name for name in _installed_rmp_unit_files(target) if name not in tracked]
     return {"units": units, "host_only_units": host_only}
 

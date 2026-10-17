@@ -4,8 +4,9 @@ r"""Install the unit files tracked in ops/systemd/ on this host: the operator's 
 The deploy never installs a unit file; its result and Kirill's note name the changed ones. Run this as root from the
 live checkout once the deploy shows ``deployed``. Without a flag it is a dry run that writes nothing. It prints the
 commit it planned from on a head: line, then each new or changed unit file with the last commit that touched it, each
-RMP unit file installed with no tracked file, and each unit of enabled-units.txt that is not enabled or is left as it
-is:
+RMP unit file installed with no tracked file, each tracked unit file whose installed path is not a regular file (a
+mask's link to /dev/null, for example), which it leaves as it is, and each unit of enabled-units.txt that is not
+enabled or is left as it is:
 
     systemd-run --wait --pipe --collect --unit=rmp-install-units -p WorkingDirectory=/root/.openclaw/rmp \
       -p Environment=PYTHONPATH=/root/.openclaw/rmp -p EnvironmentFile=-/etc/rmp/rmp.env \
@@ -27,10 +28,11 @@ first. --apply installs every new and changed file at once; <sha> is the commit 
 
 --apply refuses unless HEAD is still that commit, so a deploy that lands after the review installs nothing unreviewed.
 It also refuses while a user task is active or a deploy or code reload holds the code-reload lock. It installs that
-commit's bytes, never the working tree, backs up every file it replaces, runs one daemon-reload and enables each
-listed unit that is not enabled. It never starts, restarts, disables or deletes a unit: it prints a start: line for
-each unit it enabled, to start in an idle window, and a rollback: line that undoes the install. A failure after the
-backup directory exists stops there, prints failed:, what was done so far and the rollback: line, and exits 1.
+commit's bytes, never the working tree, backs up every file it replaces, never writes over, backs up or removes an
+installed path that is not a regular file, runs one daemon-reload and enables each listed unit that is not enabled.
+It never starts, restarts, disables or deletes a unit: it prints a start: line for each unit it enabled, to start in
+an idle window, and a rollback: line that undoes the install. A failure after the backup directory exists stops
+there, prints failed:, what was done so far and the rollback: line, and exits 1.
 """
 import argparse
 import fcntl
@@ -86,14 +88,19 @@ def _commit(repo: Path, sha: str) -> Optional[str]:
 
 
 class Plan:
-    """What commit ``head`` asks of this host's units: the new and changed unit files, the host-only ones, and the
-    listed units that are not enabled or are left as they are."""
+    """What commit ``head`` asks of this host's units: the new and changed unit files, those whose installed path is
+    not a regular file and stays as it is, the host-only ones, and the listed units that are not enabled or are left
+    as they are."""
 
     def __init__(self, repo: Path, head: str, target: Path, systemctl: Systemctl):
         self.head = head
         drift = deploy.unit_drift(repo, self.head, target)
-        self.files = [name.removesuffix(deploy.MISSING) for name in drift["units"]]
-        self.new = {name.removesuffix(deploy.MISSING) for name in drift["units"] if name.endswith(deploy.MISSING)}
+        # An installed path that is not a regular file, a mask's link to /dev/null for example, is someone's deliberate
+        # choice: never written over, backed up or removed, so the install neither unmasks a unit nor loses the link.
+        self.kept = [name for name in drift["units"] if name.endswith(deploy.NOT_REGULAR)]
+        units = [name for name in drift["units"] if name not in self.kept]
+        self.files = [name.removesuffix(deploy.MISSING) for name in units]
+        self.new = {name.removesuffix(deploy.MISSING) for name in units if name.endswith(deploy.MISSING)}
         self.host_only = drift["host_only_units"]
         listed = deploy._git(repo, "cat-file", "blob", f"{self.head}:{deploy.UNIT_DIR}{ENABLED_LIST}")
         lines = (line.strip() for line in listed.splitlines())
@@ -131,7 +138,7 @@ def dry_run(repo: Path, target: Path, systemctl: Systemctl) -> int:
         print(f"host-only: {name}")
     for unit in plan.not_enabled:
         print(f"not enabled: {unit}")
-    for unit in plan.left:
+    for unit in plan.kept + plan.left:
         print(f"left as is: {unit}")
     return 0
 
@@ -182,7 +189,7 @@ def apply(repo: Path, head: str, target: Path, backup_root: Path, systemctl: Sys
     plan = Plan(repo, head, target, systemctl)
     print(f"head: {head}")
     backup = _backup_directory(backup_root, target)
-    done: Dict[str, List[str]] = {"installed": [], "enabled": [], "left": plan.left}
+    done: Dict[str, List[str]] = {"installed": [], "enabled": [], "left": plan.kept + plan.left}
     step = ""
 
     def call(*args: str) -> Tuple[int, str]:
@@ -212,7 +219,8 @@ def apply(repo: Path, head: str, target: Path, backup_root: Path, systemctl: Sys
             done["installed"].append(name)
         if done["installed"]:
             _succeeded(call("daemon-reload"))
-        not_enabled, done["left"] = enablement(plan.listed, plan.new, call)
+        not_enabled, left = enablement(plan.listed, plan.new, call)
+        done["left"] = plan.kept + left
         for unit in not_enabled:
             _succeeded(call("enable", unit))
             done["enabled"].append(unit)

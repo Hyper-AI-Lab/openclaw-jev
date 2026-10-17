@@ -202,6 +202,25 @@ def test_host_file_drift_warns_and_names_each_kind(tmp_path, monkeypatch):
         "rmp-y.timer, plugins/p/a.js, plugins/p/b.js")
 
 
+def test_host_file_drift_names_a_tracked_unit_whose_installed_path_is_not_a_regular_file(tmp_path, monkeypatch):
+    from app.production.readiness import check_host_file_drift
+
+    host = host_files(tmp_path, monkeypatch)
+    # systemctl mask's link to /dev/null, and a link to a copy with the committed bytes: neither is a regular file, and
+    # neither is read through.
+    (host.target / "rmp-x.service").unlink()
+    (host.target / "rmp-x.service").symlink_to("/dev/null")
+    conf = host.target / "rmp-x.service.d" / "10-a.conf"
+    (tmp_path / "10-a.conf").write_bytes(conf.read_bytes())
+    conf.unlink()
+    conf.symlink_to(tmp_path / "10-a.conf")
+    r = check_host_file_drift(str(host.repo))
+    assert r.status == "warn"
+    assert r.details == {
+        "units": ["rmp-x.service (not a regular file)", "rmp-x.service.d/10-a.conf (not a regular file)"],
+        "host_only_units": [], "mirrors": []}
+
+
 def test_host_file_drift_warns_when_it_cannot_compare(tmp_path, monkeypatch):
     from app.production.readiness import check_host_file_drift
 
