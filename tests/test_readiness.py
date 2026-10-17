@@ -138,7 +138,8 @@ async def test_an_inactive_web_backend_warns_and_an_inactive_core_unit_still_fai
 def host_files(tmp_path, monkeypatch):
     """A committed unit, its drop-in, the enabled list and two plugin files, each installed as committed, with the
     deploy's unit target and mirror pointed here. Beside them in the target: another unit and its drop-in, a .wants/
-    link, a symlinked RMP unit and an RMP unit's backup, none of which is an RMP unit file."""
+    link, a symlinked RMP unit, an RMP unit's backup, and in its drop-in directory a file that is not a .conf and a
+    symlinked .conf, none of which is an RMP unit file."""
     from app.coding import deploy
 
     repo, target, plugins = tmp_path / "repo", tmp_path / "etc-systemd-system", tmp_path / "plugins"
@@ -162,6 +163,9 @@ def host_files(tmp_path, monkeypatch):
     (target / "multi-user.target.wants" / "rmp-x.service").symlink_to(target / "rmp-x.service")
     (target / "rmp-alias.service").symlink_to(target / "rmp-x.service")
     (target / "rmp-x.service.bak").write_text("[Service]\n")
+    (target / "rmp-x.service.d" / "10-a.conf.orig").write_text("[Service]\n")
+    (tmp_path / "shared.conf").write_text("[Service]\n")
+    (target / "rmp-x.service.d" / "20-shared.conf").symlink_to(tmp_path / "shared.conf")
     monkeypatch.setattr(deploy, "UNIT_TARGET", target)
     monkeypatch.setattr(deploy, "MIRRORS", (("plugins/", plugins),))
     return SimpleNamespace(repo=repo, target=target, plugins=plugins)

@@ -281,9 +281,12 @@ def test_nothing_to_install_reloads_nothing(host, capsys):
     assert out[3] == f"rollback: cp -a {backup}/. {host.target}/ && systemctl daemon-reload"
 
 
-def test_a_masked_or_static_listed_unit_is_left_as_it_is(host, capsys):
-    states = {**STATES, "rmp-c.service": "masked", "rmp-d.service": "static"}
-    left = ["left as is: rmp-c.service (masked)", "left as is: rmp-d.service (static)"]
+def test_a_masked_static_or_not_found_listed_unit_is_left_as_it_is(host, capsys):
+    # The install changes rmp-a.service's file but does not add it, so not-found is no unit to enable but one for the
+    # operator to diagnose.
+    states = {**STATES, "rmp-a.service": "not-found", "rmp-c.service": "masked", "rmp-d.service": "static"}
+    left = ["left as is: rmp-a.service (not-found)", "left as is: rmp-c.service (masked)",
+            "left as is: rmp-d.service (static)"]
     assert run(host, systemctl=FakeSystemctl(states)) == 0
     assert [line for line in capsys.readouterr().out.splitlines() if line.startswith("left as is: ")] == left
 
