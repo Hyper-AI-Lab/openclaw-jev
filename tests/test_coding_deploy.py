@@ -162,8 +162,8 @@ def test_a_deploy_that_changes_a_unit_file_names_it(repos):
     result = deploy.self_deploy(spec(repos, head), FakeHost(repos.live), log=lambda m: None)
     assert result["status"] == "deployed" and result["units"] == ["aura-x.service"]
     assert result["summary"].endswith("Files under ops/systemd/ changed (aura-x.service): the deploy does not "
-                                      "install them; an operator reviews them and runs ops/install_units.py, then "
-                                      "with --apply, in an idle window.")
+                                      "install them; an operator reviews them, runs ops/install_units.py, then "
+                                      "--apply --head with the sha it printed, in an idle window.")
 
     repos.old = head
     head = repos.change({"ops/systemd/enabled-units.txt": "aura-x.service\n"})
@@ -570,7 +570,8 @@ def test_a_deploy_of_githubs_main_that_is_live_is_recorded_without_telling_kiril
 
 def test_a_live_deploy_that_changed_unit_files_still_tells_kirill(tmp_path, monkeypatch):
     summary = ("Deployed cccccccccccc. Files under ops/systemd/ changed (aura-x.service): the deploy does not install "
-               "them; an operator reviews them and runs ops/install_units.py, then with --apply, in an idle window.")
+               "them; an operator reviews them, runs ops/install_units.py, then --apply --head with the sha it "
+               "printed, in an idle window.")
     code, notes = run_github_unit(tmp_path, monkeypatch, "deployed", units=["aura-x.service"], summary=summary)
     assert code == 0 and len(notes) == 1
     note, incident = notes[0]

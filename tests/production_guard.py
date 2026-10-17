@@ -41,7 +41,8 @@ PathArg = Union[str, bytes, os.PathLike]
 
 # Any access, read or write: the host's production state and secrets, and the live targets of a deploy
 # (deploy.MIRRORS writes plugins, web-stack and Cursor rules; /etc/systemd/system is deploy.UNIT_TARGET, which no
-# deploy writes; deploy.CODE_RELOAD_LOCK is the host's code-reload lock).
+# deploy writes; ops/install_units.py writes deploy.UNIT_TARGET and backs up into /var/backups/rmp-units;
+# deploy.CODE_RELOAD_LOCK is the host's code-reload lock).
 DENIED_ROOTS = (
     "/root/.openclaw",
     "/etc/openclaw",
@@ -53,6 +54,7 @@ DENIED_ROOTS = (
     "/root/.claude-team",
     "/etc/systemd/system",
     "/root/.cursor",
+    "/var/backups/rmp-units",
     "/run/rmp-code-reload.lock",
 )
 # Under the repo root, and denied there too: in the live checkout they are production state.

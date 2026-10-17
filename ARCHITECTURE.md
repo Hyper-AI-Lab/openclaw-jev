@@ -110,6 +110,15 @@ Aura is a **three-layer system** on one machine:
 | `rmp-janitor.timer` | Daily workflow janitor (`ops/workflow_janitor.py`) |
 | `rmp-backup.timer` | Daily Postgres backup |
 
+Every RMP unit file is tracked in `ops/systemd/`, with drop-ins in `ops/systemd/<unit>.d/` and the units that must be enabled in `ops/systemd/enabled-units.txt`. The deploy never installs them: it names the changed files in its result and in Kirill's note, and readiness's `host_file_drift` warns until they are installed. After the deploy, an operator reviews each new or changed file's diff and the commit that brought it, and gets Kirill's explicit OK first for a unit change that does not come from a reviewed programme PR. The operator then runs the command below, a dry run that prints the commit it planned from on a `head:` line and lists the new and changed files, host-only units and units to enable, and runs it again with `--apply --head <sha>` appended in an idle window, `<sha>` being that `head:` line's commit. `--apply` refuses unless `HEAD` is still that commit, and while the checkout has a git replace ref, a user task is active or the code-reload lock is held. It installs that commit's bytes, backs up every file it replaces, runs one `daemon-reload`, enables the listed units that are not enabled and prints a `rollback:` line, after a failed step too. It never starts, restarts, disables or deletes a unit: the operator starts each unit on a `start:` line in an idle window.
+
+```bash
+systemd-run --wait --pipe --collect --unit=rmp-install-units -p WorkingDirectory=/root/.openclaw/rmp \
+  -p Environment=PYTHONPATH=/root/.openclaw/rmp -p EnvironmentFile=-/etc/rmp/rmp.env \
+  -p EnvironmentFile=-/etc/openclaw/openclaw.env \
+  /root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/install_units.py
+```
+
 ---
 
 ## 3. Message flow (Slack → reply)
@@ -449,7 +458,7 @@ The orchestrator keeps **program logic** in charge; the LLM proposes actions and
 | **Workflow janitor** | `ops/workflow_janitor.py`, `rmp-janitor.timer` | Daily sweep of orphaned Temporal executions >24h |
 | **Canary timers** | `rmp-canary.timer`, `rmp-memory-canary.timer` | Hourly E2E + 6h memory/vector canary; results in logs + `data/last_memory_canary.json` |
 | **Canary sentinel** | `app/production/canary_sentinel.py`, `rmp-canary-sentinel.timer` | Every 30 min: canary health with remediation, then the invariant checks; pages Kirill by Slack DM on a failure (4 h cooldown per incident) |
-| **Readiness** | `GET /api/production/readiness` | Stuck workflow count, canary freshness, LLM orchestration snapshot, deep memory (`app/deep_memory/health.py`: ingest lag, enrichment, index drift, memory-lane budget, recall latency and follow-up rate), and the invariants (`app/production/invariants.py`): completions without an accept, attached messages neither answered nor resubmitted, Slack delivery failures, internal traces in shared memory, vector outbox and drift, orphan recoveries, finished user tasks without an enriched task document after 30 min, internal content in deep memory, follow-ups without an accept |
+| **Readiness** | `GET /api/production/readiness` | Stuck workflow count, canary freshness, LLM orchestration snapshot, deep memory (`app/deep_memory/health.py`: ingest lag, enrichment, index drift, memory-lane budget, recall latency and follow-up rate), and the invariants (`app/production/invariants.py`): completions without an accept, attached messages neither answered nor resubmitted, Slack delivery failures, internal traces in shared memory, vector outbox and drift, orphan recoveries, finished user tasks without an enriched task document after 30 min, internal content in deep memory, follow-ups without an accept; and host-file drift (`host_file_drift`, warn only, names only): installed unit files that are missing or differ from `ops/systemd/` at `main`, RMP units installed with no tracked file, and mirror files whose live copy is missing or differs from `main` |
 | **Deep ingest** | `app/deep_memory/ingest.py` (API loop) | Drains `dm_ingest_queue` every 10 s (claim lease, backoff up to 1 h; a spent model budget defers to the next UTC day) |
 
 This layer makes the single-VPS deployment **set-and-forget**: transient worker crashes, hung OpenClaw sessions, and orphaned children are repaired without operator intervention.
@@ -935,7 +944,7 @@ Prioritized for stability first, then capability.
 /root/aura_safe_harbor/           # Scanners, watchdog, legacy Kairos
 /etc/rmp/rmp.env                  # RMP_API_KEY, DATABASE_URL
 /etc/openclaw/openclaw.env        # OPENAI_API_KEY, NVIDIA_API_KEY, NVIDIA_API_KEY_2, NVIDIA_API_KEY_3
-/etc/systemd/system/              # Service units (ExecStartPre key sync)
+/etc/systemd/system/              # installed copies of ops/systemd/ (ops/install_units.py)
 ```
 
 ---

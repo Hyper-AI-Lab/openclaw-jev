@@ -2,7 +2,10 @@ import asyncio
 import builtins
 import errno
 import json
+import os
+import shutil
 import subprocess
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -109,11 +112,157 @@ async def test_run_all_checks_structure(tmp_path, monkeypatch):
     # Each probe was refused, and the check that made it reports the service as out of reach.
     statuses = {c["name"]: c["status"] for c in result["checks"]}
     assert {name: statuses[name] for name in ("systemd_services", "rmp_health", "temporal", "temporal_persistence",
-                                              "task_registry_vector", "stuck_workflows")} == {
+                                              "task_registry_vector", "stuck_workflows", "host_file_drift")} == {
         "systemd_services": "fail", "rmp_health": "fail", "temporal": "fail", "temporal_persistence": "warn",
-        "task_registry_vector": "fail", "stuck_workflows": "warn"}
+        "task_registry_vector": "fail", "stuck_workflows": "warn", "host_file_drift": "warn"}
     assert {kind for kind, _ in probes} == {"process", "http", "temporal", "grpc", "open"}
     assert ("grpc", ("127.0.0.1", 6334)) in probes and ("open", TEMPORAL_UNIT) in probes
+
+
+@pytest.mark.asyncio
+async def test_an_inactive_web_backend_warns_and_an_inactive_core_unit_still_fails(monkeypatch):
+    from app.production import readiness as rd
+
+    inactive = set()
+    monkeypatch.setattr(rd, "_systemd_active", lambda unit: unit not in inactive)
+    r = await rd.check_systemd_services()
+    assert (r.status, r.details) == ("pass", {})
+    inactive.add("aura-web-backends.service")
+    r = await rd.check_systemd_services()
+    assert (r.status, r.message) == ("warn", "Inactive units: aura-web-backends.service (web tools unavailable)")
+    assert r.details == {"inactive": ["aura-web-backends.service"]}
+    inactive.add("rmp-api.service")
+    r = await rd.check_systemd_services()
+    assert (r.status, r.message) == ("fail", "Inactive units: rmp-api.service")
+    assert r.details == {"inactive": ["rmp-api.service", "aura-web-backends.service"]}
+
+
+def host_files(tmp_path, monkeypatch):
+    """A committed unit, its drop-in, the enabled list and two plugin files, each installed as committed, with the
+    deploy's unit target and mirror pointed here. Beside them in the target: another unit and its drop-in, a .wants/
+    link, a symlinked RMP unit, an RMP unit's backup, and in its drop-in directory a file that is not a .conf and a
+    symlinked .conf, none of which is an RMP unit file."""
+    from app.coding import deploy
+
+    repo, target, plugins = tmp_path / "repo", tmp_path / "etc-systemd-system", tmp_path / "plugins"
+    units = {"rmp-x.service": "[Service]\nExecStart=/bin/true\n", "rmp-x.service.d/10-a.conf": "[Service]\nNice=5\n"}
+    files = {**{f"ops/systemd/{name}": text for name, text in units.items()},
+             "ops/systemd/enabled-units.txt": "rmp-x.service\n", "plugins/p/a.js": "a\n", "plugins/p/b.js": "b\n"}
+    for root, written in ((repo, files), (target, units), (plugins, {"p/a.js": "a\n", "p/b.js": "b\n"})):
+        for path, text in written.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_text(text)
+            # The committed mode, whatever the umask: RMP's own test runs use 0077.
+            (root / path).chmod(0o644)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "units"],
+                   check=True)
+    (target / "ssh.service").write_text("[Service]\n")
+    (target / "ssh.service.d").mkdir()
+    (target / "ssh.service.d" / "override.conf").write_text("[Service]\n")
+    (target / "multi-user.target.wants").mkdir()
+    (target / "multi-user.target.wants" / "rmp-x.service").symlink_to(target / "rmp-x.service")
+    (target / "rmp-alias.service").symlink_to(target / "rmp-x.service")
+    (target / "rmp-x.service.bak").write_text("[Service]\n")
+    (target / "rmp-x.service.d" / "10-a.conf.orig").write_text("[Service]\n")
+    (tmp_path / "shared.conf").write_text("[Service]\n")
+    (target / "rmp-x.service.d" / "20-shared.conf").symlink_to(tmp_path / "shared.conf")
+    monkeypatch.setattr(deploy, "UNIT_TARGET", target)
+    monkeypatch.setattr(deploy, "MIRRORS", (("plugins/", plugins),))
+    return SimpleNamespace(repo=repo, target=target, plugins=plugins)
+
+
+def test_host_file_drift_passes_when_every_copy_matches(tmp_path, monkeypatch):
+    from app.production.readiness import check_host_file_drift
+
+    host = host_files(tmp_path, monkeypatch)
+    r = check_host_file_drift(str(host.repo))
+    assert (r.name, r.status, r.message, r.details) == (
+        "host_file_drift", "pass", "Installed unit files and mirrors match main", {})
+
+
+def test_host_file_drift_warns_and_names_each_kind(tmp_path, monkeypatch):
+    from app.production.readiness import check_host_file_drift
+
+    host = host_files(tmp_path, monkeypatch)
+    (host.target / "rmp-x.service").write_text("[Service]\nExecStart=/bin/false\n")
+    (host.target / "rmp-x.service.d" / "10-a.conf").unlink()
+    (host.target / "rmp-y.timer").write_text("[Timer]\n")
+    (host.target / "aura-z.service.d").mkdir()
+    (host.target / "aura-z.service.d" / "x.conf").write_text("[Service]\n")
+    (host.plugins / "p" / "a.js").write_text("a, edited\n")
+    (host.plugins / "p" / "b.js").chmod(0o600)
+    r = check_host_file_drift(str(host.repo))
+    assert r.status == "warn"
+    assert r.details == {"units": ["rmp-x.service", "rmp-x.service.d/10-a.conf (missing)"],
+                         "host_only_units": ["aura-z.service.d/x.conf", "rmp-y.timer"],
+                         "mirrors": ["plugins/p/a.js", "plugins/p/b.js"]}
+    assert r.message == (
+        "Host files differ from main: 2 unit file(s), 2 host-only unit(s), 2 mirror file(s); install units with "
+        "ops/install_units.py — rmp-x.service, rmp-x.service.d/10-a.conf (missing), aura-z.service.d/x.conf, "
+        "rmp-y.timer, plugins/p/a.js, plugins/p/b.js")
+
+
+@pytest.mark.parametrize("kind", ["a mask's link to /dev/null", "a dangling link", "a FIFO", "a directory"])
+def test_host_file_drift_names_a_tracked_unit_whose_installed_path_is_not_a_regular_file(tmp_path, monkeypatch, kind):
+    from app.production.readiness import check_host_file_drift
+
+    host = host_files(tmp_path, monkeypatch)
+    unit = host.target / "rmp-x.service"
+    unit.unlink()
+    if kind == "a mask's link to /dev/null":
+        unit.symlink_to("/dev/null")
+    elif kind == "a dangling link":
+        unit.symlink_to(tmp_path / "nowhere")
+    elif kind == "a FIFO":
+        os.mkfifo(unit)
+    else:
+        unit.mkdir()
+    # A link to a copy with the committed bytes is no regular file either, and is not read through.
+    conf = host.target / "rmp-x.service.d" / "10-a.conf"
+    (tmp_path / "10-a.conf").write_bytes(conf.read_bytes())
+    conf.unlink()
+    conf.symlink_to(tmp_path / "10-a.conf")
+    r = check_host_file_drift(str(host.repo))
+    assert r.status == "warn"
+    assert r.details == {
+        "units": ["rmp-x.service (not a regular file)", "rmp-x.service.d/10-a.conf (not a regular file)"],
+        "host_only_units": [], "mirrors": []}
+
+
+@pytest.mark.parametrize("kind", ["a link out of the target", "a dangling link", "a file"])
+def test_host_file_drift_names_each_conf_in_a_drop_in_path_that_is_not_a_directory(tmp_path, monkeypatch, kind):
+    from app.production.readiness import check_host_file_drift
+
+    host = host_files(tmp_path, monkeypatch)
+    shutil.rmtree(host.target / "rmp-x.service.d")
+    if kind == "a file":
+        (host.target / "rmp-x.service.d").write_text("[Service]\n")
+    elif kind == "a dangling link":
+        (host.target / "rmp-x.service.d").symlink_to(tmp_path / "nowhere")
+    else:
+        # The directory the link leads to holds another 10-a.conf; it is never read through the link.
+        (tmp_path / "outside").mkdir()
+        (tmp_path / "outside" / "10-a.conf").write_text("[Service]\nNice=15\n")
+        (host.target / "rmp-x.service.d").symlink_to(tmp_path / "outside")
+    r = check_host_file_drift(str(host.repo))
+    assert r.status == "warn"
+    assert r.details == {"units": ["rmp-x.service.d/10-a.conf (not a regular file)"], "host_only_units": [],
+                         "mirrors": []}
+
+
+def test_host_file_drift_warns_when_it_cannot_compare(tmp_path, monkeypatch):
+    from app.production.readiness import check_host_file_drift
+
+    host_files(tmp_path, monkeypatch)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    # git looks for a repository in the parent directories; none above tmp_path counts.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    r = check_host_file_drift(str(plain))
+    assert r.status == "warn" and r.message.startswith("Could not compare host files: git ls-tree")
+    assert "not a git repository" in r.message
 
 
 def test_slack_sockets_single_is_pass(monkeypatch):

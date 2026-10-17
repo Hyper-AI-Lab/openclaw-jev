@@ -8,6 +8,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -15,6 +16,7 @@ import httpx
 from app.config import (
     OPENCLAW_CONFIG_PATH,
     RMP_DATA_DIR,
+    RMP_ROOT,
     SETTINGS_PATH,
     get_openclaw_hook_token,
     get_openclaw_url,
@@ -35,6 +37,8 @@ SYSTEMD_UNITS = [
     "openclaw-gateway.service",
     "rmp-qdrant.service",
 ]
+# Inactive, these only warn: Aura stays online without them.
+WARN_UNITS = ["aura-web-backends.service"]
 BACKUP_ROOT = os.path.join(RMP_DATA_DIR, "backups")
 MEMORY_CANARY_RESULT_PATH = os.path.join(RMP_DATA_DIR, "last_memory_canary.json")
 HEALTH_CANARY_RESULT_PATH = os.path.join(RMP_DATA_DIR, "last_health_canary.json")
@@ -69,13 +73,21 @@ def _read_json(path: str) -> dict:
 
 
 async def check_systemd_services() -> CheckResult:
-    missing = [u for u in SYSTEMD_UNITS if not _systemd_active(u)]
-    if missing:
+    inactive = [u for u in SYSTEMD_UNITS + WARN_UNITS if not _systemd_active(u)]
+    core = [u for u in inactive if u in SYSTEMD_UNITS]
+    if core:
         return CheckResult(
             "systemd_services",
             "fail",
-            f"Inactive units: {', '.join(missing)}",
-            {"inactive": missing},
+            f"Inactive units: {', '.join(core)}",
+            {"inactive": inactive},
+        )
+    if inactive:
+        return CheckResult(
+            "systemd_services",
+            "warn",
+            f"Inactive units: {', '.join(inactive)} (web tools unavailable)",
+            {"inactive": inactive},
         )
     return CheckResult("systemd_services", "pass", "All core systemd units active")
 
@@ -799,6 +811,30 @@ def check_runtime_code_sync() -> CheckResult:
     )
 
 
+def check_host_file_drift(repo: Optional[str] = None) -> CheckResult:
+    """Warn when an installed unit file or a mirror file differs from main, or an RMP unit is installed with no tracked
+    file. Names only, never contents. Unit files differ between a merge and the operator's install, so this never
+    fails."""
+    try:
+        from app.coding import deploy
+
+        drift = deploy.host_file_drift(Path(repo or RMP_ROOT))
+    except Exception as exc:
+        return CheckResult("host_file_drift", "warn", f"Could not compare host files: {exc}")
+    names = drift["units"] + drift["host_only_units"] + drift["mirrors"]
+    if not names:
+        return CheckResult("host_file_drift", "pass", "Installed unit files and mirrors match main")
+    more = f" and {len(names) - 10} more" if len(names) > 10 else ""
+    return CheckResult(
+        "host_file_drift",
+        "warn",
+        f"Host files differ from main: {len(drift['units'])} unit file(s), {len(drift['host_only_units'])} host-only "
+        f"unit(s), {len(drift['mirrors'])} mirror file(s); install units with ops/install_units.py — "
+        f"{', '.join(names[:10])}{more}",
+        drift,
+    )
+
+
 async def run_all_checks() -> Dict[str, Any]:
     from app.deep_memory.health import run_readiness_checks
     from app.production.invariants import run_invariant_checks
@@ -822,6 +858,7 @@ async def run_all_checks() -> Dict[str, Any]:
         check_task_registry_vector(),
         check_task_registry_index_fresh(),
         check_runtime_code_sync(),
+        check_host_file_drift(),
         check_openai_key(),
         check_safe_harbor_peripheral(),
     ]

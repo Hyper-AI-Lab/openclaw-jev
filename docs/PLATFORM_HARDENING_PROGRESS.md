@@ -1374,3 +1374,216 @@ All five edits of WP-02 spec §8 "before batch 1" are applied: ledger TRI-002 �
 - the gateway is not touched.
 
 **After the deploy:** WP02-10's host steps and the WP02-09 host moves, inside the WP02-19 timer check.
+
+## 2026-10-17 02:06 UTC · WP-02 batch 2 merged and deployed (first full reconcile); host steps done
+
+**PR #34:** CI green. `origin/main` was unchanged at `45f3aff`. Squash-merged as `33496f9`.
+
+**Deploy** (the first one on batch 1's code), `result.json`:
+- `deployed`;
+- `restarted: ["aura-web-backends"]`, as predicted, with the gateway untouched;
+- canary ok;
+- `units` lists **exactly 21** names: the 17 imported, the 2 moved, `enabled-units.txt` and `temporal-dev.service`;
+- the summary says they are not installed. Kirill gets the deploy note listing them (WP02-02).
+
+**WP02-10 host steps:**
+1. `result.json` as above.
+2. `cmp` of the converged `crawl4ai_adapter.py`: identical.
+3. `:8791/health` returned 200.
+4. No `/root/.openclaw/web-stack/*.service` left.
+5. `plugins/rmp_adapter/index.js.bak` moved to `/root/attic/wp-02/`. **Rollback:** `mv /root/attic/wp-02/index.js.bak /root/.openclaw/plugins/rmp_adapter/`.
+
+A fresh mirror probe prints only `checked`: **every mirror now matches the repo.**
+
+**WP02-09 host steps** (idle: 0 user tasks, no coding units):
+1. **Pre-check:** `temporal-dev` and `aura-web-stack` inactive and disabled.
+2. **Units:** timer check before (8 `next:`). Both units moved to `/root/attic/wp-02/` and `systemctl daemon-reload` run. `list-unit-files` shows "0 unit files listed". Timer check after: 8 `next:`, 0 `NO NEXT`. **Rollback:** move both back, then `daemon-reload`, with the timer check around it.
+3. **Aura's notes:** `TOOLS.md:40` and the `AGENTS.md` copy now name `temporal` instead of `temporal-dev` in the `systemctl is-active` line; `grep -c temporal-dev` prints 0 for both. Backups are in `/root/attic/wp-02/`. **Rollback:** `cp -p` them back.
+
+**Next:** batch 3 (WP02-11…13). The hold continues until batch 3's host steps are logged.
+
+## 2026-10-17 02:48 UTC · Workflow tool blocked by an unresponsive app hook; batch 3 runs through the same pipeline as subagents
+
+Four launches of the `wp-batch` workflow for WP-02 batch 3 failed before running, each with "PreToolUse hook did not respond before its timeout (host client may be unreachable)". Bash and plain subagents work.
+- **So the programme does not stall,** batch 3 runs through the same pipeline by hand: implementer, then Tier-1 reviewers (correctness, closure), then fix rounds. Each is a subagent, run one after another.
+- **Prompts:** rendered from the workflow script (`/root/.cache/wp-batch-manual/render.js`), so the instructions are identical. The implementer also runs `LAYOUT=live`.
+- **Workflow launches resume** once the hook answers again.
+
+## 2026-10-17 03:42 UTC · WP-02 batch 3 implemented (subagent pipeline); Tier-1 review started
+
+**Implementer:** 3 commits.
+- `136885b` (WP02-11): `host_file_drift` at warn, names only; the drift check shares `_out_of_date` with `reconcile`.
+- `0a1739a` (WP02-13): `WARN_UNITS` for `aura-web-backends`.
+- `c931f23` (WP02-12): `ops/install_units.py` with 11 tests, including running the printed rollback line. `/var/backups/rmp-units` added to the guard's denied roots.
+
+**Harness, all four layouts:** 1353 passed, 1 skipped; node 58/58; leftovers 0; clean; exit 0.
+
+**Deviation:**
+- `backup_root` is 0700, but each stamp directory and its `<unit>.d/` copy the mode of what they back up.
+- **Reason:** the spec's rollback line `cp -a <dir>/. <target>/` would otherwise chmod `/etc/systemd/system` to 0700.
+- **Evidence:** a scratch `cp -a` test, and a test that fails with 0700.
+
+**Review:** the Tier-1 correctness reviewer is running, followed by the closure reviewer.
+
+## 2026-10-17 04:27 UTC · WP-02 batch 3: correctness review approves; closure review running
+
+**Correctness reviewer (round 1): approve.**
+- Its own four-layout harness run is green.
+- Three mutations (working-tree install, 0700 backup directories, no symlink skip) were each caught by a test.
+- It confirms the backup-mode deviation by a scratch `cp -a` test.
+- The new warns cannot roll a deploy back: `readiness_failures`, `healthcheck.sh` and `go_live.sh` count only `fail`.
+
+**Two non-blocking points, both to be fixed after the closure review:**
+1. A `systemctl` timeout in `_systemctl` raises `TimeoutExpired` and skips the `failed:` and `rollback:` lines. It should turn into a non-zero exit instead.
+2. `--apply` installs whatever `HEAD` is current. A deploy landing between the reviewed dry run and `--apply` would install an unreviewed unit change. **Programme decision:** the dry run prints the `HEAD` it planned; `--apply` requires `--head <sha>`, refuses if `HEAD` differs, and prints the `HEAD` it installed. This closes AS-04's review gate.
+
+## 2026-10-17 04:50 UTC · WP-02 batch 3: both Tier-1 reviewers approve; spec amendment 1; fix round started
+
+**Closure reviewer (round 1): approve.**
+- All three items are closed.
+- The default harness and the changed test files in the live and coding-job layouts are green.
+- Probes confirm the scan's ignores and the warn-only behaviour.
+- The reported backup-mode deviation is confirmed. An unreported one, the install calling `unit_drift` with its own target, is justified.
+
+**Its non-blocking points:**
+- a write-phase exception skips the rollback line;
+- a backup-stamp collision within the same second;
+- the reviewed-commit race, the same point as the correctness reviewer's;
+- two test gaps (`.d/` non-`.conf` and symlink ignores; a listed `not-found` unit).
+
+**WP-02 spec amendment 1 (§10, WP02-12a):**
+- the dry run prints `head: <sha>`;
+- `--apply` requires `--head <sha>` and refuses a missing or stale one (exit 2), which closes the AS-04 race;
+- every failure after the backup exists (non-zero, `TimeoutExpired`, or a write-phase exception) prints `failed:`, `backup:` and `rollback:` and exits 1;
+- the stamp gets a unique suffix;
+- the two missing tests are added;
+- §3 and the later `--apply` steps read `--apply --head <sha>`.
+
+**Fix round:** a subagent implements it, with proof that each test fails before and passes after, plus the four-layout harness.
+
+## 2026-10-17 05:42 UTC · WP-02 batch 3 fix round done; round-2 re-review running
+
+**Fixer (subagent): 3 commits.**
+- `bf8af8c`: `--head` is required and must be a commit id; a stale one is refused under the code-reload lock (order: arguments, lock, reviewed head, idle).
+- `4b1e2d4`: every failure after the backup exists prints `failed:`, the lines so far, `backup:` and `rollback:` and exits 1, including timeouts and backup or write errors. Atomic backup copies; unique stamp.
+- `217ff3a`: tests for the not-found unit and the drop-in scan.
+
+**Fail-before proof:** c931f23 with `--head` merely accepted fails 12 tests, each for its own reason; the stale case there installed the unreviewed commit. 5 mutations were caught.
+
+**Deviations:**
+- `--head` must be 7–64 lowercase hex, because a ref name always resolves to `HEAD`;
+- atomic backup copies, so a torn copy can never be rolled back into `/etc`;
+- `installed:` is omitted after a pre-write failure.
+
+**Four-layout harness:** 1360 passed, 1 skipped; node 58/58; 0 leftovers; exit 0.
+
+**My commit `5e4d564`:** the deploy summary now says "then --apply --head <the sha it printed>", and its two test assertions are updated. The fixer had left this as out of its file list. Spec §10 records the wording. `test_coding_deploy`: 41 passed.
+
+**Round-2 Tier-1 re-review** (correctness and adversarial closure) runs in parallel as subagents.
+
+## 2026-10-17 15:51 UTC · Usage limit; WP-02 batch 3 round-2 re-review relaunched
+
+Both round-2 reviewers stopped with "session limit" before reporting. They changed nothing: the branch is clean at `5e4d564`, with no scratch copies left. Both are relaunched in parallel.
+
+## 2026-10-17 16:12 UTC · WP-02 batch 3 round 2: the closure reviewer found a blocking issue (symlinked unit)
+
+**Closure reviewer (round 2): changes.** WP02-12a's own points are implemented and proven: 12 tests fail on the old behaviour, and 5 mutations were caught.
+
+**Blocking (WP02-12): an installed unit path that is a symlink is mishandled.** For example, a persistent mask `-> /dev/null`:
+- `unit_drift` tests `is_file()`, so the dry run reports the unit as `new` (and also as `left as is (masked)`);
+- `--apply` overwrites the mask without a backup, which unmasks it;
+- the rollback's `rm -f` cannot restore the mask, and a linked unit file comes back as a regular file.
+
+This breaks D-3 ("backs up every file it replaces") and D-4 ("never changes a masked unit"). A scratch probe confirmed it.
+
+**Non-blocking:**
+- An abbreviated `--head` can be redirected by a hex-named local ref (needs root). The fix accepts only the full sha the dry run prints.
+- The rollback after a failed or timed-out `enable` omits that unit from its `disable` list.
+
+**Live host check (read-only):** no RMP, aura, openclaw or temporal unit in `/etc/systemd/system` is a symlink today. The bug is latent and is fixed before merge.
+
+**Next:** a fix round covering all three once the correctness reviewer reports, then round-3 re-review.
+
+## 2026-10-17 16:35 UTC · WP-02 batch 3: correctness round 2 approves; spec amendment 2; fix round 2
+
+**Correctness reviewer (round 2): approve.**
+- All six round-1 issues are closed, verified with 6 mutation probes.
+- Its four-layout harness is green.
+- It judged the fixer's three deviations correct.
+- **New note:** the spec-mandated `<the sha it printed>` would reach Kirill's Slack note unescaped, and Slack renders `<...>` as markup.
+
+**WP-02 spec amendment 2** (§11, WP02-12b):
+- a symlinked or non-regular installed unit path is reported `(not a regular file)` and never written over (this was the closure reviewer's blocking finding);
+- `--head` accepts only the full 40/64-hex sha, compared as a string;
+- a failed or timed-out `enable` goes into the rollback's `disable` list;
+- the summary wording drops the angle brackets.
+
+**Fix round 2** (subagent) implements it, with fail-before proofs and the four-layout harness. Round-3 re-review follows.
+
+## 2026-10-17 17:20 UTC · WP-02 batch 3 fix round 2 done; one more gap being closed
+
+**Fix round 2:** 4 commits.
+- `e2f2f01`: a non-regular installed unit path is reported `(not a regular file)` and left as is in both modes. A mask link to `/dev/null` survives `--apply` and its rollback, with the snapshot equal before and after.
+- `e9a3aa4`: `--head` takes the full sha only, compared as a string. A hex-named branch can no longer redirect it; on `5e4d564` it could, exiting 0.
+- `7e1b120`: the rollback disables a unit whose `enable` failed or timed out.
+- `8fb20bf`: Slack-safe summary wording.
+
+The new tests fail on `5e4d564`. **Four-layout harness:** 1364 passed, 1 skipped, exit 0.
+
+**One more gap, reported by the fixer:** a tracked unit's drop-in directory that is itself a symlink would be written through. It is the same class as the blocking finding, so the same fixer is closing it now (left as is, never read or written through, with a test of the snapshot before and after). Round-3 re-review follows.
+
+## 2026-10-17 18:01 UTC · WP-02 batch 3: drop-in symlink gap closed; round-3 re-review running
+
+**`64dc3c8`:** a tracked `<unit>.d/` that is a symlink or not a directory is left as is. Each conf under it is reported `(not a regular file)` and is never read, written, backed up or removed through. `install_units.py` needed no logic change.
+- **Tests:** an install snapshot test (target plus the outside directory equal before and after `--apply` and its rollback) and a two-case readiness test. All three fail on `8fb20bf` and pass now. A probe that writes the kept confs was caught.
+
+**Four-layout harness:** 1367 passed, 1 skipped; node 58/58; 0 leftovers; exit 0.
+
+**Round-3 Tier-1 re-review:** both reviewers (correctness, adversarial closure) run in parallel on the round-2 commits `e2f2f01`…`64dc3c8`.
+
+## 2026-10-17 18:36 UTC · WP-02 batch 3 round 3: both reviewers approve; last hardening round
+
+**Correctness reviewer (round 3): approve, no issues.**
+- All four round-2 issues are resolved.
+- The live `/etc/systemd/system` (metadata only) has no non-regular tracked path, so the new marker changes nothing on today's host.
+
+**Closure reviewer (round 3): approve.**
+- 10 kinds of non-regular path were probed and none is touched.
+- 7 failure paths were probed, and each printed rollback restored the exact snapshot.
+- Three non-blocking points: a write-through at a planted temp-file symlink (root only); no shipped tests for a dangling link, FIFO or directory at a unit path, or a dangling drop-in link, so three mutations survive; a `git replace` ref added after the review (root only).
+
+**Last hardening round** (the same fixer): exclusive `O_NOFOLLOW` temp creation, the parametrised non-regular tests, and a refusal while replace refs exist. Then the deterministic verify and the PR.
+
+## 2026-10-17 19:21 UTC · WP-02 batch 3 last hardening round done; my review of it
+
+**Commits:**
+- `6e46621`: unit and backup temp files are created with `tempfile.mkstemp` (O_EXCL, own name), so a link planted at a temp name is neither written through nor installed. Test fails on `64dc3c8`.
+- `4136f9a`: readiness tests now cover a dangling link, a FIFO and a directory at a unit path, and a dangling drop-in link. The three surviving mutations now each fail a named case.
+- `9794a0b`: `--apply` refuses (exit 2), and the dry run warns, while `refs/replace` lists anything. The check runs under the lock, after the `HEAD` check. Test fails on `64dc3c8`.
+
+**Fixer's harness, all four layouts:** 1373 passed, 1 skipped, exit 0.
+
+**Review of this round:** done by me, not a fourth subagent round, because these are small bounded fixes to points both round-3 reviewers had already accepted as non-blocking.
+- Diff read: `mkstemp` plus the caller's `copy2` / `chmod 0644`; the refusal order is arguments, lock, `HEAD`, replace refs, idle.
+- Nothing else changed.
+
+**My deterministic four-layout verify is running.**
+
+## 2026-10-17 20:04 UTC · WP-02 batch 3 verified in four layouts; PR
+
+**My verify on `9794a0b`** (all `verify: exit 0`):
+
+| Layout | pytest | node | Leftovers | Placeholder grep | Ignored files |
+|---|---|---|---|---|---|
+| Default | 1373 passed, 1 skipped | 58/58 | 0 | clean | none |
+| live | 1373 passed, 1 skipped | — | 0 | clean | none |
+| coding-job | 1373 passed, 1 skipped | — | 0 | clean | none |
+| direct | 1373 passed, 1 skipped | — | 0 | clean | none |
+
+**Branch:** 15 commits on `33496f9`; `origin/main` is unchanged.
+
+**Deploy:** restarts `rmp-api` and `rmp-worker` (`app/coding/deploy.py`, `app/production/readiness.py`). No unit file changes, so `units` is `[]`.
+
+**After the deploy, the host steps that end the hold:**
+- the readiness probe: `host_file_drift` pass and `systemd_services` pass;
+- the install dry run: `head:`, then `nothing to install`, with no host-only, `not enabled` or `left as is` line.
