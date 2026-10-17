@@ -102,7 +102,7 @@ def host(tmp_path):
         "d": commit(repo, {"rmp-d.service.d/05-nice.conf": "[Service]\nNice=10\n"}, "Renice the d service"),
     }
     return SimpleNamespace(repo=repo, target=target, backups=tmp_path / "backups", lock=tmp_path / "code-reload.lock",
-                           commits=commits)
+                           commits=commits, head=git(repo, "rev-parse", "HEAD"))
 
 
 def run(host, *argv, systemctl, active_user_tasks=lambda: 0):
@@ -134,6 +134,7 @@ def test_a_dry_run_names_each_file_with_its_commit_and_each_unit_to_enable_and_w
     systemctl = FakeSystemctl()
     assert run(host, systemctl=systemctl) == 0
     assert capsys.readouterr().out.splitlines() == [
+        f"head: {host.head}",
         f"changed: rmp-a.service ({host.commits['a']})",
         f"new: rmp-b.service ({host.commits['b']})",
         f"new: rmp-b.timer ({host.commits['b']})",
@@ -154,7 +155,7 @@ def test_apply_installs_heads_bytes_backs_up_reloads_once_and_enables_without_st
     (host.repo / "ops" / "systemd" / "rmp-a.service").write_text(unit("a, edited and not committed"))
     (host.repo / "ops" / "systemd" / "rmp-e.service").write_text(unit("e, never committed"))
     systemctl = FakeSystemctl(reloaded={"rmp-b.timer": "disabled"})
-    assert run(host, "--apply", systemctl=systemctl) == 0
+    assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 0
 
     installed = ["rmp-a.service", "rmp-b.service", "rmp-b.timer", "rmp-c.service.d/10-limits.conf",
                  "rmp-d.service.d/05-nice.conf"]
@@ -172,6 +173,7 @@ def test_apply_installs_heads_bytes_backs_up_reloads_once_and_enables_without_st
                                ("enable", "rmp-d.service")]
     target = host.target
     assert capsys.readouterr().out.splitlines() == [
+        f"head: {host.head}",
         f"installed: {', '.join(installed)}",
         "enabled: rmp-b.timer, rmp-d.service",
         "start: rmp-b.timer",
@@ -187,7 +189,7 @@ def test_apply_installs_heads_bytes_backs_up_reloads_once_and_enables_without_st
 
 def test_the_rollback_line_puts_back_every_file_and_mode_it_replaced(host, capsys):
     before = snapshot(host.target)
-    assert run(host, "--apply", systemctl=FakeSystemctl()) == 0
+    assert run(host, "--apply", "--head", host.head, systemctl=FakeSystemctl()) == 0
     rollback = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("rollback: "))
     for step in rollback.removeprefix("rollback: ").split(" && "):
         if not step.startswith("systemctl "):
@@ -207,7 +209,7 @@ def unknown():
 def test_apply_refuses_unless_aura_is_known_to_be_idle(host, capsys, active, refusal):
     before = snapshot(host.target)
     systemctl = FakeSystemctl()
-    assert run(host, "--apply", systemctl=systemctl, active_user_tasks=active) == 2
+    assert run(host, "--apply", "--head", host.head, systemctl=systemctl, active_user_tasks=active) == 2
     assert capsys.readouterr().out.splitlines() == [refusal]
     assert snapshot(host.target) == before and not host.backups.exists() and systemctl.calls == []
 
@@ -217,9 +219,34 @@ def test_apply_refuses_while_a_deploy_or_code_reload_holds_the_lock(host, capsys
     systemctl, counted = FakeSystemctl(), []
     with open(host.lock, "w") as other:
         fcntl.flock(other, fcntl.LOCK_EX)
-        assert run(host, "--apply", systemctl=systemctl, active_user_tasks=lambda: counted.append(1) or 0) == 2
+        assert run(host, "--apply", "--head", host.head, systemctl=systemctl,
+                   active_user_tasks=lambda: counted.append(1) or 0) == 2
     assert capsys.readouterr().out.splitlines() == [f"refused: a deploy or code reload holds {host.lock}"]
     assert snapshot(host.target) == before and not host.backups.exists() and systemctl.calls == [] and counted == []
+
+
+USAGE = "usage: install_units.py [--apply --head <sha>], <sha> being the commit on the reviewed dry run's head: line"
+
+
+@pytest.mark.parametrize("given", ["missing", "a name", "stale"])
+def test_apply_installs_only_the_reviewed_commit(host, capsys, given):
+    """A deploy lands between the reviewed dry run and --apply: --apply refuses without the dry run's head, with a
+    name that follows HEAD, and with the reviewed head once HEAD has moved on."""
+    reviewed = host.head
+    commit(host.repo, {"rmp-a.service": unit("a, changed after the review")}, "Change a after the review")
+    head = git(host.repo, "rev-parse", "HEAD")
+    argv, refusal = {
+        "missing": (["--apply"], USAGE),
+        "a name": (["--apply", "--head", "HEAD"], USAGE),
+        "stale": (["--apply", "--head", reviewed], f"refused: HEAD is {head}, the reviewed dry run was {reviewed}"),
+    }[given]
+    before = snapshot(host.target)
+    systemctl, counted = FakeSystemctl(), []
+    assert run(host, *argv, systemctl=systemctl, active_user_tasks=lambda: counted.append(1) or 0) == 2
+    assert capsys.readouterr().out.splitlines() == [refusal]
+    assert snapshot(host.target) == before and not host.backups.exists() and systemctl.calls == [] and counted == []
+    # The arguments are checked before the lock is taken.
+    assert host.lock.exists() == (given == "stale")
 
 
 def test_nothing_to_install_reloads_nothing(host, capsys):
@@ -229,16 +256,17 @@ def test_nothing_to_install_reloads_nothing(host, capsys):
     (host.target / "rmp-old.service").unlink()
     states = {**STATES, "rmp-b.timer": "enabled", "rmp-d.service": "enabled"}
     assert run(host, systemctl=FakeSystemctl(states)) == 0
-    assert capsys.readouterr().out == "nothing to install\n"
+    assert capsys.readouterr().out == f"head: {host.head}\nnothing to install\n"
 
     systemctl = FakeSystemctl(states)
-    assert run(host, "--apply", systemctl=systemctl) == 0
+    # An abbreviated id of the reviewed commit names it as well as the whole one.
+    assert run(host, "--apply", "--head", host.head[:12], systemctl=systemctl) == 0
     assert [call for call in systemctl.calls if call[0] != "is-enabled"] == []
     [backup] = host.backups.iterdir()
     assert list(backup.iterdir()) == []
     out = capsys.readouterr().out.splitlines()
-    assert out[0] == "nothing to install" and out[1] == f"backup: {backup}"
-    assert out[2] == f"rollback: cp -a {backup}/. {host.target}/ && systemctl daemon-reload"
+    assert out[:3] == [f"head: {host.head}", "nothing to install", f"backup: {backup}"]
+    assert out[3] == f"rollback: cp -a {backup}/. {host.target}/ && systemctl daemon-reload"
 
 
 def test_a_masked_or_static_listed_unit_is_left_as_it_is(host, capsys):
@@ -248,18 +276,18 @@ def test_a_masked_or_static_listed_unit_is_left_as_it_is(host, capsys):
     assert [line for line in capsys.readouterr().out.splitlines() if line.startswith("left as is: ")] == left
 
     systemctl = FakeSystemctl(states, reloaded={"rmp-b.timer": "disabled"})
-    assert run(host, "--apply", systemctl=systemctl) == 0
+    assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 0
     assert [call for call in systemctl.calls if call[0] == "enable"] == [("enable", "rmp-b.timer")]
     assert [line for line in capsys.readouterr().out.splitlines() if line.startswith("left as is: ")] == left
 
 
 def test_a_failing_daemon_reload_stops_before_any_enable(host, capsys):
     systemctl = FakeSystemctl(failing=[("daemon-reload",)])
-    assert run(host, "--apply", systemctl=systemctl) == 1
+    assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 1
     assert systemctl.calls[-1] == ("daemon-reload",) and not [call for call in systemctl.calls if call[0] == "enable"]
     out = capsys.readouterr().out.splitlines()
-    assert out[:2] == ["failed: systemctl daemon-reload (exit 1)", "installed: rmp-a.service, rmp-b.service, "
-                       "rmp-b.timer, rmp-c.service.d/10-limits.conf, rmp-d.service.d/05-nice.conf"]
+    assert out[:3] == [f"head: {host.head}", "failed: systemctl daemon-reload (exit 1)", "installed: rmp-a.service, "
+                       "rmp-b.service, rmp-b.timer, rmp-c.service.d/10-limits.conf, rmp-d.service.d/05-nice.conf"]
     [backup] = host.backups.iterdir()
     assert f"rollback: cp -a {backup}/. {host.target}/ && rm -f {host.target}/rmp-b.service" in "\n".join(out)
     assert (host.target / "rmp-b.timer").read_bytes() == committed(host, "rmp-b.timer")
@@ -267,10 +295,10 @@ def test_a_failing_daemon_reload_stops_before_any_enable(host, capsys):
 
 def test_a_failing_enable_stops_there_and_its_rollback_disables_what_was_enabled(host, capsys):
     systemctl = FakeSystemctl(reloaded={"rmp-b.timer": "disabled"}, failing=[("enable", "rmp-d.service")])
-    assert run(host, "--apply", systemctl=systemctl) == 1
+    assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 1
     assert systemctl.calls[-2:] == [("enable", "rmp-b.timer"), ("enable", "rmp-d.service")]
     out = capsys.readouterr().out.splitlines()
-    assert out[0] == "failed: systemctl enable rmp-d.service (exit 1)"
+    assert out[:2] == [f"head: {host.head}", "failed: systemctl enable rmp-d.service (exit 1)"]
     assert "enabled: rmp-b.timer" in out and "start: rmp-b.timer" in out and "start: rmp-d.service" not in out
     assert next(line for line in out if line.startswith("rollback: ")).startswith(
         "rollback: systemctl disable rmp-b.timer && cp -a ")

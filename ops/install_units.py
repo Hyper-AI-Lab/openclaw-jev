@@ -2,9 +2,10 @@
 r"""Install the unit files tracked in ops/systemd/ on this host: the operator's reviewed step after a deploy.
 
 The deploy never installs a unit file; its result and Kirill's note name the changed ones. Run this as root from the
-live checkout once the deploy shows ``deployed``. Without a flag it is a dry run that writes nothing. It prints each
-new or changed unit file with the last commit that touched it, each RMP unit file installed with no tracked file, and
-each unit of enabled-units.txt that is not enabled or is left as it is:
+live checkout once the deploy shows ``deployed``. Without a flag it is a dry run that writes nothing. It prints the
+commit it planned from on a head: line, then each new or changed unit file with the last commit that touched it, each
+RMP unit file installed with no tracked file, and each unit of enabled-units.txt that is not enabled or is left as it
+is:
 
     systemd-run --wait --pipe --collect --unit=rmp-install-units -p WorkingDirectory=/root/.openclaw/rmp \
       -p Environment=PYTHONPATH=/root/.openclaw/rmp -p EnvironmentFile=-/etc/rmp/rmp.env \
@@ -17,21 +18,23 @@ Before --apply, review each new or changed file with
 
 (/dev/null for a new file's installed copy), and check the commit the dry run names. Install only changes that trace
 to a reviewed programme PR. A unit change from any other source (Aura's PRs, a coding job) needs Kirill's explicit OK
-first. --apply installs every new and changed file at once:
+first. --apply installs every new and changed file at once; <sha> is the commit on the reviewed dry run's head: line:
 
     systemd-run --wait --pipe --collect --unit=rmp-install-units -p WorkingDirectory=/root/.openclaw/rmp \
       -p Environment=PYTHONPATH=/root/.openclaw/rmp -p EnvironmentFile=-/etc/rmp/rmp.env \
       -p EnvironmentFile=-/etc/openclaw/openclaw.env \
-      /root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/install_units.py --apply
+      /root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/install_units.py --apply --head <sha>
 
---apply refuses while a user task is active or a deploy or code reload holds the code-reload lock. It installs HEAD's
-committed bytes, never the working tree, backs up every file it replaces, runs one daemon-reload and enables each
+--apply refuses unless HEAD is still that commit, so a deploy that lands after the review installs nothing unreviewed.
+It also refuses while a user task is active or a deploy or code reload holds the code-reload lock. It installs that
+commit's bytes, never the working tree, backs up every file it replaces, runs one daemon-reload and enables each
 listed unit that is not enabled. It never starts, restarts, disables or deletes a unit: it prints a start: line for
 each unit it enabled, to start in an idle window, and a rollback: line that undoes the install.
 """
 import argparse
 import fcntl
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -49,6 +52,9 @@ BACKUP_ROOT = Path("/var/backups/rmp-units")
 ENABLED_LIST = "enabled-units.txt"
 AFTERWARDS = ("Each changed unit takes effect at its next start; restart one now only in an idle window. Start each "
               "unit on a start: line in an idle window.")
+USAGE = "usage: install_units.py [--apply --head <sha>], <sha> being the commit on the reviewed dry run's head: line"
+# A commit id, whole or abbreviated. A name such as HEAD or main would follow a later deploy, not the reviewed commit.
+SHA = re.compile(r"[0-9a-f]{7,64}")
 
 # systemctl with its arguments: its exit code and its output.
 Systemctl = Callable[..., Tuple[int, str]]
@@ -65,12 +71,24 @@ def _active_user_tasks() -> int:
     return count_active_user_tasks_sync(strict=True)
 
 
-class Plan:
-    """What HEAD asks of this host's units: the new and changed unit files, the host-only ones, and the listed units
-    that are not enabled or are left as they are."""
+def _head(repo: Path) -> str:
+    return deploy._git(repo, "rev-parse", "HEAD").strip()
 
-    def __init__(self, repo: Path, target: Path, systemctl: Systemctl):
-        self.head = deploy._git(repo, "rev-parse", "HEAD").strip()
+
+def _commit(repo: Path, sha: str) -> Optional[str]:
+    """The full id of the commit ``sha`` names, or None when it names none."""
+    try:
+        return deploy._git(repo, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}").strip()
+    except RuntimeError:
+        return None
+
+
+class Plan:
+    """What commit ``head`` asks of this host's units: the new and changed unit files, the host-only ones, and the
+    listed units that are not enabled or are left as they are."""
+
+    def __init__(self, repo: Path, head: str, target: Path, systemctl: Systemctl):
+        self.head = head
         drift = deploy.unit_drift(repo, self.head, target)
         self.files = [name.removesuffix(deploy.MISSING) for name in drift["units"]]
         self.new = {name.removesuffix(deploy.MISSING) for name in drift["units"] if name.endswith(deploy.MISSING)}
@@ -100,7 +118,8 @@ def enablement(units: Sequence[str], new: Collection[str], systemctl: Systemctl)
 
 
 def dry_run(repo: Path, target: Path, systemctl: Systemctl) -> int:
-    plan = Plan(repo, target, systemctl)
+    plan = Plan(repo, _head(repo), target, systemctl)
+    print(f"head: {plan.head}")
     for name in plan.files:
         commit = deploy._git(repo, "log", "-1", "--format=%h %s", plan.head, "--", f"{deploy.UNIT_DIR}{name}").strip()
         print(f"{'new' if name in plan.new else 'changed'}: {name} ({commit})")
@@ -122,9 +141,11 @@ def _directory_like(directory: Path, original: Path) -> None:
     os.chmod(directory, stat.S_IMODE(original.stat().st_mode))
 
 
-def apply(repo: Path, target: Path, backup_root: Path, systemctl: Systemctl) -> int:
-    """Back up, install, reload and enable; the caller holds the lock and saw Aura idle."""
-    plan = Plan(repo, target, systemctl)
+def apply(repo: Path, head: str, target: Path, backup_root: Path, systemctl: Systemctl) -> int:
+    """Back up, install ``head``'s unit files, reload and enable; the caller holds the lock, checked that ``head`` is
+    the reviewed commit and saw Aura idle."""
+    plan = Plan(repo, head, target, systemctl)
+    print(f"head: {head}")
     backup_root.mkdir(parents=True, exist_ok=True)
     os.chmod(backup_root, 0o700)
     backup = backup_root / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -191,18 +212,28 @@ def main(argv: Optional[Sequence[str]] = None, *, repo: Optional[Path] = None, t
                                                  "--apply is given.")
     parser.add_argument("--apply", action="store_true",
                         help="install the new and changed files, back up those replaced, daemon-reload and enable")
+    parser.add_argument("--head", metavar="SHA",
+                        help="the commit on the reviewed dry run's head: line; --apply needs it and installs only it")
     args = parser.parse_args(argv)
     repo = repo or REPO
     target = target or deploy.UNIT_TARGET
     systemctl = systemctl or _systemctl
     if not args.apply:
         return dry_run(repo, target, systemctl)
+    if not SHA.fullmatch(args.head or ""):
+        print(USAGE)
+        return 2
     lock = lock or deploy.CODE_RELOAD_LOCK
     with open(lock, "w") as held:
         try:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print(f"refused: a deploy or code reload holds {lock}")
+            return 2
+        # Under the lock, so no deploy moves HEAD between this check and the install.
+        head = _head(repo)
+        if _commit(repo, args.head) != head:
+            print(f"refused: HEAD is {head}, the reviewed dry run was {args.head}")
             return 2
         try:
             busy = (active_user_tasks or _active_user_tasks)()
@@ -212,7 +243,7 @@ def main(argv: Optional[Sequence[str]] = None, *, repo: Optional[Path] = None, t
         if busy > 0:
             print(f"refused: {busy} user task(s) active; run again when Aura is idle")
             return 2
-        return apply(repo, target, backup_root or BACKUP_ROOT, systemctl)
+        return apply(repo, head, target, backup_root or BACKUP_ROOT, systemctl)
 
 
 if __name__ == "__main__":
