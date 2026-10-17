@@ -2,6 +2,7 @@ import asyncio
 import builtins
 import errno
 import json
+import shutil
 import subprocess
 from types import SimpleNamespace
 
@@ -219,6 +220,25 @@ def test_host_file_drift_names_a_tracked_unit_whose_installed_path_is_not_a_regu
     assert r.details == {
         "units": ["rmp-x.service (not a regular file)", "rmp-x.service.d/10-a.conf (not a regular file)"],
         "host_only_units": [], "mirrors": []}
+
+
+@pytest.mark.parametrize("kind", ["a link out of the target", "a file"])
+def test_host_file_drift_names_each_conf_in_a_drop_in_path_that_is_not_a_directory(tmp_path, monkeypatch, kind):
+    from app.production.readiness import check_host_file_drift
+
+    host = host_files(tmp_path, monkeypatch)
+    shutil.rmtree(host.target / "rmp-x.service.d")
+    if kind == "a file":
+        (host.target / "rmp-x.service.d").write_text("[Service]\n")
+    else:
+        # The directory the link leads to holds another 10-a.conf; it is never read through the link.
+        (tmp_path / "outside").mkdir()
+        (tmp_path / "outside" / "10-a.conf").write_text("[Service]\nNice=15\n")
+        (host.target / "rmp-x.service.d").symlink_to(tmp_path / "outside")
+    r = check_host_file_drift(str(host.repo))
+    assert r.status == "warn"
+    assert r.details == {"units": ["rmp-x.service.d/10-a.conf (not a regular file)"], "host_only_units": [],
+                         "mirrors": []}
 
 
 def test_host_file_drift_warns_when_it_cannot_compare(tmp_path, monkeypatch):

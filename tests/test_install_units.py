@@ -354,6 +354,64 @@ def test_a_masks_link_to_dev_null_stays_in_place_through_the_dry_run_apply_and_r
     assert snapshot(host.target) == before
 
 
+def test_a_drop_in_directory_linked_out_of_the_target_is_never_read_or_written_through(host, tmp_path, capsys):
+    """rmp-x.service.d is a link to a directory outside the target whose 10-a.conf differs from HEAD's. Writing,
+    backing up or removing that conf through the link would touch a file the install does not own, and the rollback
+    could not undo it, so the install leaves it as it is."""
+    commit(host.repo, {"rmp-x.service": unit("x"), "rmp-x.service.d/10-a.conf": "[Service]\nNice=5\n"},
+           "Add the x service")
+    head = git(host.repo, "rev-parse", "HEAD")
+    install(host.target, "rmp-x.service", unit("x"))
+    outside = tmp_path / "outside"
+    install(outside.parent, "outside/10-a.conf", "[Service]\nNice=15\n")
+    (host.target / "rmp-x.service.d").symlink_to(outside)
+    # The new drop-in's directory is there already, so the rollback leaves the whole target as it was.
+    (host.target / "rmp-c.service.d").mkdir()
+    (host.target / "rmp-c.service.d").chmod(0o755)
+    before = {"target": snapshot(host.target), "outside": snapshot(outside)}
+    assert before["target"]["rmp-x.service.d"] == ("link", str(outside))
+    left = "left as is: rmp-x.service.d/10-a.conf (not a regular file)"
+    assert run(host, systemctl=FakeSystemctl()) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"head: {head}",
+        f"changed: rmp-a.service ({host.commits['a']})",
+        f"new: rmp-b.service ({host.commits['b']})",
+        f"new: rmp-b.timer ({host.commits['b']})",
+        f"new: rmp-c.service.d/10-limits.conf ({host.commits['c']})",
+        f"changed: rmp-d.service.d/05-nice.conf ({host.commits['d']})",
+        "host-only: rmp-old.service",
+        "not enabled: rmp-b.timer",
+        "not enabled: rmp-d.service",
+        left,
+    ]
+    assert {"target": snapshot(host.target), "outside": snapshot(outside)} == before
+
+    assert run(host, "--apply", "--head", head, systemctl=FakeSystemctl(reloaded={"rmp-b.timer": "disabled"})) == 0
+    assert os.readlink(host.target / "rmp-x.service.d") == str(outside)
+    assert snapshot(outside) == before["outside"]
+    [backup] = host.backups.iterdir()
+    assert not os.path.lexists(backup / "rmp-x.service.d")
+    target = host.target
+    out = capsys.readouterr().out.splitlines()
+    assert out == [
+        f"head: {head}",
+        "installed: rmp-a.service, rmp-b.service, rmp-b.timer, rmp-c.service.d/10-limits.conf, "
+        "rmp-d.service.d/05-nice.conf",
+        "enabled: rmp-b.timer, rmp-d.service",
+        "start: rmp-b.timer",
+        "start: rmp-d.service",
+        left,
+        f"backup: {backup}",
+        f"rollback: systemctl disable rmp-b.timer rmp-d.service && cp -a {backup}/. {target}/ && rm -f "
+        f"{target}/rmp-b.service {target}/rmp-b.timer {target}/rmp-c.service.d/10-limits.conf "
+        "&& systemctl daemon-reload",
+        "Each changed unit takes effect at its next start; restart one now only in an idle window. Start each unit on "
+        "a start: line in an idle window.",
+    ]
+    roll_back(out)
+    assert {"target": snapshot(host.target), "outside": snapshot(outside)} == before
+
+
 def test_a_failing_daemon_reload_stops_before_any_enable(host, capsys):
     systemctl = FakeSystemctl(failing=[("daemon-reload",)])
     assert run(host, "--apply", "--head", host.head, systemctl=systemctl) == 1

@@ -5,8 +5,8 @@ The deploy never installs a unit file; its result and Kirill's note name the cha
 live checkout once the deploy shows ``deployed``. Without a flag it is a dry run that writes nothing. It prints the
 commit it planned from on a head: line, then each new or changed unit file with the last commit that touched it, each
 RMP unit file installed with no tracked file, each tracked unit file whose installed path is not a regular file (a
-mask's link to /dev/null, for example), which it leaves as it is, and each unit of enabled-units.txt that is not
-enabled or is left as it is:
+mask's link to /dev/null, for example) or lies in a <unit>.d/ that is a symlink or no directory, which it leaves as it
+is, and each unit of enabled-units.txt that is not enabled or is left as it is:
 
     systemd-run --wait --pipe --collect --unit=rmp-install-units -p WorkingDirectory=/root/.openclaw/rmp \
       -p Environment=PYTHONPATH=/root/.openclaw/rmp -p EnvironmentFile=-/etc/rmp/rmp.env \
@@ -28,11 +28,12 @@ first. --apply installs every new and changed file at once; <sha> is the full sh
 
 --apply refuses unless HEAD is still that commit, so a deploy that lands after the review installs nothing unreviewed.
 It also refuses while a user task is active or a deploy or code reload holds the code-reload lock. It installs that
-commit's bytes, never the working tree, backs up every file it replaces, never writes over, backs up or removes an
-installed path that is not a regular file, runs one daemon-reload and enables each listed unit that is not enabled.
-It never starts, restarts, disables or deletes a unit: it prints a start: line for each unit it enabled, to start in
-an idle window, and a rollback: line that undoes the install. A failure after the backup directory exists stops
-there, prints failed:, what was done so far and the rollback: line, and exits 1.
+commit's bytes, never the working tree, backs up every file it replaces, never writes, backs up or removes anything
+at an installed path that is not a regular file or through a <unit>.d/ that is not a real directory, runs one
+daemon-reload and enables each listed unit that is not enabled. It never starts, restarts, disables or deletes a unit:
+it prints a start: line for each unit it enabled, to start in an idle window, and a rollback: line that undoes the
+install. A failure after the backup directory exists stops there, prints failed:, what was done so far and the
+rollback: line, and exits 1.
 """
 import argparse
 import fcntl
@@ -88,8 +89,9 @@ class Plan:
     def __init__(self, repo: Path, head: str, target: Path, systemctl: Systemctl):
         self.head = head
         drift = deploy.unit_drift(repo, self.head, target)
-        # An installed path that is not a regular file, a mask's link to /dev/null for example, is someone's deliberate
-        # choice: never written over, backed up or removed, so the install neither unmasks a unit nor loses the link.
+        # An installed path that is not a regular file, a mask's link to /dev/null for example, or a drop-in directory
+        # linked elsewhere, is someone's deliberate choice: nothing is written, backed up or removed at it or through
+        # it, so the install neither unmasks a unit, loses a link nor changes a file outside the target.
         self.kept = [name for name in drift["units"] if name.endswith(deploy.NOT_REGULAR)]
         units = [name for name in drift["units"] if name not in self.kept]
         self.files = [name.removesuffix(deploy.MISSING) for name in units]

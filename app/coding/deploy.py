@@ -60,7 +60,8 @@ UNIT_SUFFIXES = (".service", ".timer", ".path", ".socket")
 # The units of this host that are RMP's, by name; an installed one the repo does not track is host-only.
 RMP_UNIT_PREFIXES = ("rmp-", "aura-", "openclaw-", "temporal.", "temporal-")
 # Marks a tracked unit file with no installed copy, and one whose installed path is not a regular file: a symlink, such
-# as a mask's link to /dev/null, or anything else that no install writes over.
+# as a mask's link to /dev/null, anything else that no install writes over, or a path in a <unit>.d/ that is a symlink
+# or no directory.
 MISSING = " (missing)"
 NOT_REGULAR = " (not a regular file)"
 
@@ -189,16 +190,25 @@ def _installed_rmp_unit_files(target: Path) -> List[str]:
     return sorted(name for name in names if is_unit_file(name))
 
 
+def _not_regular(path: Path, target: Path) -> bool:
+    """Whether the installed path ``path`` under ``target`` is there but is not a regular file, or lies in a
+    ``<unit>.d/`` that is there but is a symlink or no directory. Nothing is read or written through such a path."""
+    directory = path.parent
+    if directory != target and os.path.lexists(directory) and (directory.is_symlink() or not directory.is_dir()):
+        return True
+    return os.path.lexists(path) and (path.is_symlink() or not path.is_file())
+
+
 def unit_drift(repo: Path, commit: str, target: Path) -> Dict[str, List[str]]:
     """How the unit files installed in ``target`` differ from ``commit``'s, by name relative to both: ``units``, the
-    tracked unit files whose installed copy is missing (marked ``MISSING``), is not a regular file (marked
-    ``NOT_REGULAR``, and never read through a symlink) or has other bytes; ``host_only_units``, RMP's unit files
-    installed there that ``commit`` does not track."""
+    tracked unit files whose installed copy is missing (marked ``MISSING``), is not a regular file or lies in a
+    ``<unit>.d/`` that is not a real directory (marked ``NOT_REGULAR``, and never read through a symlink) or has other
+    bytes; ``host_only_units``, RMP's unit files installed there that ``commit`` does not track."""
     tracked = {path[len(UNIT_DIR):]: blob for _, blob, path in tracked_files(repo, commit, UNIT_DIR)
                if is_unit_file(path[len(UNIT_DIR):])}
     names = sorted(tracked)
-    present = [name for name in names if (target / name).is_file() and not (target / name).is_symlink()]
-    other = {name for name in names if name not in present and os.path.lexists(target / name)}
+    other = {name for name in names if _not_regular(target / name, target)}
+    present = [name for name in names if name not in other and (target / name).is_file()]
     current = dict(zip(present, blob_ids(repo, [target / name for name in present])))
     units = [f"{name}{NOT_REGULAR}" if name in other else name if name in current else f"{name}{MISSING}"
              for name in names if current.get(name) != tracked[name]]
