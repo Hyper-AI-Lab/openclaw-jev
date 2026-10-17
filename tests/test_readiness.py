@@ -2,6 +2,7 @@ import asyncio
 import builtins
 import errno
 import json
+import os
 import shutil
 import subprocess
 from types import SimpleNamespace
@@ -203,14 +204,22 @@ def test_host_file_drift_warns_and_names_each_kind(tmp_path, monkeypatch):
         "rmp-y.timer, plugins/p/a.js, plugins/p/b.js")
 
 
-def test_host_file_drift_names_a_tracked_unit_whose_installed_path_is_not_a_regular_file(tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", ["a mask's link to /dev/null", "a dangling link", "a FIFO", "a directory"])
+def test_host_file_drift_names_a_tracked_unit_whose_installed_path_is_not_a_regular_file(tmp_path, monkeypatch, kind):
     from app.production.readiness import check_host_file_drift
 
     host = host_files(tmp_path, monkeypatch)
-    # systemctl mask's link to /dev/null, and a link to a copy with the committed bytes: neither is a regular file, and
-    # neither is read through.
-    (host.target / "rmp-x.service").unlink()
-    (host.target / "rmp-x.service").symlink_to("/dev/null")
+    unit = host.target / "rmp-x.service"
+    unit.unlink()
+    if kind == "a mask's link to /dev/null":
+        unit.symlink_to("/dev/null")
+    elif kind == "a dangling link":
+        unit.symlink_to(tmp_path / "nowhere")
+    elif kind == "a FIFO":
+        os.mkfifo(unit)
+    else:
+        unit.mkdir()
+    # A link to a copy with the committed bytes is no regular file either, and is not read through.
     conf = host.target / "rmp-x.service.d" / "10-a.conf"
     (tmp_path / "10-a.conf").write_bytes(conf.read_bytes())
     conf.unlink()
@@ -222,7 +231,7 @@ def test_host_file_drift_names_a_tracked_unit_whose_installed_path_is_not_a_regu
         "host_only_units": [], "mirrors": []}
 
 
-@pytest.mark.parametrize("kind", ["a link out of the target", "a file"])
+@pytest.mark.parametrize("kind", ["a link out of the target", "a dangling link", "a file"])
 def test_host_file_drift_names_each_conf_in_a_drop_in_path_that_is_not_a_directory(tmp_path, monkeypatch, kind):
     from app.production.readiness import check_host_file_drift
 
@@ -230,6 +239,8 @@ def test_host_file_drift_names_each_conf_in_a_drop_in_path_that_is_not_a_directo
     shutil.rmtree(host.target / "rmp-x.service.d")
     if kind == "a file":
         (host.target / "rmp-x.service.d").write_text("[Service]\n")
+    elif kind == "a dangling link":
+        (host.target / "rmp-x.service.d").symlink_to(tmp_path / "nowhere")
     else:
         # The directory the link leads to holds another 10-a.conf; it is never read through the link.
         (tmp_path / "outside").mkdir()
