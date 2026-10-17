@@ -3,6 +3,7 @@ import builtins
 import errno
 import json
 import subprocess
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -109,11 +110,87 @@ async def test_run_all_checks_structure(tmp_path, monkeypatch):
     # Each probe was refused, and the check that made it reports the service as out of reach.
     statuses = {c["name"]: c["status"] for c in result["checks"]}
     assert {name: statuses[name] for name in ("systemd_services", "rmp_health", "temporal", "temporal_persistence",
-                                              "task_registry_vector", "stuck_workflows")} == {
+                                              "task_registry_vector", "stuck_workflows", "host_file_drift")} == {
         "systemd_services": "fail", "rmp_health": "fail", "temporal": "fail", "temporal_persistence": "warn",
-        "task_registry_vector": "fail", "stuck_workflows": "warn"}
+        "task_registry_vector": "fail", "stuck_workflows": "warn", "host_file_drift": "warn"}
     assert {kind for kind, _ in probes} == {"process", "http", "temporal", "grpc", "open"}
     assert ("grpc", ("127.0.0.1", 6334)) in probes and ("open", TEMPORAL_UNIT) in probes
+
+
+def host_files(tmp_path, monkeypatch):
+    """A committed unit, its drop-in, the enabled list and two plugin files, each installed as committed, with the
+    deploy's unit target and mirror pointed here. Beside them in the target: another unit and its drop-in, a .wants/
+    link, a symlinked RMP unit and an RMP unit's backup, none of which is an RMP unit file."""
+    from app.coding import deploy
+
+    repo, target, plugins = tmp_path / "repo", tmp_path / "etc-systemd-system", tmp_path / "plugins"
+    units = {"rmp-x.service": "[Service]\nExecStart=/bin/true\n", "rmp-x.service.d/10-a.conf": "[Service]\nNice=5\n"}
+    files = {**{f"ops/systemd/{name}": text for name, text in units.items()},
+             "ops/systemd/enabled-units.txt": "rmp-x.service\n", "plugins/p/a.js": "a\n", "plugins/p/b.js": "b\n"}
+    for root, written in ((repo, files), (target, units), (plugins, {"p/a.js": "a\n", "p/b.js": "b\n"})):
+        for path, text in written.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_text(text)
+            # The committed mode, whatever the umask: RMP's own test runs use 0077.
+            (root / path).chmod(0o644)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "units"],
+                   check=True)
+    (target / "ssh.service").write_text("[Service]\n")
+    (target / "ssh.service.d").mkdir()
+    (target / "ssh.service.d" / "override.conf").write_text("[Service]\n")
+    (target / "multi-user.target.wants").mkdir()
+    (target / "multi-user.target.wants" / "rmp-x.service").symlink_to(target / "rmp-x.service")
+    (target / "rmp-alias.service").symlink_to(target / "rmp-x.service")
+    (target / "rmp-x.service.bak").write_text("[Service]\n")
+    monkeypatch.setattr(deploy, "UNIT_TARGET", target)
+    monkeypatch.setattr(deploy, "MIRRORS", (("plugins/", plugins),))
+    return SimpleNamespace(repo=repo, target=target, plugins=plugins)
+
+
+def test_host_file_drift_passes_when_every_copy_matches(tmp_path, monkeypatch):
+    from app.production.readiness import check_host_file_drift
+
+    host = host_files(tmp_path, monkeypatch)
+    r = check_host_file_drift(str(host.repo))
+    assert (r.name, r.status, r.message, r.details) == (
+        "host_file_drift", "pass", "Installed unit files and mirrors match main", {})
+
+
+def test_host_file_drift_warns_and_names_each_kind(tmp_path, monkeypatch):
+    from app.production.readiness import check_host_file_drift
+
+    host = host_files(tmp_path, monkeypatch)
+    (host.target / "rmp-x.service").write_text("[Service]\nExecStart=/bin/false\n")
+    (host.target / "rmp-x.service.d" / "10-a.conf").unlink()
+    (host.target / "rmp-y.timer").write_text("[Timer]\n")
+    (host.target / "aura-z.service.d").mkdir()
+    (host.target / "aura-z.service.d" / "x.conf").write_text("[Service]\n")
+    (host.plugins / "p" / "a.js").write_text("a, edited\n")
+    (host.plugins / "p" / "b.js").chmod(0o600)
+    r = check_host_file_drift(str(host.repo))
+    assert r.status == "warn"
+    assert r.details == {"units": ["rmp-x.service", "rmp-x.service.d/10-a.conf (missing)"],
+                         "host_only_units": ["aura-z.service.d/x.conf", "rmp-y.timer"],
+                         "mirrors": ["plugins/p/a.js", "plugins/p/b.js"]}
+    assert r.message == (
+        "Host files differ from main: 2 unit file(s), 2 host-only unit(s), 2 mirror file(s); install units with "
+        "ops/install_units.py — rmp-x.service, rmp-x.service.d/10-a.conf (missing), aura-z.service.d/x.conf, "
+        "rmp-y.timer, plugins/p/a.js, plugins/p/b.js")
+
+
+def test_host_file_drift_warns_when_it_cannot_compare(tmp_path, monkeypatch):
+    from app.production.readiness import check_host_file_drift
+
+    host_files(tmp_path, monkeypatch)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    # git looks for a repository in the parent directories; none above tmp_path counts.
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    r = check_host_file_drift(str(plain))
+    assert r.status == "warn" and r.message.startswith("Could not compare host files: git ls-tree")
+    assert "not a git repository" in r.message
 
 
 def test_slack_sockets_single_is_pass(monkeypatch):

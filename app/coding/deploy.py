@@ -56,6 +56,11 @@ MIRRORS = (
 # The tracked unit files and where systemd reads them. No deploy writes there: an operator installs them.
 UNIT_DIR = "ops/systemd/"
 UNIT_TARGET = Path("/etc/systemd/system")
+UNIT_SUFFIXES = (".service", ".timer", ".path", ".socket")
+# The units of this host that are RMP's, by name; an installed one the repo does not track is host-only.
+RMP_UNIT_PREFIXES = ("rmp-", "aura-", "openclaw-", "temporal.", "temporal-")
+# Marks a tracked unit file with no installed copy.
+MISSING = " (missing)"
 
 
 def restarts_for(paths: Iterable[str]) -> List[str]:
@@ -120,6 +125,22 @@ def drifted(repo: Path, old: str, prefix: str, target: Path) -> List[str]:
     return found
 
 
+def _live_mode(mode: str) -> int:
+    """The permission bits of a live copy of a file committed with ``mode``."""
+    return 0o755 if mode == "100755" else 0o644
+
+
+def _out_of_date(repo: Path, commit: str, prefix: str, target: Path) -> List[Tuple[str, str, str, Path]]:
+    """Tracked files under ``prefix`` at ``commit`` whose live copy under ``target`` is missing or has other bytes or
+    permission bits, as (mode, blob, path, live copy)."""
+    files = [(mode, blob, path, target / path[len(prefix):])
+             for mode, blob, path in tracked_files(repo, commit, prefix)]
+    present = [dest for _, _, _, dest in files if dest.is_file()]
+    current = dict(zip(present, blob_ids(repo, present)))
+    return [(mode, blob, path, dest) for mode, blob, path, dest in files
+            if current.get(dest) != blob or stat.S_IMODE(dest.stat().st_mode) != _live_mode(mode)]
+
+
 def reconcile(repo: Path, commit: str, changed: List[Tuple[str, str]], prefix: str, target: Path) -> List[str]:
     """Make the mirror of ``prefix`` match ``commit``: delete the live copy of each file the range deleted, then write
     every tracked file whose live copy is missing or has other bytes or permission bits. Files the commit does not track
@@ -129,22 +150,65 @@ def reconcile(repo: Path, commit: str, changed: List[Tuple[str, str]], prefix: s
         if status == "D" and path.startswith(prefix):
             (target / path[len(prefix):]).unlink(missing_ok=True)
             done.append(path)
-    files = [(mode, blob, path, target / path[len(prefix):])
-             for mode, blob, path in tracked_files(repo, commit, prefix)]
-    present = [dest for _, _, _, dest in files if dest.is_file()]
-    current = dict(zip(present, blob_ids(repo, present)))
-    for mode, blob, path, dest in files:
-        want = 0o755 if mode == "100755" else 0o644
-        if current.get(dest) == blob and stat.S_IMODE(dest.stat().st_mode) == want:
-            continue
+    for mode, blob, path, dest in _out_of_date(repo, commit, prefix, target):
         data = _git_bytes(repo, "cat-file", "blob", blob)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(f".{dest.name}.aura-deploy")
         tmp.write_bytes(data)
-        os.chmod(tmp, want)
+        os.chmod(tmp, _live_mode(mode))
         os.replace(tmp, dest)
         done.append(path)
     return done
+
+
+def is_unit_file(name: str) -> bool:
+    """Whether ``name``, relative to a unit directory, is a unit file: a unit, or a ``.conf`` drop-in in a unit's
+    ``<unit>.d/`` directory."""
+    parts = name.split("/")
+    if len(parts) == 1:
+        return name.endswith(UNIT_SUFFIXES)
+    return (len(parts) == 2 and parts[0].endswith(tuple(f"{suffix}.d" for suffix in UNIT_SUFFIXES))
+            and parts[1].endswith(".conf"))
+
+
+def _installed_rmp_unit_files(target: Path) -> List[str]:
+    """RMP's unit files installed in ``target``, by name relative to it: its units' regular files there, and the
+    ``.conf`` files in their ``<unit>.d/`` directories. Symlinks, ``*.wants/`` links and other units are not."""
+    names = []
+    with os.scandir(target) as entries:
+        for entry in entries:
+            if entry.is_symlink() or not entry.name.startswith(RMP_UNIT_PREFIXES):
+                continue
+            if entry.is_file():
+                names.append(entry.name)
+            elif entry.is_dir():
+                with os.scandir(entry.path) as inside:
+                    names += [f"{entry.name}/{item.name}" for item in inside if item.is_file(follow_symlinks=False)]
+    return sorted(name for name in names if is_unit_file(name))
+
+
+def unit_drift(repo: Path, commit: str, target: Path) -> Dict[str, List[str]]:
+    """How the unit files installed in ``target`` differ from ``commit``'s, by name relative to both: ``units``, the
+    tracked unit files whose installed copy is missing (marked ``MISSING``) or has other bytes; ``host_only_units``,
+    RMP's unit files installed there that ``commit`` does not track."""
+    tracked = {path[len(UNIT_DIR):]: blob for _, blob, path in tracked_files(repo, commit, UNIT_DIR)
+               if is_unit_file(path[len(UNIT_DIR):])}
+    present = [name for name in sorted(tracked) if (target / name).is_file()]
+    current = dict(zip(present, blob_ids(repo, [target / name for name in present])))
+    units = [name if name in current else f"{name}{MISSING}"
+             for name in sorted(tracked) if current.get(name) != tracked[name]]
+    host_only = [name for name in _installed_rmp_unit_files(target) if name not in tracked]
+    return {"units": units, "host_only_units": host_only}
+
+
+def host_file_drift(repo: Path, commit: str = "HEAD") -> Dict[str, List[str]]:
+    """What this host's files differ from ``commit`` in, by name only: ``unit_drift`` under ``UNIT_TARGET``, and
+    ``mirrors``, the tracked mirror files whose live copy is missing or has other bytes or permission bits. The next
+    deploy writes the mirror files; ``ops/install_units.py`` installs the unit files."""
+    drift = unit_drift(repo, commit, UNIT_TARGET)
+    drift["mirrors"] = [path for prefix, target in MIRRORS
+                        for _, _, path, _ in _out_of_date(repo, commit, prefix, target)]
+    return drift
 
 
 def fetch_approved(job: workspace.Job, head: str, *, live: Path = LIVE_REPO) -> Dict[str, Any]:
