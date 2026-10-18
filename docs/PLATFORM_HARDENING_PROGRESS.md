@@ -1587,3 +1587,92 @@ The new tests fail on `5e4d564`. **Four-layout harness:** 1364 passed, 1 skipped
 **After the deploy, the host steps that end the hold:**
 - the readiness probe: `host_file_drift` pass and `systemd_services` pass;
 - the install dry run: `head:`, then `nothing to install`, with no host-only, `not enabled` or `left as is` line.
+
+## 2026-10-17 22:56 UTC · WP-02 batch 3 merged; the Workflow tool works again
+
+**PR #35:** CI green. `origin/main` was unchanged at `33496f9`. Squash-merged as `d8d429a`; the deploy is being watched.
+
+**Workflow tool:** a no-agent probe workflow (`wf_a4d9f284-302`) launched normally, so the app hook answers again. Batch 4 goes back to the `wp-batch` workflow.
+
+## 2026-10-17 23:02 UTC · WP-02 batch 3 deployed; host steps pass; the hold ends
+
+**Deploy:** `d8d429a` `deployed`. `rmp-api` and `rmp-worker` restarted; canary ok; `units: []`; 0 worker-journal errors. **Rollback:** revert `d8d429a`.
+
+**WP02-11 host step (readiness probe):**
+- `production_ready`, score 98;
+- `host_file_drift`: **pass `{}`**;
+- `systemd_services`: **pass**;
+- the only warn is the known telemetry OTLP warning (WP-03).
+
+**WP02-12 host step (install dry run):** `head: d8d429a8cc209279cc47fc921d112517a88d953c`, then **`nothing to install`**. No host-only, `not enabled` or `left as is` line. The repository describes the host exactly.
+
+**The WP02-18 hold ends with this entry.** Rule 19 alone applies again.
+
+**Next:** batch 4 (WP02-14 non-blocking key sync, WP02-15 backup bounds). It is the first real use of `install_units.py`.
+
+## 2026-10-17 23:23 UTC · WP-02 batch 4 started (subagent pipeline; the workflow hook is blocked again)
+
+**Branch:** `aura/wp-02-4-unit-edits`, from `d8d429a`. **Items:** WP02-14 and WP02-15, Tier 1.
+
+Two `wp-batch` workflow launches timed out at the app's PreToolUse hook again; the no-agent probe had passed minutes earlier. Batch 4 therefore runs as rendered subagents (`/root/.cache/wp-batch-manual/wp02-b4/`): implementer first, then the two Tier-1 reviewers.
+
+## 2026-10-18 00:08 UTC · WP-02 batch 4 implemented; Tier-1 review running
+
+**Implementer:** 3 commits, no deviations.
+- `a102193`: `sync_nvidia_keys.py` exits 0 when any key synced and finds `app` through its own path.
+- `71a57e1`: `ExecStartPre=-` on the key-sync line in `rmp-api`, `rmp-worker` and the gateway; the worker's `wait_temporal.sh` still blocks.
+- `fb77a01`: `rmp-backup.service` gets `TimeoutStartSec=1h` and `After=… rmp-qdrant.service`; both `pg_dump` calls get `--lock-wait-timeout=5min`.
+
+5 of the 6 new tests fail on the old code; the sixth is the negative control. `systemd-analyze verify` on the four units printed no warnings.
+
+**Scratch install probe** (`d8d429a`'s units as the installed copies): the dry run lists exactly 4 `changed:` lines (gateway, api, backup, worker). `--apply` installs only those, with one `daemon-reload`, no enable and no `start:`.
+
+**Harness, all four layouts:** 1379 passed, 1 skipped; node 58/58; 0 leftovers; exit 0.
+
+**Review:** the Tier-1 correctness and closure reviewers run in parallel.
+
+## 2026-10-18 00:52 UTC · WP-02 batch 4: both Tier-1 reviewers approve; small test-strength fixes
+
+**Correctness reviewer: approve.**
+- Nothing relies on the blocking key sync: `check_openai_key` reads the environment; `upgrade_openclaw.sh` and `make sync-nvidia-keys` run the script directly.
+- The 1 h backup limit is about 40× the longest run.
+- The ordering after `rmp-qdrant` is safe (a bounded oneshot).
+- `systemd-analyze verify` is clean.
+
+**Closure reviewer: approve.**
+- The 5 new tests fail on `d8d429a`; the harness is green in all four layouts.
+- The `install_units` probe lists exactly the 4 units.
+- Mutations are caught except two (below).
+
+**Non-blocking points, sent back to the implementer:**
+1. The sys.path test does not catch a deleted `sys.path.insert`, because pytest's `pythonpath` already puts the repo first.
+2. The unit parser in `test_systemd_units` does not join backslash continuations, so a blocking `ExecStartPre` split over two lines would pass.
+3. The backup log blames "credentials" after a lock-wait timeout.
+
+## 2026-10-18 02:11 UTC · WP-02 batch 4 fixes done and verified; PR
+
+**Fix commits** (implementer):
+- `415f51c`: the sys.path test drops the checkout first, so a deleted insert fails it.
+- `8b3246e`: `_lines` joins backslash continuations as systemd does; both continuation mutations now fail the test.
+- `122c9ac`: "pg_dump failed (see backup.log)".
+
+**Review of these commits:** done by me. A small bounded diff; the joiner matches systemd's trailing-whitespace and comment rules.
+
+**My verify on `122c9ac`** (all `verify: exit 0`):
+
+| Layout | pytest | node | Leftovers | Placeholder grep | Ignored files |
+|---|---|---|---|---|---|
+| Default | 1379 passed, 1 skipped | 58/58 | 0 | clean | none |
+| live | 1379 passed, 1 skipped | — | 0 | clean | none |
+| coding-job | 1379 passed, 1 skipped | — | 0 | clean | none |
+| direct | 1379 passed, 1 skipped | — | 0 | clean | none |
+
+**Deploy:** restarts nothing (`ops/`, tests and docs). `units` will name the 4 changed unit files, and Kirill gets the deploy note.
+
+**Host step after the deploy:** the first real use of `install_units.py`, run while Aura is idle:
+1. the dry run;
+2. a review of the 4 diffs;
+3. the timer check;
+4. `--apply --head`;
+5. the timer check again;
+6. `systemctl show` checks.

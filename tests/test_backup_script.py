@@ -71,6 +71,7 @@ sys.exit(22)
 '''
 
 FAKE_PG_DUMP = r'''#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_STATE}/pg_dump.log"
 [ "${FAKE_PGDUMP_FAIL:-0}" = 1 ] && { echo "pg_dump: connection refused" >&2; exit 1; }
 for a in "$@"; do last="$a"; done
 while [ $# -gt 0 ]; do [ "$1" = "-f" ] && { printf 'PGDMP' > "$2"; exit 0; }; shift; done
@@ -163,6 +164,15 @@ def test_a_failed_postgres_dump_is_reported_not_swallowed(host):
     result, dest, manifest, _ = host.run(FAKE_PGDUMP_FAIL="1")
     assert result.returncode == 1 and manifest["failures"] == ["postgres", "temporal:temporal", "temporal:temporal_visibility"]
     assert (dest / "qdrant-full.snapshot").exists()
+
+
+def test_every_dump_bounds_its_lock_wait(host):
+    """A dump that cannot take its table locks within 5 minutes fails instead of hanging the night's run."""
+    result, _, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == []
+    dumps = [line.split() for line in (host.state / "pg_dump.log").read_text().splitlines()]
+    assert len(dumps) == 3 and all("--lock-wait-timeout=5min" in args for args in dumps)
+    assert "rmp_db" in dumps[0] and dumps[1][-1] == "temporal" and dumps[2][-1] == "temporal_visibility"
 
 
 def test_embedded_mode_archives_the_storage_directory(host):

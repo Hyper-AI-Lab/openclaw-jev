@@ -98,9 +98,9 @@ Aura is a **three-layer system** on one machine:
 
 | Unit | Purpose |
 |------|---------|
-| `openclaw-gateway` | Slack + agent gateway; env from `/etc/openclaw/openclaw.env`; **ExecStartPre:** `ops/sync_nvidia_keys.py` |
-| `rmp-api` | FastAPI; `/etc/rmp/rmp.env` + `/etc/openclaw/openclaw.env`; key sync pre-start |
-| `rmp-worker` | Temporal worker (`openclaw-tasks` queue); same env + key sync |
+| `openclaw-gateway` | Slack + agent gateway; env from `/etc/openclaw/openclaw.env`; **ExecStartPre:** `ops/sync_nvidia_keys.py`, non-blocking (`-`) |
+| `rmp-api` | FastAPI; `/etc/rmp/rmp.env` + `/etc/openclaw/openclaw.env`; non-blocking key sync pre-start |
+| `rmp-worker` | Temporal worker (`openclaw-tasks` queue); same env + non-blocking key sync |
 | `temporal` | Official Temporal server 1.30.1 on this host's Postgres (`temporal`, `temporal_visibility`), frontend `127.0.0.1:7233`. One node, not Temporal Cloud. |
 | `rmp-canary.timer` | Hourly health check (`*:07`) |
 | `rmp-canary-sentinel.timer` | Every 30 min: health/memory canaries, runtime code sync, LLM usage (24 h budget, live context > 60k, abort rate > 10%) → ops Slack alert with a 4 h cooldown |
@@ -550,7 +550,7 @@ All RMP-issued NVIDIA calls (worker dispatch, embeddings, quality review) and ga
 }
 ```
 
-**Key sync:** `ops/sync_nvidia_keys.py` writes env keys into SQLite `authProfiles.store` on service start. Manual: `make sync-nvidia-keys`. Live probe: `ops/nvidia_key_probe.py`. Do not recreate leftover `auth-profiles.json`.
+**Key sync:** `ops/sync_nvidia_keys.py` writes env keys into SQLite `authProfiles.store` on service start. It never blocks a start: `rmp-api`, `rmp-worker` and the gateway run it as `ExecStartPre=-`, so a missing key or an auth-store error is logged in the unit's journal and the unit starts anyway (readiness's `openai_key` reports a missing primary key). It exits 0 when any key synced, NVIDIA or OpenAI, and 1 when none did. Manual: `make sync-nvidia-keys`. Live probe: `ops/nvidia_key_probe.py`. Do not recreate leftover `auth-profiles.json`.
 
 #### Usage monitor (`app/llm/usage_monitor.py`)
 
