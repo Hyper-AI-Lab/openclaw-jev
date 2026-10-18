@@ -68,13 +68,29 @@ def _enabled_units() -> List[str]:
     return [line for line in lines if line and not line.startswith("#")]
 
 
+def _lines(name: str) -> Iterator[str]:
+    """A unit file's lines as systemd reads them: comment lines skipped, even inside a continued line, and a line ending
+    in a backslash joined to the next with a space."""
+    pending = ""
+    for line in (UNIT_DIR / name).read_text().splitlines():
+        line = line.lstrip()
+        if line.startswith(("#", ";")):
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        yield (pending + line).strip()
+        pending = ""
+    if pending:
+        yield pending.strip()
+
+
 def _sections(name: str) -> Dict[str, List[Tuple[str, str]]]:
     """A unit file's sections, each with its (key, value) lines in order. systemd repeats keys, so not configparser."""
     sections: Dict[str, List[Tuple[str, str]]] = {}
     current = None
-    for line in (UNIT_DIR / name).read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith(("#", ";")):
+    for line in _lines(name):
+        if not line:
             continue
         if line.startswith("[") and line.endswith("]"):
             current = sections.setdefault(line[1:-1], [])
