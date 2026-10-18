@@ -55,7 +55,7 @@ PG_PASSWORD="${PGPASSWORD:-$("${PY}" -c 'from sqlalchemy.engine import make_url;
 if command -v pg_dump >/dev/null 2>&1; then
   log "Dumping PostgreSQL ${PG_DB}..."
   PGPASSWORD="${PG_PASSWORD}" pg_dump -U "${PG_USER}" -h localhost --lock-wait-timeout=5min -Fc "${PG_DB}" -f "${DEST}/rmp_db.dump" 2>>"${LOG}" \
-    || fail postgres "pg_dump failed (check credentials)"
+    || fail postgres "pg_dump failed (see backup.log)"
 else
   fail postgres "pg_dump not found"
 fi
