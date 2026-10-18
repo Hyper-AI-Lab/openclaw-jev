@@ -5,6 +5,7 @@ settings and OpenClaw home in the test's tmp tree, so nothing live is read. A sc
 could reach on the host resolves to its fake, and a restore only when it takes every path it writes from the
 environment: the production guard does not see a child process's own calls.
 """
+import fcntl
 import hashlib
 import io
 import json
@@ -25,13 +26,18 @@ RESTORE = REPO / "ops" / "restore_backup.sh"
 RESTORE_PG = REPO / "ops" / "restore_pg_database.sh"
 RESTORE_QDRANT = REPO / "ops" / "restore_qdrant_snapshot.sh"
 # Every path the restore writes or locks comes from one of these, each with a default (ops/backup.sh's names).
-RESTORE_PATHS = ("RMP_ROOT", "RMP_DATA_DIR", "RMP_SETTINGS_PATH", "RMP_PYTHON")
+RESTORE_PATHS = ("RMP_ROOT", "RMP_DATA_DIR", "RMP_SETTINGS_PATH", "RMP_PYTHON", "RMP_CODE_RELOAD_LOCK")
 # The RMP timers enabled on the host; the fake systemctl lists them as active.
 TIMERS = sorted(u for u in (REPO / "ops" / "systemd" / "enabled-units.txt").read_text().splitlines()
                 if u.endswith(".timer"))
 # The one restore command of every database: the superuser drops it and recreates it from its archive.
 PG_RESTORE = ["pg_restore", "-h", "/var/run/postgresql", "-p", "5432", "--clean", "--if-exists", "--create",
               "--exit-on-error", "-d", "postgres"]
+# What the restore stops, in order: each timer and its service, the code watch, the gateway, RMP and Temporal.
+STOPS = [*(unit for timer in TIMERS for unit in (timer, timer.replace(".timer", ".service"))),
+         "rmp-code-watch", "openclaw-gateway", "rmp-api", "rmp-worker", "temporal"]
+# What it starts again, in dependency order.
+STARTS = ["temporal", "rmp-api", "rmp-worker", "openclaw-gateway", "rmp-code-watch", *TIMERS]
 
 FAKE_CURL = r'''#!/usr/bin/env python3
 """curl, as far as the scripts use it against Qdrant's API. FAKE_QDRANT_* variables choose failures."""
@@ -133,7 +139,8 @@ FAKE_SYSTEMCTL = r'''#!/usr/bin/env python3
 """systemctl, as far as ops/restore_backup.sh and ops/backup_openclaw_state.py use it.
 
 Every call is recorded in ${FAKE_STATE}/systemctl.log, a start with the sha256 of the live settings at that moment.
-Unit states live in ${FAKE_STATE}/units; stop and start update them. FAKE_STOP_FAIL=<unit> fails that unit's stop.
+Unit states live in ${FAKE_STATE}/units; stop and start update them. FAKE_STOP_FAIL=<unit> fails that unit's stop,
+FAKE_LIST_UNITS_FAIL=1 every list-units.
 FAKE_DEPLOY_ON_STOP=<unit>=<deploy unit> lists the deploy unit once the fake has handled that unit's stop.
 FAKE_TIMER_RUN=<timer>=<n> keeps the timer's service active for n is-active calls after the timer starts.
 """
@@ -203,6 +210,9 @@ elif verb == "is-active":
         print(current)
     sys.exit(0 if current == "active" else 3)
 elif verb == "list-units":
+    if env("FAKE_LIST_UNITS_FAIL") == "1":
+        print("Failed to connect to bus", file=sys.stderr)
+        sys.exit(1)
     if "--type=timer" in args:
         listed = [t for t in timers if get(t) == "active"]
     else:
@@ -459,6 +469,115 @@ def test_restore_pg_database_refuses_a_missing_dump_and_reports_a_failed_restore
     result = host.restore(dest, FAKE_PGRESTORE_FAIL="rmp_db")
     assert result.returncode == 1 and "Restore INCOMPLETE: not restored: postgres\n" in result.stderr
     assert len(host.log("sudo.log")) == 3
+
+
+def _in_order(host):
+    """systemctl's and sudo's calls, merged in the order they were made, as (tool, argv, record)."""
+    calls = [(record["t"], tool, record) for tool in ("systemctl", "sudo") for record in host.log(f"{tool}.log")]
+    return [(tool, record["argv"], record) for _, tool, record in sorted(calls, key=lambda call: call[0])]
+
+
+def _verbs(host, verb):
+    return [record["argv"][1] for record in host.log("systemctl.log") if record["argv"][0] == verb]
+
+
+def test_restore_stops_every_writer_before_the_first_database_and_starts_them_after_the_last_step(host):
+    _, dest, _, _ = host.run()
+    host.settings.write_text(json.dumps({**json.loads(host.settings.read_text()), "changed": "after the backup"}))
+    assert _sha256(host.settings) != _sha256(dest / "settings.json")
+    result = host.restore(dest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = _in_order(host)
+    databases = [i for i, (tool, _, _) in enumerate(calls) if tool == "sudo"]
+    assert len(databases) == 3
+    assert [argv[1] for _, argv, _ in calls[:databases[0]] if argv[0] == "stop"] == STOPS
+    assert [argv[1] for _, argv, _ in calls[databases[0]:] if argv[0] == "stop"] == []
+    starts = [(i, argv[1], record["settings_sha256"]) for i, (_, argv, record) in enumerate(calls) if argv[0] == "start"]
+    assert [unit for _, unit, _ in starts] == STARTS
+    assert all(i > databases[-1] for i, _, _ in starts)
+    # Every start saw the backup's settings in place: the starts follow the settings copy.
+    assert {sha for _, _, sha in starts} == {_sha256(dest / "settings.json")}
+    assert calls[-1][1][0] == "list-timers"
+    assert result.stdout.count("\nnext: ") == len(TIMERS) and "NO NEXT" not in result.stdout
+    assert result.stdout.rstrip().endswith("Restore complete.")
+
+
+def test_a_restore_that_fails_after_its_first_database_step_starts_nothing(host):
+    """rmp-api runs create_all on rmp_db at start, and the watchdog would restart Temporal on a partial database."""
+    _, dest, _, _ = host.run()
+    result = host.restore(dest, FAKE_PGRESTORE_FAIL="temporal")
+    assert result.returncode == 1
+    assert _verbs(host, "stop") == STOPS and _verbs(host, "start") == []
+    units = " ".join(STARTS)
+    assert "Restore INCOMPLETE: not restored: temporal:temporal\n" in result.stderr
+    assert f"Left stopped, because a store may be half restored: {units}\n" in result.stderr
+    assert f"When the stores are whole, start them with: systemctl start {units}\n" in result.stderr
+    assert ("Do not start rmp-api, rmp-worker or openclaw-gateway, run a deploy or reboot before the stores are whole: "
+            "each starts rmp-api, which runs create_all on rmp_db\n") in result.stderr
+
+
+def test_a_restore_refused_by_the_code_reload_lock_stops_nothing(host):
+    _, dest, _, _ = host.run()
+    lock = host.tmp / "code-reload.lock"
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        result = host.restore(dest)
+    assert result.returncode == 1
+    assert f"refused: a deploy or code reload holds {lock}; run the restore again when it ends" in result.stderr
+    assert _verbs(host, "stop") == [] and host.log("sudo.log") == []
+
+
+def test_a_declined_restore_touches_nothing(host):
+    _, dest, _, _ = host.run()
+    result = host.restore(dest, answer="n\n")
+    assert result.returncode == 0
+    assert host.log("systemctl.log") == [] and host.log("sudo.log") == []
+    assert not (host.tmp / "code-reload.lock").exists()
+
+
+def test_a_restore_refuses_while_a_deploy_unit_is_active(host):
+    """A deploy blocks on the lock, then restarts rmp-api and rmp-worker: it must not outlive the restore."""
+    _, dest, _, _ = host.run()
+    (host.state / "deploy-units").write_text("aura-deploy-main.service\n")
+    result = host.restore(dest)
+    assert result.returncode == 1
+    assert "refused: aura-deploy-main.service is active; run the restore again when it ends" in result.stderr
+    assert _verbs(host, "stop") == []
+    (host.state / "deploy-units").unlink()
+    result = host.restore(dest, FAKE_LIST_UNITS_FAIL="1")
+    assert result.returncode == 1 and "refused: systemctl could not list the deploy units" in result.stderr
+    assert _verbs(host, "stop") == []
+    # Launched by rmp-api or rmp-worker after the first check: the second check, after the last stop, finds it.
+    result = host.restore(dest, FAKE_DEPLOY_ON_STOP="temporal=aura-deploy-main.service")
+    assert result.returncode == 1
+    assert ("refused: aura-deploy-main.service started while the restore stopped the services; "
+            "run the restore again when it ends") in result.stderr
+    assert host.log("sudo.log") == []
+    assert _verbs(host, "stop") == STOPS and _verbs(host, "start") == STARTS
+    assert host.log("systemctl.log")[-1]["argv"][0] == "list-timers"
+
+
+def test_a_failed_stop_ends_the_restore_and_starts_what_it_stopped(host):
+    _, dest, _, _ = host.run()
+    result = host.restore(dest, FAKE_STOP_FAIL="rmp-worker")
+    assert result.returncode == 1 and "systemctl stop rmp-worker failed: nothing was restored" in result.stderr
+    assert host.log("sudo.log") == []
+    assert _verbs(host, "start") == [unit for unit in STARTS if unit not in ("rmp-worker", "temporal")]
+
+
+def test_a_timer_whose_run_is_in_progress_after_the_restart_is_waited_for(host):
+    """A started timer whose interval passed during the restore runs its service at once and shows no next elapse
+    until that run ends."""
+    _, dest, _, _ = host.run()
+    result = host.restore(dest, FAKE_TIMER_RUN="rmp-temporal-watchdog.timer=3")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NO NEXT:" not in result.stdout + result.stderr
+    assert (host.state / "sleep.log").read_text().splitlines() == ["10"] * 3
+    result = host.restore(dest, FAKE_TIMER_RUN="rmp-temporal-watchdog.timer=100")
+    assert result.returncode == 1
+    assert ("NO NEXT: rmp-temporal-watchdog.timer (rmp-temporal-watchdog.service still running after 15 min)\n"
+            in result.stdout)
+    assert (host.state / "sleep.log").read_text().splitlines() == ["10"] * 90
 
 @pytest.mark.parametrize("name", RESTORE_PATHS)
 def test_a_restore_that_hard_codes_a_production_path_is_never_run(host, name):
