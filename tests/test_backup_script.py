@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -235,6 +236,18 @@ FAKES = {"curl": FAKE_CURL, "pg_dump": FAKE_PG_DUMP, "sudo": FAKE_SUDO, "pg_rest
 LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log")
 
 
+def _store(path, rows):
+    """A small SQLite store in the shape of OpenClaw's, holding ``rows``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS events (n INTEGER)")
+        con.executemany("INSERT INTO events VALUES (?)", [(n,) for n in rows])
+        con.commit()
+    finally:
+        con.close()
+
+
 def _runs_only_against_fakes(script, env, fake):
     """The precondition of every script run here: each tool it could reach on the host resolves to its fake, and a
     restore takes every path it writes from the environment. A restore that hard-codes a production path is never
@@ -258,6 +271,10 @@ def host(tmp_path):
     for unit in (*TIMERS, "rmp-code-watch.service", "openclaw-gateway.service", "rmp-api.service", "rmp-worker.service",
                  "temporal.service", "rmp-qdrant.service"):
         (state / "units" / unit).write_text("active")
+    stores = {"openclaw-agent.sqlite": home / "agents" / "main" / "agent" / "openclaw-agent.sqlite",
+              "openclaw.sqlite": home / "state" / "openclaw.sqlite"}
+    for rows, store in enumerate(stores.values(), start=2):
+        _store(store, range(rows))
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"vector_memory": {"qdrant_mode": "server", "qdrant_host": "127.0.0.1", "qdrant_port": 6333}}))
     env = {**os.environ, "RMP_ROOT": str(REPO), "RMP_DATA_DIR": str(data), "RMP_BACKUP_ROOT": str(data / "backups"),
@@ -290,7 +307,8 @@ def host(tmp_path):
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     return type("Host", (), {"run": staticmethod(run), "restore": staticmethod(restore), "log": staticmethod(log),
-                             "tmp": tmp_path, "state": state, "backups": data / "backups", "settings": settings})
+                             "tmp": tmp_path, "state": state, "backups": data / "backups", "settings": settings,
+                             "stores": stores})
 
 
 def _sha256(path):
@@ -578,6 +596,23 @@ def test_a_timer_whose_run_is_in_progress_after_the_restart_is_waited_for(host):
     assert ("NO NEXT: rmp-temporal-watchdog.timer (rmp-temporal-watchdog.service still running after 15 min)\n"
             in result.stdout)
     assert (host.state / "sleep.log").read_text().splitlines() == ["10"] * 90
+
+
+def test_restore_puts_the_openclaw_stores_back_with_the_gateway_stopped(host):
+    """Sessions, transcripts, auth profiles and cron jobs are coupled to rmp_db: they come back with it."""
+    _, dest, manifest, _ = host.run()
+    assert manifest["failures"] == []
+    for name, live in host.stores.items():
+        _store(live, range(100, 110))
+        assert _sha256(live) != _sha256(dest / "openclaw-state" / name)
+    result = host.restore(dest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for name, live in host.stores.items():
+        assert _sha256(live) == _sha256(dest / "openclaw-state" / name)
+    calls = [record["argv"] for record in host.log("systemctl.log")]
+    # The tool refuses while the gateway runs; it asked only after the restore had stopped it.
+    assert calls.index(["stop", "openclaw-gateway"]) < calls.index(["is-active", "--quiet", "openclaw-gateway"])
+    assert "restored agent, state from" in result.stdout
 
 @pytest.mark.parametrize("name", RESTORE_PATHS)
 def test_a_restore_that_hard_codes_a_production_path_is_never_run(host, name):

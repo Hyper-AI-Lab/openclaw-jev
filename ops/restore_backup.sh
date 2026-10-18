@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Restore RMP from a backup directory made by ops/backup.sh: the RMP and Temporal databases, Qdrant, artifacts and
-# settings. Runbook: docs/runbooks/backup-restore.md. Exits 1, naming what was not restored, if any part fails.
+# Restore RMP from a backup directory made by ops/backup.sh: the RMP and Temporal databases, Qdrant, artifacts,
+# OpenClaw's stores and settings. Runbook: docs/runbooks/backup-restore.md. Exits 1, naming what was not restored, if
+# any part fails.
 #
 # Nothing may write to a store while it is replaced. The restore holds the code-reload lock, which a deploy and a code
 # reload take too, refuses while a deploy unit is active, and stops every writer first: the RMP timers and their runs,
@@ -210,6 +211,13 @@ fi
 if [[ -f "${SRC}/artifacts.tar.gz" ]]; then
   echo "Restoring artifacts..."
   { rm -rf "${RMP_DATA}/artifacts" && tar -xzf "${SRC}/artifacts.tar.gz" -C "${RMP_DATA}"; } || FAILED+=("artifacts")
+fi
+
+# OpenClaw's stores (sessions, transcripts, auth profiles, cron jobs), with the gateway stopped above. The tool checks
+# every copy's checksum and integrity before it replaces anything, and refuses while the gateway runs.
+if [[ -f "${SRC}/openclaw-state/manifest.json" ]]; then
+  echo "Restoring OpenClaw's stores..."
+  "${PY}" "${RMP_ROOT}/ops/backup_openclaw_state.py" restore "${SRC}/openclaw-state" --yes || FAILED+=("openclaw-state")
 fi
 
 if [[ -f "${SRC}/settings.json" ]]; then
