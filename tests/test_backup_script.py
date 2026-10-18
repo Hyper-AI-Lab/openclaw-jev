@@ -1,12 +1,16 @@
-"""ops/backup.sh and ops/restore_qdrant_snapshot.sh end to end, against fake pg_dump, sudo and Qdrant API.
+"""ops/backup.sh and the restore scripts end to end, against fake pg_dump, pg_restore, sudo, systemctl and Qdrant API.
 
 The scripts run from outside the checkout (as rmp-backup.service does, with no working directory), with their data,
-settings and OpenClaw home in the test's tmp tree, so nothing live is read.
+settings and OpenClaw home in the test's tmp tree, so nothing live is read. A script runs only when every tool it
+could reach on the host resolves to its fake, and a restore only when it takes every path it writes from the
+environment: the production guard does not see a child process's own calls.
 """
 import hashlib
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -17,7 +21,13 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 BACKUP = REPO / "ops" / "backup.sh"
+RESTORE = REPO / "ops" / "restore_backup.sh"
 RESTORE_QDRANT = REPO / "ops" / "restore_qdrant_snapshot.sh"
+# Every path the restore writes or locks comes from one of these, each with a default (ops/backup.sh's names).
+RESTORE_PATHS = ("RMP_ROOT", "RMP_DATA_DIR", "RMP_SETTINGS_PATH", "RMP_PYTHON")
+# The RMP timers enabled on the host; the fake systemctl lists them as active.
+TIMERS = sorted(u for u in (REPO / "ops" / "systemd" / "enabled-units.txt").read_text().splitlines()
+                if u.endswith(".timer"))
 
 FAKE_CURL = r'''#!/usr/bin/env python3
 """curl, as far as the scripts use it against Qdrant's API. FAKE_QDRANT_* variables choose failures."""
@@ -78,29 +88,175 @@ while [ $# -gt 0 ]; do [ "$1" = "-f" ] && { printf 'PGDMP' > "$2"; exit 0; }; sh
 printf 'PGDMP-%s' "$last"
 '''
 
-# sudo -n -u postgres <cmd...>: run the command as this user.
-FAKE_SUDO = r'''#!/bin/sh
-while [ $# -gt 0 ]; do case "$1" in -n) shift ;; -u) shift 2 ;; *) break ;; esac; done
-exec "$@"
+FAKE_SUDO = r'''#!/usr/bin/env python3
+"""sudo -n -u <user> <command...>: records the user, the argv, the sha256 of stdin and whether PGPASSWORD is set in
+${FAKE_STATE}/sudo.log, then runs the command as this user with the same stdin."""
+import hashlib, json, os, subprocess, sys, time
+args, user = sys.argv[1:], None
+while args and args[0] in ("-n", "-u"):
+    user, args = (args[1], args[2:]) if args[0] == "-u" else (user, args[1:])
+data = sys.stdin.buffer.read()
+with open(os.path.join(os.environ["FAKE_STATE"], "sudo.log"), "a") as log:
+    log.write(json.dumps({"t": time.monotonic_ns(), "user": user, "argv": args,
+                          "stdin_sha256": hashlib.sha256(data).hexdigest(),
+                          "pgpassword": "PGPASSWORD" in os.environ}) + "\n")
+sys.exit(subprocess.run(args, input=data).returncode)
 '''
+
+# pg_restore of an archive of the fake pg_dump on stdin: PGDMP is rmp_db (its -f form), PGDMP-<db> a Temporal one.
+FAKE_PG_RESTORE = r'''#!/bin/sh
+archive="$(cat)"
+db="${archive#PGDMP-}"
+[ "${archive}" = PGDMP ] && db=rmp_db
+if [ "${FAKE_PGRESTORE_FAIL:-}" = "${db}" ]; then
+  echo "pg_restore: error: could not execute query: database \"${db}\" is being accessed by other users" >&2
+  exit 1
+fi
+exit 0
+'''
+
+# dropdb and createdb: the restore never calls them (the rmp role cannot create a database), so each call is recorded.
+FAKE_REFUSED = r'''#!/bin/sh
+printf '%s %s\n' "$(basename "$0")" "$*" >> "${FAKE_STATE}/refused.log"
+exit 1
+'''
+
+FAKE_SLEEP = r'''#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_STATE}/sleep.log"
+'''
+
+FAKE_SYSTEMCTL = r'''#!/usr/bin/env python3
+"""systemctl, as far as ops/restore_backup.sh and ops/backup_openclaw_state.py use it.
+
+Every call is recorded in ${FAKE_STATE}/systemctl.log, a start with the sha256 of the live settings at that moment.
+Unit states live in ${FAKE_STATE}/units; stop and start update them. FAKE_STOP_FAIL=<unit> fails that unit's stop.
+FAKE_DEPLOY_ON_STOP=<unit>=<deploy unit> lists the deploy unit once the fake has handled that unit's stop.
+FAKE_TIMER_RUN=<timer>=<n> keeps the timer's service active for n is-active calls after the timer starts.
+"""
+import hashlib, json, os, sys, time
+args, env = sys.argv[1:], os.environ.get
+state = env("FAKE_STATE")
+units = os.path.join(state, "units")
+words = [a for a in args if not a.startswith("-")]
+verb = words[0]
+
+
+def path(unit):
+    return os.path.join(units, unit if "." in unit else unit + ".service")
+
+
+def get(unit):
+    return open(path(unit)).read() if os.path.exists(path(unit)) else "inactive"
+
+
+def put(unit, value):
+    with open(path(unit), "w") as f:
+        f.write(value)
+
+
+def service(timer):
+    return timer[:-len(".timer")] + ".service"
+
+
+record = {"t": time.monotonic_ns(), "argv": args}
+if verb == "start":
+    settings = env("RMP_SETTINGS_PATH", "")
+    record["settings_sha256"] = (hashlib.sha256(open(settings, "rb").read()).hexdigest()
+                                 if os.path.isfile(settings) else None)
+with open(os.path.join(state, "systemctl.log"), "a") as log:
+    log.write(json.dumps(record) + "\n")
+timers = sorted(n for n in os.listdir(units) if n.endswith(".timer"))
+
+if verb == "stop":
+    for unit in words[1:]:
+        if env("FAKE_STOP_FAIL") and path(env("FAKE_STOP_FAIL")) == path(unit):
+            print(f"Job for {unit} failed.", file=sys.stderr)
+            sys.exit(1)
+        put(unit, "inactive")
+        trigger, _, deploy = env("FAKE_DEPLOY_ON_STOP", "").partition("=")
+        if trigger and path(trigger) == path(unit):
+            with open(os.path.join(state, "deploy-units"), "a") as f:
+                f.write(deploy + "\n")
+elif verb == "start":
+    for unit in words[1:]:
+        put(unit, "active")
+        timer, _, calls = env("FAKE_TIMER_RUN", "").partition("=")
+        if unit == timer:
+            put(service(timer), "active")
+            with open(path(service(timer)) + ".run", "w") as f:
+                f.write(calls)
+elif verb == "is-active":
+    current, run = get(words[1]), path(words[1]) + ".run"
+    if os.path.exists(run):
+        left = int(open(run).read()) - 1
+        if left > 0:
+            with open(run, "w") as f:
+                f.write(str(left))
+        else:
+            os.remove(run)
+            put(words[1], "inactive")
+    if "--quiet" not in args:
+        print(current)
+    sys.exit(0 if current == "active" else 3)
+elif verb == "list-units":
+    if "--type=timer" in args:
+        listed = [t for t in timers if get(t) == "active"]
+    else:
+        deploys = os.path.join(state, "deploy-units")
+        listed = open(deploys).read().split() if os.path.exists(deploys) else []
+    for unit in listed:
+        print(f"{unit} loaded active running {unit}")
+elif verb == "show":
+    print(service(words[-1]))
+elif verb == "list-timers":
+    for t in timers:
+        armed = get(t) == "active" and get(service(t)) not in ("active", "activating")
+        upcoming = "Tue 2026-10-20 03:15:00 UTC 5h left" if armed else "- -"
+        print(f"{upcoming} Mon 2026-10-19 03:15:00 UTC 18h ago {t} {service(t)}")
+'''
+
+FAKES = {"curl": FAKE_CURL, "pg_dump": FAKE_PG_DUMP, "sudo": FAKE_SUDO, "pg_restore": FAKE_PG_RESTORE,
+         "systemctl": FAKE_SYSTEMCTL, "sleep": FAKE_SLEEP, "dropdb": FAKE_REFUSED, "createdb": FAKE_REFUSED}
+# The fakes' logs, which each call of host.run() starts without.
+LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log")
+
+
+def _runs_only_against_fakes(script, env, fake):
+    """The precondition of every script run here: each tool it could reach on the host resolves to its fake, and a
+    restore takes every path it writes from the environment. A restore that hard-codes a production path is never
+    executed: in a direct session it would remove the live artifacts and copy over the live settings."""
+    if script.name == RESTORE.name:
+        text = script.read_text()
+        for name in RESTORE_PATHS:
+            assert re.search(rf'^[A-Z_]+="\$\{{{name}:-', text, re.M), f"{script} hard-codes the path {name} sets"
+    for tool in FAKES:
+        assert shutil.which(tool, path=env["PATH"]) == str(fake / tool), f"{tool} does not resolve to its fake"
 
 
 @pytest.fixture
 def host(tmp_path):
     fake, state, data, home = tmp_path / "bin", tmp_path / "state", tmp_path / "data", tmp_path / "openclaw"
-    for d in (fake, state, data, home):
+    for d in (fake, state, data, home, state / "units"):
         d.mkdir()
-    for name, body in (("curl", FAKE_CURL), ("pg_dump", FAKE_PG_DUMP), ("sudo", FAKE_SUDO)):
+    for name, body in FAKES.items():
         (fake / name).write_text(body)
         (fake / name).chmod(0o755)
+    for unit in (*TIMERS, "rmp-code-watch.service", "openclaw-gateway.service", "rmp-api.service", "rmp-worker.service",
+                 "temporal.service", "rmp-qdrant.service"):
+        (state / "units" / unit).write_text("active")
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"vector_memory": {"qdrant_mode": "server", "qdrant_host": "127.0.0.1", "qdrant_port": 6333}}))
     env = {**os.environ, "RMP_ROOT": str(REPO), "RMP_DATA_DIR": str(data), "RMP_BACKUP_ROOT": str(data / "backups"),
            "RMP_PYTHON": sys.executable, "RMP_SETTINGS_PATH": str(settings), "OPENCLAW_HOME": str(home),
+           "RMP_CODE_RELOAD_LOCK": str(tmp_path / "code-reload.lock"),
            "PATH": f"{fake}:{os.environ['PATH']}", "FAKE_STATE": str(state)}
+    env.pop("PGPASSWORD", None)
 
-    def run(script=BACKUP, *args, **extra):
-        result = subprocess.run(["bash", str(script), *args], env={**env, **extra}, cwd=tmp_path,
+    def run(script=BACKUP, *args, answer="y\n", **extra):
+        _runs_only_against_fakes(script, {**env, **extra}, fake)
+        for name in LOGS:
+            (state / name).unlink(missing_ok=True)
+        result = subprocess.run(["bash", str(script), *args], env={**env, **extra}, cwd=tmp_path, input=answer,
                                 capture_output=True, text=True, timeout=300)
         backups = data / "backups"
         stamps = sorted(p for p in backups.iterdir() if p.name[:2] == "20") if backups.is_dir() else []
@@ -261,3 +417,13 @@ def test_restore_fails_loudly_when_an_upload_fails_or_the_file_is_not_a_snapshot
     junk.write_text("not a tar")
     result, _, _, _ = host.run(RESTORE_QDRANT, str(junk), "http://127.0.0.1:6333")
     assert result.returncode == 1 and "not a readable archive" in result.stderr
+
+
+@pytest.mark.parametrize("name", RESTORE_PATHS)
+def test_a_restore_that_hard_codes_a_production_path_is_never_run(host, name):
+    script = host.tmp / RESTORE.name
+    script.write_text(RESTORE.read_text().replace(f"${{{name}:-", f"${{UNREAD_{name}:-"))
+    assert script.read_text() != RESTORE.read_text()
+    with pytest.raises(AssertionError, match=f"hard-codes the path {name} sets"):
+        host.run(script, str(host.tmp))
+    assert not (host.state / "systemctl.log").exists()

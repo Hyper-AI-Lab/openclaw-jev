@@ -9,9 +9,11 @@ if [[ $# -lt 1 ]]; then
 fi
 
 SRC="$1"
-RMP_ROOT="/root/.openclaw/rmp"
-RMP_DATA="${RMP_ROOT}/data"
-PY="${RMP_ROOT}/venv/bin/python"
+# The names and defaults of ops/backup.sh. Production sets none of them; the tests point them at a tmp tree.
+RMP_ROOT="${RMP_ROOT:-/root/.openclaw/rmp}"
+RMP_DATA="${RMP_DATA_DIR:-${RMP_ROOT}/data}"
+PY="${RMP_PYTHON:-${RMP_ROOT}/venv/bin/python}"
+SETTINGS="${RMP_SETTINGS_PATH:-${RMP_ROOT}/settings.json}"
 PG_USER="${PGUSER:-rmp}"
 # The rmp role's password lives only in DATABASE_URL (environment or /etc/rmp/rmp.env).
 PG_PASSWORD="${PGPASSWORD:-$(cd "${RMP_ROOT}" && "${PY}" -c 'from sqlalchemy.engine import make_url; from app.db.database import DATABASE_URL; print(make_url(DATABASE_URL).password or "")')}"
@@ -68,7 +70,7 @@ if [[ -f "${SRC}/artifacts.tar.gz" ]]; then
 fi
 
 if [[ -f "${SRC}/settings.json" ]]; then
-  cp -a "${SRC}/settings.json" "${RMP_ROOT}/settings.json" || FAILED+=("settings")
+  cp -a "${SRC}/settings.json" "${SETTINGS}" || FAILED+=("settings")
 fi
 
 systemctl restart temporal rmp-api rmp-worker openclaw-gateway
