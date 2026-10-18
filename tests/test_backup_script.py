@@ -22,12 +22,16 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 BACKUP = REPO / "ops" / "backup.sh"
 RESTORE = REPO / "ops" / "restore_backup.sh"
+RESTORE_PG = REPO / "ops" / "restore_pg_database.sh"
 RESTORE_QDRANT = REPO / "ops" / "restore_qdrant_snapshot.sh"
 # Every path the restore writes or locks comes from one of these, each with a default (ops/backup.sh's names).
 RESTORE_PATHS = ("RMP_ROOT", "RMP_DATA_DIR", "RMP_SETTINGS_PATH", "RMP_PYTHON")
 # The RMP timers enabled on the host; the fake systemctl lists them as active.
 TIMERS = sorted(u for u in (REPO / "ops" / "systemd" / "enabled-units.txt").read_text().splitlines()
                 if u.endswith(".timer"))
+# The one restore command of every database: the superuser drops it and recreates it from its archive.
+PG_RESTORE = ["pg_restore", "-h", "/var/run/postgresql", "-p", "5432", "--clean", "--if-exists", "--create",
+              "--exit-on-error", "-d", "postgres"]
 
 FAKE_CURL = r'''#!/usr/bin/env python3
 """curl, as far as the scripts use it against Qdrant's API. FAKE_QDRANT_* variables choose failures."""
@@ -250,7 +254,8 @@ def host(tmp_path):
            "RMP_PYTHON": sys.executable, "RMP_SETTINGS_PATH": str(settings), "OPENCLAW_HOME": str(home),
            "RMP_CODE_RELOAD_LOCK": str(tmp_path / "code-reload.lock"),
            "PATH": f"{fake}:{os.environ['PATH']}", "FAKE_STATE": str(state)}
-    env.pop("PGPASSWORD", None)
+    for name in ("PGPASSWORD", "RMP_PG_SOCKET_DIR", "RMP_PG_PORT"):
+        env.pop(name, None)
 
     def run(script=BACKUP, *args, answer="y\n", **extra):
         _runs_only_against_fakes(script, {**env, **extra}, fake)
@@ -267,8 +272,19 @@ def host(tmp_path):
         log.unlink(missing_ok=True)
         return result, dest, manifest, calls
 
-    return type("Host", (), {"run": staticmethod(run), "tmp": tmp_path, "state": state, "backups": data / "backups",
-                             "settings": settings})
+    def restore(src, answer="y\n", **extra):
+        return run(RESTORE, str(src), answer=answer, **extra)[0]
+
+    def log(name):
+        path = state / name
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    return type("Host", (), {"run": staticmethod(run), "restore": staticmethod(restore), "log": staticmethod(log),
+                             "tmp": tmp_path, "state": state, "backups": data / "backups", "settings": settings})
+
+
+def _sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def test_a_healthy_backup_takes_a_verified_qdrant_snapshot_and_dumps_temporal(host):
@@ -418,6 +434,31 @@ def test_restore_fails_loudly_when_an_upload_fails_or_the_file_is_not_a_snapshot
     result, _, _, _ = host.run(RESTORE_QDRANT, str(junk), "http://127.0.0.1:6333")
     assert result.returncode == 1 and "not a readable archive" in result.stderr
 
+
+def test_restore_recreates_each_database_from_its_dump_through_the_postgres_superuser(host):
+    """The rmp role has neither CREATEDB nor superuser: dropdb and createdb as rmp would leave rmp_db dropped."""
+    _, dest, _, _ = host.run()
+    result = host.restore(dest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = host.log("sudo.log")
+    assert [(c["user"], c["argv"]) for c in calls] == [("postgres", PG_RESTORE)] * 3
+    assert [c["stdin_sha256"] for c in calls] == [
+        _sha256(dest / name) for name in ("rmp_db.dump", "temporal.dump", "temporal_visibility.dump")]
+    assert not any(c["pgpassword"] or "-U" in c["argv"] for c in calls)
+    assert not (host.state / "refused.log").exists(), "dropdb or createdb was called"
+
+
+def test_restore_pg_database_refuses_a_missing_dump_and_reports_a_failed_restore(host):
+    empty = host.tmp / "empty.dump"
+    empty.touch()
+    for dump in (empty, host.tmp / "missing.dump"):
+        result, _, _, _ = host.run(RESTORE_PG, str(dump))
+        assert result.returncode == 1 and f"{dump} is missing or empty" in result.stderr
+        assert host.log("sudo.log") == []
+    _, dest, _, _ = host.run()
+    result = host.restore(dest, FAKE_PGRESTORE_FAIL="rmp_db")
+    assert result.returncode == 1 and "Restore INCOMPLETE: not restored: postgres\n" in result.stderr
+    assert len(host.log("sudo.log")) == 3
 
 @pytest.mark.parametrize("name", RESTORE_PATHS)
 def test_a_restore_that_hard_codes_a_production_path_is_never_run(host, name):

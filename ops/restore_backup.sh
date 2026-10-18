@@ -14,10 +14,6 @@ RMP_ROOT="${RMP_ROOT:-/root/.openclaw/rmp}"
 RMP_DATA="${RMP_DATA_DIR:-${RMP_ROOT}/data}"
 PY="${RMP_PYTHON:-${RMP_ROOT}/venv/bin/python}"
 SETTINGS="${RMP_SETTINGS_PATH:-${RMP_ROOT}/settings.json}"
-PG_USER="${PGUSER:-rmp}"
-# The rmp role's password lives only in DATABASE_URL (environment or /etc/rmp/rmp.env).
-PG_PASSWORD="${PGPASSWORD:-$(cd "${RMP_ROOT}" && "${PY}" -c 'from sqlalchemy.engine import make_url; from app.db.database import DATABASE_URL; print(make_url(DATABASE_URL).password or "")')}"
-PG_DB="${PGDATABASE:-rmp_db}"
 FAILED=()
 
 if [[ ! -d "$SRC" ]]; then
@@ -35,20 +31,14 @@ read -r -p "This will overwrite live data. Continue? [y/N] " confirm
 
 systemctl stop rmp-api rmp-worker temporal || true
 
-if [[ -f "${SRC}/rmp_db.dump" && -s "${SRC}/rmp_db.dump" ]]; then
-  echo "Restoring Postgres ${PG_DB}..."
-  if ! { PGPASSWORD="$PG_PASSWORD" dropdb -U "$PG_USER" -h localhost --if-exists "$PG_DB" \
-         && PGPASSWORD="$PG_PASSWORD" createdb -U "$PG_USER" -h localhost "$PG_DB" \
-         && PGPASSWORD="$PG_PASSWORD" pg_restore -U "$PG_USER" -h localhost -d "$PG_DB" "${SRC}/rmp_db.dump"; }; then
-    FAILED+=("postgres")
-  fi
-fi
-
-# Temporal's own databases (Temporal is stopped above), through the postgres superuser's peer login.
-for db in temporal temporal_visibility; do
+# RMP's ledger, then Temporal's own databases (Temporal is stopped above). Each is dropped and recreated as an exact
+# copy of its archive through the postgres superuser: the rmp role cannot create a database. A failure is named as in
+# the backup's manifest.
+declare -A PART=([rmp_db]=postgres [temporal]=temporal:temporal [temporal_visibility]=temporal:temporal_visibility)
+for db in rmp_db temporal temporal_visibility; do
   if [[ -s "${SRC}/${db}.dump" ]]; then
-    echo "Restoring Temporal database ${db}..."
-    sudo -n -u postgres pg_restore --clean --if-exists -d "${db}" < "${SRC}/${db}.dump" || FAILED+=("temporal:${db}")
+    echo "Restoring the ${db} database..."
+    bash "${RMP_ROOT}/ops/restore_pg_database.sh" "${SRC}/${db}.dump" || FAILED+=("${PART[${db}]}")
   fi
 done
 

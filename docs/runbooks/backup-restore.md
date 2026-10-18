@@ -49,8 +49,8 @@ bash /root/.openclaw/rmp/ops/restore_backup.sh /root/.openclaw/rmp/data/backups/
 The script does the following:
 1. Asks for confirmation.
 2. Stops rmp-api, rmp-worker and Temporal.
-3. Restores `rmp_db`.
-4. Restores both Temporal databases (`pg_restore --clean --if-exists`, as the postgres user).
+3. Restores `rmp_db` as an exact copy, through the postgres superuser (`ops/restore_pg_database.sh`). `pg_restore --clean --if-exists --create --exit-on-error -d postgres` drops the database and recreates it from its archive: its owner, encoding and settings, the `vector` extension, and nothing the dump lacks. The `rmp` role cannot do this: it has neither CREATEDB nor superuser. The first error stops it, so a `DROP DATABASE` refused because a session is still connected changes nothing.
+4. Restores both Temporal databases the same way.
 5. Restores Qdrant collection by collection into the **running** Qdrant (`ops/restore_qdrant_snapshot.sh`).
 6. Restores artifacts and settings.
 7. Restarts the services.
@@ -58,6 +58,13 @@ The script does the following:
 The OpenClaw stores are restored separately, with the gateway stopped: `ops/backup_openclaw_state.py restore <backup>/openclaw-state --yes`.
 
 If any part fails it prints `Restore INCOMPLETE: not restored: …` and exits 1.
+
+**On a new host**, the Postgres roles `rmp` and `temporal` must exist before the restore, because each archive names its owner. No backup holds them or their passwords. Create each as the postgres superuser with the password from `/etc/rmp/rmp.env` (`DATABASE_URL`) or `/etc/openclaw/openclaw.env`; the prompt keeps it off the command line:
+
+```bash
+sudo -u postgres createuser --pwprompt rmp
+sudo -u postgres createuser --pwprompt temporal
+```
 
 **Qdrant only:**
 
