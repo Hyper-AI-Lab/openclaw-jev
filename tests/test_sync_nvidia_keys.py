@@ -72,7 +72,9 @@ def test_no_key_at_all_fails_the_sync(store):
     assert store.profiles() == []
 
 
-def test_the_script_finds_app_through_its_own_checkout(store):
+def test_the_script_finds_app_through_its_own_checkout(store, monkeypatch):
     """The gateway unit sets no PYTHONPATH: the script's own checkout, never a literal production path, finds app."""
+    # pytest.ini's pythonpath and the working directory already name the checkout: only the script may put it back.
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if Path(p or ".").resolve() != ROOT])
     load()
     assert sys.path[0] == str(ROOT)
