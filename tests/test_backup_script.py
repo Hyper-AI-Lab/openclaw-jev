@@ -132,6 +132,11 @@ printf '%s %s\n' "$(basename "$0")" "$*" >> "${FAKE_STATE}/refused.log"
 exit 1
 '''
 
+# openclaw --version, which ops/backup_openclaw_state.py records in its manifest.
+FAKE_OPENCLAW = r'''#!/bin/sh
+echo "OpenClaw 2026.9.7"
+'''
+
 FAKE_SLEEP = r'''#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_STATE}/sleep.log"
 '''
@@ -231,7 +236,8 @@ elif verb == "list-timers":
 '''
 
 FAKES = {"curl": FAKE_CURL, "pg_dump": FAKE_PG_DUMP, "sudo": FAKE_SUDO, "pg_restore": FAKE_PG_RESTORE,
-         "systemctl": FAKE_SYSTEMCTL, "sleep": FAKE_SLEEP, "dropdb": FAKE_REFUSED, "createdb": FAKE_REFUSED}
+         "systemctl": FAKE_SYSTEMCTL, "sleep": FAKE_SLEEP, "dropdb": FAKE_REFUSED, "createdb": FAKE_REFUSED,
+         "openclaw": FAKE_OPENCLAW}
 # The fakes' logs, which each call of host.run() starts without.
 LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log")
 
