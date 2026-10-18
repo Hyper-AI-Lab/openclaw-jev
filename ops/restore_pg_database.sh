@@ -7,8 +7,9 @@
 #   bash ops/restore_pg_database.sh <backup-dir>/rmp_db.dump
 #
 # --exit-on-error stops at the first error: a DROP DATABASE refused because a session is still connected changes
-# nothing. The caller (root) opens the archive, because postgres cannot read the root-only backups. RMP_PG_SOCKET_DIR
-# and RMP_PG_PORT point it at a scratch server for the restore drill; the restore never sets them.
+# nothing. The archive reaches pg_restore on stdin, opened here by root, because postgres cannot read the root-only
+# backups. RMP_PG_SOCKET_DIR and RMP_PG_PORT point it at a scratch server for the restore drill; the restore never sets
+# them.
 set -euo pipefail
 
 dump="${1:?usage: restore_pg_database.sh <dump>}"

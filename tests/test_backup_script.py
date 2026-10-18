@@ -26,7 +26,8 @@ BACKUP = REPO / "ops" / "backup.sh"
 RESTORE = REPO / "ops" / "restore_backup.sh"
 RESTORE_PG = REPO / "ops" / "restore_pg_database.sh"
 RESTORE_QDRANT = REPO / "ops" / "restore_qdrant_snapshot.sh"
-# Every path the restore writes or locks comes from one of these, each with a default (ops/backup.sh's names).
+# Every path the restore writes or locks comes from one of these, each with a default (the names of ops/backup.sh and
+# of the code reload's lock).
 RESTORE_PATHS = ("RMP_ROOT", "RMP_DATA_DIR", "RMP_SETTINGS_PATH", "RMP_PYTHON", "RMP_CODE_RELOAD_LOCK")
 # The RMP timers enabled on the host; the fake systemctl lists them as active.
 TIMERS = sorted(u for u in (REPO / "ops" / "systemd" / "enabled-units.txt").read_text().splitlines()
@@ -516,7 +517,8 @@ def test_restore_stops_every_writer_before_the_first_database_and_starts_them_af
     assert len(databases) == 3
     assert [argv[1] for _, argv, _ in calls[:databases[0]] if argv[0] == "stop"] == STOPS
     assert [argv[1] for _, argv, _ in calls[databases[0]:] if argv[0] == "stop"] == []
-    starts = [(i, argv[1], record["settings_sha256"]) for i, (_, argv, record) in enumerate(calls) if argv[0] == "start"]
+    starts = [(i, argv[1], record["settings_sha256"])
+              for i, (_, argv, record) in enumerate(calls) if argv[0] == "start"]
     assert [unit for _, unit, _ in starts] == STARTS
     assert all(i > databases[-1] for i, _, _ in starts)
     # Every start saw the backup's settings in place: the starts follow the settings copy.

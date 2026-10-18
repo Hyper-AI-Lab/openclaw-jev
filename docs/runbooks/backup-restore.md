@@ -48,6 +48,13 @@ A restore takes Aura offline: it needs Kirill's OK and an idle window.
 bash /root/.openclaw/rmp/ops/restore_backup.sh /root/.openclaw/rmp/data/backups/YYYYMMDDTHHMMSSZ
 ```
 
+**On a new host**, the Postgres roles `rmp` and `temporal` must exist before the restore, because each archive names its owner. No backup holds them or their passwords. Create each as the postgres superuser with the password from `/etc/rmp/rmp.env` (`DATABASE_URL`) or `/etc/openclaw/openclaw.env`; the prompt keeps it off the command line:
+
+```bash
+sudo -u postgres createuser --pwprompt rmp
+sudo -u postgres createuser --pwprompt temporal
+```
+
 The script does the following:
 1. Asks for confirmation.
 2. Takes the code-reload lock (`/run/rmp-code-reload.lock`) and holds it until it exits: a deploy waits for it, a code reload skips. It refuses before anything stops while the lock is held or an `aura-deploy-*` unit is active. The watchdog and the canary sentinel do not take the lock; step 3 stops their timers.
@@ -73,13 +80,6 @@ cd /root/.openclaw/rmp && venv/bin/python -c 'from app.llm.model_policy import a
 Make the stores whole, by restoring the failed part again or running the whole restore again, then run the printed `systemctl start` command. A second run of the restore starts only what it stopped itself, so the first run's command is still needed.
 
 **Residual risk:** after a partial failure, only a person can start the services on a half-restored store. That happens through a `systemctl start`, a deploy unit started by hand, or a reboot, because all four units are enabled. The restore's last line warns against all three.
-
-**On a new host**, the Postgres roles `rmp` and `temporal` must exist before the restore, because each archive names its owner. No backup holds them or their passwords. Create each as the postgres superuser with the password from `/etc/rmp/rmp.env` (`DATABASE_URL`) or `/etc/openclaw/openclaw.env`; the prompt keeps it off the command line:
-
-```bash
-sudo -u postgres createuser --pwprompt rmp
-sudo -u postgres createuser --pwprompt temporal
-```
 
 **Qdrant only:**
 
