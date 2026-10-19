@@ -24,7 +24,8 @@ restore to the end of the Qdrant restore: the steps a real restore repeats on th
 
 It exits 0 when every check passed and 1 when one failed. It exits 2, having created nothing, when the host is not
 ready for it. The scratch instances and the scratch directory are removed however the drill ends, after a SIGTERM,
-SIGINT or SIGHUP too. After a hard kill, remove them with:
+SIGINT or SIGHUP too; started under nohup, which ignores SIGHUP, it keeps running when its session hangs up. After a
+hard kill, remove them with:
 
     docker rm -f rmp-qdrant-drill; for d in /var/tmp/rmp-restore-drill-*; do sudo -n -u postgres /usr/lib/postgresql/16/bin/pg_ctl -D "$d/pg/data" stop -m fast; rm -rf "$d"; done
 """
@@ -538,7 +539,9 @@ def main(argv: Optional[Sequence[str]] = None, *, run: Run = _run, probes: Optio
             print(f"refused: {reason}")
         return 2
     print(f"backup: {backup}", flush=True)
-    previous = {sig: signal.signal(sig, _exit_on_signal) for sig in SIGNALS}
+    # A hangup the caller ignores, as nohup does, stays ignored: the drill then outlives its session.
+    handled = [sig for sig in SIGNALS if not (sig == signal.SIGHUP and signal.getsignal(sig) == signal.SIG_IGN)]
+    previous = {sig: signal.signal(sig, _exit_on_signal) for sig in handled}
     try:
         return Drill(backup, run=run, scratch_root=scratch_root, pg_bin=os.environ.get("RMP_PG_BIN", PG_BIN),
                      image=image).perform()

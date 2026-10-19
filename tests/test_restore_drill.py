@@ -158,6 +158,17 @@ def backup(tmp_path):
 
 
 @pytest.fixture
+def signals():
+    """SIGHUP not ignored, as a terminal session starts the drill; the test process's own handlers again
+    afterwards."""
+    before = {sig: signal.getsignal(sig) for sig in drill.SIGNALS}
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    yield
+    for sig, handler in before.items():
+        signal.signal(sig, handler)
+
+
+@pytest.fixture
 def scratch_root(tmp_path):
     root = tmp_path / "scratch"
     root.mkdir()
@@ -294,7 +305,7 @@ def test_the_drill_removes_its_scratch_instances_when_a_step_fails(capsys, backu
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP], ids=lambda sig: sig.name)
-def test_a_signal_ends_the_drill_through_its_cleanup(capsys, backup, scratch_root, sig):
+def test_a_signal_ends_the_drill_through_its_cleanup(capsys, backup, scratch_root, signals, sig):
     """A kill, Ctrl-C or a hung-up session during the Qdrant restore: both instances and the scratch directory go,
     with the snapshot restore's work directory, and the signal's handlers are the caller's again afterwards."""
     before = {s: signal.getsignal(s) for s in drill.SIGNALS}
@@ -314,6 +325,17 @@ def test_a_signal_ends_the_drill_through_its_cleanup(capsys, backup, scratch_roo
     assert list(scratch_root.iterdir()) == [] and not os.path.lexists(work[0])
     assert "restore duration" not in capsys.readouterr().out
     assert {s: signal.getsignal(s) for s in drill.SIGNALS} == before
+
+
+def test_a_hangup_ignored_as_under_nohup_stays_ignored(capsys, backup, scratch_root, signals):
+    """nohup starts the drill with SIGHUP ignored: a hangup then leaves it running to its end."""
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    host = Host(on={"restore_qdrant_snapshot.sh": lambda: os.kill(os.getpid(), signal.SIGHUP)})
+    code, lines = run_drill(capsys, backup, scratch_root, host)
+    assert code == 0, lines
+    assert "ok qdrant collections: 2, as in the snapshot" in lines
+    assert re.fullmatch(r"restore duration: \d+ min \d+ s", lines[-1])
+    assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
 
 
 @pytest.mark.parametrize("ended_by", [None, signal.SIGTERM], ids=["a whole drill", "a drill ended by SIGTERM"])

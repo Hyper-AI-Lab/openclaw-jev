@@ -130,7 +130,7 @@ It drills the newest backup whose manifest has `"failures": []`; to drill anothe
 
 **Output:** one line per step and check, `ok …` or `FAIL <reason>`, with names and counts only. Expected: every line `ok`. The exit code is 0 only when every check passed. The last line is `restore duration: <m> min <s> s`, the time from the first database restore to the end of the Qdrant restore: the steps a real restore repeats on the same data, so it is the basis of the RTO.
 
-**Cleanup:** however the drill ends, including a SIGTERM, Ctrl-C or a hung-up session, it runs `docker rm -f rmp-qdrant-drill`, `pg_ctl stop -m fast` and removes the scratch directory. If the drill is killed hard (`kill -9`, a reboot), remove what it left:
+**Cleanup:** however the drill ends, including a SIGTERM, Ctrl-C or a hung-up session, it runs `docker rm -f rmp-qdrant-drill`, `pg_ctl stop -m fast` and removes the scratch directory. Started under `nohup`, which ignores the hangup, it keeps running when the session ends (redirect its output, or nohup writes `nohup.out` into the live checkout). If the drill is killed hard (`kill -9`, a reboot), remove what it left:
 
 ```bash
 docker rm -f rmp-qdrant-drill; for d in /var/tmp/rmp-restore-drill-*; do sudo -n -u postgres /usr/lib/postgresql/16/bin/pg_ctl -D "$d/pg/data" stop -m fast; rm -rf "$d"; done
