@@ -7,8 +7,8 @@
 # reload take too, refuses while a deploy unit is active, and stops every writer first: the RMP timers and their runs,
 # rmp-code-watch, the gateway, rmp-api, rmp-worker and Temporal. rmp-qdrant keeps running for the Qdrant restore.
 # It starts what it stopped when every part was restored, or when it ends before its first database step. After a
-# failed part it starts nothing: rmp-api runs create_all on rmp_db at start, so the operator starts the units once the
-# stores are whole.
+# failed part, or an exit by any signal before its last step, it starts nothing: rmp-api runs create_all on rmp_db at
+# start, so the operator starts the units once the stores are whole.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -30,6 +30,7 @@ declare -A TRIGGERS=()  # the service each recorded timer triggers
 declare -A STOPPED=()   # every unit this restore stopped
 RUNNING=()              # of rmp-code-watch and openclaw-gateway, those that were running
 CHANGED=""              # set before the first database step: from then on a failed part leaves every unit stopped
+DONE=""                 # set after the last step: an exit before it, by an error or any signal, restored only part
 
 if [[ ! -d "$SRC" ]]; then
   echo "Backup directory not found: $SRC"
@@ -130,13 +131,16 @@ check_timers() {
 finish() {
   local rc=$? unit
   local start=() not_started=()
+  # Bash runs this trap with status 0 after a signal it does not trap: an exit before the last step fails either way.
+  [[ -n "${DONE}" ]] || (( rc )) || rc=1
   for unit in temporal rmp-api rmp-worker openclaw-gateway rmp-code-watch "${TIMERS[@]}"; do
     [[ -z "${STOPPED[${unit}]:-}" ]] || start+=("${unit}")
   done
   if [[ -n "${CHANGED}" ]] && (( rc != 0 || ${#FAILED[@]} )); then
     if (( ${#FAILED[@]} )); then
       echo "Restore INCOMPLETE: not restored: ${FAILED[*]}" >&2
-    else
+    fi
+    if (( rc != 0 )); then
       echo "Restore INCOMPLETE: it ended before its last step (exit ${rc})" >&2
     fi
     echo "Left stopped, because a store may be half restored: ${start[*]}" >&2
@@ -159,6 +163,7 @@ finish() {
 }
 trap finish EXIT
 trap 'exit 143' TERM INT
+trap 'exit 129' HUP
 
 stop() {
   systemctl stop "$1" || { echo "systemctl stop $1 failed: nothing was restored" >&2; exit 1; }
@@ -223,4 +228,5 @@ fi
 if [[ -f "${SRC}/settings.json" ]]; then
   cp -a "${SRC}/settings.json" "${SETTINGS}" || FAILED+=("settings")
 fi
+DONE=1
 # finish, the EXIT trap, starts what the restore stopped, or reports what was not restored.

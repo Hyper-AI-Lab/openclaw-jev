@@ -116,10 +116,19 @@ sys.exit(subprocess.run(args, input=data).returncode)
 '''
 
 # pg_restore of an archive of the fake pg_dump on stdin: PGDMP is rmp_db (its -f form), PGDMP-<db> a Temporal one.
+# FAKE_PGRESTORE_SIGNAL=<db>=<signal> sends the signal to the restore_backup.sh this call descends from while it
+# restores <db>, as a hung-up SSH session or a kill would.
 FAKE_PG_RESTORE = r'''#!/bin/sh
 archive="$(cat)"
 db="${archive#PGDMP-}"
 [ "${archive}" = PGDMP ] && db=rmp_db
+if [ "${FAKE_PGRESTORE_SIGNAL%%=*}" = "${db}" ]; then
+  pid=$$
+  while [ "${pid}" -gt 1 ] && ! grep -q 'restore_backup\.sh' "/proc/${pid}/cmdline"; do
+    pid="$(sed 's/.*) //' "/proc/${pid}/stat" | cut -d' ' -f2)"
+  done
+  [ "${pid}" -gt 1 ] && kill -s "${FAKE_PGRESTORE_SIGNAL#*=}" "${pid}"
+fi
 if [ "${FAKE_PGRESTORE_FAIL:-}" = "${db}" ]; then
   echo "pg_restore: error: could not execute query: database \"${db}\" is being accessed by other users" >&2
   exit 1
@@ -540,6 +549,23 @@ def test_a_restore_that_fails_after_its_first_database_step_starts_nothing(host)
     assert f"When the stores are whole, start them with: systemctl start {units}\n" in result.stderr
     assert ("Do not start rmp-api, rmp-worker or openclaw-gateway, run a deploy or reboot before the stores are whole: "
             "each starts rmp-api, which runs create_all on rmp_db\n") in result.stderr
+
+
+@pytest.mark.parametrize("signal, status", [("HUP", "129"), ("USR1", "1")])
+def test_a_restore_ended_by_a_signal_after_its_first_database_step_starts_nothing(host, signal, status):
+    """A hung-up SSH session sends HUP. Bash runs the EXIT trap with status 0 after a signal the script does not trap,
+    such as USR1, and the killed step never reports its failure: either way the stores may be half restored."""
+    _, dest, _, _ = host.run()
+    result = host.restore(dest, FAKE_PGRESTORE_SIGNAL=f"temporal={signal}")
+    assert result.returncode != 0
+    assert len(host.log("sudo.log")) == 2, "the restore went on after the signal"
+    assert _verbs(host, "stop") == STOPS and _verbs(host, "start") == []
+    units = " ".join(STARTS)
+    assert f"Restore INCOMPLETE: it ended before its last step (exit {status})\n" in result.stderr
+    assert "not restored:" not in result.stderr
+    assert f"Left stopped, because a store may be half restored: {units}\n" in result.stderr
+    assert f"When the stores are whole, start them with: systemctl start {units}\n" in result.stderr
+    assert "Restore complete." not in result.stdout
 
 
 def test_a_restore_refused_by_the_code_reload_lock_stops_nothing(host):
