@@ -130,6 +130,10 @@ check_timers() {
 # and check the timers. After a failed part: start nothing, and say what is left stopped.
 finish() {
   local rc=$? unit
+  # Nothing may end this before it starts what the restore stopped: not a write to a terminal that hung up (EIO) or to
+  # a `| tee` that died (SIGPIPE), nor the second HUP of a hang-up, which the kernel sends when the login shell exits.
+  set +e
+  trap '' PIPE HUP
   local start=() not_started=()
   # Bash runs this trap with status 0 after a signal it does not trap: an exit before the last step fails either way.
   [[ -n "${DONE}" ]] || (( rc )) || rc=1

@@ -48,6 +48,8 @@ A restore takes Aura offline: it needs Kirill's OK and an idle window.
 bash /root/.openclaw/rmp/ops/restore_backup.sh /root/.openclaw/rmp/data/backups/YYYYMMDDTHHMMSSZ
 ```
 
+Run it inside `tmux` or `screen`. An SSH session that hangs up then neither ends the restore nor loses its output, and after a partial failure that output holds the one command that starts the units again.
+
 **On a new host**, the Postgres roles `rmp` and `temporal` must exist before the restore, because each archive names its owner. No backup holds them or their passwords. Create each as the postgres superuser with the password from `/etc/rmp/rmp.env` (`DATABASE_URL`) or `/etc/openclaw/openclaw.env`; the prompt keeps it off the command line:
 
 ```bash

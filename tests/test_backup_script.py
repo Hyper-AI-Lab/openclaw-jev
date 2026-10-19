@@ -158,7 +158,8 @@ Every call is recorded in ${FAKE_STATE}/systemctl.log, a start with the sha256 o
 Unit states live in ${FAKE_STATE}/units; stop and start update them. FAKE_STOP_FAIL=<unit> fails that unit's stop,
 FAKE_LIST_UNITS_FAIL=1 every list-units.
 FAKE_DEPLOY_ON_STOP=<unit>=<deploy unit> lists the deploy unit once the fake has handled that unit's stop.
-FAKE_SIGNAL_ON_STOP=<unit>=<signal> sends the signal to the restore, the fake's parent, once it has stopped that unit.
+FAKE_SIGNAL_ON_STOP=<unit>=<signal> sends the signal to the restore, the fake's parent, once it has stopped that unit;
+FAKE_SIGNAL_ON_START=<unit>=<signal> once it has started it.
 FAKE_TIMER_RUN=<timer>=<n> keeps the timer's service active for n is-active calls after the timer starts, or in the
 state FAKE_TIMER_RUN_STATE names: activating is how a Type=oneshot service shows its run.
 """
@@ -187,6 +188,12 @@ def service(timer):
     return timer[:-len(".timer")] + ".service"
 
 
+def signal_restore(variable, unit):
+    trigger, _, name = env(variable, "").partition("=")
+    if trigger and path(trigger) == path(unit):
+        os.kill(os.getppid(), getattr(signal, "SIG" + name))
+
+
 record = {"t": time.monotonic_ns(), "argv": args}
 if verb == "start":
     settings = env("RMP_SETTINGS_PATH", "")
@@ -206,9 +213,7 @@ if verb == "stop":
         if trigger and path(trigger) == path(unit):
             with open(os.path.join(state, "deploy-units"), "a") as f:
                 f.write(deploy + "\n")
-        trigger, _, name = env("FAKE_SIGNAL_ON_STOP", "").partition("=")
-        if trigger and path(trigger) == path(unit):
-            os.kill(os.getppid(), getattr(signal, "SIG" + name))
+        signal_restore("FAKE_SIGNAL_ON_STOP", unit)
 elif verb == "start":
     for unit in words[1:]:
         put(unit, "active")
@@ -217,6 +222,7 @@ elif verb == "start":
             put(service(timer), env("FAKE_TIMER_RUN_STATE", "active"))
             with open(path(service(timer)) + ".run", "w") as f:
                 f.write(calls)
+        signal_restore("FAKE_SIGNAL_ON_START", unit)
 elif verb == "is-active":
     current, run = get(words[1]), path(words[1]) + ".run"
     if os.path.exists(run):
@@ -305,11 +311,15 @@ def host(tmp_path):
     for name in ("PGPASSWORD", "RMP_PG_SOCKET_DIR", "RMP_PG_PORT"):
         env.pop(name, None)
 
-    def run(script=BACKUP, *args, answer="y\n", **extra):
+    def prepared(script, extra):
+        """The environment of a run of ``script``, once the precondition holds; the fakes' logs start empty."""
         _runs_only_against_fakes(script, {**env, **extra}, fake)
         for name in LOGS:
             (state / name).unlink(missing_ok=True)
-        result = subprocess.run(["bash", str(script), *args], env={**env, **extra}, cwd=tmp_path, input=answer,
+        return {**env, **extra}
+
+    def run(script=BACKUP, *args, answer="y\n", **extra):
+        result = subprocess.run(["bash", str(script), *args], env=prepared(script, extra), cwd=tmp_path, input=answer,
                                 capture_output=True, text=True, timeout=300)
         backups = data / "backups"
         stamps = sorted(p for p in backups.iterdir() if p.name[:2] == "20") if backups.is_dir() else []
@@ -323,11 +333,17 @@ def host(tmp_path):
     def restore(src, answer="y\n", **extra):
         return run(RESTORE, str(src), answer=answer, **extra)[0]
 
+    def spawn(src, output, **extra):
+        """The restore running, its stdin a pipe the test writes, its stdout and stderr both going to ``output``."""
+        return subprocess.Popen(["bash", str(RESTORE), str(src)], env=prepared(RESTORE, extra), cwd=tmp_path,
+                                stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT)
+
     def log(name):
         path = state / name
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
-    return type("Host", (), {"run": staticmethod(run), "restore": staticmethod(restore), "log": staticmethod(log),
+    return type("Host", (), {"run": staticmethod(run), "restore": staticmethod(restore), "spawn": staticmethod(spawn),
+                             "log": staticmethod(log),
                              "tmp": tmp_path, "state": state, "backups": data / "backups", "settings": settings,
                              "stores": stores})
 
@@ -597,6 +613,31 @@ def test_a_restore_ended_by_a_signal_before_its_first_database_step_starts_what_
     assert host.log("sudo.log") == []
     assert _verbs(host, "stop") == STOPS and _verbs(host, "start") == STARTS
     assert "Restore complete." not in result.stdout and "INCOMPLETE" not in result.stderr
+
+
+@pytest.mark.parametrize("output", ["pipe", "terminal"])
+def test_a_restore_whose_session_hangs_up_before_its_first_database_step_starts_what_it_stopped(host, output):
+    """A hang-up takes the output with it: a write to the hung-up terminal fails with EIO, one to the pipe of a
+    `| tee` that died raises SIGPIPE. The login shell sends the restore HUP, and the kernel sends it once more when that
+    shell exits, which can be while the restore starts the units. The restore writes nothing between its prompt and the
+    stops."""
+    _, dest, _, _ = host.run()
+    hang_up = {"FAKE_SIGNAL_ON_STOP": "temporal=HUP", "FAKE_SIGNAL_ON_START": "temporal=HUP"}
+    if output == "pipe":
+        restore = host.spawn(dest, subprocess.PIPE, **hang_up)
+        reader = restore.stdout
+    else:
+        terminal, line = os.openpty()
+        restore = host.spawn(dest, line, **hang_up)
+        os.close(line)
+        reader = open(terminal, "rb")
+    assert reader.readline().startswith(b"=== RMP Restore from ")
+    reader.close()
+    restore.stdin.write(b"y\n")
+    restore.stdin.close()
+    assert restore.wait(timeout=300) == 129
+    assert host.log("sudo.log") == []
+    assert _verbs(host, "stop") == STOPS and _verbs(host, "start") == STARTS
 
 
 def test_a_restore_refused_by_the_code_reload_lock_stops_nothing(host):
