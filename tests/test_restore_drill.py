@@ -390,6 +390,15 @@ def test_the_drill_drills_the_newest_backup_whose_manifest_has_no_failures(capsy
     assert host.calls == []
 
 
+def test_a_backup_given_by_a_relative_path_is_drilled_by_its_absolute_path(capsys, backup, scratch_root, monkeypatch):
+    """Every command runs from /, so a relative path would name nothing there."""
+    monkeypatch.chdir(backup.parent)
+    host = Host()
+    code, lines = run_drill(capsys, backup, scratch_root, host, argv=[backup.name])
+    assert code == 0 and lines[0] == f"backup: {backup}"
+    assert [c.argv[-1] for c in host.named("restore_pg_database.sh")] == [str(backup / f"{db}.dump") for db in OWNERS]
+
+
 def test_the_drill_port_is_closed_to_aura_coder_and_its_key_never_reaches_argv(capsys, backup, scratch_root):
     assert covers(port_elements(DEFAULT_CODING["blocked_tcp_ports"]), drill.DRILL_QDRANT_PORT)
     host = Host()
