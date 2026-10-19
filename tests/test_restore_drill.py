@@ -14,6 +14,7 @@ import sqlite3
 import stat
 import subprocess
 import tarfile
+import tempfile
 import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
@@ -264,10 +265,11 @@ def test_the_drill_only_ever_targets_its_scratch_instances(capsys, backup, scrat
     assert run[:4] == ["docker", "run", "-d", "--name"] and run[4] == "rmp-qdrant-drill"
     assert run[run.index("-p") + 1] == "127.0.0.1:6937:6333" and run[run.index("--memory") + 1] == "1g"
     assert run[-1] == drill.qdrant_image() and not any(word in ("-v", "--volume", "--mount") for word in run)
-    # The Qdrant URL is the drill's.
+    # The Qdrant URL is the drill's, and the snapshot restore's work directory goes in the scratch directory.
     [qdrant] = host.named("restore_qdrant_snapshot.sh")
     assert qdrant.argv[1:] == [str(REPO / "ops" / "restore_qdrant_snapshot.sh"), str(backup / "qdrant-full.snapshot"),
                                "http://127.0.0.1:6937"]
+    assert qdrant.env["TMPDIR"] == str(pg.parent)
     assert {c.argv[-1].rsplit("/", 1)[0] for c in host.named("curl")} == {
         "http://127.0.0.1:6937", "http://127.0.0.1:6937/collections"}
 
@@ -292,15 +294,22 @@ def test_the_drill_removes_its_scratch_instances_when_a_step_fails(capsys, backu
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP], ids=lambda sig: sig.name)
 def test_a_signal_ends_the_drill_through_its_cleanup(capsys, backup, scratch_root, sig):
     """A kill, Ctrl-C or a hung-up session during the Qdrant restore: both instances and the scratch directory go,
-    and the signal's handlers are the caller's again afterwards."""
+    with the snapshot restore's work directory, and the signal's handlers are the caller's again afterwards."""
     before = {s: signal.getsignal(s) for s in drill.SIGNALS}
-    host = Host(on={"restore_qdrant_snapshot.sh": lambda: os.kill(os.getpid(), sig)})
+    work = []
+
+    def restore_cut_short():
+        # The script's mktemp -d makes its work directory in its TMPDIR; the signal kills it before its trap runs.
+        work.append(tempfile.mkdtemp(dir=host.calls[-1].env.get("TMPDIR")))
+        os.kill(os.getpid(), sig)
+
+    host = Host(on={"restore_qdrant_snapshot.sh": restore_cut_short})
     with pytest.raises(SystemExit) as ended:
         run_drill(capsys, backup, scratch_root, host)
     assert ended.value.code == 128 + sig
     assert [c.argv[:2] for c in host.calls[-2:]] == [["docker", "rm"], ["sudo", "-n"]]
     assert host.calls[-1].argv[-3:] == ["stop", "-m", "fast"]
-    assert list(scratch_root.iterdir()) == []
+    assert list(scratch_root.iterdir()) == [] and not os.path.lexists(work[0])
     assert "restore duration" not in capsys.readouterr().out
     assert {s: signal.getsignal(s) for s in drill.SIGNALS} == before
 

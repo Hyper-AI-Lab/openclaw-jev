@@ -382,9 +382,11 @@ class Drill:
         return restored
 
     def restore_qdrant(self) -> bool:
+        # TMPDIR: the script extracts the collection snapshots into a work directory in the scratch directory, which
+        # the cleanup removes even when a signal kills the script before its own trap can.
         if not self.call("restore qdrant", "restore_qdrant_snapshot.sh",
                          ["bash", str(REPO / "ops" / "restore_qdrant_snapshot.sh"), str(self.snapshot), QDRANT_URL],
-                         env={**os.environ, "QDRANT_API_KEY": self.key}):
+                         env={**os.environ, "QDRANT_API_KEY": self.key, "TMPDIR": str(self.scratch)}):
             return False
         self.ok("restore qdrant")
         return True
