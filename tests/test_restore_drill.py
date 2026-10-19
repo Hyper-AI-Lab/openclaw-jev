@@ -11,6 +11,7 @@ import os
 import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import tarfile
 import urllib.parse
@@ -211,13 +212,20 @@ def test_a_drill_of_a_whole_backup_checks_every_store_and_leaves_nothing_behind(
 
 
 def test_the_drill_only_ever_targets_its_scratch_instances(capsys, backup, scratch_root, pg_bin):
-    host = Host()
+    modes = {}
+
+    def scratch_modes():
+        [scratch] = scratch_root.iterdir()
+        modes.update(scratch=stat.S_IMODE(scratch.stat().st_mode), pg=stat.S_IMODE((scratch / "pg").stat().st_mode))
+
+    host = Host(on={"chown": scratch_modes})
     code, lines = run_drill(capsys, backup, scratch_root, host)
     assert code == 0, lines
     [chown] = host.named("chown")
     pg = Path(chown.argv[-1])
     assert chown.argv == ["chown", "postgres:postgres", str(pg)]
     assert pg.name == "pg" and pg.parent.parent == scratch_root and pg.parent.name.startswith("rmp-restore-drill-")
+    assert modes == {"scratch": 0o711, "pg": 0o700}
     data = str(pg / "data")
     # The one production read: the role names, read-only.
     [roles] = [c for c in host.named("psql") if "-h" not in c.argv]
