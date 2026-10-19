@@ -555,7 +555,7 @@ def test_restore_stops_every_writer_before_the_first_database_and_starts_them_af
     assert {sha for _, _, sha in starts} == {_sha256(dest / "settings.json")}
     assert calls[-1][1][0] == "list-timers"
     assert result.stdout.count("\nnext: ") == len(TIMERS) and "NO NEXT" not in result.stdout
-    assert result.stdout.rstrip().endswith("Restore complete.")
+    assert result.stdout.rstrip().endswith("Restore complete.") and "Restore ended" not in result.stderr
 
 
 def test_a_gateway_waiting_to_restart_is_stopped_and_started_again_and_an_inactive_code_watch_is_left_alone(host):
@@ -605,14 +605,15 @@ def test_a_restore_ended_by_a_signal_after_its_first_database_step_starts_nothin
     assert "Restore complete." not in result.stdout
 
 
-@pytest.mark.parametrize("signal", ["HUP", "USR1"])
-def test_a_restore_ended_by_a_signal_before_its_first_database_step_starts_what_it_stopped(host, signal):
+@pytest.mark.parametrize("signal, status", [("HUP", "129"), ("USR1", "1")])
+def test_a_restore_ended_by_a_signal_before_its_first_database_step_starts_what_it_stopped(host, signal, status):
     """Including the unit whose stop the signal interrupted, and without claiming that the restore completed."""
     _, dest, _, _ = host.run()
     result = host.restore(dest, FAKE_SIGNAL_ON_STOP=f"temporal={signal}")
     assert result.returncode != 0
     assert host.log("sudo.log") == []
     assert _verbs(host, "stop") == STOPS and _verbs(host, "start") == STARTS
+    assert f"Restore ended before its first database step (exit {status}): nothing was restored\n" in result.stderr
     assert "Restore complete." not in result.stdout and "INCOMPLETE" not in result.stderr
 
 
@@ -686,6 +687,7 @@ def test_a_failed_stop_ends_the_restore_and_starts_what_it_stopped(host):
     _, dest, _, _ = host.run()
     result = host.restore(dest, FAKE_STOP_FAIL="rmp-worker")
     assert result.returncode == 1 and "systemctl stop rmp-worker failed: nothing was restored" in result.stderr
+    assert "Restore ended before its first database step (exit 1): nothing was restored\n" in result.stderr
     assert host.log("sudo.log") == []
     assert _verbs(host, "start") == [unit for unit in STARTS if unit not in ("rmp-worker", "temporal")]
 

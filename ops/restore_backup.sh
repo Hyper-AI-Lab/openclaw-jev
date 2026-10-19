@@ -153,6 +153,7 @@ finish() {
     exit 1
   fi
   (( ${#start[@]} )) || exit "${rc}"
+  (( rc == 0 )) || echo "Restore ended before its first database step (exit ${rc}): nothing was restored" >&2
   echo "Starting what the restore stopped: ${start[*]}"
   for unit in "${start[@]}"; do
     systemctl start "${unit}" || not_started+=("${unit}")
