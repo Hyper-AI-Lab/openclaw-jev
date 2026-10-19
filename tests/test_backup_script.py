@@ -680,6 +680,7 @@ def test_restore_puts_the_openclaw_stores_back_with_the_gateway_stopped(host):
     assert calls.index(["stop", "openclaw-gateway"]) < calls.index(["is-active", "--quiet", "openclaw-gateway"])
     assert "restored agent, state from" in result.stdout
 
+
 @pytest.mark.parametrize("name", RESTORE_PATHS)
 def test_a_restore_that_hard_codes_a_production_path_is_never_run(host, name):
     script = host.tmp / RESTORE.name
