@@ -1877,3 +1877,138 @@ The batch 1 verify summary is kept as `research/wp12-b1-verify-summary.txt`.
 **Diff:** `ops/restore_drill.py` (new), `ops/restore_qdrant_snapshot.sh`, `tests/test_restore_drill.py` (new, 27 tests), `tests/test_backup_script.py` and the runbook. Nothing under `app/`, so the deploy restarts nothing.
 
 **Kirill:** asked in chat, ahead of time, for the OK on batch 3's `systemctl restart rmp-qdrant`. Not yet given.
+
+## 2026-10-19 12:58 UTC · WP-12 batch 2 deployed; the drill restored the real backup; B3b-01 closed
+
+**PR #38:**
+- CI `test` SUCCESS on head `9774fd9`; `origin/main` unchanged at `8473b2c`.
+- Squash-merged as `8947cb3`. No other open PRs.
+
+**Deploy:** `deployed`; restarted nothing; canary ok; no units; CI success.
+
+**Host step (WP12-05):** `cd /root/.openclaw/rmp && venv/bin/python ops/restore_drill.py` at `8947cb3`, on an idle host, outside the backup window. Backup `20261019T031500Z`. Every line `ok`, exit 0:
+- scratch Postgres on port 55432, socket only, roles `temporal` and `rmp` NOLOGIN;
+- scratch Qdrant on 6937, keyed;
+- `rmp_db`, `temporal` and `temporal_visibility` restored;
+- owners rmp, temporal and temporal; `vector` present;
+- rows:
+  - `rmp_db`: 20 tables, 59474 rows;
+  - `temporal`: 39 tables, 7210 rows;
+  - `temporal_visibility`: 3 tables, 284 rows;
+  - each as in its COPY block;
+- Qdrant: 4 collections, as in the snapshot (mem0migrations 1, rmp_deep_memory_v1 1433, rmp_memories_openai_3small 2676, rmp_task_registry_openai_3small 252 points);
+- openclaw-state: checksums and quick_check ok; `artifacts.tar.gz`: 29 entries read to the end;
+- **`restore duration: 0 min 7 s`**, the RTO basis for WP12-14.
+
+**During the drill:** readiness `coding_isolation` was `pass`.
+
+**Afterwards:**
+- no `rmp-qdrant-drill` container, no `/var/tmp/rmp-restore-drill-*`, no scratch postmaster, nothing on 6937;
+- rmp-api, rmp-worker, temporal, rmp-qdrant and the gateway active; Qdrant `readyz` 200.
+
+**Ledger** (spec §7, "after batch 2"):
+- **B3b-01 closed:** the batch 1 fix, proved on real data.
+- **R-132 progress:** the scripted Temporal `pg_restore` drill was delivered and run.
+
+**Rollback:** revert `8947cb3`. The drill leaves nothing behind.
+
+**Next:** WP-12 batch 3 (WP12-06, B2b-01): one Qdrant container identity. Its host step, `systemctl restart rmp-qdrant`, waits for Kirill's OK.
+
+## 2026-10-19 12:59 UTC · WP-12 batch 3 started
+
+- **Branch:** `aura/wp-12-3-qdrant` from `8947cb3`.
+- **Item:** WP12-06 (B2b-01), Tier 1. `rmp-qdrant` owns one `docker run` container: start recreates it gracefully, stop really stops it. The compose file goes, and the whole-store procedure keeps the sentinel and the backup away from a stopped Qdrant.
+- **Workflow:** run `wf_1805c126-1fc`.
+- **Host step after its deploy:** one `systemctl restart rmp-qdrant`, with Kirill's OK.
+
+## 2026-10-19 14:02 UTC · WP-12 batch 3 resumed after the usage limit
+
+**Run `wf_1805c126-1fc`:** the implementer stopped at the session limit after 12 min. It left three commits and a clean tree:
+- `2a03e72`: the start and stop scripts, with `tests/test_qdrant_service_scripts.py`;
+- `5dc98cc`: the compose file deleted; ARCHITECTURE.md and R-148's evidence updated;
+- `af942ac`: the runbook's whole-store procedure.
+
+No scratch copies and no verify scopes were left.
+
+**Backup:** `/root/.cache/wp12-b3-wip-1401/` (format-patch).
+
+**Relaunch:** run `wf_ea7c0f6d-c94`, whose args tell the implementer to review those three commits critically, then finish the batch.
+
+## 2026-10-19 19:49 UTC · WP-12 batch 3: workflow ended unapproved; rounds 3 and 4 fixed by me; round 5 running
+
+**Workflow `wf_ea7c0f6d-c94`:** `approved: false` after 2 fix rounds.
+- **Implementer:** kept the three resumed commits and added `029432d` (the tests fake `docker-compose` too, so no test can reach the host's `/usr/bin/docker-compose`).
+- **Deviations:** `activating` counts in the runbook's wait; `make -s readiness`; a `Wants=` warning in the runbook intro.
+- **Round 1:** both reviewers approved, with non-blocking points. Fixed in `09d9ef7` (the image when `rmp-qdrant` is gone).
+- **Round 2:** both approved. Fixed `2a88c9f` (step 2 checks the container really stopped) and `f8e73eb` (a failed one-off reruns step 3).
+- **Round 3:** correctness approved. Closure raised one blocking finding: the health and memory canaries also run the sentinel's remediation on failure (`ops/canary.sh` `run_sentinel`; `ops/canary_slack_memory.sh`), and it restarts an inactive `rmp-qdrant`. Stopping only the sentinel and backup timers therefore did not keep a second Qdrant off the storage being rebuilt. The reviewer reproduced it with a scratch test.
+
+**My fixes:**
+- **`948c4fd`:**
+  - runbook step 1 stops every `rmp-*` timer (the `enabled-units.txt` order) and waits for `activating` and `active`; step 5 starts them all;
+  - `ops/start_qdrant.sh` refuses (exit 1, no other docker call) while `rmp-qdrant-from-snapshot` exists;
+  - test 5 derives the timers from `enabled-units.txt`; a new guard test; the fake docker keeps existence per name.
+  - **Probes:** the guard removed or placed late, two timers, the wait dropped. All caught.
+- **Round 4 (my re-review):** the round-3 finding is closed; the guard does not misfire, and a refused start is harmless for the oneshot unit. Two new blocking findings:
+  - the reverse order (the one-off run beside an `rmp-qdrant` started since step 2, or in the failure branch);
+  - R-148's line went stale (`:31` became `mkdir`).
+- **`aa40992`:**
+  - step 3 is `docker create`, then the `is-active` and `State.Running` check, then `docker start`; the failure branch restarts from the create, and a reboot restarts at step 1;
+  - R-148 cites `:43`, pinned by `test_r148_cites_the_start_scripts_loopback_ports`;
+  - the header and intro name every actor.
+  - **Probes:** `docker run` restored, the check before the create, the start before the check, `:31`. All caught.
+
+**Spec:** amendments 2 (§10) and 3 (§11) in `specs/WP-12.md`. Amendment 2 also records that the host step uses `make -s readiness`, and that batch 8 must key the one-off container.
+
+**Escalation note:** this batch went past the two-loop rule. The findings were concrete and their fixes unambiguous, so I did not need Kirill's judgement, and none was asked. Should round 5 still block, I will escalate to Kirill with the options.
+
+**Round 5:** a fresh adversarial closure reviewer is running, with a severity calibration.
+
+## 2026-10-19 20:59 UTC · WP-12 batch 3: round 5, its fix, and Kirill's decisions
+
+**Round 5** (adversarial closure, with a severity calibration): **changes**, one blocking finding.
+- **Blocking:** when `rmp-qdrant` did not exist, step 3's image argument from `docker inspect` was empty, so the create failed and the runbook said to rerun only the create. The stop check had then run before the create that succeeded, which reopened round 4's gap in that branch.
+- **Non-blocking:**
+  - the remedy looped when the container ran outside systemd;
+  - "no order of events" overclaimed for starts by hand, a sub-second TOCTOU reproduced with a fake docker;
+  - an old one-off after a reboot;
+  - prose not pinned.
+- **Confirmed on the host, read-only:**
+  - `docker create` takes the same arguments;
+  - the image runs `./qdrant` from WorkingDir `/qdrant`, and its binary has `--storage-snapshot` and `--force-snapshot`;
+  - the log line is on stdout;
+  - the no-such-object wording is right.
+- **Harness:** default 1440 passed, 1 skipped, node 58/58; the Qdrant and drill modules pass in all layouts.
+
+**My fix, `2d29f61`:**
+- step 3 reads the image from `ops/start_qdrant.sh`'s `IMAGE=` line (the `sed` line prints `qdrant/qdrant:v1.17.0`), so the empty-image branch is gone;
+- every retry runs the whole block again (a failed create, a name conflict, a failed recovery);
+- the remedies are `systemctl stop` and `docker stop rmp-qdrant`;
+- the guarantee is scoped to starts through systemd, and starts by hand are forbidden during the procedure;
+- test 5 pins all of this.
+- **Probes caught:** the inspect image, the `docker stop` remedy dropped, the create retried alone, `activating` accepted.
+- **Spec:** amendment 4 (§12).
+
+**Escalation to Kirill** (rounds had passed the two-loop rule), answered:
+- **K-35:** ship after the four-layout verify, no sixth round.
+- **K-36:** OK for the `systemctl restart rmp-qdrant` host step.
+
+Both are recorded in `decisions.md`.
+
+**Four-layout verify** on `2d29f61`: running.
+
+## 2026-10-19 23:36 UTC · WP-12 batch 3 verified
+
+**Four-layout verify** (HEAD `2d29f61`): default, live, coding-job and direct each gave 1440 passed, 1 skipped (the `RMP_QDRANT_IT` opt-in), leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. Summary in `research/wp12-b3-verify-summary.txt`.
+
+The runs took 12–14 min each, twice the usual; the host was busier.
+
+**Diff** (10 commits on `8947cb3`):
+- `ops/start_qdrant.sh`, `ops/stop_qdrant.sh`;
+- `docker-compose.qdrant.yml` deleted;
+- `ARCHITECTURE.md`, `docs/VISION_CONFORMANCE.md` (R-148 → `:43`), `docs/runbooks/backup-restore.md`;
+- the new `tests/test_qdrant_service_scripts.py`.
+
+Nothing under `app/`, so the deploy restarts nothing.
+
+**Next:** PR, merge on green (K-35), deploy, then the K-36 host step.
