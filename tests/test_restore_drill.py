@@ -233,6 +233,8 @@ def test_the_drill_only_ever_targets_its_scratch_instances(capsys, backup, scrat
     assert roles.argv[:5] == ["sudo", "-n", "-u", "postgres", f"{pg_bin}/psql"]
     assert roles.argv[roles.argv.index("-c") + 1].startswith("SET default_transaction_read_only=on;")
     assert roles.argv[roles.argv.index("-d") + 1] == "postgres" and "-p" not in roles.argv
+    # -q: without it psql prints SET's status line among the names, and the drill would create a role "SET".
+    assert {"-At", "-q", "-X"} <= set(roles.argv)
     # Every other server call names the scratch directory, and psql its socket and port.
     server_calls = [c for name in ("initdb", "pg_ctl", "psql") for c in host.named(name) if c is not roles]
     assert len(server_calls) == 1 + 2 + 1 + 3 + 1 + 3
