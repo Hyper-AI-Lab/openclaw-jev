@@ -42,20 +42,25 @@ STOPS = [*(unit for timer in TIMERS for unit in (timer, timer.replace(".timer", 
 STARTS = ["temporal", "rmp-api", "rmp-worker", "openclaw-gateway", "rmp-code-watch", *TIMERS]
 
 FAKE_CURL = r'''#!/usr/bin/env python3
-"""curl, as far as the scripts use it against Qdrant's API. FAKE_QDRANT_* variables choose failures."""
-import hashlib, io, json, os, sys, tarfile
-args, method, out, url, form, i = sys.argv[1:], "GET", None, None, None, 0
+"""curl, as far as the scripts use it against Qdrant's API. FAKE_QDRANT_* variables choose failures. Each call's argv
+and the headers of a config read from stdin (-K -) are recorded in ${FAKE_STATE}/curl-argv.log."""
+import hashlib, io, json, os, re, sys, tarfile
+args, method, out, url, form, config, i = sys.argv[1:], "GET", None, None, None, None, 0
 while i < len(args):
     a = args[i]
     if a == "-X": method = args[i + 1]; i += 2; continue
     if a == "-o": out = args[i + 1]; i += 2; continue
     if a == "-F": form = args[i + 1]; i += 2; continue
+    if a == "-K": config = args[i + 1]; i += 2; continue
     if a in ("-m", "--retry", "--retry-delay"): i += 2; continue
     if a.startswith("-"): i += 1; continue
     url = a; i += 1
+headers = re.findall(r'^header = "(.*)"$', sys.stdin.read(), re.M) if config == "-" else []
 state = os.environ["FAKE_STATE"]
 with open(os.path.join(state, "curl.log"), "a") as log:
     log.write(f"{method} {url}\n")
+with open(os.path.join(state, "curl-argv.log"), "a") as log:
+    log.write(json.dumps({"argv": sys.argv[1:], "headers": headers}) + "\n")
 env = os.environ.get
 def snapshot_bytes():
     buf = io.BytesIO()
@@ -264,7 +269,7 @@ FAKES = {"curl": FAKE_CURL, "pg_dump": FAKE_PG_DUMP, "sudo": FAKE_SUDO, "pg_rest
          "systemctl": FAKE_SYSTEMCTL, "sleep": FAKE_SLEEP, "dropdb": FAKE_REFUSED, "createdb": FAKE_REFUSED,
          "openclaw": FAKE_OPENCLAW}
 # The fakes' logs, which each call of host.run() starts without.
-LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log")
+LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log", "curl-argv.log")
 
 
 def _store(path, rows):
@@ -316,11 +321,13 @@ def host(tmp_path):
         env.pop(name, None)
 
     def prepared(script, extra):
-        """The environment of a run of ``script``, once the precondition holds; the fakes' logs start empty."""
-        _runs_only_against_fakes(script, {**env, **extra}, fake)
+        """The environment of a run of ``script``, once the precondition holds; the fakes' logs start empty. A
+        variable given as None is left out."""
+        run_env = {name: value for name, value in {**env, **extra}.items() if value is not None}
+        _runs_only_against_fakes(script, run_env, fake)
         for name in LOGS:
             (state / name).unlink(missing_ok=True)
-        return {**env, **extra}
+        return run_env
 
     def run(script=BACKUP, *args, answer="y\n", **extra):
         result = subprocess.run(["bash", str(script), *args], env=prepared(script, extra), cwd=tmp_path, input=answer,
@@ -502,6 +509,24 @@ def test_restore_fails_loudly_when_an_upload_fails_or_the_file_is_not_a_snapshot
     junk.write_text("not a tar")
     result, _, _, _ = host.run(RESTORE_QDRANT, str(junk), "http://127.0.0.1:6333")
     assert result.returncode == 1 and "not a readable archive" in result.stderr
+
+
+def test_the_snapshot_restore_sends_a_given_key_on_stdin_only(host):
+    """The restore drill keys its scratch Qdrant: the key reaches curl on stdin, never on a command line any local user
+    can read."""
+    _, dest, _, _ = host.run()
+    snapshot = str(dest / "qdrant-full.snapshot")
+    result, _, _, _ = host.run(RESTORE_QDRANT, snapshot, "http://127.0.0.1:6937", QDRANT_API_KEY="dummy")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = host.log("curl-argv.log")
+    assert [call["argv"][-1].split("/")[-1].split("?")[0] for call in calls] == ["readyz", "upload"]
+    assert all(call["argv"][:2] == ["-K", "-"] and call["headers"] == ["api-key: dummy"] for call in calls)
+    assert not any("dummy" in word for call in calls for word in call["argv"])
+    for unset in (None, ""):
+        result, _, _, _ = host.run(RESTORE_QDRANT, snapshot, "http://127.0.0.1:6937", QDRANT_API_KEY=unset)
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = host.log("curl-argv.log")
+        assert len(calls) == 2 and not any("-K" in call["argv"] or call["headers"] for call in calls)
 
 
 def test_restore_recreates_each_database_from_its_dump_through_the_postgres_superuser(host):

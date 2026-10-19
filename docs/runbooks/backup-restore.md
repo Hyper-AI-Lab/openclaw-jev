@@ -97,7 +97,43 @@ Each collection is uploaded with `POST /collections/<c>/snapshots/upload?priorit
 3. Restart it normally.
 
 ## Quarterly DR drill
-1. Copy the latest backup to a staging VM, or to a scratch Postgres and Qdrant.
-2. Run the restore script there.
-3. Run `make production-check`.
-4. Run the canary once.
+
+`ops/restore_drill.py` restores a backup into a scratch PostgreSQL and a scratch Qdrant, checks every store, and removes both. It restores nothing in production and only reads production's databases: the idle check counts the active user tasks, and one query lists the role names. Run it quarterly, and after any change to a backup or restore script, as root, on an idle host, outside the backup's window (03:00-03:45 UTC):
+
+```bash
+cd /root/.openclaw/rmp && venv/bin/python ops/restore_drill.py
+```
+
+It drills the newest backup whose manifest has `"failures": []`; to drill another, pass its directory as the argument.
+
+**It refuses to start** (exit 2, nothing created), printing one `refused:` line per reason, when:
+- it does not run as root;
+- `MemAvailable` is below 2 GiB;
+- a user task is active, or the count fails (`count_active_user_tasks_sync(strict=True)`);
+- an `aura-claude-*`, `aura-verify-*`, `aura-collect-*`, `aura-direct-*` or `aura-deploy-*` unit is active or activating;
+- port 6937 is not in `coding.blocked_tcp_ports`;
+- something accepts connections on `127.0.0.1:6937`;
+- a container named `rmp-qdrant-drill` exists.
+
+**What it does:**
+1. A scratch directory `/var/tmp/rmp-restore-drill-*` (mode 0711), with `pg/` owned by postgres (mode 0700).
+2. A throwaway PostgreSQL 16 from the host's own binaries (`/usr/lib/postgresql/16/bin`): `initdb` and `pg_ctl` as postgres, socket only in `pg/`, port 55432, no TCP listener. Production's roles (today `rmp` and `temporal`) are created there `NOLOGIN`, so the archives' owners apply.
+3. A container `rmp-qdrant-drill` of the image `ops/start_qdrant.sh` runs, on `127.0.0.1:6937`, with 1 GiB and no volume. It requires a key made for this drill, which docker and the snapshot restore get through their environment and which is never printed. Port 6937 is in `coding.blocked_tcp_ports`, so aura-coder cannot reach the copy of Aura's memory, and `coding_isolation` in `make readiness` stays at `pass` while the drill runs.
+4. Restores `rmp_db`, `temporal` and `temporal_visibility` through `ops/restore_pg_database.sh`, the restore's own command, and the Qdrant snapshot through `ops/restore_qdrant_snapshot.sh`.
+5. Checks:
+   - each database's owner: `rmp_db` → `rmp`, `temporal` and `temporal_visibility` → `temporal`;
+   - the `vector` extension in `rmp_db`;
+   - every table's `count(*)` against the rows of its `COPY` block in `pg_restore --data-only -f - <dump>`;
+   - the collections against the snapshot, with each collection's points;
+   - OpenClaw's store copies (`backup_openclaw_state.verify`);
+   - every `*.tar.gz` read to its end.
+
+**Output:** one line per step and check, `ok …` or `FAIL <reason>`, with names and counts only. Expected: every line `ok`. The exit code is 0 only when every check passed. The last line is `restore duration: <m> min <s> s`, the time from the first database restore to the end of the Qdrant restore: the steps a real restore repeats on the same data, so it is the basis of the RTO.
+
+**Cleanup:** however the drill ends, including a SIGTERM, Ctrl-C or a hung-up session, it runs `docker rm -f rmp-qdrant-drill`, `pg_ctl stop -m fast` and removes the scratch directory. Started under `nohup`, which ignores the hangup, it keeps running when the session ends (redirect its output, or nohup writes `nohup.out` into the live checkout). If the drill is killed hard (`kill -9`, a reboot), remove what it left:
+
+```bash
+docker rm -f rmp-qdrant-drill; for d in /var/tmp/rmp-restore-drill-*; do sudo -n -u postgres /usr/lib/postgresql/16/bin/pg_ctl -D "$d/pg/data" stop -m fast; rm -rf "$d"; done
+```
+
+A drill with a `FAIL` line means a store does not restore from that backup: diagnose it before relying on the backup, and before any change that needs a proven restore.

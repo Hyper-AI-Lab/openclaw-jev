@@ -6,9 +6,22 @@
 # Qdrant restores a *full* snapshot only at startup (`qdrant --storage-snapshot <file>`). Its archive holds one
 # snapshot per collection (`<collection>-<peer id>-<date>.snapshot`), and each of those restores through the API,
 # into the live server, replacing the collection's data (priority=snapshot).
+#
+# With QDRANT_API_KEY set and not empty, every call sends it in Qdrant's api-key header. The restore drill
+# (ops/restore_drill.py) passes its scratch Qdrant's key this way.
 set -euo pipefail
 
 die() { echo "[restore-qdrant] ERROR: $*" >&2; exit 1; }
+
+# Every Qdrant call. The key reaches curl as a config line on stdin, never on its command line, which any local user
+# can read.
+qcurl() {
+  if [[ -n "${QDRANT_API_KEY:-}" ]]; then
+    curl -K - "$@" <<<"header = \"api-key: ${QDRANT_API_KEY}\""
+  else
+    curl "$@"
+  fi
+}
 
 SNAPSHOT="${1:-}"
 URL="${2:-}"
@@ -22,7 +35,7 @@ c = get_vector_memory_config()
 print("http://%s:%d" % (c.get("qdrant_host") or "127.0.0.1", int(c.get("qdrant_port") or 6333)))')" \
     || die "could not read the Qdrant address from settings; pass it as the second argument"
 fi
-curl -fsS -m 10 --retry 12 --retry-delay 5 --retry-all-errors -o /dev/null "${URL}/readyz" || die "Qdrant at ${URL} is not ready"
+qcurl -fsS -m 10 --retry 12 --retry-delay 5 --retry-all-errors -o /dev/null "${URL}/readyz" || die "Qdrant at ${URL} is not ready"
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
@@ -42,7 +55,7 @@ for file in "${collections[@]}"; do
     continue
   fi
   echo "[restore-qdrant] restoring ${collection} from ${name}..."
-  if curl -fsS -m 3600 -X POST -F "snapshot=@${file}" \
+  if qcurl -fsS -m 3600 -X POST -F "snapshot=@${file}" \
       "${URL}/collections/${collection}/snapshots/upload?priority=snapshot&wait=true" >/dev/null; then
     echo "[restore-qdrant] ${collection} restored"
   else
