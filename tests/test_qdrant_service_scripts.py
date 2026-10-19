@@ -56,6 +56,14 @@ else:
     sys.exit(1)
 '''
 
+# The host has /usr/bin/docker-compose, which the scripts used before; a call is recorded with docker's and fails.
+FAKE_DOCKER_COMPOSE = r'''#!/usr/bin/env python3
+import json, os, sys
+with open(os.path.join(os.environ["FAKE_STATE"], "docker.log"), "a") as log:
+    log.write(json.dumps(["docker-compose", *sys.argv[1:]]) + "\n")
+sys.exit(1)
+'''
+
 # curl -sf http://127.0.0.1:6333/readyz: ready while the container exists.
 FAKE_CURL = r'''#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_STATE}/curl.log"
@@ -69,7 +77,7 @@ FAKE_SLEEP = r'''#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_STATE}/sleep.log"
 '''
 
-FAKES = {"docker": FAKE_DOCKER, "curl": FAKE_CURL, "sleep": FAKE_SLEEP}
+FAKES = {"docker": FAKE_DOCKER, "docker-compose": FAKE_DOCKER_COMPOSE, "curl": FAKE_CURL, "sleep": FAKE_SLEEP}
 
 
 def _runs_only_against_fakes(script, env, fake):
