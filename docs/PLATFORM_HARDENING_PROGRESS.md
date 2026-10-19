@@ -1676,3 +1676,126 @@ Two `wp-batch` workflow launches timed out at the app's PreToolUse hook again; t
 4. `--apply --head`;
 5. the timer check again;
 6. `systemctl show` checks.
+
+## 2026-10-18 22:41 UTC · Incident: the host was stopped hard on 2026-10-18 13:47:49 CEST (provider side); recovery verified
+
+**Kirill reported** that the server had been stopped. Read-only investigation:
+
+| Evidence | Finding |
+|---|---|
+| Boots | Boot −1 ran from 2026-10-09 08:47 to its last journal line at **2026-10-18 13:47:49 CEST**. The next boot was **2026-10-19 00:36:22**: about 11 h down. The new kernel `6.8.0-147` (installed by unattended-upgrades) was picked up at that boot. |
+| Shutdown | **None:** `wtmp` has no shutdown record ("still running"), and the journal ends mid-operation with no shutdown sequence. |
+| Kernel | **No crash:** no pstore dump, no OOM, no hung task, no soft lockup, no RCU stall. The kernel's last lines were routine UFW blocks at 13:43. |
+| Load | **Healthy up to the end** (sysstat): 35% memory used, 4.7 GB available, load about 0.5, nothing blocked. |
+| Network | **The trigger signature:** from **13:46:47**, 62 s before the stop, DNS to Contabo's resolvers (213.136.95.11, 2a02:c207::1:53) degraded and Slack socket mode failed ("fetch failed"). No such errors earlier that day. |
+
+**Conclusion:** a provider-side event (host node or network), not anything on the VM. Kirill can confirm in Contabo's panel, status page or email, or with a support ticket giving 2026-10-18 13:46–13:48 CEST.
+
+**Recovery checks** (00:36–00:41):
+- **Postgres:** "not properly shut down; automatic recovery in progress"; redo ended at the normal end-of-WAL marker, end-of-recovery checkpoint, accepting connections. **No corruption.**
+- **Services:** all core services active, all 8 rmp timers with a next run, readiness production-ready at 98 (only the telemetry warn).
+- **Qdrant:** counts 2675/1433/252/1, consistent with growth.
+- **Backup:** the last nightly backup, 2026-10-18 03:15Z, has `failures: []`.
+- **Canaries:** the two Persistent canaries ran within seconds of boot, before `rmp-api` was up, and failed (`http=000` and exit 7), leaving the system "degraded". A manual `rmp-canary` at 00:40:34 gave **CANARY OK** (task completed in 13 s). `reset-failed` brought the system back to `running`.
+- **`/tmp`:** the two files were restored from `/root/.cache/rmp-tests`.
+
+**Ledger:**
+- `OPS-2026-10-18-provider-stop`: closed, recovered. Lesson for WP-03: Healthchecks.io would have alerted Kirill during the 11 h outage.
+- `OPS-2026-10-19-boot-canaries`: open, WP-08. Gate the canary units on RMP health so catch-up runs at boot do not fail falsely.
+
+## 2026-10-18 22:47 UTC · WP-02 complete: batch 4 deployed, the first reviewed unit install done, ledger closed
+
+**PR #36:** CI green, run before the outage. `origin/main` was unchanged at `d8d429a`. Squash-merged as `d0b9e0c`.
+
+**Deploy (22:46Z):** `deployed`; nothing restarted; canary ok; `units` lists the 4 files, not installed; Kirill told (WP02-02).
+- **Rollback:** the install's `rollback:` line, then revert `d0b9e0c`.
+
+**First real install with `ops/install_units.py`** (WP02-14 and -15 host step, §3 convention):
+1. **Dry run:** `head: d0b9e0c9…` and exactly 4 `changed:` lines, each naming `d0b9e0c` (#36).
+2. **Review:** `diff -u` of each installed file against `HEAD` shows only the reviewed lines (the `-` on the 3 key-sync lines; `After=… rmp-qdrant.service` and `TimeoutStartSec=1h` on the backup unit). They trace to reviewed PR #36, so no further OK is needed.
+3. **Timer check before:** 8 `next:`.
+4. **`--apply --head d0b9e0c90888cffc1515ad3f6fef02c718c2ad43`:** idle check passed; `installed:` the 4 files.
+   - Backup: `/var/backups/rmp-units/20261018T224636Z`.
+   - **Rollback:** `cp -a /var/backups/rmp-units/20261018T224636Z/. /etc/systemd/system/ && systemctl daemon-reload`.
+   - No restart, no `start:` line.
+5. **Timer check after:** 8 `next:`.
+6. **Verify:**
+   - `systemctl show -p ExecStartPre` counts 3 `ignore_errors=yes` key-sync lines;
+   - `rmp-backup.service` has `TimeoutStartUSec=1h` and `After` includes `rmp-qdrant.service`;
+   - the dry run prints `nothing to install`;
+   - readiness 98 with `host_file_drift` pass `{}`.
+
+**Ledger:**
+- **Closed:** debt-scalability-07 (residuals → WP-25 and WP-09), ops-deploy-R11, B4b-02.
+- **Progress noted:** B4b-01, authz-secrets-04, debt-scalability-06, R-115, R-132, R-138, R-89, R-91, R-131.
+- No open item remains homed in WP-02.
+
+**WP-02 is done.**
+
+**Next:** WP-12 (spec ready). Its first item is B3b-01, the `rmp_db` restore that would drop the database.
+
+## 2026-10-18 22:47 UTC · WP-12 batch 1 started
+
+**Branch:** `aura/wp-12-1-restore`, from `d0b9e0c`.
+
+**Items:** WP12-01…04, Tier 1:
+- B3b-01 first: the restore through the postgres superuser;
+- the restore stops writers, holds the lock, and runtime-masks units on a partial failure;
+- OpenClaw store restore;
+- paths from the environment, tests against fakes only.
+
+**Workflow:** the `wp-batch` workflow launched normally this time (run `wf_5a0128f0-f2f`).
+
+## 2026-10-19 03:32 UTC · WP-12 batch 1 implemented and partly reviewed; resumed after the usage limit
+
+**Implementer:** 6 commits.
+- `b35404a` (WP12-01, **B3b-01**): new `ops/restore_pg_database.sh` restores each database through the postgres superuser with `pg_restore --clean --if-exists --create --exit-on-error`. The `dropdb`/`createdb` chain as `rmp` is gone.
+- `b963e8b` (WP12-02): the restore holds the code-reload lock, refuses while a deploy is active, stops every writer, and starts them only when the stores are whole. The timer check waits for an in-flight run.
+- `64cd1c0` (WP12-03): the OpenClaw stores are restored while the gateway is stopped.
+- `e993200` (WP12-04): paths come from the environment; tests refuse a hard-coded path and resolve every host tool to a fake.
+- `501d58c`, `4381719`: the `openclaw --version` fake, and runbook roles for a new host.
+
+**Mutation probes:** the old `dropdb`/`createdb` chain fails 6 tests.
+
+**Spec over task text:** the implementer did **not** add `systemctl mask --runtime`. The task text mentioned it, but spec WP12-02's "Reviewer point considered" rejects it for this host, and the spec is the law.
+
+**Deviation:** an `activating` `rmp-code-watch` or gateway counts as running and is stopped. Both have `Restart=always`, so otherwise a writer could come back mid-restore.
+
+**Review:**
+- **Round 1, correctness: one blocking finding.** A SIGHUP after the first database step started every unit on a half-restored store and printed "Restore complete." Only TERM and INT were trapped.
+- **Round 1, closure:** approve.
+- **Fixes:** `f61f9db` (HUP trapped; any exit before the last step is INCOMPLETE), `bf9e826`, `b710523`, `8538db9`, `1ee7af7`, `3cbc686`.
+- **Round 2, correctness:** approve.
+- **Round 2, closure:** cut off by the usage limit; resumed from cache (run `wf_5a0128f0-f2f`).
+
+## 2026-10-19 06:12 UTC · WP-12 batch 1 reviewed and verified
+
+**Fix round 2** (round-2 closure findings):
+- `a47b5f5`: `finish` starts what it stopped even when its output is gone or a second HUP arrives. The runbook says to run the restore in `tmux` or `screen`.
+- `41c540b`: Ctrl-C exits 130, not 143.
+- `82dd6d0`: an early end prints `Restore ended before its first database step (exit <n>): nothing was restored`.
+- `a36c3ed`, `0b83a4b`: the runbook and the comments.
+
+**Round 3:**
+- **Correctness:** approve, with one non-blocking point: a second HUP could end `finish` before it starts anything.
+- **Closure:** one blocking finding. With the output on `| tee`, a hang-up during a `systemctl stop` also kills that child. Bash then writes its job notice to the dead pipe and SIGPIPE ends the shell before `finish` runs, so nothing is started again.
+- The workflow ended `approved: false` after its 2 fix rounds.
+
+**Fixed by me:**
+- `96a1384`: script-level `trap '' PIPE`, and `trap 'trap "" HUP; exit 129' HUP`. The test fake's `signal_restore` gains a `+self` suffix, so the hang-up kills the stop child too.
+  - **Mutation:** without `trap '' PIPE`, the `[pipe]` case fails.
+- `11c0f27`: runbook step 3 says the nothing-restored line prints only once a unit was stopped.
+
+**Round 4, adversarial closure: approve.**
+- **Reproduction:** an interactive bash on a pty with SIGPIPE at its default, output through `2>&1 | tee`, and the pty master closed to stand in for the SSH drop.
+  - 0b83a4b, and HEAD without the PIPE trap: SIGPIPE (exit -13), nothing started, 4/4. strace shows `write(2,"Hangup\n") = -1 EPIPE`.
+  - HEAD: exit 129, and exactly what was stopped is started again, 4/4.
+- **The test:** fails 15/15 without the trap and is blind without `+self`.
+- **No regressions** across 12 signal cases.
+- **One non-blocking point:** no test pins the second-HUP trap. Fixed in `1740410`: the hang-up test pins the trap's text, because no fake can time a signal into that window. The mutation `trap 'exit 129' HUP` fails both cases.
+
+**Four-layout verify** (HEAD `1740410`): default, live, coding-job and direct each gave 1404 passed, 1 skipped, leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58.
+
+**Diff:** `ops/restore_backup.sh`, the new `ops/restore_pg_database.sh`, `tests/test_backup_script.py` (41 tests) and `docs/runbooks/backup-restore.md`. Nothing under `app/`, so the deploy restarts nothing.
+
+**Next:** PR, merge on green, deploy check. Then close B4b-03 and ops-deploy-R8 (spec §7).
