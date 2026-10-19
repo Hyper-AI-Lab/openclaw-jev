@@ -645,6 +645,10 @@ def test_a_restore_whose_session_hangs_up_before_its_first_database_step_starts_
     assert restore.wait(timeout=300) == 129
     assert host.log("sudo.log") == []
     assert _verbs(host, "stop") == STOPS and _verbs(host, "start") == STARTS
+    # The second HUP above lands inside finish, which ignores HUP itself. One between the HUP trap and finish's first
+    # line would end the restore before it starts anything; no fake can time a signal into that window, so the trap
+    # that ignores it is pinned by its text.
+    assert "\ntrap 'trap \"\" HUP; exit 129' HUP\n" in RESTORE.read_text()
 
 
 def test_a_restore_refused_by_the_code_reload_lock_stops_nothing(host):
