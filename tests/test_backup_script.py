@@ -159,7 +159,8 @@ Unit states live in ${FAKE_STATE}/units; stop and start update them. FAKE_STOP_F
 FAKE_LIST_UNITS_FAIL=1 every list-units.
 FAKE_DEPLOY_ON_STOP=<unit>=<deploy unit> lists the deploy unit once the fake has handled that unit's stop.
 FAKE_SIGNAL_ON_STOP=<unit>=<signal> sends the signal to the restore, the fake's parent, once it has stopped that unit;
-FAKE_SIGNAL_ON_START=<unit>=<signal> once it has started it.
+FAKE_SIGNAL_ON_START=<unit>=<signal> once it has started it. A '+self' suffix (<signal>+self) then ends the fake
+with the same signal, as a real hang-up does to the whole foreground job, so bash reports the killed child.
 FAKE_TIMER_RUN=<timer>=<n> keeps the timer's service active for n is-active calls after the timer starts, or in the
 state FAKE_TIMER_RUN_STATE names: activating is how a Type=oneshot service shows its run.
 """
@@ -191,7 +192,10 @@ def service(timer):
 def signal_restore(variable, unit):
     trigger, _, name = env(variable, "").partition("=")
     if trigger and path(trigger) == path(unit):
+        name, _, itself = name.partition("+")
         os.kill(os.getppid(), getattr(signal, "SIG" + name))
+        if itself == "self":
+            os.kill(os.getpid(), getattr(signal, "SIG" + name))
 
 
 record = {"t": time.monotonic_ns(), "argv": args}
@@ -621,10 +625,11 @@ def test_a_restore_ended_by_a_signal_before_its_first_database_step_starts_what_
 def test_a_restore_whose_session_hangs_up_before_its_first_database_step_starts_what_it_stopped(host, output):
     """A hang-up takes the output with it: a write to the hung-up terminal fails with EIO, one to the pipe of a
     `| tee` that died raises SIGPIPE. The login shell sends the restore HUP, and the kernel sends it once more when that
-    shell exits, which can be while the restore starts the units. The restore writes nothing between its prompt and the
-    stops."""
+    shell exits, which can be while the restore starts the units. The hang-up also kills the `systemctl stop` running
+    at that moment, and bash then reports that child on the dead output. The restore writes nothing between its prompt
+    and the stops."""
     _, dest, _, _ = host.run()
-    hang_up = {"FAKE_SIGNAL_ON_STOP": "temporal=HUP", "FAKE_SIGNAL_ON_START": "temporal=HUP"}
+    hang_up = {"FAKE_SIGNAL_ON_STOP": "temporal=HUP+self", "FAKE_SIGNAL_ON_START": "temporal=HUP"}
     if output == "pipe":
         restore = host.spawn(dest, subprocess.PIPE, **hang_up)
         reader = restore.stdout

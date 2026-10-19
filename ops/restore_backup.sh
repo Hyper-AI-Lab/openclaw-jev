@@ -170,7 +170,11 @@ finish() {
 trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-trap 'exit 129' HUP
+# A hang-up ignores any further HUP before it exits, so a second one cannot end finish before it starts anything.
+trap 'trap "" HUP; exit 129' HUP
+# With the output on a pipe (`| tee`), a hang-up also ends the reader: bash's own job notice for a child the HUP
+# killed would then raise SIGPIPE and end the shell before finish runs. Writes fail with EPIPE instead.
+trap '' PIPE
 
 # Recorded first: a signal during the stop runs the trap before the next command, and the unit may be stopped by then.
 stop() {
