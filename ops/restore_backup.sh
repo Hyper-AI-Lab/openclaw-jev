@@ -130,8 +130,9 @@ check_timers() {
 # and check the timers. After a failed part: start nothing, and say what is left stopped.
 finish() {
   local rc=$? unit
-  # Nothing may end this before it starts what the restore stopped: not a write to a terminal that hung up (EIO) or to
-  # a `| tee` that died (SIGPIPE), nor the second HUP of a hang-up, which the kernel sends when the login shell exits.
+  # Neither a lost output nor a hang-up may end this before it starts what the restore stopped: a write to a terminal
+  # that hung up fails (EIO), one to a `| tee` that died raises SIGPIPE, and the kernel sends a second HUP when the
+  # login shell exits. Ctrl-C and a kill still end it.
   set +e
   trap '' PIPE HUP
   local start=() not_started=()
