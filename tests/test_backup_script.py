@@ -159,7 +159,8 @@ Unit states live in ${FAKE_STATE}/units; stop and start update them. FAKE_STOP_F
 FAKE_LIST_UNITS_FAIL=1 every list-units.
 FAKE_DEPLOY_ON_STOP=<unit>=<deploy unit> lists the deploy unit once the fake has handled that unit's stop.
 FAKE_SIGNAL_ON_STOP=<unit>=<signal> sends the signal to the restore, the fake's parent, once it has stopped that unit.
-FAKE_TIMER_RUN=<timer>=<n> keeps the timer's service active for n is-active calls after the timer starts.
+FAKE_TIMER_RUN=<timer>=<n> keeps the timer's service active for n is-active calls after the timer starts, or in the
+state FAKE_TIMER_RUN_STATE names: activating is how a Type=oneshot service shows its run.
 """
 import hashlib, json, os, signal, sys, time
 args, env = sys.argv[1:], os.environ.get
@@ -213,7 +214,7 @@ elif verb == "start":
         put(unit, "active")
         timer, _, calls = env("FAKE_TIMER_RUN", "").partition("=")
         if unit == timer:
-            put(service(timer), "active")
+            put(service(timer), env("FAKE_TIMER_RUN_STATE", "active"))
             with open(path(service(timer)) + ".run", "w") as f:
                 f.write(calls)
 elif verb == "is-active":
@@ -541,6 +542,21 @@ def test_restore_stops_every_writer_before_the_first_database_and_starts_them_af
     assert result.stdout.rstrip().endswith("Restore complete.")
 
 
+def test_a_gateway_waiting_to_restart_is_stopped_and_started_again_and_an_inactive_code_watch_is_left_alone(host):
+    """The gateway has Restart=always: between two runs it is activating, and its next run would write OpenClaw's
+    stores mid-restore. The OpenClaw tool's own check misses that: it refuses only an active gateway."""
+    _, dest, _, _ = host.run()
+    (host.state / "units" / "openclaw-gateway.service").write_text("activating")
+    (host.state / "units" / "rmp-code-watch.service").write_text("inactive")
+    result = host.restore(dest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = _in_order(host)
+    first = next(i for i, (tool, _, _) in enumerate(calls) if tool == "sudo")
+    stops = [unit for unit in STOPS if unit != "rmp-code-watch"]
+    assert [argv[1] for _, argv, _ in calls[:first] if argv[0] == "stop"] == _verbs(host, "stop") == stops
+    assert _verbs(host, "start") == [unit for unit in STARTS if unit != "rmp-code-watch"]
+
+
 def test_a_restore_that_fails_after_its_first_database_step_starts_nothing(host):
     """rmp-api runs create_all on rmp_db at start, and the watchdog would restart Temporal on a partial database."""
     _, dest, _, _ = host.run()
@@ -632,15 +648,16 @@ def test_a_failed_stop_ends_the_restore_and_starts_what_it_stopped(host):
     assert _verbs(host, "start") == [unit for unit in STARTS if unit not in ("rmp-worker", "temporal")]
 
 
-def test_a_timer_whose_run_is_in_progress_after_the_restart_is_waited_for(host):
+@pytest.mark.parametrize("run_state", ["active", "activating"])
+def test_a_timer_whose_run_is_in_progress_after_the_restart_is_waited_for(host, run_state):
     """A started timer whose interval passed during the restore runs its service at once and shows no next elapse
-    until that run ends."""
+    until that run ends. Every RMP timer's service is Type=oneshot, which shows activating while it runs."""
     _, dest, _, _ = host.run()
-    result = host.restore(dest, FAKE_TIMER_RUN="rmp-temporal-watchdog.timer=3")
+    result = host.restore(dest, FAKE_TIMER_RUN="rmp-temporal-watchdog.timer=3", FAKE_TIMER_RUN_STATE=run_state)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "NO NEXT:" not in result.stdout + result.stderr
     assert (host.state / "sleep.log").read_text().splitlines() == ["10"] * 3
-    result = host.restore(dest, FAKE_TIMER_RUN="rmp-temporal-watchdog.timer=100")
+    result = host.restore(dest, FAKE_TIMER_RUN="rmp-temporal-watchdog.timer=100", FAKE_TIMER_RUN_STATE=run_state)
     assert result.returncode == 1
     assert ("NO NEXT: rmp-temporal-watchdog.timer (rmp-temporal-watchdog.service still running after 15 min)\n"
             in result.stdout)
