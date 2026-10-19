@@ -504,9 +504,11 @@ class Drill:
 
         if self.container_created and not removed(["docker", "rm", "-f", DRILL_CONTAINER]):
             left.append(f"the container {DRILL_CONTAINER}")
-        if self.pg_started and not removed(self.as_postgres("pg_ctl", "-D", str(self.pg / "data"), "stop",
-                                                            "-m", "fast")):
-            left.append("the scratch server")
+        if self.pg_started:
+            stopped = removed(self.as_postgres("pg_ctl", "-D", str(self.pg / "data"), "stop", "-m", "fast"))
+            # pg_ctl stop fails too when no server runs, as after a failed start; a running server has its pid file.
+            if not stopped and os.path.exists(self.pg / "data" / "postmaster.pid"):
+                left.append("the scratch server")
         if self.scratch is not None:
             shutil.rmtree(self.scratch, ignore_errors=True)
             if os.path.lexists(self.scratch):

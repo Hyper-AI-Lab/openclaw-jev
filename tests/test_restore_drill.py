@@ -58,7 +58,8 @@ class Host:
 
     ``fail`` names a dump whose restore_pg_database.sh exits 1, ``counts`` overrides a database's count(*) answers,
     ``units`` is what systemctl lists as active coding units, ``containers`` what docker lists, and ``on`` maps a
-    command's name to what to do while the runner handles it.
+    command's name to what to do while the runner handles it; what that returns, unless None, is the command's exit
+    code.
     """
 
     def __init__(self, *, fail=None, counts=None, units="", containers="", on=None):
@@ -70,10 +71,9 @@ class Host:
         self.calls.append(SimpleNamespace(argv=argv, env=env, input=input))
         words = argv[4:] if argv[0] == "sudo" else argv
         name = Path(words[1] if words[0] == "bash" else words[0]).name
-        if name in self.on:
-            self.on[name]()
+        exited = self.on[name]() if name in self.on else None
         returncode, stdout = self.answer(name, words)
-        return subprocess.CompletedProcess(argv, returncode, stdout, b"")
+        return subprocess.CompletedProcess(argv, returncode if exited is None else exited, stdout, b"")
 
     def answer(self, name, words):
         if name == "systemctl":
@@ -301,6 +301,28 @@ def test_the_drill_removes_its_scratch_instances_when_a_step_fails(capsys, backu
     assert re.fullmatch(r"restore duration: \d+ min \d+ s", lines[-1])
     assert ["docker", "rm", "-f", "rmp-qdrant-drill"] in [c.argv for c in host.calls]
     assert host.named("pg_ctl")[-1].argv[-3:] == ["stop", "-m", "fast"]
+    assert list(scratch_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("server_left", [False, True], ids=["no server", "a server left"])
+def test_a_failed_stop_reports_the_scratch_server_only_when_one_is_left(capsys, backup, scratch_root, server_left):
+    """pg_ctl start fails, and pg_ctl stop with it, as it does when no server runs. The cleanup names the server as
+    left, with the command that removes it, only when a server has its postmaster.pid."""
+    def pg_ctl():
+        argv = host.calls[-1].argv
+        if argv[-1] == "start" and server_left:
+            data = Path(argv[argv.index("-D") + 1])
+            data.mkdir()
+            (data / "postmaster.pid").write_text("4242\n")
+        return 1
+
+    host = Host(on={"pg_ctl": pg_ctl})
+    code, lines = run_drill(capsys, backup, scratch_root, host)
+    assert code == 1
+    assert "FAIL scratch postgres: pg_ctl start exited 1" in lines
+    assert host.named("pg_ctl")[-1].argv[-3:] == ["stop", "-m", "fast"]
+    left = f"FAIL cleanup: could not remove the scratch server; remove what is left with: {HARD_KILL}"
+    assert [line for line in lines if line.startswith("FAIL cleanup")] == ([left] if server_left else [])
     assert list(scratch_root.iterdir()) == []
 
 
