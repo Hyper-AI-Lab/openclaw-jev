@@ -587,10 +587,11 @@ def test_a_restore_that_fails_after_its_first_database_step_starts_nothing(host)
             "each starts rmp-api, which runs create_all on rmp_db\n") in result.stderr
 
 
-@pytest.mark.parametrize("signal, status", [("HUP", "129"), ("USR1", "1")])
+@pytest.mark.parametrize("signal, status", [("HUP", "129"), ("INT", "130"), ("TERM", "143"), ("USR1", "1")])
 def test_a_restore_ended_by_a_signal_after_its_first_database_step_starts_nothing(host, signal, status):
-    """A hung-up SSH session sends HUP. Bash runs the EXIT trap with status 0 after a signal the script does not trap,
-    such as USR1, and the killed step never reports its failure: either way the stores may be half restored."""
+    """A hung-up SSH session sends HUP, Ctrl-C INT, a kill TERM, each reported with its own status. Bash runs the EXIT
+    trap with status 0 after a signal the script does not trap, such as USR1, and the killed step never reports its
+    failure: either way the stores may be half restored."""
     _, dest, _, _ = host.run()
     result = host.restore(dest, FAKE_PGRESTORE_SIGNAL=f"temporal={signal}")
     assert result.returncode != 0

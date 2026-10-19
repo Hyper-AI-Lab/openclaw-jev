@@ -166,7 +166,8 @@ finish() {
   exit "${rc}"
 }
 trap finish EXIT
-trap 'exit 143' TERM INT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 # Recorded first: a signal during the stop runs the trap before the next command, and the unit may be stopped by then.
