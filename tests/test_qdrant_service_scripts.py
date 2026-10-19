@@ -159,3 +159,13 @@ def test_stop_stops_the_container(qdrant):
     result = qdrant.run(STOP, container=True, FAKE_DOCKER_FAIL="stop", FAKE_DOCKER_MESSAGE=message)
     assert result.returncode != 0 and message in result.stderr
     assert qdrant.docker() == [INSPECT, ["stop", "rmp-qdrant"]]
+
+
+def test_no_file_names_the_qdrant_compose_file():
+    """rmp-qdrant is one docker-run container; the compose file that described another identity of it is gone."""
+    name = b"docker-compose.qdrant.yml"
+    assert not (REPO / name.decode()).exists()
+    files = [p for p in sorted((REPO / "ops").rglob("*")) if p.is_file()]
+    files += [REPO / "ARCHITECTURE.md", REPO / "docs" / "VISION_CONFORMANCE.md",
+              REPO / "docs" / "runbooks" / "backup-restore.md", REPO / "Makefile"]
+    assert [str(p.relative_to(REPO)) for p in files if name in p.read_bytes()] == []
