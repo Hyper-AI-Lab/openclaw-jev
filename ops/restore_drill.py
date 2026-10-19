@@ -320,8 +320,11 @@ class Drill:
             self.check_openclaw()
             self.check_archives()
         finally:
-            _hold_signals()
-            self.cleanup()
+            # A signal whose handler runs before all three are ignored still ends in the cleanup.
+            try:
+                _hold_signals()
+            finally:
+                self.cleanup()
         print(f"restore duration: {duration // 60} min {duration % 60} s", flush=True)
         return 1 if self.failed else 0
 

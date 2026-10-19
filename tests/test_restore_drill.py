@@ -316,6 +316,49 @@ def test_a_signal_ends_the_drill_through_its_cleanup(capsys, backup, scratch_roo
     assert {s: signal.getsignal(s) for s in drill.SIGNALS} == before
 
 
+@pytest.mark.parametrize("ended_by", [None, signal.SIGTERM], ids=["a whole drill", "a drill ended by SIGTERM"])
+def test_a_signal_during_the_cleanup_is_ignored(backup, scratch_root, ended_by):
+    """Ctrl-C while the container is removed: the server is still stopped and the scratch directory removed, and
+    the drill ends as it would have without it."""
+    def ctrl_c_during_docker_rm():
+        if host.calls[-1].argv[1] == "rm":
+            os.kill(os.getpid(), signal.SIGINT)
+
+    on = {"docker": ctrl_c_during_docker_rm}
+    if ended_by:
+        on["restore_qdrant_snapshot.sh"] = lambda: os.kill(os.getpid(), ended_by)
+    host = Host(on=on)
+    try:
+        code = drill.main([str(backup)], run=host, probes=IDLE, scratch_root=scratch_root, backups=backup.parent)
+    except SystemExit as ended:
+        code = ended.code
+    assert code == (128 + ended_by if ended_by else 0)
+    assert [c.argv[:2] for c in host.calls[-2:]] == [["docker", "rm"], ["sudo", "-n"]]
+    assert host.calls[-1].argv[-3:] == ["stop", "-m", "fast"]
+    assert list(scratch_root.iterdir()) == []
+
+
+def test_a_signal_handled_as_the_cleanup_begins_ends_the_drill_after_it(capsys, backup, scratch_root, monkeypatch):
+    """A SIGTERM whose handler runs as the cleanup begins, before the signals are ignored: the cleanup still runs
+    whole, then the drill ends with the signal's code."""
+    hold = drill._hold_signals
+
+    def handled_first():
+        monkeypatch.setattr(drill, "_hold_signals", hold)
+        os.kill(os.getpid(), signal.SIGTERM)   # its handler runs here
+        hold()
+
+    monkeypatch.setattr(drill, "_hold_signals", handled_first)
+    host = Host()
+    with pytest.raises(SystemExit) as ended:
+        run_drill(capsys, backup, scratch_root, host)
+    assert ended.value.code == 128 + signal.SIGTERM
+    assert [c.argv[:2] for c in host.calls[-2:]] == [["docker", "rm"], ["sudo", "-n"]]
+    assert host.calls[-1].argv[-3:] == ["stop", "-m", "fast"]
+    assert list(scratch_root.iterdir()) == []
+    assert "restore duration" not in capsys.readouterr().out
+
+
 def test_a_row_count_mismatch_fails_the_drill(capsys, backup, scratch_root):
     stream = io.BytesIO(copy_stream({"public.tasks": 3, "public.events": 0, 'public."Task Notes"': 2}))
     assert drill.copy_rows(stream) == {"public.tasks": 3, "public.events": 0, 'public."Task Notes"': 2}
