@@ -1799,3 +1799,81 @@ Two `wp-batch` workflow launches timed out at the app's PreToolUse hook again; t
 **Diff:** `ops/restore_backup.sh`, the new `ops/restore_pg_database.sh`, `tests/test_backup_script.py` (41 tests) and `docs/runbooks/backup-restore.md`. Nothing under `app/`, so the deploy restarts nothing.
 
 **Next:** PR, merge on green, deploy check. Then close B4b-03 and ops-deploy-R8 (spec §7).
+
+## 2026-10-19 06:40 UTC · WP-12 batch 1 merged; batch 2 started
+
+**PR #37:** CI `test` SUCCESS on head `2243a93`; `origin/main` unchanged at `d0b9e0c`. Squash-merged as `8473b2c`. No other open PRs. The deploy is being watched.
+
+**Batch 2:**
+- **Branch:** `aura/wp-12-2-drill` from `8473b2c`.
+- **Item:** WP12-05, the scratch restore drill. Tier 1.
+- **Workflow:** run `wf_b36cba15-6a3`.
+- **Host step after its deploy:** run the drill on real data. It closes B3b-01.
+
+The batch 1 verify summary is kept as `research/wp12-b1-verify-summary.txt`.
+
+## 2026-10-19 06:52 UTC · WP-12 batch 1 deployed
+
+- **Deploy:** `result.json` `deployed`, `8473b2c`, from `d0b9e0c`. Restarted nothing; canary ok; no units; CI success.
+- **Host check:**
+  - the live checkout is at `8473b2c` and holds `ops/restore_pg_database.sh`;
+  - readiness production-ready, the only non-pass check is `telemetry` (warn);
+  - the timer check gives 8 `next:`.
+- **Ledger** (spec §7, "after batch 1"):
+  - **closed:** B4b-03 and ops-deploy-R8;
+  - **progress on B3b-01:** code fixed; it closes with batch 2's drill on real data.
+- **Rollback:** revert `8473b2c`.
+
+## 2026-10-19 · WP-12 batch 2 implemented, reviewed and verified
+
+**Workflow `wf_b36cba15-6a3`:** `approved: true`.
+
+**Implementer:** 5 commits.
+- `a0ed5dc`: `qcurl` in `ops/restore_qdrant_snapshot.sh`, which sends the key on stdin.
+- `9099cca`: the new `ops/restore_drill.py`.
+- `03668a6`: the runbook's quarterly DR drill.
+- `e957516`: a relative backup path is made absolute.
+- `2dab96c`: the test pins the scratch modes.
+
+**Deviations reported:**
+- `-q -X` on the role query;
+- SIGHUP is an exit too;
+- the refusal test allows the two read-only listings.
+
+**Round 1:**
+- **Correctness:** approve, with non-blocking points:
+  - `-q` unpinned;
+  - signal windows at the cleanup's start;
+  - `nohup`'s ignored HUP was overridden;
+  - a false "server left" line after a failed start;
+  - runbook wording.
+- **Closure:** one blocking finding. A signal during the Qdrant restore left the extracted collection snapshots in `/tmp`, because the snapshot restore's `mktemp -d` ignored the scratch directory. Plus a note: the spec's combined `SET …; SELECT` does not make the SELECT read-only.
+
+**Fix round 1:**
+- `27cea65`: `TMPDIR` in the scratch directory;
+- `5a8b676`: `-q` and `-X` pinned;
+- `7a03430`: cleanup is robust to a signal at its start;
+- `f8c9966`: an inherited ignored HUP is kept;
+- `26d4bd3`: "server left" only when `postmaster.pid` exists;
+- `3fdeee7`: the runbook names both production reads.
+
+**Round 2:** both reviewers approve.
+
+**My follow-up on the closure note:**
+- **Live probe** on the production server, a `SHOW` only:
+  - `psql -c "SET default_transaction_read_only=on; SHOW transaction_read_only"` returns `off`;
+  - with two `-c` options, it returns `on`.
+- **Fix `b80e6a9`:** the SET is its own `-c`. The test pins the argv's last four words and the fake psql answers only that form.
+- **Mutation:** joining the two statements again fails 2 tests.
+- **Spec:** `specs/WP-12.md` §9 amendment 1 records this and the implementer's deviations.
+
+**My read of the whole script before the live run:**
+- The snapshot restore's `readyz` retries for about 60 s, enough for a fresh container.
+- The newest backup `20261019T031500Z` is `rmp_db.dump` 4.8 MB, `temporal.dump` 1.1 MB and `qdrant-full.snapshot` 94 MB.
+- 96 GB of disk free; PostgreSQL 16 is the only server version on the host.
+
+**Four-layout verify** (HEAD `b80e6a9`): default, live, coding-job and direct each gave 1432 passed, 1 skipped (the `RMP_QDRANT_IT` opt-in), leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. Summary in `research/wp12-b2-verify-summary.txt`.
+
+**Diff:** `ops/restore_drill.py` (new), `ops/restore_qdrant_snapshot.sh`, `tests/test_restore_drill.py` (new, 27 tests), `tests/test_backup_script.py` and the runbook. Nothing under `app/`, so the deploy restarts nothing.
+
+**Kirill:** asked in chat, ahead of time, for the OK on batch 3's `systemctl restart rmp-qdrant`. Not yet given.
