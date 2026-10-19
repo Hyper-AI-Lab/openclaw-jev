@@ -6,9 +6,9 @@
 # Nothing may write to a store while it is replaced. The restore holds the code-reload lock, which a deploy and a code
 # reload take too, refuses while a deploy unit is active, and stops every writer first: the RMP timers and their runs,
 # rmp-code-watch, the gateway, rmp-api, rmp-worker and Temporal. rmp-qdrant keeps running for the Qdrant restore.
-# It starts what it stopped when every part was restored, or when it ends before its first database step. After a
-# failed part, or an exit by any signal before its last step, it starts nothing: rmp-api runs create_all on rmp_db at
-# start, so the operator starts the units once the stores are whole.
+# It starts what it stopped when every part was restored, or when it ends before its first database step. When a part
+# failed, or a signal ended it after that step and before its last, it starts nothing: rmp-api runs create_all on rmp_db
+# at start, so the operator starts the units once the stores are whole.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -30,7 +30,7 @@ declare -A TRIGGERS=()  # the service each recorded timer triggers
 declare -A STOPPED=()   # every unit this restore stopped
 RUNNING=()              # of rmp-code-watch and openclaw-gateway, those that were running
 CHANGED=""              # set before the first database step: from then on a failed part leaves every unit stopped
-DONE=""                 # set after the last step: an exit before it, by an error or any signal, restored only part
+DONE=""                 # set after the last step: an exit before it, by an error or any signal, is a failure
 
 if [[ ! -d "$SRC" ]]; then
   echo "Backup directory not found: $SRC"
