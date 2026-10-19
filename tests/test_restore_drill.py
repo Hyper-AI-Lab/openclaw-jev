@@ -411,3 +411,10 @@ def test_the_drill_port_is_closed_to_aura_coder_and_its_key_never_reaches_argv(c
     assert not any(key in word for call in host.calls for word in call.argv)
     assert key not in "\n".join(lines) and key not in os.environ.values()
 
+
+def test_the_docs_give_the_drill_and_its_hard_kill_cleanup():
+    runbook = (REPO / "docs" / "runbooks" / "backup-restore.md").read_text()
+    drill_section = runbook.split("## Quarterly DR drill", 1)[1]
+    assert "cd /root/.openclaw/rmp && venv/bin/python ops/restore_drill.py" in drill_section
+    assert HARD_KILL in drill_section
+    assert drill.HARD_KILL_CLEANUP == HARD_KILL and HARD_KILL in drill.__doc__
