@@ -102,10 +102,12 @@ Each collection is uploaded with `POST /collections/<c>/snapshots/upload?priorit
    systemctl is-active rmp-canary-sentinel.service rmp-backup.service
    ```
    Both are oneshot services, which show `activating` while a run is in progress. If either line is `activating` or `active`, wait for that run to end and ask again. Then run the timer check again: it shows `NO NEXT:` for exactly these two timers.
-2. Stop Qdrant. This stops the container `rmp-qdrant`, whose data stays in the bind mount:
+2. Stop Qdrant. This stops the container `rmp-qdrant`, whose data stays in the bind mount. Then check the container itself, because `systemctl stop` reports success even when the unit's stop script fails (the unit then shows `failed`):
    ```bash
    systemctl stop rmp-qdrant
+   docker inspect -f '{{.State.Running}}' rmp-qdrant
    ```
+   It must print `false`, or fail with no such object where `rmp-qdrant` does not exist (step 3 says what to do then). If it prints `true`, Qdrant still runs on the storage: do not go on. `journalctl -u rmp-qdrant -n 20` shows why the stop failed; fix that, run `docker stop rmp-qdrant` and check again.
 3. Restore the storage with a one-off container named `rmp-qdrant-from-snapshot`, never `rmp-qdrant`. It mounts the same storage directory and the snapshot, publishes no port, and runs the image `rmp-qdrant` ran:
    ```bash
    docker run -d --name rmp-qdrant-from-snapshot \
