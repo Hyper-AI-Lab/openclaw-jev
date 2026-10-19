@@ -117,10 +117,11 @@ Each collection is uploaded with `POST /collections/<c>/snapshots/upload?priorit
      ./qdrant --storage-snapshot /qdrant/full.snapshot --force-snapshot
    docker logs rmp-qdrant-from-snapshot 2>&1 | grep -c 'Qdrant HTTP listening on 6333'
    ```
-   If `rmp-qdrant` does not exist (a rebuilt host, or a container removed by hand), the image argument is empty and the `docker run` fails without creating anything. Run it again with the image on `ops/start_qdrant.sh`'s `IMAGE=` line, which `grep '^IMAGE=' /root/.openclaw/rmp/ops/start_qdrant.sh` prints, in place of the `"$(docker inspect …)"` argument: it is the image step 4 runs on the restored storage. It is ready when the `docker logs` line prints `1`; repeat that line until it does. If the container exits instead, `docker logs rmp-qdrant-from-snapshot` says why. Then remove it:
+   If `rmp-qdrant` does not exist (a rebuilt host, or a container removed by hand), the image argument is empty and the `docker run` fails without creating anything. Run it again with the image on `ops/start_qdrant.sh`'s `IMAGE=` line, which `grep '^IMAGE=' /root/.openclaw/rmp/ops/start_qdrant.sh` prints, in place of the `"$(docker inspect …)"` argument: it is the image step 4 runs on the restored storage. It is ready when the `docker logs` line prints `1`; repeat that line until it does. Then remove it:
    ```bash
    docker stop rmp-qdrant-from-snapshot && docker rm rmp-qdrant-from-snapshot
    ```
+   If `docker inspect -f '{{.State.Status}}' rmp-qdrant-from-snapshot` prints `exited` before that line appears, the restore failed, and the storage may hold some collections from the snapshot and not others: `docker logs rmp-qdrant-from-snapshot` says why. Remove the container with the same command and run this step again, with the same backup or an older one. Go on to step 4 only after the `docker logs` line printed `1`.
 4. Start Qdrant, which recreates `rmp-qdrant` on the restored storage. Then readiness shows `vector_memory`, `task_registry_vector` and `vector_sync` at `pass`:
    ```bash
    systemctl start rmp-qdrant
