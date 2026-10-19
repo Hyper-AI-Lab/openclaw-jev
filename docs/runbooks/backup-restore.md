@@ -98,7 +98,7 @@ Each collection is uploaded with `POST /collections/<c>/snapshots/upload?priorit
 
 ## Quarterly DR drill
 
-`ops/restore_drill.py` restores a backup into a scratch PostgreSQL and a scratch Qdrant, checks every store, and removes both. It restores nothing in production: its one production read is a read-only query for the role names. Run it quarterly, and after any change to a backup or restore script, as root, on an idle host, outside the backup's window (03:00-03:45 UTC):
+`ops/restore_drill.py` restores a backup into a scratch PostgreSQL and a scratch Qdrant, checks every store, and removes both. It restores nothing in production and only reads production's databases: the idle check counts the active user tasks, and one query lists the role names. Run it quarterly, and after any change to a backup or restore script, as root, on an idle host, outside the backup's window (03:00-03:45 UTC):
 
 ```bash
 cd /root/.openclaw/rmp && venv/bin/python ops/restore_drill.py
