@@ -158,9 +158,10 @@ Every call is recorded in ${FAKE_STATE}/systemctl.log, a start with the sha256 o
 Unit states live in ${FAKE_STATE}/units; stop and start update them. FAKE_STOP_FAIL=<unit> fails that unit's stop,
 FAKE_LIST_UNITS_FAIL=1 every list-units.
 FAKE_DEPLOY_ON_STOP=<unit>=<deploy unit> lists the deploy unit once the fake has handled that unit's stop.
+FAKE_SIGNAL_ON_STOP=<unit>=<signal> sends the signal to the restore, the fake's parent, once it has stopped that unit.
 FAKE_TIMER_RUN=<timer>=<n> keeps the timer's service active for n is-active calls after the timer starts.
 """
-import hashlib, json, os, sys, time
+import hashlib, json, os, signal, sys, time
 args, env = sys.argv[1:], os.environ.get
 state = env("FAKE_STATE")
 units = os.path.join(state, "units")
@@ -204,6 +205,9 @@ if verb == "stop":
         if trigger and path(trigger) == path(unit):
             with open(os.path.join(state, "deploy-units"), "a") as f:
                 f.write(deploy + "\n")
+        trigger, _, name = env("FAKE_SIGNAL_ON_STOP", "").partition("=")
+        if trigger and path(trigger) == path(unit):
+            os.kill(os.getppid(), getattr(signal, "SIG" + name))
 elif verb == "start":
     for unit in words[1:]:
         put(unit, "active")
@@ -566,6 +570,17 @@ def test_a_restore_ended_by_a_signal_after_its_first_database_step_starts_nothin
     assert f"Left stopped, because a store may be half restored: {units}\n" in result.stderr
     assert f"When the stores are whole, start them with: systemctl start {units}\n" in result.stderr
     assert "Restore complete." not in result.stdout
+
+
+@pytest.mark.parametrize("signal", ["HUP", "USR1"])
+def test_a_restore_ended_by_a_signal_before_its_first_database_step_starts_what_it_stopped(host, signal):
+    """Including the unit whose stop the signal interrupted, and without claiming that the restore completed."""
+    _, dest, _, _ = host.run()
+    result = host.restore(dest, FAKE_SIGNAL_ON_STOP=f"temporal={signal}")
+    assert result.returncode != 0
+    assert host.log("sudo.log") == []
+    assert _verbs(host, "stop") == STOPS and _verbs(host, "start") == STARTS
+    assert "Restore complete." not in result.stdout and "INCOMPLETE" not in result.stderr
 
 
 def test_a_restore_refused_by_the_code_reload_lock_stops_nothing(host):

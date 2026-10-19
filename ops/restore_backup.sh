@@ -165,9 +165,10 @@ trap finish EXIT
 trap 'exit 143' TERM INT
 trap 'exit 129' HUP
 
+# Recorded first: a signal during the stop runs the trap before the next command, and the unit may be stopped by then.
 stop() {
-  systemctl stop "$1" || { echo "systemctl stop $1 failed: nothing was restored" >&2; exit 1; }
   STOPPED[$1]=1
+  systemctl stop "$1" || { unset "STOPPED[$1]"; echo "systemctl stop $1 failed: nothing was restored" >&2; exit 1; }
 }
 # Each timer, then the service it triggers: stopping an inactive oneshot does nothing, and a running canary, janitor,
 # watchdog or backup run ends. Then the code watch and the gateway, then RMP and Temporal.
