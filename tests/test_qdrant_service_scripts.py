@@ -221,7 +221,16 @@ def test_the_whole_store_procedure_keeps_the_sentinel_and_the_backup_away_from_a
     assert stop_timers < asked
     stop_qdrant = at(r"systemctl stop rmp-qdrant(?![\w-])")
     assert asked < stop_qdrant[0]
-    assert re.findall(r"docker run\b[^\n]*?--name (\S+)", section) == ["rmp-qdrant-from-snapshot"]
+    assert re.findall(r"docker (?:run|create)\b[^\n]*?--name (\S+)", section) == ["rmp-qdrant-from-snapshot"]
+    # The one-off is created first, which turns start_qdrant.sh's guard on, then rmp-qdrant is checked, then the one-off
+    # starts: a start of rmp-qdrant before the create is seen by the check, and one after it is refused. A docker run
+    # would start the one-off before any check.
+    assert not re.search(r"docker run\b", section)
+    created = at(r"docker create --name rmp-qdrant-from-snapshot")[0]
+    asked = at(r"systemctl is-active rmp-qdrant\n")[0]
+    running = at(re.escape("docker inspect -f '{{.State.Running}}' rmp-qdrant\n"))[-1]
+    started = at(r"docker start rmp-qdrant-from-snapshot")[0]
+    assert stop_qdrant[0] < created < asked < started and created < running < started
     removed = at(r"docker rm rmp-qdrant-from-snapshot")[-1]
     start_qdrant = at(r"systemctl start rmp-qdrant(?![\w-])")
     assert stop_qdrant[-1] < removed < start_qdrant[0]
@@ -231,3 +240,12 @@ def test_the_whole_store_procedure_keeps_the_sentinel_and_the_backup_away_from_a
     check = at(re.escape("""systemctl list-timers 'rmp-*' --all --no-pager --no-legend | awk '{print ($1 == "-" ? """
                          """"NO NEXT: " : "next: ") $(NF-1)}'"""))
     assert check[-1] > start_timers and check[-1] == max(at(r"\b(?:systemctl|docker) "))
+
+
+def test_r148_cites_the_start_scripts_loopback_ports():
+    """docs/VISION_CONFORMANCE.md's R-148 row gives start_qdrant.sh's -p flags as the evidence that Qdrant publishes
+    only on loopback; the line it cites holds them."""
+    row = next(line for line in (REPO / "docs" / "VISION_CONFORMANCE.md").read_text().splitlines()
+               if line.startswith("| R-148 |"))
+    cited = int(re.search(r"ops/start_qdrant\.sh:(\d+)", row).group(1))
+    assert "-p 127.0.0.1:6333:6333 -p 127.0.0.1:6334:6334" in START.read_text().splitlines()[cited - 1]

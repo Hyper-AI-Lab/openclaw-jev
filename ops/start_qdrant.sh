@@ -6,12 +6,13 @@
 # takes effect at the next `systemctl restart rmp-qdrant`. The data lives in the bind mount ${DATA_DIR}/qdrant-server
 # and survives the recreate.
 #
-# Whenever a canary sentinel run finds a canary issue, it restarts every inactive unit of its SERVICE_UNITS,
-# rmp-qdrant among them (app/production/canary_sentinel.py:32-38,481-487,665-668). The sentinel runs from its own timer
-# every 30 min and from the failure paths of the health and memory canaries (ops/canary.sh, ops/canary_slack_memory.sh),
-# and a start or restart of rmp-api or rmp-worker, which want rmp-qdrant, starts it too. So the procedure that keeps
-# Qdrant stopped while it rebuilds the storage (docs/runbooks/backup-restore.md, "Whole store from scratch") stops every
-# rmp-* timer first, and this start refuses while that procedure's container rmp-qdrant-from-snapshot exists.
+# Many things start rmp-qdrant. Whenever a canary sentinel run finds a canary issue, it restarts every inactive unit of
+# its SERVICE_UNITS, rmp-qdrant among them (app/production/canary_sentinel.py:32-38,481-487,665-668); the sentinel runs
+# from its own timer every 30 min and from the failure paths of the health and memory canaries (ops/canary.sh,
+# ops/canary_slack_memory.sh). A start or restart of rmp-api or rmp-worker, which want rmp-qdrant, starts it too, as do
+# a boot, `make qdrant`, `make migrate-qdrant` and a start by hand. So the procedure that keeps Qdrant stopped while it
+# rebuilds the storage (docs/runbooks/backup-restore.md, "Whole store from scratch") stops every rmp-* timer first, and
+# this start refuses, whatever asks for it, while that procedure's container rmp-qdrant-from-snapshot exists.
 set -euo pipefail
 
 RMP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
