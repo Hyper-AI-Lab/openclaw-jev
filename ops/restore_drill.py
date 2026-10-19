@@ -75,8 +75,9 @@ CODING_UNITS = ("aura-claude-*", "aura-verify-*", "aura-collect-*", "aura-direct
 # Each database a backup dumps, with the owner its archive gives it.
 OWNERS = {"rmp_db": "rmp", "temporal": "temporal", "temporal_visibility": "temporal"}
 STAMP = re.compile(r"20\d{6}T\d{6}Z")
-# The drill's one production read: the roles the archives may name.
-ROLE_QUERY = ("SET default_transaction_read_only=on; "
+# The drill's one read of production's server: the roles the archives may name. The SET is its own -c, so it ends
+# its own transaction and the SELECT's starts read-only; in one -c string both share a transaction that is not.
+ROLE_QUERY = ("SET default_transaction_read_only=on",
               "SELECT rolname FROM pg_roles WHERE rolname !~ '^pg_' AND rolname <> 'postgres'")
 # Every ordinary table outside the system schemas, named as pg_dump names it, with the rows it holds itself.
 COUNT_QUERY = ("SELECT format('%I.%I', n.nspname, c.relname), "
@@ -345,7 +346,8 @@ class Drill:
             return False
         # -q: psql would print SET's status line before the names.
         listed = self.call("production roles", "psql", ["sudo", "-n", "-u", "postgres", f"{self.pg_bin}/psql",
-                                                        "-d", "postgres", "-At", "-q", "-X", "-c", ROLE_QUERY])
+                                                        "-d", "postgres", "-At", "-q", "-X",
+                                                        "-c", ROLE_QUERY[0], "-c", ROLE_QUERY[1]])
         if listed is None:
             return False
         roles = [line for line in listed.stdout.decode(errors="replace").splitlines() if line]

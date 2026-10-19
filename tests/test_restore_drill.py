@@ -86,7 +86,7 @@ class Host:
             return 0, copy_stream(TABLES[Path(words[-1]).stem])
         if name == "psql":
             sql, db = words[words.index("-c") + 1], words[words.index("-d") + 1]
-            if sql == drill.ROLE_QUERY:
+            if words[-4:] == ["-c", drill.ROLE_QUERY[0], "-c", drill.ROLE_QUERY[1]]:
                 return 0, b"rmp\ntemporal\n"
             if "pg_database" in sql:
                 return 0, (OWNERS[re.search(r"datname = '(\w+)'", sql).group(1)] + "\n").encode()
@@ -242,7 +242,9 @@ def test_the_drill_only_ever_targets_its_scratch_instances(capsys, backup, scrat
     # The one production read: the role names, read-only.
     [roles] = [c for c in host.named("psql") if "-h" not in c.argv]
     assert roles.argv[:5] == ["sudo", "-n", "-u", "postgres", f"{pg_bin}/psql"]
-    assert roles.argv[roles.argv.index("-c") + 1].startswith("SET default_transaction_read_only=on;")
+    # The SET is a -c of its own before the SELECT: sharing one -c, both run in one transaction that is not read-only.
+    assert roles.argv[-4:] == ["-c", "SET default_transaction_read_only=on", "-c", drill.ROLE_QUERY[1]]
+    assert drill.ROLE_QUERY[1].startswith("SELECT rolname FROM pg_roles ")
     assert roles.argv[roles.argv.index("-d") + 1] == "postgres" and "-p" not in roles.argv
     # -q: without it psql prints SET's status line among the names, and the drill would create a role "SET".
     assert {"-At", "-q", "-X"} <= set(roles.argv)
