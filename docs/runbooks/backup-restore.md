@@ -115,7 +115,7 @@ Each collection is uploaded with `POST /collections/<c>/snapshots/upload?priorit
      ./qdrant --storage-snapshot /qdrant/full.snapshot --force-snapshot
    docker logs rmp-qdrant-from-snapshot 2>&1 | grep -c 'Qdrant HTTP listening on 6333'
    ```
-   It is ready when the `docker logs` line prints `1`; repeat that line until it does. If the container exits instead, `docker logs rmp-qdrant-from-snapshot` says why. Then remove it:
+   If `rmp-qdrant` does not exist (a rebuilt host, or a container removed by hand), the image argument is empty and the `docker run` fails without creating anything. Run it again with the image on `ops/start_qdrant.sh`'s `IMAGE=` line, which `grep '^IMAGE=' /root/.openclaw/rmp/ops/start_qdrant.sh` prints, in place of the `"$(docker inspect …)"` argument: it is the image step 4 runs on the restored storage. It is ready when the `docker logs` line prints `1`; repeat that line until it does. If the container exits instead, `docker logs rmp-qdrant-from-snapshot` says why. Then remove it:
    ```bash
    docker stop rmp-qdrant-from-snapshot && docker rm rmp-qdrant-from-snapshot
    ```
