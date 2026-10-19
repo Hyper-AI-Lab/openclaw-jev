@@ -91,17 +91,19 @@ bash /root/.openclaw/rmp/ops/restore_qdrant_snapshot.sh <backup>/qdrant-full.sna
 
 Each collection is uploaded with `POST /collections/<c>/snapshots/upload?priority=snapshot`, which replaces that collection's data.
 
-**Whole store from scratch, as an alternative:** Qdrant restores a full snapshot only at startup. This needs Kirill's OK and an idle window, because Aura's memory is offline throughout; recall falls back to Postgres full-text search. Two things would otherwise start `rmp-qdrant` in the middle of it, and its start recreates the container on the storage being rebuilt:
-- the canary sentinel, which restarts an inactive `rmp-qdrant` whenever a run finds a canary issue, so step 1 stops its timer (and the backup's, whose run would take a snapshot of the storage);
-- any start of `rmp-api` or `rmp-worker`, which want `rmp-qdrant` (`Wants=`): a deploy or the Temporal watchdog's recovery restarts both, so merge nothing that deploys before step 4 has ended.
+**Whole store from scratch, as an alternative:** Qdrant restores a full snapshot only at startup. This needs Kirill's OK and an idle window, because Aura's memory is offline throughout; recall falls back to Postgres full-text search. Several things would otherwise start `rmp-qdrant` in the middle of it, and its start recreates the container on the storage being rebuilt:
+- the canary sentinel, which restarts an inactive `rmp-qdrant` whenever a run finds a canary issue. It runs from its own timer, and from the health canary and the memory canary when they fail, which they do while Qdrant is down;
+- any start or restart of `rmp-api` or `rmp-worker`, which want `rmp-qdrant` (`Wants=`): the Temporal watchdog's recovery, a deploy, or an automatic restart after a crash.
 
-1. Run the timer check, stop the two timers, and ask whether either service is running:
+So step 1 stops every `rmp-*` timer, as the restore does, which also keeps a backup from taking a snapshot of the storage; merge nothing that deploys before step 4 has ended. And while the one-off container `rmp-qdrant-from-snapshot` of step 3 exists, `ops/start_qdrant.sh` refuses to start `rmp-qdrant`, whatever asks for it: the unit then shows `failed`, and step 4's start works all the same.
+
+1. Run the timer check, stop every `rmp-*` timer, and ask whether any of their services is running:
    ```bash
    systemctl list-timers 'rmp-*' --all --no-pager --no-legend | awk '{print ($1 == "-" ? "NO NEXT: " : "next: ") $(NF-1)}'
-   systemctl stop rmp-canary-sentinel.timer rmp-backup.timer
-   systemctl is-active rmp-canary-sentinel.service rmp-backup.service
+   systemctl stop rmp-backup.timer rmp-canary-sentinel.timer rmp-canary.timer rmp-janitor-frequent.timer rmp-janitor.timer rmp-memory-canary.timer rmp-temporal-vacuum.timer rmp-temporal-watchdog.timer
+   systemctl is-active rmp-backup.service rmp-canary-sentinel.service rmp-canary.service rmp-janitor-frequent.service rmp-janitor.service rmp-memory-canary.service rmp-temporal-vacuum.service rmp-temporal-watchdog.service
    ```
-   Both are oneshot services, which show `activating` while a run is in progress. If either line is `activating` or `active`, wait for that run to end and ask again. Then run the timer check again: it shows `NO NEXT:` for exactly these two timers.
+   All are oneshot services, which show `activating` while a run is in progress. If any line is `activating` or `active`, wait for that run to end and ask again: a canary run in progress may still call the sentinel at its end. Then run the timer check again: every line shows `NO NEXT:`.
 2. Stop Qdrant. This stops the container `rmp-qdrant`, whose data stays in the bind mount. Then check the container itself, because `systemctl stop` reports success even when the unit's stop script fails (the unit then shows `failed`):
    ```bash
    systemctl stop rmp-qdrant
@@ -127,9 +129,9 @@ Each collection is uploaded with `POST /collections/<c>/snapshots/upload?priorit
    systemctl start rmp-qdrant
    cd /root/.openclaw/rmp && make -s readiness | python3 -c 'import json,sys; d=json.load(sys.stdin); print({c["name"]: c["status"] for c in d["checks"] if c["name"] in ("vector_memory","task_registry_vector","vector_sync")})'
    ```
-5. Start the two timers again, then run the timer check: 8 `next:` lines.
+5. Start the timers again, then run the timer check: 8 `next:` lines.
    ```bash
-   systemctl start rmp-canary-sentinel.timer rmp-backup.timer
+   systemctl start rmp-backup.timer rmp-canary-sentinel.timer rmp-canary.timer rmp-janitor-frequent.timer rmp-janitor.timer rmp-memory-canary.timer rmp-temporal-vacuum.timer rmp-temporal-watchdog.timer
    systemctl list-timers 'rmp-*' --all --no-pager --no-legend | awk '{print ($1 == "-" ? "NO NEXT: " : "next: ") $(NF-1)}'
    ```
    A timer whose interval passed meanwhile runs its service at once and shows `NO NEXT:` until that run ends: wait for it and run the check again. A timer still without a next elapse is re-armed as in step 8 of the restore above.

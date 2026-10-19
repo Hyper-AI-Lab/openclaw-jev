@@ -7,8 +7,11 @@
 # and survives the recreate.
 #
 # Whenever a canary sentinel run finds a canary issue, it restarts every inactive unit of its SERVICE_UNITS,
-# rmp-qdrant among them (app/production/canary_sentinel.py:32-38,481-487,665-668; every 30 min). So a procedure that
-# keeps Qdrant stopped stops the sentinel's timer first (docs/runbooks/backup-restore.md, "Whole store from scratch").
+# rmp-qdrant among them (app/production/canary_sentinel.py:32-38,481-487,665-668). The sentinel runs from its own timer
+# every 30 min and from the failure paths of the health and memory canaries (ops/canary.sh, ops/canary_slack_memory.sh),
+# and a start or restart of rmp-api or rmp-worker, which want rmp-qdrant, starts it too. So the procedure that keeps
+# Qdrant stopped while it rebuilds the storage (docs/runbooks/backup-restore.md, "Whole store from scratch") stops every
+# rmp-* timer first, and this start refuses while that procedure's container rmp-qdrant-from-snapshot exists.
 set -euo pipefail
 
 RMP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,6 +19,14 @@ DATA_DIR="${RMP_DATA_DIR:-${RMP_ROOT}/data}"
 STORAGE="${DATA_DIR}/qdrant-server"
 IMAGE="qdrant/qdrant:v1.17.0"
 CONTAINER="rmp-qdrant"
+ONE_OFF="rmp-qdrant-from-snapshot"
+
+# Two Qdrants never share the storage, whatever starts rmp-qdrant while the one-off container rebuilds it.
+if docker container inspect "${ONE_OFF}" >/dev/null 2>&1; then
+  echo "refused: ${ONE_OFF} exists and rebuilds ${STORAGE}; start rmp-qdrant once it is removed" \
+    "(docs/runbooks/backup-restore.md, \"Whole store from scratch\")" >&2
+  exit 1
+fi
 
 mkdir -p "${STORAGE}"
 
