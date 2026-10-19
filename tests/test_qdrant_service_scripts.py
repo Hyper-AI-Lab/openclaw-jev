@@ -169,3 +169,31 @@ def test_no_file_names_the_qdrant_compose_file():
     files += [REPO / "ARCHITECTURE.md", REPO / "docs" / "VISION_CONFORMANCE.md",
               REPO / "docs" / "runbooks" / "backup-restore.md", REPO / "Makefile"]
     assert [str(p.relative_to(REPO)) for p in files if name in p.read_bytes()] == []
+
+
+def test_the_whole_store_procedure_keeps_the_sentinel_and_the_backup_away_from_a_stopped_qdrant():
+    """The runbook's "Whole store from scratch": the sentinel would start rmp-qdrant, whose start recreates it on the
+    storage being rebuilt, and a backup would snapshot that storage, so both timers stop before Qdrant does and start
+    only after it runs again; the one-off restore container is never rmp-qdrant."""
+    runbook = (REPO / "docs" / "runbooks" / "backup-restore.md").read_text()
+    assert "**Whole store from scratch" in runbook
+    section = runbook.split("**Whole store from scratch", 1)[1].split("\n## ", 1)[0]
+
+    def at(pattern):
+        found = [m.start() for m in re.finditer(pattern, section)]
+        assert found, f"the procedure lacks {pattern}"
+        return found
+
+    stop_timers = at(r"systemctl stop rmp-canary-sentinel\.timer rmp-backup\.timer")[0]
+    stop_qdrant = at(r"systemctl stop rmp-qdrant(?![\w-])")
+    assert stop_timers < stop_qdrant[0]
+    assert re.findall(r"docker run\b[^\n]*?--name (\S+)", section) == ["rmp-qdrant-from-snapshot"]
+    removed = at(r"docker rm rmp-qdrant-from-snapshot")[-1]
+    start_qdrant = at(r"systemctl start rmp-qdrant(?![\w-])")
+    assert stop_qdrant[-1] < removed < start_qdrant[0]
+    start_timers = at(r"systemctl start rmp-canary-sentinel\.timer rmp-backup\.timer")[0]
+    assert start_qdrant[-1] < start_timers
+    # The timer check is the procedure's last command.
+    check = at(re.escape("""systemctl list-timers 'rmp-*' --all --no-pager --no-legend | awk '{print ($1 == "-" ? """
+                         """"NO NEXT: " : "next: ") $(NF-1)}'"""))
+    assert check[-1] > start_timers and check[-1] == max(at(r"\b(?:systemctl|docker) "))

@@ -91,10 +91,45 @@ bash /root/.openclaw/rmp/ops/restore_qdrant_snapshot.sh <backup>/qdrant-full.sna
 
 Each collection is uploaded with `POST /collections/<c>/snapshots/upload?priority=snapshot`, which replaces that collection's data.
 
-**Whole store from scratch, as an alternative:** Qdrant restores a full snapshot only at startup.
-1. Stop `rmp-qdrant`.
-2. Start the container once with `--storage-snapshot /path/to/qdrant-full.snapshot --force-snapshot`, and the snapshot mounted into it.
-3. Restart it normally.
+**Whole store from scratch, as an alternative:** Qdrant restores a full snapshot only at startup. This needs Kirill's OK and an idle window, because Aura's memory is offline throughout; recall falls back to Postgres full-text search. Two things would otherwise start `rmp-qdrant` in the middle of it, and its start recreates the container on the storage being rebuilt:
+- the canary sentinel, which restarts an inactive `rmp-qdrant` whenever a run finds a canary issue, so step 1 stops its timer (and the backup's, whose run would take a snapshot of the storage);
+- any start of `rmp-api` or `rmp-worker`, which want `rmp-qdrant` (`Wants=`): a deploy or the Temporal watchdog's recovery restarts both, so merge nothing that deploys before step 4 has ended.
+
+1. Run the timer check, stop the two timers, and ask whether either service is running:
+   ```bash
+   systemctl list-timers 'rmp-*' --all --no-pager --no-legend | awk '{print ($1 == "-" ? "NO NEXT: " : "next: ") $(NF-1)}'
+   systemctl stop rmp-canary-sentinel.timer rmp-backup.timer
+   systemctl is-active rmp-canary-sentinel.service rmp-backup.service
+   ```
+   Both are oneshot services, which show `activating` while a run is in progress. If either line is `activating` or `active`, wait for that run to end and ask again. Then run the timer check again: it shows `NO NEXT:` for exactly these two timers.
+2. Stop Qdrant. This stops the container `rmp-qdrant`, whose data stays in the bind mount:
+   ```bash
+   systemctl stop rmp-qdrant
+   ```
+3. Restore the storage with a one-off container named `rmp-qdrant-from-snapshot`, never `rmp-qdrant`. It mounts the same storage directory and the snapshot, publishes no port, and runs the image `rmp-qdrant` ran:
+   ```bash
+   docker run -d --name rmp-qdrant-from-snapshot \
+     -v /root/.openclaw/rmp/data/qdrant-server:/qdrant/storage \
+     -v <backup>/qdrant-full.snapshot:/qdrant/full.snapshot:ro \
+     "$(docker inspect -f '{{.Config.Image}}' rmp-qdrant)" \
+     ./qdrant --storage-snapshot /qdrant/full.snapshot --force-snapshot
+   docker logs rmp-qdrant-from-snapshot 2>&1 | grep -c 'Qdrant HTTP listening on 6333'
+   ```
+   It is ready when the `docker logs` line prints `1`; repeat that line until it does. If the container exits instead, `docker logs rmp-qdrant-from-snapshot` says why. Then remove it:
+   ```bash
+   docker stop rmp-qdrant-from-snapshot && docker rm rmp-qdrant-from-snapshot
+   ```
+4. Start Qdrant, which recreates `rmp-qdrant` on the restored storage. Then readiness shows `vector_memory`, `task_registry_vector` and `vector_sync` at `pass`:
+   ```bash
+   systemctl start rmp-qdrant
+   cd /root/.openclaw/rmp && make -s readiness | python3 -c 'import json,sys; d=json.load(sys.stdin); print({c["name"]: c["status"] for c in d["checks"] if c["name"] in ("vector_memory","task_registry_vector","vector_sync")})'
+   ```
+5. Start the two timers again, then run the timer check: 8 `next:` lines.
+   ```bash
+   systemctl start rmp-canary-sentinel.timer rmp-backup.timer
+   systemctl list-timers 'rmp-*' --all --no-pager --no-legend | awk '{print ($1 == "-" ? "NO NEXT: " : "next: ") $(NF-1)}'
+   ```
+   A timer whose interval passed meanwhile runs its service at once and shows `NO NEXT:` until that run ends: wait for it and run the check again. A timer still without a next elapse is re-armed as in step 8 of the restore above.
 
 ## Quarterly DR drill
 
