@@ -307,3 +307,37 @@ def test_the_command_line_writes_a_manifest_and_verifies_a_backup(dest, tmp_path
     assert bm.main([*write[:-1], "off"]) == 0
     assert capsys.readouterr().out == "settings\n"
     assert json.loads((dest / "manifest.json").read_text())["components"]["artifacts"] == []
+
+
+@pytest.mark.parametrize("settings, enabled", [
+    ({}, False), ({"backup": None}, False), ({"backup": {}}, False), ({"backup": {"offsite": {}}}, False),
+    ({"backup": {"offsite": {"enabled": False}}}, False), ({"backup": {"offsite": {"enabled": True}}}, True),
+])
+def test_the_offsite_copy_is_off_unless_the_settings_switch_it_on(monkeypatch, settings, enabled):
+    """Accepted exception K-7: backups stay on this host while backup.offsite.enabled is not true."""
+    monkeypatch.setattr("app.config.load_settings", lambda: settings)
+    assert bm.offsite_config() == {"enabled": enabled}
+
+
+def test_the_command_line_records_the_offsite_copy_and_a_failed_copy_fails_the_run(dest, capsys):
+    _write(dest)
+    before = json.loads((dest / "manifest.json").read_text())
+    for state in ("off", "copied"):
+        assert bm.main(["offsite", str(dest), state]) == 0
+        manifest = json.loads((dest / "manifest.json").read_text())
+        assert manifest == {**before, "offsite": state} and list(manifest)[-2:] == ["offsite", "failures"]
+        assert bm.problems(dest, hashes=True) == []
+    # A failed copy is a run failure, named once however often it is recorded; the files stay as they were.
+    for _ in range(2):
+        assert bm.main(["offsite", str(dest), "failed"]) == 0
+        manifest = json.loads((dest / "manifest.json").read_text())
+        assert manifest == {**before, "offsite": "failed", "failures": ["offsite"]}
+    assert bm.problems(dest, hashes=True) == ["failed: offsite"]
+    assert capsys.readouterr().out == "" and not (dest / "manifest.json.partial").exists()
+    with pytest.raises(SystemExit):
+        bm.main(["offsite", str(dest), "skipped"])
+    with pytest.raises(ValueError):
+        bm.record_offsite(dest, "skipped")
+    # The run's own failures come first.
+    _write(dest, failures=["qdrant"])
+    assert bm.record_offsite(dest, "failed")["failures"] == ["qdrant", "offsite"]
