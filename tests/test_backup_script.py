@@ -841,11 +841,22 @@ def test_the_offsite_copy_is_off_by_default_and_the_manifest_says_so(host):
         shutil.rmtree(dest)  # a second run within the same second would reuse its directory
 
 
+def _python_counting_restic_variables(host):
+    """An RMP_PYTHON that records, for each run, how many RESTIC_ and AWS_ variables its environment holds."""
+    python = host.tmp / "python"
+    python.write_text('#!/bin/sh\nenv | grep -c -E "^(RESTIC|AWS)_" >> "${FAKE_STATE}/python-env.log"\n'
+                      f'exec "{sys.executable}" "$@"\n')
+    python.chmod(0o755)
+    return str(python)
+
+
 def test_the_offsite_copy_runs_restic_with_the_env_file(host):
     _offsite(host, True)
     variables = _s3_variables(host)
     env_file = _restic_env(host, **variables)
-    result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(env_file))
+    inherited = {name: None for name in os.environ if name.startswith(("RESTIC_", "AWS_"))}
+    result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(env_file),
+                                         RMP_PYTHON=_python_counting_restic_variables(host), **inherited)
     assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
     assert manifest["offsite"] == "copied"
     calls = host.log("restic.log")
@@ -860,6 +871,9 @@ def test_the_offsite_copy_runs_restic_with_the_env_file(host):
     shown = result.stdout + result.stderr + (dest / "backup.log").read_text()
     for value in variables.values():
         assert value not in shown and not any(value in word for call in calls for word in call["argv"])
+    # Read in a subshell, they reach no other step: not the manifest's record of the copy, nor the pruning after it.
+    counts = (host.state / "python-env.log").read_text().split()
+    assert len(counts) >= 5 and set(counts) == {"0"}
     # The copy runs after a local failure too.
     shutil.rmtree(dest)  # a second run within the same second would reuse its directory
     result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(env_file), FAKE_QDRANT_DOWN="1")
