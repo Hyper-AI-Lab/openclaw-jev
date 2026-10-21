@@ -7,6 +7,12 @@ Run it as root from the live checkout, on an idle host and outside the backup's 
 
 It drills the newest stamped backup under data/backups whose manifest has "failures": [], unless given another.
 
+- restic: the backup goes through a scratch restic repository and back. ops/offsite_copy.sh, the off-host step
+  ops/backup.sh runs, copies it into a repository in the drill's scratch directory under /var/tmp, whose password is
+  random and lives only in a 0600 file there, and restic restores it there. The restored copy must match the backup's
+  manifest, checksums included, and every leg after this one reads it, so the drill proves a restore from the off-host
+  copy. The drill never reads /etc/rmp/restic.env and drops every RESTIC_ variable of its own environment. A missing
+  restic, or a round trip that fails, is a FAIL; the other legs then read the backup itself.
 - PostgreSQL: a throwaway server from this host's own binaries, the server that made the dumps. initdb and pg_ctl run
   as postgres, with the data and the socket in a scratch directory under /var/tmp, port 55432 and no TCP listener.
   Production's roles are created there NOLOGIN, so the archives' OWNER TO lines apply; their names come from the
@@ -18,9 +24,9 @@ It drills the newest stamped backup under data/backups whose manifest has "failu
   prints it. 6937 is in coding.blocked_tcp_ports, so aura-coder cannot reach the copy of Aura's memory.
 
 The checks: first the backup against its manifest, with every file's size and checksum, before anything is created; a
-backup that does not verify is not drilled. Then each database's owner, rmp_db's vector extension, every table's row
-count against its COPY block in the dump, the collections against the snapshot, the OpenClaw store copies, and every
-archive read to its end. Each prints one line, ok or FAIL, with names and counts only. The last line is the restore
+backup that does not verify is not drilled. Then the restic round trip, each database's owner, rmp_db's vector
+extension, every table's row count against its COPY block in the dump, the collections against the snapshot, the
+OpenClaw store copies, and every archive read to its end. Each prints one line, ok or FAIL, with names and counts only. The last line is the restore
 duration, from the first database restore to the end of the Qdrant restore: the steps a real restore repeats on the
 same data.
 
@@ -71,6 +77,8 @@ QDRANT_URL = f"http://127.0.0.1:{DRILL_QDRANT_PORT}"
 KEY_VARIABLE = "QDRANT__SERVICE__API_KEY"
 SCRATCH_ROOT = Path("/var/tmp")
 SCRATCH_PREFIX = "rmp-restore-drill-"
+# Where restic restores the drilled backup, in the scratch directory; the backup lies under it at its own path.
+FROM_RESTIC = "from-restic"
 # Qdrant's 1 GiB, the scratch server and the drill's own reads.
 MIN_AVAILABLE = 2 << 30
 # The coding units: none may run during a drill, so no deploy's post-check falls inside one.
@@ -270,13 +278,16 @@ class Drill:
 
     def __init__(self, backup: Path, *, run: Run, scratch_root: Path, pg_bin: str, image: str):
         self.backup, self.run, self.scratch_root, self.pg_bin, self.image = backup, run, scratch_root, pg_bin, image
-        self.snapshot = backup / "qdrant-full.snapshot"
         # Held here only: docker and the snapshot restore get it in their environment, curl on stdin.
         self.key = secrets.token_hex(32)
         self.scratch: Optional[Path] = None
         self.pg_started = False
         self.container_created = False
         self.failed = False
+
+    @property
+    def snapshot(self) -> Path:
+        return self.backup / "qdrant-full.snapshot"
 
     @property
     def pg(self) -> Path:
@@ -307,11 +318,12 @@ class Drill:
                                 "-c", sql)
 
     def perform(self) -> int:
-        """Both scratch instances, the restores, the checks; then the cleanup and the restore duration. 0 when every
-        check passed."""
+        """The restic round trip, both scratch instances, the restores, the checks; then the cleanup and the restore
+        duration. 0 when every check passed."""
         try:
             self.scratch = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=self.scratch_root))
             os.chmod(self.scratch, 0o711)
+            self.restic_round_trip()
             postgres = self.start_postgres()
             qdrant = self.start_qdrant()
             started = time.monotonic()
@@ -332,6 +344,44 @@ class Drill:
                 self.cleanup()
         print(f"restore duration: {duration // 60} min {duration % 60} s", flush=True)
         return 1 if self.failed else 0
+
+    def restic_round_trip(self) -> None:
+        """The backup through a scratch restic repository and back: ops/offsite_copy.sh, the step ops/backup.sh runs,
+        copies it in, restic restores it, and the restored copy must match its manifest, checksums included. Every leg
+        after this one then reads the restored copy; after a FAIL line, the backup itself."""
+        check = "restic round trip"
+        work = self.scratch / "restic"
+        work.mkdir(mode=0o700)
+        password = work / "password"
+        # The repository's password exists only in this file, which restic reads; nothing prints it.
+        with os.fdopen(os.open(password, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as file:
+            file.write(secrets.token_hex(32))
+        # No RESTIC_ variable of the caller's environment comes along: none may point restic at another repository or
+        # password. TMPDIR: restic's temporary files go in the scratch directory, which the cleanup removes.
+        env = {name: value for name, value in os.environ.items() if not name.startswith("RESTIC_")}
+        env.update(RESTIC_REPOSITORY=str(work / "repo"), RESTIC_PASSWORD_FILE=str(password),
+                   RESTIC_CACHE_DIR=str(work / "cache"), TMPDIR=str(work))
+        target = self.scratch / FROM_RESTIC
+        try:
+            initialised = self.call(check, "restic init", ["restic", "init"], env=env)
+        except FileNotFoundError:
+            self.fail(f"{check}: restic is not installed")
+            return
+        if not (initialised
+                and self.call(check, "offsite_copy.sh",
+                              ["bash", str(REPO / "ops" / "offsite_copy.sh"), str(self.backup)], env=env)
+                and self.call(check, "restic restore",
+                              ["restic", "restore", "latest", "--target", str(target)], env=env)):
+            return
+        restored = target / self.backup.relative_to(self.backup.anchor)
+        problems = backup_manifest.problems(restored, hashes=True)
+        for problem in problems:
+            self.fail(f"{check}: {problem}")
+        if problems:
+            return
+        files = json.loads((restored / backup_manifest.MANIFEST).read_text(encoding="utf-8"))["files"]
+        self.ok(f"{check}: {len(files)} files, checksums match")
+        self.backup = restored
 
     def start_postgres(self) -> bool:
         """The scratch server, running with production's roles; False after a FAIL line."""
