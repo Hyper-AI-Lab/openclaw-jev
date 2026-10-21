@@ -2012,3 +2012,71 @@ The runs took 12–14 min each, twice the usual; the host was busier.
 Nothing under `app/`, so the deploy restarts nothing.
 
 **Next:** PR, merge on green (K-35), deploy, then the K-36 host step.
+
+## 2026-10-21 13:05 UTC · WP-12 batch 3 merged and deployed; rmp-qdrant recreated (K-36); B2b-01 closed
+
+**Before merging:** the session had been interrupted for about a day.
+- Host check: up 2 d 14 h; all services active; 8 `next:` timers; the nightly backups ran on 10-20 and 10-21.
+- The only failed unit is Ubuntu's `fwupd-refresh.service` (firmware metadata). It is not RMP and is left as is; noted for WP-22's host hygiene.
+
+**PR #39:** CI `test` SUCCESS on head `75ff66f`; `origin/main` unchanged at `8947cb3`; no other open PRs. Squash-merged as `2a253b6`.
+
+**Deploy:** `deployed`; restarted nothing; canary ok; no units; CI success.
+
+**Host step WP12-06** (K-36), at 13:04Z:
+- **Checks before:** idle (0 user tasks, no coding units); outside the backup window; the live checkout at `2a253b6` with the guard; no one-off container.
+- **Before:** created `2026-06-07T10:08:21Z`, restart `unless-stopped`, ports 127.0.0.1:6333/6334, bind mount `/root/.openclaw/rmp/data/qdrant-server` → `/qdrant/storage`, image `qdrant/qdrant:v1.17.0`, `QDRANT__SERVICE__GRPC_PORT=6334`.
+- **`systemctl restart rmp-qdrant`:** rc 0, about 8 s (13:04:15–13:04:23). The journal shows a stop, then a start, then "Qdrant ready".
+- **After:** created `2026-10-21T13:04:17Z`, the restart time. Every other field is identical (cmp). `active`, `readyz` 200.
+- **Readiness** (`make -s readiness`): `vector_memory`, `task_registry_vector` and `vector_sync` pass.
+- **Collections green:** memories 2685, deep 1433, task registry 252, mem0migrations 1.
+- **Observation:** in the operator shell, `make readiness` warns `temporal_persistence`, because `TEMPORAL_POSTGRES_PWD` is only in the service environment. The API's readiness passes it. Ledgered as `OPS-2026-10-21-make-readiness-env` (WP-19).
+- **Rollback:** revert `2a253b6`, then `systemctl restart rmp-qdrant`.
+
+**Bookkeeping** (spec §7):
+- **B2b-01 closed.**
+- `phaseA/VISION_CONFORMANCE.md` R-148 repointed from `docker-compose.qdrant.yml:15` to `ops/start_qdrant.sh:43`, as the repo copy; the verdict stays MATCH.
+
+**Next:** WP-12 batch 4 (WP12-07…13).
+
+## 2026-10-21 13:06 UTC · WP-12 batch 4 started
+
+- **Branch:** `aura/wp-12-4-manifest` from `2a253b6`.
+- **Items:** WP12-07…13, Tier 1:
+  - manifest format 2 with sizes and sha256, where a missing or empty component fails the run;
+  - every dump and archive reads back;
+  - artifacts from the configured root, with the restore's root guard;
+  - the workspace archive; the dead `cron/jobs.json` and `temporal.db` copies go;
+  - the restore and the drill check checksums first;
+  - the working-directory test runs with `cwd=/`.
+- **Workflow:** run `wf_b3991d27-481`.
+- **Deploy:** restarts rmp-api and rmp-worker (a new `app/` file).
+- **Host step:** the next nightly backup is verified with `backup_manifest verify`.
+
+## 2026-10-21 22:38 UTC · WP-12 batch 4 implemented, reviewed and verified
+
+**Workflow `wf_b3991d27-481`:** resumed from cache after the usage limit cut off its round-2 closure re-review. `approved: true`.
+- **Implementer:** 10 commits for WP12-07…13, with deviations that are refinements (spec §13, amendment 5).
+- **Round 1:**
+  - **correctness:** approve, with non-blocking points (the backup root and SRC rules untested, `RMP_TEMPORAL_DBS` untested at script level, a warning with no reason);
+  - **closure:** one blocking finding. No test exercised the guard's ancestor rule, which protects the restore's `rm -rf`, because the spec's "ancestor" case equals RMP_DATA and is refused by the equality test first. Also non-blocking: a symlinked root was archived as a link, and the writer-crash path was untested.
+- **Fix round 1:** `e99dac7`, `f5d8564`, `09b4e61`, `5493dcd`, `c902e36`, `822fa6b`.
+- **Round 2:**
+  - **correctness:** approve;
+  - **closure:** approve, with a non-blocking point: `problems()` skipped a listed file that had no `files` entry.
+- **Fix round 2:** `5257b7a`, `cd8a823`.
+- **Round 3:** both approve. Closure's non-blocking point: after `rm -rf` of the root, a failed `mv` also deleted the extracted copy.
+
+**Fixed by me, `74b5655`:** a failed `rm` or `mv` keeps the restored copy and prints where; `test_a_failed_move_keeps_the_restored_artifacts_beside_the_root` covers it. The mutation (the old `rm && mv`) fails it.
+
+**My read of `ops/backup.sh` before the live run:**
+- the manifest writer's failure propagates through `tee` under `pipefail`;
+- live inputs:
+  - the artifact store is enabled, at root `data/artifacts`;
+  - `openclaw.json` is present;
+  - the workspace is about 1.7 MB after its excludes;
+- 99 GB of disk free; KEEP=14 complete backups.
+
+**Four-layout verify** (HEAD `74b5655`): default, live, coding-job and direct each gave 1507 passed, 1 skipped, leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. The runs took 13–15 min each.
+
+**Host step plan** (an adjustment, logged): run one backup through `rmp-backup.service` right after the deploy, while idle, instead of waiting for the nightly run. Then `backup_manifest verify` on it, then the drill on it, which exercises WP12-12 on real data. The nightly run is checked too.
