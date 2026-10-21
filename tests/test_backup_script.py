@@ -608,20 +608,25 @@ def test_a_symlinked_artifact_root_is_archived_as_its_directory_and_restored_thr
     assert [p.name for p in store.parent.iterdir()] == ["store"]
 
 
-def test_an_artifacts_archive_without_exactly_one_top_level_directory_is_not_restored(host):
+@pytest.mark.parametrize("entries, count", [(("artifacts/report.json", "stray.json"), 2), (("artifacts",), 1)])
+def test_an_artifacts_archive_without_exactly_one_top_level_directory_is_not_restored(host, entries, count):
     """The archive's one top-level directory replaces the root; with any other shape the root stays as it is, and
-    nothing is left beside it."""
+    nothing is left beside it. A lone top-level entry must be a directory itself, not a link to one."""
     _, dest, _, _ = host.run()
     root = host.tmp / "data" / "artifacts"
+    elsewhere = host.tmp / "elsewhere"
+    elsewhere.mkdir()
     with tarfile.open(dest / "artifacts.tar.gz", "w:gz") as tar:
-        for name in ("artifacts/report.json", "stray.json"):
+        for name in entries:
             info = tarfile.TarInfo(name)
+            if name == "artifacts":
+                info.type, info.linkname = tarfile.SYMTYPE, str(elsewhere)
             tar.addfile(info, io.BytesIO(b""))
     _artifact_store(host, root_path=str(root))
     tree = {str(p): _sha256(p) if p.is_file() else None for p in root.parent.rglob("*")}
     result = host.restore(dest)
     assert result.returncode == 1
-    assert "artifacts: artifacts.tar.gz holds 2 top-level entries, not one directory\n" in result.stderr
+    assert f"artifacts: artifacts.tar.gz holds {count} top-level entries, not one directory\n" in result.stderr
     assert "Restore INCOMPLETE: not restored: artifacts\n" in result.stderr
     assert {str(p): _sha256(p) if p.is_file() else None for p in root.parent.rglob("*")} == tree
 
