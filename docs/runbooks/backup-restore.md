@@ -16,7 +16,6 @@ Backups are stored in `/root/.openclaw/rmp/data/backups/<YYYYMMDDTHHMMSSZ>/`. Fi
 | `qdrant.tar.gz` | Embedded-mode Qdrant only. **Backups made before 2026-10-08 hold no Qdrant data**: their `qdrant.tar.gz` is a 110-byte tar of an empty directory |
 | `artifacts.tar.gz` | The evidence store |
 | `openclaw-state/` | OpenClaw's agent and state SQLite stores, taken with the backup API and checksummed |
-| `temporal.db` | The legacy Temporal SQLite file from before Temporal moved to Postgres. It is no longer live |
 | `settings.json`, `openclaw.json`, `cron_jobs.json` | Config snapshots |
 | `manifest.json` | Contains `"failures"`, which is empty when every component succeeded |
 | `backup.log` | The run's log |

@@ -144,31 +144,6 @@ if [[ -d "${ART}" ]]; then
   tar -czf "${DEST}/artifacts.tar.gz" -C "${DATA_DIR}" artifacts 2>>"${LOG}" || fail artifacts "tar failed"
 fi
 
-# Legacy Temporal SQLite file, from before Temporal moved to Postgres (SQLite backup API, not a hot cp)
-TEMPORAL_DB="${DATA_DIR}/temporal.db"
-if [[ -f "${TEMPORAL_DB}" ]]; then
-  log "Backing up the legacy Temporal SQLite file..."
-  if "${PY}" - <<PY
-import sqlite3
-src = sqlite3.connect("${TEMPORAL_DB}", timeout=10)
-dst = sqlite3.connect("${DEST}/temporal.db")
-try:
-    src.backup(dst)
-    print("temporal sqlite backup ok")
-finally:
-    dst.close()
-    src.close()
-PY
-  then
-    :
-  else
-    log "WARN: sqlite backup API failed; copying files"
-    cp -a "${TEMPORAL_DB}" "${DEST}/temporal.db" || fail temporal-sqlite "copy failed"
-    if [[ -f "${TEMPORAL_DB}-wal" ]]; then cp -a "${TEMPORAL_DB}-wal" "${DEST}/temporal.db-wal" || fail temporal-sqlite "wal copy failed"; fi
-    if [[ -f "${TEMPORAL_DB}-shm" ]]; then cp -a "${TEMPORAL_DB}-shm" "${DEST}/temporal.db-shm" || fail temporal-sqlite "shm copy failed"; fi
-  fi
-fi
-
 # OpenClaw's agent and state stores (sessions, transcripts, auth, cron): SQLite backup API
 log "Backing up OpenClaw stores..."
 "${PY}" "${RMP_ROOT}/ops/backup_openclaw_state.py" backup --dest "${DEST}/openclaw-state" \

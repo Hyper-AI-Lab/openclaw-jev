@@ -435,6 +435,14 @@ def test_embedded_mode_archives_the_storage_directory(host):
     assert calls == []
 
 
+def test_the_legacy_temporal_sqlite_file_is_not_copied(host):
+    """data/temporal.db is dead since Temporal moved to Postgres: it stays on disk and is no longer copied."""
+    _store(host.tmp / "data" / "temporal.db", range(3))
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert not list(dest.glob("temporal.db*")) and (host.tmp / "data" / "temporal.db").is_file()
+
+
 def _dated(root, days, old, failures=(), month="09"):
     """Dated backups as ops/backup.sh leaves them; ``failures`` marks them failed (unfinished if None)."""
     for day in days:
