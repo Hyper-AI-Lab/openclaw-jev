@@ -17,10 +17,12 @@ It drills the newest stamped backup under data/backups whose manifest has "failu
   ops/restore_qdrant_snapshot.sh get it in their environment and curl on stdin, never on a command line, and nothing
   prints it. 6937 is in coding.blocked_tcp_ports, so aura-coder cannot reach the copy of Aura's memory.
 
-The checks: each database's owner, rmp_db's vector extension, every table's row count against its COPY block in the
-dump, the collections against the snapshot, the OpenClaw store copies, and every archive read to its end. Each prints
-one line, ok or FAIL, with names and counts only. The last line is the restore duration, from the first database
-restore to the end of the Qdrant restore: the steps a real restore repeats on the same data.
+The checks: first the backup against its manifest, with every file's size and checksum, before anything is created; a
+backup that does not verify is not drilled. Then each database's owner, rmp_db's vector extension, every table's row
+count against its COPY block in the dump, the collections against the snapshot, the OpenClaw store copies, and every
+archive read to its end. Each prints one line, ok or FAIL, with names and counts only. The last line is the restore
+duration, from the first database restore to the end of the Qdrant restore: the steps a real restore repeats on the
+same data.
 
 It exits 0 when every check passed and 1 when one failed. It exits 2, having created nothing, when the host is not
 ready for it. The scratch instances and the scratch directory are removed however the drill ends, after a SIGTERM,
@@ -56,6 +58,7 @@ sys.path.insert(0, str(REPO))
 
 from app.coding import firewall  # noqa: E402
 from app.config import RMP_DATA_DIR, get_coding_config  # noqa: E402
+from app.production import backup_manifest  # noqa: E402
 from ops import backup_openclaw_state  # noqa: E402
 
 # The server that made the dumps; RMP_PG_BIN points the tests elsewhere.
@@ -543,6 +546,14 @@ def main(argv: Optional[Sequence[str]] = None, *, run: Run = _run, probes: Optio
             print(f"refused: {reason}")
         return 2
     print(f"backup: {backup}", flush=True)
+    # The backup against its manifest first, checksums included: one that does not verify is not drilled, and the
+    # drill creates nothing.
+    problems = backup_manifest.problems(backup, hashes=True)
+    for problem in problems:
+        print(f"FAIL backup manifest: {problem}", flush=True)
+    if problems:
+        return 1
+    print("ok backup manifest: every file's size and checksum match", flush=True)
     # A hangup the caller ignores, as nohup does, stays ignored: the drill then outlives its session.
     handled = [sig for sig in SIGNALS if not (sig == signal.SIGHUP and signal.getsignal(sig) == signal.SIG_IGN)]
     previous = {sig: signal.signal(sig, _exit_on_signal) for sig in handled}

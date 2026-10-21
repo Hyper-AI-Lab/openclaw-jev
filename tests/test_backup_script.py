@@ -571,7 +571,8 @@ def test_a_moved_artifact_store_is_backed_up_and_restored(host):
     (root / "added.json").write_text("{}")
     result = host.restore(dest)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert sorted(p.name for p in root.iterdir()) == ["report.json"] and (root / "report.json").read_text() == '{"v": 1}'
+    assert sorted(p.name for p in root.iterdir()) == ["report.json"]
+    assert (root / "report.json").read_text() == '{"v": 1}'
     # Extracted beside the root, then moved into its place: nothing is left beside it.
     assert [p.name for p in root.parent.iterdir()] == ["evidence"]
     assert (host.tmp / "data" / "artifacts" / "report.json").read_text() == "{}"
@@ -694,6 +695,34 @@ def test_the_snapshot_restore_sends_a_given_key_on_stdin_only(host):
         assert result.returncode == 0, result.stdout + result.stderr
         calls = host.log("curl-argv.log")
         assert len(calls) == 2 and not any("-K" in call["argv"] or call["headers"] for call in calls)
+
+
+def test_restore_warns_before_its_prompt_when_a_file_does_not_match_its_checksum(host):
+    """A disaster may leave only a damaged backup: the restore verifies it, warns before its prompt, and the operator
+    decides. The backup's path may be relative to where the restore runs."""
+    _, dest, _, _ = host.run()
+    dump = dest / "rmp_db.dump"
+    dump.write_bytes(dump.read_bytes()[:-1] + b"!")
+    for src in (dest, dest.relative_to(host.tmp)):
+        result = host.restore(src, answer="n\n")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.startswith("WARNING: this backup does not verify:\n"
+                                        "rmp_db.dump does not match its checksum\n"
+                                        f"=== RMP Restore from {src} ===\n"), result.stdout
+        assert host.log("systemctl.log") == [] and host.log("sudo.log") == []
+    # A backup made before manifest format 2 gets its note; one that verifies, no warning.
+    dump.write_bytes(b"PGDMP")
+    manifest = dest / "manifest.json"
+    complete = manifest.read_text()
+    manifest.write_text(json.dumps({"timestamp": dest.name, "failures": []}))
+    result = host.restore(dest, answer="n\n")
+    assert result.stdout.startswith("WARNING: this backup does not verify:\n"
+                                    "made before manifest format 2 (no file list)\n"
+                                    "=== RMP Restore from "), result.stdout
+    manifest.write_text(complete)
+    result = host.restore(dest, answer="n\n")
+    assert result.returncode == 0 and result.stdout.startswith("=== RMP Restore from "), result.stdout
+    assert "WARNING" not in result.stdout + result.stderr
 
 
 def test_restore_recreates_each_database_from_its_dump_through_the_postgres_superuser(host):

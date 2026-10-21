@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Restore RMP from a backup directory made by ops/backup.sh: the RMP and Temporal databases, Qdrant, artifacts,
 # OpenClaw's stores and settings. Runbook: docs/runbooks/backup-restore.md. Exits 1, naming what was not restored, if
-# any part fails.
+# any part fails. Before its prompt it verifies the backup against its manifest, checksums included, and warns when it
+# does not verify.
 #
 # Nothing may write to a store while it is replaced. The restore holds the code-reload lock, which a deploy and a code
 # reload take too, refuses while a deploy unit is active, and stops every writer first: the RMP timers and their runs,
@@ -37,9 +38,13 @@ if [[ ! -d "$SRC" ]]; then
   echo "Backup directory not found: $SRC"
   exit 1
 fi
-if [[ -f "${SRC}/manifest.json" ]]; then
-  failures="$("${PY}" -c 'import json, sys; print(" ".join(json.load(open(sys.argv[1])).get("failures") or []))' "${SRC}/manifest.json")"
-  [[ -z "${failures}" ]] || echo "WARNING: this backup recorded failures when it was made: ${failures}"
+# The backup's own check, checksums included (app/production/backup_manifest.py), run from the checkout on the backup's
+# absolute path. A disaster may leave only a damaged backup, so one that does not verify is a warning, not a refusal:
+# the operator decides at the prompt.
+if ! problems="$(src="$(realpath -- "${SRC}")" && cd "${RMP_ROOT}" \
+    && "${PY}" -m app.production.backup_manifest verify "${src}")"; then
+  echo "WARNING: this backup does not verify:"
+  [[ -z "${problems}" ]] || printf '%s\n' "${problems}"
 fi
 
 echo "=== RMP Restore from $SRC ==="
