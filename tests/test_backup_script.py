@@ -741,6 +741,27 @@ def test_a_failed_run_prunes_nothing(host):
     assert len([p for p in host.backups.iterdir() if p.name[:2] == "20"]) == 17
 
 
+def _python_without_the_manifest_module(host):
+    """An RMP_PYTHON that runs everything but ``-m app.production.backup_manifest``, which fails as a crash would."""
+    python = host.tmp / "python"
+    python.write_text('#!/bin/sh\nif [ "$1 $2" = "-m app.production.backup_manifest" ]; then\n'
+                      '  echo "Traceback: the manifest module crashed" >&2\n  exit 1\nfi\n'
+                      f'exec "{sys.executable}" "$@"\n')
+    python.chmod(0o755)
+    return str(python)
+
+
+def test_a_run_whose_manifest_is_not_written_fails_and_prunes_nothing(host):
+    """Without a manifest nothing records what the run holds: it is a failed run, whatever its components did."""
+    _dated(host.backups, range(1, 17), time.time() - 30 * 86400)
+    result, dest, manifest, _ = host.run(RMP_PYTHON=_python_without_the_manifest_module(host))
+    assert result.returncode == 1 and manifest is None and not list(dest.glob("manifest.json*"))
+    assert "FAIL: manifest: the manifest was not written" in result.stdout
+    assert "Backup INCOMPLETE: manifest failed" in result.stdout and "no older backup was pruned" in result.stdout
+    assert "the manifest module crashed" in result.stderr
+    assert len([p for p in host.backups.iterdir() if p.name[:2] == "20"]) == 17
+
+
 def test_a_second_run_while_one_holds_the_lock_exits_without_touching_anything(host):
     import fcntl
     host.backups.mkdir(parents=True)
