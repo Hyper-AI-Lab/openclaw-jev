@@ -642,6 +642,23 @@ def test_an_artifacts_archive_without_exactly_one_top_level_directory_is_not_res
     assert {str(p): _sha256(p) if p.is_file() else None for p in root.parent.rglob("*")} == tree
 
 
+def test_a_failed_move_keeps_the_restored_artifacts_beside_the_root(host):
+    """Once the old root is removed, the restored copy is the only one on disk: a failed mv keeps it beside the root,
+    and the restore says where, instead of deleting it with its temporary directory."""
+    _, dest, _, _ = host.run()
+    root = host.tmp / "data" / "artifacts"
+    _artifact_store(host, root_path=str(root))
+    mv = host.tmp / "bin" / "mv"
+    mv.write_text("#!/bin/sh\necho 'mv: cannot move: Device or resource busy' >&2\nexit 1\n")
+    mv.chmod(0o755)
+    result = host.restore(dest)
+    assert result.returncode == 1
+    assert "Restore INCOMPLETE: not restored: artifacts\n" in result.stderr
+    [kept] = root.parent.glob(".artifacts.restoring.*")
+    assert (f"artifacts: could not move the restored copy into {root}; it is kept in {kept}\n") in result.stderr
+    assert (kept / "artifacts" / "report.json").read_text() == "{}" and not root.exists()
+
+
 @pytest.mark.parametrize("root", ["ancestor", "relative"])
 def test_the_restore_refuses_an_artifact_root_that_would_delete_more_than_artifacts(host, root):
     """A root that holds the backups (here the data directory), or a relative one, which would resolve against

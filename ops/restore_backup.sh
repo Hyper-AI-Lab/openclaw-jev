@@ -267,9 +267,17 @@ restore_artifacts() {
     mapfile -t top < <(find "${work}" -mindepth 1 -maxdepth 1)
     if (( ${#top[@]} != 1 )) || [[ ! -d "${top[0]}" || -L "${top[0]}" ]]; then
       echo "artifacts: artifacts.tar.gz holds ${#top[@]} top-level entries, not one directory" >&2
-    elif rm -rf -- "${real}" && mv -- "${top[0]}" "${real}"; then
-      rmdir -- "${work}"
-      return 0
+    else
+      # From here the old root may be gone: a failed step keeps the restored copy, the one the restore has left.
+      if ! rm -rf -- "${real}"; then
+        echo "artifacts: could not remove ${real}; the restored copy is kept in ${work}" >&2
+      elif ! mv -- "${top[0]}" "${real}"; then
+        echo "artifacts: could not move the restored copy into ${real}; it is kept in ${work}" >&2
+      else
+        rmdir -- "${work}"
+        return 0
+      fi
+      return 1
     fi
   fi
   rm -rf -- "${work}"
