@@ -91,10 +91,60 @@ bash /root/.openclaw/rmp/ops/restore_qdrant_snapshot.sh <backup>/qdrant-full.sna
 
 Each collection is uploaded with `POST /collections/<c>/snapshots/upload?priority=snapshot`, which replaces that collection's data.
 
-**Whole store from scratch, as an alternative:** Qdrant restores a full snapshot only at startup.
-1. Stop `rmp-qdrant`.
-2. Start the container once with `--storage-snapshot /path/to/qdrant-full.snapshot --force-snapshot`, and the snapshot mounted into it.
-3. Restart it normally.
+**Whole store from scratch, as an alternative:** Qdrant restores a full snapshot only at startup. This needs Kirill's OK and an idle window, because Aura's memory is offline throughout; recall falls back to Postgres full-text search. Several things would otherwise start `rmp-qdrant` in the middle of it, and its start recreates the container on the storage being rebuilt:
+- the canary sentinel, which restarts an inactive `rmp-qdrant` whenever a run finds a canary issue. It runs from its own timer, and from the health canary and the memory canary when they fail, which they do while Qdrant is down;
+- any start or restart of `rmp-api` or `rmp-worker`, which want `rmp-qdrant` (`Wants=`): the Temporal watchdog's recovery, a deploy, an automatic restart after a crash, or a start of a unit that wants them in turn (`openclaw-gateway`, `rmp-code-watch`, whose code reload restarts both);
+- a boot, `make qdrant` or `make migrate-qdrant`, or a `systemctl start` or `restart` of `rmp-qdrant` by hand.
+
+So step 1 stops every `rmp-*` timer, as the restore does, which also keeps a backup from taking a snapshot of the storage; merge nothing that deploys before step 4 has ended. And while the one-off container `rmp-qdrant-from-snapshot` of step 3 exists, `ops/start_qdrant.sh` refuses to start `rmp-qdrant`, whatever asks for it: the unit then shows `failed`, and step 4's start works all the same. Step 3 creates the one-off before it checks that `rmp-qdrant` is stopped, and starts it only after that check, so no start of `rmp-qdrant` through systemd puts two Qdrants on the storage, whenever it comes. Run no `make qdrant`, `make migrate-qdrant` or `ops/start_qdrant.sh` by hand during the procedure: `systemctl is-active` does not see such a start, and one that passed its refusal check just before the create still runs its container.
+
+1. Run the timer check, stop every `rmp-*` timer, and ask whether any of their services is running:
+   ```bash
+   systemctl list-timers 'rmp-*' --all --no-pager --no-legend | awk '{print ($1 == "-" ? "NO NEXT: " : "next: ") $(NF-1)}'
+   systemctl stop rmp-backup.timer rmp-canary-sentinel.timer rmp-canary.timer rmp-janitor-frequent.timer rmp-janitor.timer rmp-memory-canary.timer rmp-temporal-vacuum.timer rmp-temporal-watchdog.timer
+   systemctl is-active rmp-backup.service rmp-canary-sentinel.service rmp-canary.service rmp-janitor-frequent.service rmp-janitor.service rmp-memory-canary.service rmp-temporal-vacuum.service rmp-temporal-watchdog.service
+   ```
+   All are oneshot services, which show `activating` while a run is in progress. If any line is `activating` or `active`, wait for that run to end and ask again: a canary run in progress may still call the sentinel at its end. Then run the timer check again: every line shows `NO NEXT:`.
+2. Stop Qdrant. This stops the container `rmp-qdrant`, whose data stays in the bind mount. Then check the container itself, because `systemctl stop` reports success even when the unit's stop script fails (the unit then shows `failed`):
+   ```bash
+   systemctl stop rmp-qdrant
+   docker inspect -f '{{.State.Running}}' rmp-qdrant
+   ```
+   It must print `false`, or fail with no such object where `rmp-qdrant` does not exist (step 3 says what to do then). If it prints `true`, Qdrant still runs on the storage: do not go on. `journalctl -u rmp-qdrant -n 20` shows why the stop failed; fix that, run `docker stop rmp-qdrant` and check again.
+3. Restore the storage with a one-off container named `rmp-qdrant-from-snapshot`, never `rmp-qdrant`. It mounts the same storage directory and the snapshot, publishes no port, and runs the image on `ops/start_qdrant.sh`'s `IMAGE=` line, the one step 4 runs on the restored storage, which the first line reads and prints. Create it first: from then on `ops/start_qdrant.sh` refuses to start `rmp-qdrant`. Then ask whether `rmp-qdrant` runs or is starting, which something may have caused since step 2:
+   ```bash
+   image="$(sed -n 's/^IMAGE="\(.*\)"$/\1/p' /root/.openclaw/rmp/ops/start_qdrant.sh)"; echo "${image}"
+   docker create --name rmp-qdrant-from-snapshot \
+     -v /root/.openclaw/rmp/data/qdrant-server:/qdrant/storage \
+     -v <backup>/qdrant-full.snapshot:/qdrant/full.snapshot:ro \
+     "${image}" \
+     ./qdrant --storage-snapshot /qdrant/full.snapshot --force-snapshot
+   systemctl is-active rmp-qdrant
+   docker inspect -f '{{.State.Running}}' rmp-qdrant
+   ```
+   If the `docker create` fails, it created nothing: fix what it says and run the whole block again, so that both questions come after a create that succeeded. If it fails because a container named `rmp-qdrant-from-snapshot` exists, left by an earlier attempt or a reboot, remove that with `docker rm rmp-qdrant-from-snapshot` and run the whole block again.
+
+   `systemctl is-active` must print `inactive` or `failed`, and `docker inspect` `false`, or fail with no such object. Anything else means a Qdrant runs or is starting on the storage. If `systemctl is-active` prints `active` or `activating`, run `systemctl stop rmp-qdrant`. If `docker inspect` still prints `true`, the container runs without systemd knowing of it (a start by hand, or one whose start systemd cut short): run `docker stop rmp-qdrant`. Then ask both again. The one-off never starts beside a running Qdrant. Then start the one-off:
+   ```bash
+   docker start rmp-qdrant-from-snapshot
+   docker logs rmp-qdrant-from-snapshot 2>&1 | grep -c 'Qdrant HTTP listening on 6333'
+   ```
+   It is ready when the `docker logs` line prints `1`; repeat that line until it does. Then remove it:
+   ```bash
+   docker stop rmp-qdrant-from-snapshot && docker rm rmp-qdrant-from-snapshot
+   ```
+   If `docker inspect -f '{{.State.Status}}' rmp-qdrant-from-snapshot` prints `exited` before that line appears, the restore failed, and the storage may hold some collections from the snapshot and not others: `docker logs rmp-qdrant-from-snapshot` says why. Remove the container with the same command and run the whole first block of this step again, with the same backup or an older one, so that both questions come after the create again. Go on to step 4 only after the `docker logs` line printed `1`. If the host reboots during the procedure, start again at step 1, because a boot arms the timers again; step 3 then finds the old one-off as above.
+4. Start Qdrant, which recreates `rmp-qdrant` on the restored storage. Then readiness shows `vector_memory`, `task_registry_vector` and `vector_sync` at `pass`:
+   ```bash
+   systemctl start rmp-qdrant
+   cd /root/.openclaw/rmp && make -s readiness | python3 -c 'import json,sys; d=json.load(sys.stdin); print({c["name"]: c["status"] for c in d["checks"] if c["name"] in ("vector_memory","task_registry_vector","vector_sync")})'
+   ```
+5. Start the timers again, then run the timer check: 8 `next:` lines.
+   ```bash
+   systemctl start rmp-backup.timer rmp-canary-sentinel.timer rmp-canary.timer rmp-janitor-frequent.timer rmp-janitor.timer rmp-memory-canary.timer rmp-temporal-vacuum.timer rmp-temporal-watchdog.timer
+   systemctl list-timers 'rmp-*' --all --no-pager --no-legend | awk '{print ($1 == "-" ? "NO NEXT: " : "next: ") $(NF-1)}'
+   ```
+   A timer whose interval passed meanwhile runs its service at once and shows `NO NEXT:` until that run ends: wait for it and run the check again. A timer still without a next elapse is re-armed as in step 8 of the restore above.
 
 ## Quarterly DR drill
 

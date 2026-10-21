@@ -648,15 +648,16 @@ Core entities: `Task`, `ProcessRun`, `Step`, `Observation`, `Event`, `MemoryItem
 **Ops:**
 
 ```bash
-# Start/stop (also systemd unit rmp-qdrant.service)
-make -C /root/.openclaw/rmp qdrant
-bash /root/.openclaw/rmp/ops/stop_qdrant.sh
+# Start, stop, or recreate after a flag change (rmp-qdrant.service runs ops/start_qdrant.sh and ops/stop_qdrant.sh)
+systemctl start rmp-qdrant
+systemctl stop rmp-qdrant
+systemctl restart rmp-qdrant
 
 # One-time migration from embedded storage
 make -C /root/.openclaw/rmp migrate-qdrant
 ```
 
-Compose file: `docker-compose.qdrant.yml`. `rmp-api` and `rmp-worker` systemd units `After=rmp-qdrant.service`.
+`ops/start_qdrant.sh` stops the container `rmp-qdrant` gracefully, removes it and recreates it from its `docker run` flags at every start; the data stays in the bind mount. `ops/stop_qdrant.sh` stops it. `rmp-api` and `rmp-worker` systemd units `After=rmp-qdrant.service`.
 
 **Key resolution:** Chat NVIDIA keys from `/etc/openclaw/openclaw.env` → SQLite `authProfiles.store`. Embeddings use `OPENAI_API_KEY` → `openai:default`.
 
