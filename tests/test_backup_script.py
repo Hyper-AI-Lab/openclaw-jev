@@ -490,6 +490,17 @@ def test_every_dump_bounds_its_lock_wait(host):
     assert "rmp_db" in dumps[0] and dumps[1][-1] == "temporal" and dumps[2][-1] == "temporal_visibility"
 
 
+def test_the_manifest_expects_a_dump_of_each_temporal_database_the_run_was_set_to_dump(host):
+    result, dest, manifest, _ = host.run(RMP_TEMPORAL_DBS="temporal")
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert manifest["components"]["temporal"] == ["temporal.dump"] and not (dest / "temporal_visibility.dump").exists()
+    # A run set to dump none has no Temporal backup: that fails the component.
+    shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+    result, dest, manifest, _ = host.run(RMP_TEMPORAL_DBS="")
+    assert result.returncode == 1 and manifest["failures"] == ["temporal"]
+    assert manifest["components"]["temporal"] == [] and not list(dest.glob("temporal*.dump"))
+
+
 def test_embedded_mode_archives_the_storage_directory(host):
     storage = host.tmp / "qdrant-embedded"
     (storage / "collection").mkdir(parents=True)
