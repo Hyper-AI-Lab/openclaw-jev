@@ -839,6 +839,18 @@ def test_restore_warns_before_its_prompt_when_a_file_does_not_match_its_checksum
     assert "WARNING" not in result.stdout + result.stderr
 
 
+def test_restore_warns_before_its_prompt_when_the_check_itself_cannot_run(host):
+    """A fresh host whose venv is not built cannot run the check: the warning says so, and its error is on stderr."""
+    _, dest, _, _ = host.run()
+    result = host.restore(dest, answer="n\n", RMP_PYTHON=_python_without_the_manifest_module(host))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.startswith("WARNING: this backup does not verify:\n"
+                                    "the check itself could not run (its error is on stderr)\n"
+                                    "=== RMP Restore from "), result.stdout
+    assert "the manifest module crashed" in result.stderr
+    assert host.log("systemctl.log") == [] and host.log("sudo.log") == []
+
+
 def test_restore_recreates_each_database_from_its_dump_through_the_postgres_superuser(host):
     """The rmp role has neither CREATEDB nor superuser: dropdb and createdb as rmp would leave rmp_db dropped."""
     _, dest, _, _ = host.run()

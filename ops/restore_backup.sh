@@ -40,11 +40,11 @@ if [[ ! -d "$SRC" ]]; then
 fi
 # The backup's own check, checksums included (app/production/backup_manifest.py), run from the checkout on the backup's
 # absolute path. A disaster may leave only a damaged backup, so one that does not verify is a warning, not a refusal:
-# the operator decides at the prompt.
+# the operator decides at the prompt. A check that fails without naming a problem could not run, and says so.
 if ! problems="$(src="$(realpath -- "${SRC}")" && cd "${RMP_ROOT}" \
     && "${PY}" -m app.production.backup_manifest verify "${src}")"; then
   echo "WARNING: this backup does not verify:"
-  [[ -z "${problems}" ]] || printf '%s\n' "${problems}"
+  printf '%s\n' "${problems:-the check itself could not run (its error is on stderr)}"
 fi
 
 echo "=== RMP Restore from $SRC ==="
