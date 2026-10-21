@@ -311,6 +311,8 @@ def host(tmp_path):
               "openclaw.sqlite": home / "state" / "openclaw.sqlite"}
     for rows, store in enumerate(stores.values(), start=2):
         _store(store, range(rows))
+    (home / "workspace").mkdir()
+    (home / "workspace" / "AGENTS.md").write_text("# Aura\n")
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"vector_memory": {"qdrant_mode": "server", "qdrant_host": "127.0.0.1", "qdrant_port": 6333}}))
     env = {**os.environ, "RMP_ROOT": str(REPO), "RMP_DATA_DIR": str(data), "RMP_BACKUP_ROOT": str(data / "backups"),
@@ -441,6 +443,31 @@ def test_the_legacy_temporal_sqlite_file_is_not_copied(host):
     result, dest, manifest, _ = host.run()
     assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
     assert not list(dest.glob("temporal.db*")) and (host.tmp / "data" / "temporal.db").is_file()
+
+
+def test_the_workspace_notes_are_archived_without_git_venv_chat_logs_or_logs(host):
+    workspace = host.tmp / "openclaw" / "workspace"
+    for name in (".git/config", "chat_logs/x", "moltmarket_venv/y", "a.log", "notes/b.log", "notes/plan.md"):
+        (workspace / name).parent.mkdir(parents=True, exist_ok=True)
+        (workspace / name).write_text(name)
+    (host.tmp / "openclaw" / "cron").mkdir()
+    (host.tmp / "openclaw" / "cron" / "jobs.json").write_text("{}")
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    with tarfile.open(dest / "workspace.tar.gz") as tar:
+        names = set(tar.getnames())
+    assert {"workspace", "workspace/AGENTS.md", "workspace/notes/plan.md"} <= names
+    assert not names & {"workspace/.git", "workspace/.git/config", "workspace/chat_logs", "workspace/chat_logs/x",
+                        "workspace/moltmarket_venv", "workspace/moltmarket_venv/y", "workspace/a.log",
+                        "workspace/notes/b.log"}
+    assert oct((dest / "workspace.tar.gz").stat().st_mode & 0o777) == "0o600"
+    # OpenClaw keeps its cron jobs in its state store, which openclaw-state/ holds.
+    assert not (dest / "cron_jobs.json").exists()
+    shutil.rmtree(workspace)
+    shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 1 and manifest["failures"] == ["workspace"]
+    assert f"FAIL: workspace: {workspace} is missing" in result.stdout and not (dest / "workspace.tar.gz").exists()
 
 
 def _dated(root, days, old, failures=(), month="09"):

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# RMP production backup: Postgres (RMP and Temporal), a Qdrant snapshot, artifacts, the OpenClaw stores and config
-# snapshots. Every component runs even when one fails; the failures are listed in manifest.json, no older backup
-# is pruned, and the script exits 1, so rmp-backup.service shows the run as failed instead of passing.
+# RMP production backup: Postgres (RMP and Temporal), a Qdrant snapshot, artifacts, the OpenClaw stores, Aura's
+# workspace notes and config snapshots. Every component runs even when one fails; the failures are listed in
+# manifest.json, no older backup is pruned, and the script exits 1, so rmp-backup.service shows the run as failed
+# instead of passing.
 # Restore: ops/restore_backup.sh (runbook: docs/runbooks/backup-restore.md).
 set -euo pipefail
 umask 077
@@ -149,10 +150,19 @@ log "Backing up OpenClaw stores..."
 "${PY}" "${RMP_ROOT}/ops/backup_openclaw_state.py" backup --dest "${DEST}/openclaw-state" \
   >>"${LOG}" 2>&1 || fail openclaw-state "the OpenClaw store backup failed"
 
-# Config snapshots (absent files are skipped)
+# Aura's workspace notes, without the git history, which can hold secrets, the moltmarket_venv virtualenv, the chat logs
+# and log files. Restored by hand (docs/runbooks/backup-restore.md).
+if [[ -d "${OPENCLAW_HOME}/workspace" ]]; then
+  log "Archiving the OpenClaw workspace..."
+  tar -czf "${DEST}/workspace.tar.gz" -C "${OPENCLAW_HOME}" --exclude=workspace/.git --exclude=workspace/moltmarket_venv \
+    --exclude=workspace/chat_logs --exclude='*.log' workspace 2>>"${LOG}" || fail workspace "tar of the workspace failed"
+else
+  fail workspace "${OPENCLAW_HOME}/workspace is missing"
+fi
+
+# Config snapshots (absent files are skipped). OpenClaw's cron jobs live in its state store, copied above.
 cp -a "${SETTINGS}" "${DEST}/settings.json" 2>/dev/null || true
 cp -a "${OPENCLAW_HOME}/openclaw.json" "${DEST}/openclaw.json" 2>/dev/null || true
-cp -a "${OPENCLAW_HOME}/cron/jobs.json" "${DEST}/cron_jobs.json" 2>/dev/null || true
 
 # Manifest
 failures_json="$(printf '%s\n' "${FAILURES[@]+"${FAILURES[@]}"}" | "${PY}" -c 'import json, sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l]))')"

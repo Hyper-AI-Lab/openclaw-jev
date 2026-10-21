@@ -15,8 +15,9 @@ Backups are stored in `/root/.openclaw/rmp/data/backups/<YYYYMMDDTHHMMSSZ>/`. Fi
 | `qdrant-full.snapshot` | A full Qdrant snapshot taken through its API. It holds one snapshot per collection plus `config.json`. Its size and checksum are verified against Qdrant's report, and the copy on the server is deleted afterwards |
 | `qdrant.tar.gz` | Embedded-mode Qdrant only. **Backups made before 2026-10-08 hold no Qdrant data**: their `qdrant.tar.gz` is a 110-byte tar of an empty directory |
 | `artifacts.tar.gz` | The evidence store |
-| `openclaw-state/` | OpenClaw's agent and state SQLite stores, taken with the backup API and checksummed |
-| `settings.json`, `openclaw.json`, `cron_jobs.json` | Config snapshots |
+| `openclaw-state/` | OpenClaw's agent and state SQLite stores, taken with the backup API and checksummed. They hold OpenClaw's cron jobs too |
+| `workspace.tar.gz` | Aura's workspace notes (`/root/.openclaw/workspace`), without `.git`, `moltmarket_venv`, `chat_logs` and `*.log` files. It holds the same classes of secrets as the OpenClaw store copies |
+| `settings.json`, `openclaw.json` | Config snapshots |
 | `manifest.json` | Contains `"failures"`, which is empty when every component succeeded |
 | `backup.log` | The run's log |
 
@@ -66,12 +67,18 @@ The script does the following:
 7. Restores artifacts, OpenClaw's stores and settings. The stores (sessions, transcripts, auth profiles, cron jobs) are coupled to `rmp_db`, so they come back with it. `ops/backup_openclaw_state.py restore` checks every copy's checksum and integrity before it replaces anything, and refuses while the gateway runs.
 8. When every part was restored, starts what it stopped: `temporal`, `rmp-api`, `rmp-worker`, then the gateway and `rmp-code-watch`, then the timers. Then it runs the timer check, one `next: <timer>` line per timer. A timer whose interval passed during the restore runs its service at once and shows no next elapse until that run ends, so the restore waits up to 15 minutes for such a run. A `NO NEXT: <timer>` line left makes it exit 1. Then wait for the run to end, or re-arm the timer: `systemctl start <timer>`, and if it still has no next elapse, `systemctl start <stem>.service` once, in an idle window. The check is `systemctl list-timers 'rmp-*' --all --no-pager --no-legend | awk '{print ($1 == "-" ? "NO NEXT: " : "next: ") $(NF-1)}'`.
 
-**Not restored by the script:** `openclaw.json`. A verbatim copy undoes what RMP applied to it since the backup, so put it back by hand only when the live file is lost or damaged, then apply RMP's model policy to it again:
+**Not restored by the script:**
+- `openclaw.json`. A verbatim copy undoes what RMP applied to it since the backup, so put it back by hand only when the live file is lost or damaged, then apply RMP's model policy to it again:
 
-```bash
-cp -a <backup>/openclaw.json /root/.openclaw/openclaw.json
-cd /root/.openclaw/rmp && venv/bin/python -c 'from app.llm.model_policy import apply_openclaw_policy; print(apply_openclaw_policy()["changed"])'
-```
+  ```bash
+  cp -a <backup>/openclaw.json /root/.openclaw/openclaw.json
+  cd /root/.openclaw/rmp && venv/bin/python -c 'from app.llm.model_policy import apply_openclaw_policy; print(apply_openclaw_policy()["changed"])'
+  ```
+- `workspace.tar.gz`. The workspace notes are Aura's own working files, which a restore of the databases should not roll back. Put them back by hand when the live workspace is lost or damaged; files the archive holds replace the live ones, and the rest stay:
+
+  ```bash
+  tar -xzf <backup>/workspace.tar.gz -C /root/.openclaw
+  ```
 
 **If a part fails** after the first database step, or a signal ends the restore after that step and before its last (Ctrl-C, a `kill`, or an SSH session that hangs up), the restore starts nothing, because a store may be half restored: rmp-api runs `create_all` on `rmp_db` at start, and the watchdog would restart Temporal on a partial database. It exits non-zero and prints:
 - `Restore INCOMPLETE: not restored: …` for a failed part, and `Restore INCOMPLETE: it ended before its last step` when a signal ended it;
