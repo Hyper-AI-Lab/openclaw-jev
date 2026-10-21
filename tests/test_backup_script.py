@@ -120,11 +120,18 @@ with open(os.path.join(os.environ["FAKE_STATE"], "sudo.log"), "a") as log:
 sys.exit(subprocess.run(args, input=data).returncode)
 '''
 
-# pg_restore of an archive of the fake pg_dump on stdin: PGDMP is rmp_db (its -f form), PGDMP-<db> a Temporal one.
+# pg_restore of an archive of the fake pg_dump: PGDMP is rmp_db (its -f form), PGDMP-<db> a Temporal one. A restore
+# reads it on stdin; the backup's read-back, pg_restore -f /dev/null <dump>, names it, and is recorded in
+# ${FAKE_STATE}/pg_restore.log. FAKE_PGRESTORE_FAIL=<db> fails either for that database.
 # FAKE_PGRESTORE_SIGNAL=<db>=<signal> sends the signal to the restore_backup.sh this call descends from while it
 # restores <db>, as a hung-up SSH session or a kill would.
 FAKE_PG_RESTORE = r'''#!/bin/sh
-archive="$(cat)"
+if [ "$1" = "-f" ]; then
+  printf '%s\n' "$*" >> "${FAKE_STATE}/pg_restore.log"
+  archive="$(cat "$3")"
+else
+  archive="$(cat)"
+fi
 db="${archive#PGDMP-}"
 [ "${archive}" = PGDMP ] && db=rmp_db
 if [ "${FAKE_PGRESTORE_SIGNAL%%=*}" = "${db}" ]; then
@@ -269,7 +276,7 @@ FAKES = {"curl": FAKE_CURL, "pg_dump": FAKE_PG_DUMP, "sudo": FAKE_SUDO, "pg_rest
          "systemctl": FAKE_SYSTEMCTL, "sleep": FAKE_SLEEP, "dropdb": FAKE_REFUSED, "createdb": FAKE_REFUSED,
          "openclaw": FAKE_OPENCLAW}
 # The fakes' logs, which each call of host.run() starts without.
-LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log", "curl-argv.log")
+LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log", "curl-argv.log", "pg_restore.log")
 
 
 def _store(path, rows):
@@ -311,6 +318,7 @@ def host(tmp_path):
               "openclaw.sqlite": home / "state" / "openclaw.sqlite"}
     for rows, store in enumerate(stores.values(), start=2):
         _store(store, range(rows))
+    (home / "openclaw.json").write_text("{}")
     (home / "workspace").mkdir()
     (home / "workspace" / "AGENTS.md").write_text("# Aura\n")
     (data / "artifacts").mkdir()
@@ -381,6 +389,59 @@ def test_a_healthy_backup_takes_a_verified_qdrant_snapshot_and_dumps_temporal(ho
     assert calls[0][1].endswith("/readyz") and calls[2][1].endswith("/snapshots?wait=true")
     assert calls[4][1].endswith("/snapshots/full-snapshot-test.snapshot")
     assert oct((dest / "rmp_db.dump").stat().st_mode & 0o777) == "0o600"
+
+
+def test_a_healthy_backup_writes_a_manifest_that_lists_every_file(host):
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert {key: manifest[key] for key in ("format", "timestamp", "qdrant_mode")} == {
+        "format": 2, "timestamp": dest.name, "qdrant_mode": "server"}
+    assert manifest["components"] == {
+        "postgres": ["rmp_db.dump"], "temporal": ["temporal.dump", "temporal_visibility.dump"],
+        "qdrant": ["qdrant-full.snapshot"], "artifacts": ["artifacts.tar.gz"],
+        "openclaw-state": ["openclaw-state/manifest.json", "openclaw-state/openclaw-agent.sqlite",
+                           "openclaw-state/openclaw.sqlite"],
+        "workspace": ["workspace.tar.gz"], "settings": ["settings.json", "openclaw.json"]}
+    listed = [name for names in manifest["components"].values() for name in names]
+    assert manifest["files"] == {name: {"bytes": (dest / name).stat().st_size, "sha256": _sha256(dest / name)}
+                                 for name in listed}
+    # Every file the run made is listed, but its log and the manifest itself.
+    assert {str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()} == {*listed, "backup.log",
+                                                                                  "manifest.json"}
+    assert oct((dest / "manifest.json").stat().st_mode & 0o777) == "0o600"
+    # Each dump read to its end before the manifest was written.
+    assert (host.state / "pg_restore.log").read_text().splitlines() == [
+        f"-f /dev/null {dest / name}" for name in ("rmp_db.dump", "temporal.dump", "temporal_visibility.dump")]
+    # The check the programme runs on the next nightly backup.
+    verify = subprocess.run([sys.executable, "-m", "app.production.backup_manifest", "verify", str(dest)], cwd=REPO,
+                            capture_output=True, text=True, timeout=120)
+    assert verify.returncode == 0 and verify.stdout == "" and verify.stderr == ""
+
+
+def test_a_missing_component_fails_the_run_instead_of_being_skipped(host):
+    """A component that silently made nothing, such as a missing openclaw.json or an OpenClaw store that moved, fails
+    the run: exit 1, and no pruning."""
+    config = host.tmp / "openclaw" / "openclaw.json"
+    config.unlink()
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 1 and manifest["failures"] == ["settings"]
+    assert f"FAIL: settings: could not copy {config}" in result.stdout
+    assert "openclaw.json" in manifest["components"]["settings"] and "openclaw.json" not in manifest["files"]
+    assert "Backup INCOMPLETE: settings failed" in result.stdout
+    config.write_text("{}")
+    host.stores["openclaw-agent.sqlite"].unlink()
+    shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 1 and manifest["failures"] == ["openclaw-state"]
+    assert "FAIL: openclaw-state: openclaw-state/manifest.json does not list agent" in result.stderr
+    assert "FAIL: openclaw-state: openclaw-state/manifest.json does not list agent" in (dest / "backup.log").read_text()
+
+
+def test_a_dump_that_does_not_read_back_fails_the_backup_run(host):
+    result, dest, manifest, _ = host.run(FAKE_PGRESTORE_FAIL="temporal")
+    assert result.returncode == 1 and manifest["failures"] == ["temporal:temporal"]
+    assert "FAIL: temporal:temporal: temporal.dump does not read back" in result.stderr
+    assert manifest["files"]["temporal.dump"]["bytes"] == (dest / "temporal.dump").stat().st_size
 
 
 def test_the_script_does_not_depend_on_its_working_directory(host):

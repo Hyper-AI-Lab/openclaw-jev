@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # RMP production backup: Postgres (RMP and Temporal), a Qdrant snapshot, artifacts, the OpenClaw stores, Aura's
-# workspace notes and config snapshots. Every component runs even when one fails; the failures are listed in
-# manifest.json, no older backup is pruned, and the script exits 1, so rmp-backup.service shows the run as failed
-# instead of passing.
+# workspace notes and config snapshots. Every component runs even when one fails. manifest.json (format 2,
+# app/production/backup_manifest.py) lists each component's files with their sizes and sha256, and the failures: each
+# component that failed, or whose expected file is missing, empty or does not read back. After a failure no older
+# backup is pruned, and the script exits 1, so rmp-backup.service shows the run as failed instead of passing.
 # Restore: ops/restore_backup.sh (runbook: docs/runbooks/backup-restore.md).
 set -euo pipefail
 umask 077
@@ -171,20 +172,27 @@ else
   fail workspace "${OPENCLAW_HOME}/workspace is missing"
 fi
 
-# Config snapshots (absent files are skipped). OpenClaw's cron jobs live in its state store, copied above.
-cp -a "${SETTINGS}" "${DEST}/settings.json" 2>/dev/null || true
-cp -a "${OPENCLAW_HOME}/openclaw.json" "${DEST}/openclaw.json" 2>/dev/null || true
+# Config snapshots: a missing one fails settings. OpenClaw's cron jobs live in its state store, copied above.
+cp -a "${SETTINGS}" "${DEST}/settings.json" 2>>"${LOG}" || fail settings "could not copy ${SETTINGS}"
+cp -a "${OPENCLAW_HOME}/openclaw.json" "${DEST}/openclaw.json" 2>>"${LOG}" \
+  || fail settings "could not copy ${OPENCLAW_HOME}/openclaw.json"
 
-# Manifest
-failures_json="$(printf '%s\n' "${FAILURES[@]+"${FAILURES[@]}"}" | "${PY}" -c 'import json, sys; print(json.dumps([l for l in sys.stdin.read().splitlines() if l]))')"
-cat > "${DEST}/manifest.json" <<EOF
-{
-  "timestamp": "${STAMP}",
-  "components": ["postgres", "temporal", "qdrant", "artifacts", "openclaw-state", "settings"],
-  "failures": ${failures_json},
-  "host": "$(hostname)"
-}
-EOF
+# The manifest (app/production/backup_manifest.py, format 2): every component's files with their sizes and sha256,
+# once each dump and archive has read back. A component whose expected file is missing, empty, unreadable or does not
+# read back fails as well. Its stdout is the run's final failures, which decide the exit and the pruning; its stderr,
+# the reason for each failure it adds, goes to the log and the journal.
+log "Writing the manifest..."
+MANIFEST_ARGS=()
+for failure in "${FAILURES[@]+"${FAILURES[@]}"}"; do
+  MANIFEST_ARGS+=(--failure "${failure}")
+done
+if written="$({ "${PY}" -m app.production.backup_manifest write "${DEST}" --temporal-dbs "${TEMPORAL_DBS}" \
+    --qdrant-mode "${QDRANT_MODE}" --artifacts "${ARTIFACTS:-on}" "${MANIFEST_ARGS[@]+"${MANIFEST_ARGS[@]}"}" \
+    2>&1 >&4 | tee -a "${LOG}" >&2; } 4>&1)"; then
+  read -r -a FAILURES <<<"${written}"
+else
+  fail manifest "the manifest was not written"
+fi
 
 du -sh "${DEST}" | tee -a "${LOG}"
 if (( ${#FAILURES[@]} )); then

@@ -130,6 +130,8 @@ def test_each_missing_or_empty_expected_file_adds_its_component_once(dest, monke
 
 
 def test_a_component_fails_once_however_many_of_its_files_are_missing(dest, capsys):
+    # Both config snapshots of a run can fail: the run's own failures are kept once each too.
+    assert _write(dest, failures=["settings", "qdrant", "settings"])["failures"] == ["settings", "qdrant"]
     (dest / "temporal.dump").unlink()
     (dest / "temporal_visibility.dump").write_bytes(b"")
     (dest / "settings.json").unlink()

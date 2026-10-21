@@ -18,18 +18,20 @@ Backups are stored in `/root/.openclaw/rmp/data/backups/<YYYYMMDDTHHMMSSZ>/`. Fi
 | `openclaw-state/` | OpenClaw's agent and state SQLite stores, taken with the backup API and checksummed. They hold OpenClaw's cron jobs too |
 | `workspace.tar.gz` | Aura's workspace notes (`/root/.openclaw/workspace`), without `.git`, `moltmarket_venv`, `chat_logs` and `*.log` files. It holds the same classes of secrets as the OpenClaw store copies |
 | `settings.json`, `openclaw.json` | Config snapshots |
-| `manifest.json` | Contains `"failures"`, which is empty when every component succeeded |
+| `manifest.json` | Format 2 (`app/production/backup_manifest.py`): `components` names each component's files, `files` gives each file's `bytes` and `sha256`, and `failures` is empty when every component succeeded. Backups made before it have no `format` and no file list |
 | `backup.log` | The run's log |
 
 **When a component fails:**
 - Every other component still runs.
+- A component also fails when one of its expected files is missing, empty or unreadable, or a dump or archive does not read back: each `*.dump` must read to its end with `pg_restore -f /dev/null`, and each `*.tar.gz` as a tar archive, gzip checksum included. With the artifact store disabled in settings, `artifacts` expects no file; with it enabled, a missing artifact root fails it.
 - The failure is listed in `manifest.json` and in the log.
 - The script exits 1, so `rmp-backup.service` shows as failed.
 - **No older backup is pruned.**
 
-Check the last run with `systemctl status rmp-backup.service`, then read the newest manifest:
+Check the last run with `systemctl status rmp-backup.service`, then verify the newest backup against its manifest, checksums included. It prints one problem per line, and nothing when the backup is complete:
 
 ```bash
+cd /root/.openclaw/rmp && venv/bin/python -m app.production.backup_manifest verify "$(ls -1d data/backups/2*/ | sort | tail -1)"
 jq . "$(ls -1d /root/.openclaw/rmp/data/backups/2*/ | sort | tail -1)manifest.json"
 ```
 

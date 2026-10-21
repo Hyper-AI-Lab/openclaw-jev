@@ -93,13 +93,13 @@ def write(dest: Path, *, failures: Sequence[str], temporal_dbs: Sequence[str], q
           artifacts_enabled: bool, read_back: Callable[[Path], bool] = read_back) -> dict:
     """Write ``dest/manifest.json`` and return it.
 
-    ``failures`` are the components the run already failed. A component is added to them, once, when it has no file to
-    list, or when an expected file is missing, empty or unreadable. A dump or an archive that does not read back adds
-    its own name: ``postgres``, ``temporal:<db>``, ``artifacts`` or ``workspace``. Every expected file is listed even
-    when it is missing, and every one that exists gets its size and sha256.
+    ``failures`` are the components the run already failed, each kept once. A component is added to them, once, when
+    it has no file to list, or when an expected file is missing, empty or unreadable. A dump or an archive that does
+    not read back adds its own name: ``postgres``, ``temporal:<db>``, ``artifacts`` or ``workspace``. Every expected
+    file is listed even when it is missing, and every one that exists gets its size and sha256.
     """
     dest = Path(dest)
-    failures = list(failures)
+    failures = list(dict.fromkeys(failures))
 
     def fail(name: str, reason: str) -> None:
         if not _named(failures, name):
