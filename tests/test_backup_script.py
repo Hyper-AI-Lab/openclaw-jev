@@ -585,6 +585,24 @@ def test_a_moved_artifact_store_is_backed_up_and_restored(host):
     assert [p.name for p in root.parent.iterdir()] == ["evidence"]
 
 
+def test_an_artifacts_archive_without_exactly_one_top_level_directory_is_not_restored(host):
+    """The archive's one top-level directory replaces the root; with any other shape the root stays as it is, and
+    nothing is left beside it."""
+    _, dest, _, _ = host.run()
+    root = host.tmp / "data" / "artifacts"
+    with tarfile.open(dest / "artifacts.tar.gz", "w:gz") as tar:
+        for name in ("artifacts/report.json", "stray.json"):
+            info = tarfile.TarInfo(name)
+            tar.addfile(info, io.BytesIO(b""))
+    _artifact_store(host, root_path=str(root))
+    tree = {str(p): _sha256(p) if p.is_file() else None for p in root.parent.rglob("*")}
+    result = host.restore(dest)
+    assert result.returncode == 1
+    assert "artifacts: artifacts.tar.gz holds 2 top-level entries, not one directory\n" in result.stderr
+    assert "Restore INCOMPLETE: not restored: artifacts\n" in result.stderr
+    assert {str(p): _sha256(p) if p.is_file() else None for p in root.parent.rglob("*")} == tree
+
+
 @pytest.mark.parametrize("root", ["ancestor", "relative"])
 def test_the_restore_refuses_an_artifact_root_that_would_delete_more_than_artifacts(host, root):
     """A root that holds the backups (here the data directory), or a relative one, which would resolve against
@@ -595,6 +613,8 @@ def test_the_restore_refuses_an_artifact_root_that_would_delete_more_than_artifa
     root, reason = ((str(data), f"it is or holds {os.path.realpath(data)}") if root == "ancestor"
                     else ("data/artifacts", "it is not an absolute path"))
     _artifact_store(host, root_path=root)
+    # Made since the backup: a restore of the root, refused or not, would remove it.
+    (data / "artifacts" / "live.json").write_text("{}")
     tree = {str(p): _sha256(p) if p.is_file() else None for p in data.rglob("*")}
     result = host.restore(dest)   # from tmp_path, where data/artifacts is the artifact store
     assert result.returncode == 1
