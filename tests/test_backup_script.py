@@ -313,6 +313,8 @@ def host(tmp_path):
         _store(store, range(rows))
     (home / "workspace").mkdir()
     (home / "workspace" / "AGENTS.md").write_text("# Aura\n")
+    (data / "artifacts").mkdir()
+    (data / "artifacts" / "report.json").write_text("{}")
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"vector_memory": {"qdrant_mode": "server", "qdrant_host": "127.0.0.1", "qdrant_port": 6333}}))
     env = {**os.environ, "RMP_ROOT": str(REPO), "RMP_DATA_DIR": str(data), "RMP_BACKUP_ROOT": str(data / "backups"),
@@ -373,6 +375,7 @@ def test_a_healthy_backup_takes_a_verified_qdrant_snapshot_and_dumps_temporal(ho
     assert (dest / "temporal.dump").read_bytes() == b"PGDMP-temporal"
     assert (dest / "temporal_visibility.dump").read_bytes() == b"PGDMP-temporal_visibility"
     assert tarfile.open(dest / "qdrant-full.snapshot").getnames()[1] == "config.json"
+    assert tarfile.open(dest / "artifacts.tar.gz").getnames() == ["artifacts", "artifacts/report.json"]
     assert not list(dest.glob("*.partial")) and not (dest / "qdrant.tar.gz").exists()
     assert [m for m, _ in calls] == ["GET", "GET", "POST", "GET", "DELETE"]
     assert calls[0][1].endswith("/readyz") and calls[2][1].endswith("/snapshots?wait=true")
@@ -468,6 +471,23 @@ def test_the_workspace_notes_are_archived_without_git_venv_chat_logs_or_logs(hos
     result, dest, manifest, _ = host.run()
     assert result.returncode == 1 and manifest["failures"] == ["workspace"]
     assert f"FAIL: workspace: {workspace} is missing" in result.stdout and not (dest / "workspace.tar.gz").exists()
+
+
+def test_a_missing_artifact_root_fails_the_artifacts_component(host):
+    """The root comes from the settings, and the backup never creates it: a store that moved is not skipped."""
+    root = host.tmp / "moved" / "store"
+    host.settings.write_text(json.dumps({**json.loads(host.settings.read_text()), "artifact_store": {"root_path": str(root)}}))
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 1 and manifest["failures"] == ["artifacts"]
+    assert f"FAIL: artifacts: the artifact root {root} is missing" in result.stdout
+    assert not root.exists() and not (dest / "artifacts.tar.gz").exists()
+    # A disabled store has nothing to archive, and that is no failure.
+    host.settings.write_text(json.dumps({**json.loads(host.settings.read_text()),
+                                         "artifact_store": {"enabled": False, "root_path": str(root)}}))
+    shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert not root.exists() and not (dest / "artifacts.tar.gz").exists()
 
 
 def _dated(root, days, old, failures=(), month="09"):

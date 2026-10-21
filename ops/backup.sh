@@ -72,18 +72,25 @@ for db in ${TEMPORAL_DBS}; do
   fi
 done
 
-# Qdrant. In server mode a full snapshot through Qdrant's API is consistent, unlike a tar of live storage.
-QDRANT_CFG="$("${PY}" -c '
-from app.config import get_vector_memory_config
+# What the settings say of Qdrant (its mode, and its address or path) and of the artifact store (on or off, and its
+# root). Read only: get_artifact_root would create a missing root.
+CFG="$("${PY}" -c '
+from app.config import get_artifact_store_config, get_vector_memory_config
 c = get_vector_memory_config()
 mode = (c.get("qdrant_mode") or "embedded").strip().lower()
 server = mode == "server" or bool(c.get("qdrant_host"))
 print("server" if server else "embedded")
 print("http://%s:%d" % (c.get("qdrant_host") or "127.0.0.1", int(c.get("qdrant_port") or 6333)) if server else c.get("qdrant_path") or "")
+a = get_artifact_store_config()
+print("on" if a.get("enabled", True) else "off")
+print(a.get("root_path") or "")
 ' 2>>"${LOG}" || true)"
-QDRANT_MODE="$(sed -n 1p <<<"${QDRANT_CFG}")"
-QDRANT_WHERE="$(sed -n 2p <<<"${QDRANT_CFG}")"
+QDRANT_MODE="$(sed -n 1p <<<"${CFG}")"
+QDRANT_WHERE="$(sed -n 2p <<<"${CFG}")"
+ARTIFACTS="$(sed -n 3p <<<"${CFG}")"
+ARTIFACT_ROOT="$(sed -n 4p <<<"${CFG}")"
 
+# Qdrant. In server mode a full snapshot through Qdrant's API is consistent, unlike a tar of live storage.
 qdrant_snapshot() {
   local url="$1" part="${DEST}/qdrant-full.snapshot.partial" body stale got
   local -a meta
@@ -138,11 +145,15 @@ else
   fail qdrant "could not resolve Qdrant from settings (mode '${QDRANT_MODE}', '${QDRANT_WHERE}')"
 fi
 
-# Artifacts (full tar)
-ART="${DATA_DIR}/artifacts"
-if [[ -d "${ART}" ]]; then
-  log "Archiving artifacts..."
-  tar -czf "${DEST}/artifacts.tar.gz" -C "${DATA_DIR}" artifacts 2>>"${LOG}" || fail artifacts "tar failed"
+# Artifacts: the configured root, archived under its own name from its parent directory.
+if [[ "${ARTIFACTS}" == off ]]; then
+  log "The artifact store is disabled: no artifacts to archive"
+elif [[ -d "${ARTIFACT_ROOT}" ]]; then
+  log "Archiving artifacts from ${ARTIFACT_ROOT}..."
+  tar -czf "${DEST}/artifacts.tar.gz" -C "$(dirname "${ARTIFACT_ROOT}")" "$(basename "${ARTIFACT_ROOT}")" 2>>"${LOG}" \
+    || fail artifacts "tar of ${ARTIFACT_ROOT} failed"
+else
+  fail artifacts "the artifact root ${ARTIFACT_ROOT} is missing"
 fi
 
 # OpenClaw's agent and state stores (sessions, transcripts, auth, cron): SQLite backup API
