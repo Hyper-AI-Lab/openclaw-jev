@@ -624,6 +624,39 @@ def test_the_restore_refuses_an_artifact_root_that_would_delete_more_than_artifa
     assert {str(p): _sha256(p) if p.is_file() else None for p in data.rglob("*")} == tree
 
 
+@pytest.mark.parametrize("holds", ["the backup", "the backup root", "the data directory"])
+def test_the_restore_refuses_an_artifact_root_that_holds_a_guarded_path_without_being_one(host, holds):
+    """The ancestor rule on its own: each root here equals none of the checkout, the data directory, the backup root
+    and the backup restored, and holds one of them. None is tmp_path itself, whose removal by a broken guard would
+    take the fake tools with it."""
+    _, dest, _, _ = host.run()
+    src, extra = dest, {}
+    if holds == "the backup":
+        root = host.tmp / "rescue"
+        src = guarded = root / dest.name
+        shutil.copytree(dest, src)
+    elif holds == "the backup root":
+        root = host.tmp / "vault"
+        guarded = root / "backups"
+        shutil.copytree(dest, guarded / dest.name)
+        extra["RMP_BACKUP_ROOT"] = str(guarded)
+    else:
+        root = host.tmp / "deep"
+        guarded = root / "data"
+        shutil.copytree(host.tmp / "data" / "artifacts", guarded / "artifacts")
+        extra["RMP_DATA_DIR"] = str(guarded)
+    _artifact_store(host, root_path=str(root))
+    watched = (host.tmp / "data", root)
+    tree = {str(p): _sha256(p) if p.is_file() else None for d in watched for p in d.rglob("*")}
+    result = host.restore(src, **extra)
+    assert result.returncode == 1
+    refusal = (f"artifacts: refusing to replace {root}: it is or holds {os.path.realpath(guarded)}; "
+               "restore artifacts.tar.gz by hand\n")
+    assert refusal in result.stderr
+    assert "Restore INCOMPLETE: not restored: artifacts\n" in result.stderr.split(refusal, 1)[1]
+    assert {str(p): _sha256(p) if p.is_file() else None for d in watched for p in d.rglob("*")} == tree
+
+
 def _dated(root, days, old, failures=(), month="09"):
     """Dated backups as ops/backup.sh leaves them; ``failures`` marks them failed (unfinished if None)."""
     for day in days:
