@@ -341,9 +341,9 @@ def host(tmp_path):
             (state / name).unlink(missing_ok=True)
         return run_env
 
-    def run(script=BACKUP, *args, answer="y\n", **extra):
-        result = subprocess.run(["bash", str(script), *args], env=prepared(script, extra), cwd=tmp_path, input=answer,
-                                capture_output=True, text=True, timeout=300)
+    def run(script=BACKUP, *args, answer="y\n", cwd=None, **extra):
+        result = subprocess.run(["bash", str(script), *args], env=prepared(script, extra), cwd=cwd or tmp_path,
+                                input=answer, capture_output=True, text=True, timeout=300)
         backups = data / "backups"
         stamps = sorted(p for p in backups.iterdir() if p.name[:2] == "20") if backups.is_dir() else []
         dest = stamps[-1] if stamps else None
@@ -445,9 +445,10 @@ def test_a_dump_that_does_not_read_back_fails_the_backup_run(host):
 
 
 def test_the_script_does_not_depend_on_its_working_directory(host):
-    """rmp-backup.service starts it with no working directory: the run above already happens from tmp, not the repo."""
-    result, _, manifest, _ = host.run()
-    assert result.returncode == 0 and manifest["failures"] == []
+    """rmp-backup.service has no WorkingDirectory=, so systemd starts the script from /: its app imports resolve only
+    because it changes to the RMP root first."""
+    result, _, manifest, _ = host.run(cwd="/")
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("failure, words", [
