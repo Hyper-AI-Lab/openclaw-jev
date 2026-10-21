@@ -23,6 +23,7 @@ RMP_ROOT="${RMP_ROOT:-/root/.openclaw/rmp}"
 RMP_DATA="${RMP_DATA_DIR:-${RMP_ROOT}/data}"
 PY="${RMP_PYTHON:-${RMP_ROOT}/venv/bin/python}"
 SETTINGS="${RMP_SETTINGS_PATH:-${RMP_ROOT}/settings.json}"
+BACKUP_ROOT="${RMP_BACKUP_ROOT:-${RMP_DATA}/backups}"
 LOCK_FILE="${RMP_CODE_RELOAD_LOCK:-/run/rmp-code-reload.lock}"
 FAILED=()
 TIMERS=()               # the active rmp-*.timer units, recorded before anything stops
@@ -225,9 +226,52 @@ elif [[ -f "${SRC}/qdrant.tar.gz" ]]; then
   { rm -rf "${RMP_DATA}/qdrant" && tar -xzf "${SRC}/qdrant.tar.gz" -C "${RMP_DATA}"; } || FAILED+=("qdrant")
 fi
 
+# Artifacts go back to the configured root, the one ops/backup.sh archives (artifact_store.root_path), which this step
+# replaces whole. Nothing validated that setting before, so the step first refuses a root that is not absolute, is /,
+# or is or holds the checkout, the data directory, the backup root or this backup, each compared by realpath -m.
+# Nothing under a refused root is touched. The archive holds one top-level directory, named as the root was when the
+# backup was made: it is extracted beside the root, on the same filesystem, then put in the root's place.
+restore_artifacts() {
+  local root real path reason="" work
+  local -a top
+  root="$(cd "${RMP_ROOT}" \
+    && "${PY}" -c 'from app.config import get_artifact_store_config as c; print(c().get("root_path") or "")')" \
+    || { echo "artifacts: could not read the artifact root from settings" >&2; return 1; }
+  if [[ "${root}" != /* ]]; then
+    reason="it is not an absolute path"
+  else
+    real="$(realpath -m -- "${root}")"
+    if [[ "${real}" == / ]]; then
+      reason="it is /"
+    else
+      for path in "${RMP_ROOT}" "${RMP_DATA}" "${BACKUP_ROOT}" "${SRC}"; do
+        if ! path="$(realpath -m -- "${path}")" || [[ "${path}" == "${real}" || "${path}" == "${real}/"* ]]; then
+          reason="it is or holds ${path}"
+          break
+        fi
+      done
+    fi
+  fi
+  if [[ -n "${reason}" ]]; then
+    echo "artifacts: refusing to replace ${root}: ${reason}; restore artifacts.tar.gz by hand" >&2
+    return 1
+  fi
+  work="$(mktemp -d "$(dirname "${real}")/.$(basename "${real}").restoring.XXXXXX")" || return 1
+  if tar -xzf "${SRC}/artifacts.tar.gz" -C "${work}"; then
+    mapfile -t top < <(find "${work}" -mindepth 1 -maxdepth 1)
+    if (( ${#top[@]} != 1 )) || [[ ! -d "${top[0]}" || -L "${top[0]}" ]]; then
+      echo "artifacts: artifacts.tar.gz holds ${#top[@]} top-level entries, not one directory" >&2
+    elif rm -rf -- "${real}" && mv -- "${top[0]}" "${real}"; then
+      rmdir -- "${work}"
+      return 0
+    fi
+  fi
+  rm -rf -- "${work}"
+  return 1
+}
 if [[ -f "${SRC}/artifacts.tar.gz" ]]; then
   echo "Restoring artifacts..."
-  { rm -rf "${RMP_DATA}/artifacts" && tar -xzf "${SRC}/artifacts.tar.gz" -C "${RMP_DATA}"; } || FAILED+=("artifacts")
+  restore_artifacts || FAILED+=("artifacts")
 fi
 
 # OpenClaw's stores (sessions, transcripts, auth profiles, cron jobs), with the gateway stopped above. The tool checks

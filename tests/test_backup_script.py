@@ -534,21 +534,72 @@ def test_the_workspace_notes_are_archived_without_git_venv_chat_logs_or_logs(hos
     assert f"FAIL: workspace: {workspace} is missing" in result.stdout and not (dest / "workspace.tar.gz").exists()
 
 
+def _artifact_store(host, **store):
+    """The live settings' artifact_store set to ``store``."""
+    host.settings.write_text(json.dumps({**json.loads(host.settings.read_text()), "artifact_store": store}))
+
+
 def test_a_missing_artifact_root_fails_the_artifacts_component(host):
     """The root comes from the settings, and the backup never creates it: a store that moved is not skipped."""
     root = host.tmp / "moved" / "store"
-    host.settings.write_text(json.dumps({**json.loads(host.settings.read_text()), "artifact_store": {"root_path": str(root)}}))
+    _artifact_store(host, root_path=str(root))
     result, dest, manifest, _ = host.run()
     assert result.returncode == 1 and manifest["failures"] == ["artifacts"]
     assert f"FAIL: artifacts: the artifact root {root} is missing" in result.stdout
     assert not root.exists() and not (dest / "artifacts.tar.gz").exists()
     # A disabled store has nothing to archive, and that is no failure.
-    host.settings.write_text(json.dumps({**json.loads(host.settings.read_text()),
-                                         "artifact_store": {"enabled": False, "root_path": str(root)}}))
+    _artifact_store(host, enabled=False, root_path=str(root))
     shutil.rmtree(dest)  # a second run within the same second would reuse its directory
     result, dest, manifest, _ = host.run()
     assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
     assert not root.exists() and not (dest / "artifacts.tar.gz").exists()
+
+
+def test_a_moved_artifact_store_is_backed_up_and_restored(host):
+    """Settings name a root outside data/, under another name: the backup archives it, and the restore puts it back
+    there, from a backup made since the move and from one made before it."""
+    # The backup before the move, under an older stamp: the next run may start within the same second.
+    before_the_move = host.run()[1].rename(host.backups / "20261001T031500Z")
+    root = host.tmp / "elsewhere" / "evidence"
+    root.mkdir(parents=True)
+    (root / "report.json").write_text('{"v": 1}')
+    _artifact_store(host, root_path=str(root))
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert tarfile.open(dest / "artifacts.tar.gz").getnames() == ["evidence", "evidence/report.json"]
+    (root / "report.json").write_text('{"v": 2}')
+    (root / "added.json").write_text("{}")
+    result = host.restore(dest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(p.name for p in root.iterdir()) == ["report.json"] and (root / "report.json").read_text() == '{"v": 1}'
+    # Extracted beside the root, then moved into its place: nothing is left beside it.
+    assert [p.name for p in root.parent.iterdir()] == ["evidence"]
+    assert (host.tmp / "data" / "artifacts" / "report.json").read_text() == "{}"
+    # An archive made before the move holds the old root's name; it goes to the configured root all the same.
+    _artifact_store(host, root_path=str(root))
+    result = host.restore(before_the_move)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(p.name for p in root.iterdir()) == ["report.json"] and (root / "report.json").read_text() == "{}"
+    assert [p.name for p in root.parent.iterdir()] == ["evidence"]
+
+
+@pytest.mark.parametrize("root", ["ancestor", "relative"])
+def test_the_restore_refuses_an_artifact_root_that_would_delete_more_than_artifacts(host, root):
+    """A root that holds the backups (here the data directory), or a relative one, which would resolve against
+    wherever the restore runs, is refused, and nothing under it is touched. / is not run as a case: a broken guard
+    would delete the host. The ancestor rule refuses it too, since / holds RMP_ROOT."""
+    _, dest, _, _ = host.run()
+    data = host.tmp / "data"
+    root, reason = ((str(data), f"it is or holds {os.path.realpath(data)}") if root == "ancestor"
+                    else ("data/artifacts", "it is not an absolute path"))
+    _artifact_store(host, root_path=root)
+    tree = {str(p): _sha256(p) if p.is_file() else None for p in data.rglob("*")}
+    result = host.restore(dest)   # from tmp_path, where data/artifacts is the artifact store
+    assert result.returncode == 1
+    refusal = f"artifacts: refusing to replace {root}: {reason}; restore artifacts.tar.gz by hand\n"
+    assert refusal in result.stderr
+    assert "Restore INCOMPLETE: not restored: artifacts\n" in result.stderr.split(refusal, 1)[1]
+    assert {str(p): _sha256(p) if p.is_file() else None for p in data.rglob("*")} == tree
 
 
 def _dated(root, days, old, failures=(), month="09"):
