@@ -26,9 +26,9 @@ It drills the newest stamped backup under data/backups whose manifest has "failu
 The checks: first the backup against its manifest, with every file's size and checksum, before anything is created; a
 backup that does not verify is not drilled. Then the restic round trip, each database's owner, rmp_db's vector
 extension, every table's row count against its COPY block in the dump, the collections against the snapshot, the
-OpenClaw store copies, and every archive read to its end. Each prints one line, ok or FAIL, with names and counts only. The last line is the restore
-duration, from the first database restore to the end of the Qdrant restore: the steps a real restore repeats on the
-same data.
+OpenClaw store copies, and every archive read to its end. Each prints one line, ok or FAIL, with names and counts
+only. The last line is the restore duration, from the first database restore to the end of the Qdrant restore: the
+steps a real restore repeats on the same data.
 
 It exits 0 when every check passed and 1 when one failed. It exits 2, having created nothing, when the host is not
 ready for it. The scratch instances and the scratch directory are removed however the drill ends, after a SIGTERM,
