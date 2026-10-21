@@ -23,6 +23,7 @@ import pytest
 
 from app.coding.firewall import covers, port_elements
 from app.config import DEFAULT_CODING
+from app.production import backup_manifest
 from ops import backup_openclaw_state
 from ops import restore_drill as drill
 
@@ -135,12 +136,20 @@ def pg_bin(tmp_path, monkeypatch):
     return tmp_path / "pg-bin"
 
 
+def _manifest(dest):
+    """The format-2 manifest ops/backup.sh writes, of the files as they are now. Its read-back is a stub: the drill's
+    own checks read the dumps and the archives."""
+    manifest = backup_manifest.write(dest, failures=[], temporal_dbs=["temporal", "temporal_visibility"],
+                                     qdrant_mode="server", artifacts_enabled=True, read_back=lambda path: True)
+    assert manifest["failures"] == []
+
+
 @pytest.fixture
 def backup(tmp_path):
-    """A clean backup as ops/backup.sh leaves it, with real OpenClaw store copies, snapshot and archive."""
+    """A clean backup as ops/backup.sh leaves it, with real OpenClaw store copies, snapshot and archives, and its
+    format-2 manifest."""
     dest = tmp_path / "backups" / STAMP
     dest.mkdir(parents=True)
-    (dest / "manifest.json").write_text(json.dumps({"timestamp": STAMP, "failures": []}))
     for db in OWNERS:
         (dest / f"{db}.dump").write_bytes(b"PGDMP" + db.encode())
     with tarfile.open(dest / "qdrant-full.snapshot", "w") as tar:
@@ -154,6 +163,12 @@ def backup(tmp_path):
     for rows, store in enumerate(backup_openclaw_state.stores(home).values(), start=2):
         _store(store, rows)
     backup_openclaw_state.backup(dest / "openclaw-state", home=home, version="OpenClaw test")
+    with tarfile.open(dest / "workspace.tar.gz", "w:gz") as tar:
+        _add(tar, "workspace/AGENTS.md", b"# Aura")
+        _add(tar, "workspace/notes.md", b"notes")
+    for name in ("settings.json", "openclaw.json"):
+        (dest / name).write_text("{}")
+    _manifest(dest)
     return dest
 
 
@@ -188,6 +203,7 @@ def test_a_drill_of_a_whole_backup_checks_every_store_and_leaves_nothing_behind(
     assert code == 0, lines
     assert lines[:-1] == [
         f"backup: {backup}",
+        "ok backup manifest: every file's size and checksum match",
         "ok scratch postgres: port 55432, socket only, production's roles rmp, temporal NOLOGIN",
         "ok scratch qdrant: 127.0.0.1:6937, 1 GiB, no volume, a key of its own",
         "ok restore rmp_db",
@@ -206,6 +222,7 @@ def test_a_drill_of_a_whole_backup_checks_every_store_and_leaves_nothing_behind(
         "ok qdrant rmp_task_registry: 7 points",
         "ok openclaw-state: agent, state, checksums match, quick_check ok",
         "ok archive artifacts.tar.gz: 2 entries, read to its end",
+        "ok archive workspace.tar.gz: 2 entries, read to its end",
     ]
     assert re.fullmatch(r"restore duration: \d+ min \d+ s", lines[-1])
     # The roles are created on the scratch server only, without a login.
@@ -426,10 +443,32 @@ def test_a_damaged_store_copy_or_archive_fails_its_check(capsys, backup, scratch
     copy.write_bytes(copy.read_bytes()[:-1] + b"x")
     archive = backup / "artifacts.tar.gz"
     archive.write_bytes(archive.read_bytes()[:-8])
+    # A manifest written after the damage describes the damaged files: only the drill's own checks see it.
+    _manifest(backup)
     code, lines = run_drill(capsys, backup, scratch_root, Host())
     assert code == 1
     assert f"FAIL openclaw-state: {copy} does not match its manifest checksum" in lines
     assert "FAIL archive artifacts.tar.gz: does not read to its end (EOFError)" in lines
+
+
+@pytest.mark.parametrize("damage", ["checksum", "format 1"])
+def test_the_drill_fails_a_backup_that_does_not_verify(capsys, backup, scratch_root, damage):
+    """The backup is checked against its manifest, checksums included, before the drill creates anything."""
+    if damage == "checksum":
+        dump = backup / "temporal.dump"
+        dump.write_bytes(dump.read_bytes()[:-1] + b"!")
+        problem = "temporal.dump does not match its checksum"
+    else:
+        (backup / "manifest.json").write_text(json.dumps({"timestamp": STAMP, "failures": []}))
+        problem = "made before manifest format 2 (no file list)"
+    host = Host()
+    code, lines = run_drill(capsys, backup, scratch_root, host)
+    assert code == 1
+    assert lines == [f"backup: {backup}", f"FAIL backup manifest: {problem}"]
+    assert host.named("initdb") == [] and host.named("chown") == []
+    # Only the read-only listings ran: no container, server or directory was created.
+    assert [c.argv[:2] for c in host.calls] == [["systemctl", "list-units"], ["docker", "ps"]]
+    assert list(scratch_root.iterdir()) == []
 
 
 def _outside_the_drill_port():

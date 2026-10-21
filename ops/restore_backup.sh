@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Restore RMP from a backup directory made by ops/backup.sh: the RMP and Temporal databases, Qdrant, artifacts,
 # OpenClaw's stores and settings. Runbook: docs/runbooks/backup-restore.md. Exits 1, naming what was not restored, if
-# any part fails.
+# any part fails. Before its prompt it verifies the backup against its manifest, checksums included, and warns when it
+# does not verify.
 #
 # Nothing may write to a store while it is replaced. The restore holds the code-reload lock, which a deploy and a code
 # reload take too, refuses while a deploy unit is active, and stops every writer first: the RMP timers and their runs,
@@ -23,6 +24,7 @@ RMP_ROOT="${RMP_ROOT:-/root/.openclaw/rmp}"
 RMP_DATA="${RMP_DATA_DIR:-${RMP_ROOT}/data}"
 PY="${RMP_PYTHON:-${RMP_ROOT}/venv/bin/python}"
 SETTINGS="${RMP_SETTINGS_PATH:-${RMP_ROOT}/settings.json}"
+BACKUP_ROOT="${RMP_BACKUP_ROOT:-${RMP_DATA}/backups}"
 LOCK_FILE="${RMP_CODE_RELOAD_LOCK:-/run/rmp-code-reload.lock}"
 FAILED=()
 TIMERS=()               # the active rmp-*.timer units, recorded before anything stops
@@ -36,9 +38,13 @@ if [[ ! -d "$SRC" ]]; then
   echo "Backup directory not found: $SRC"
   exit 1
 fi
-if [[ -f "${SRC}/manifest.json" ]]; then
-  failures="$("${PY}" -c 'import json, sys; print(" ".join(json.load(open(sys.argv[1])).get("failures") or []))' "${SRC}/manifest.json")"
-  [[ -z "${failures}" ]] || echo "WARNING: this backup recorded failures when it was made: ${failures}"
+# The backup's own check, checksums included (app/production/backup_manifest.py), run from the checkout on the backup's
+# absolute path. A disaster may leave only a damaged backup, so one that does not verify is a warning, not a refusal:
+# the operator decides at the prompt. A check that fails without naming a problem could not run, and says so.
+if ! problems="$(src="$(realpath -- "${SRC}")" && cd "${RMP_ROOT}" \
+    && "${PY}" -m app.production.backup_manifest verify "${src}")"; then
+  echo "WARNING: this backup does not verify:"
+  printf '%s\n' "${problems:-the check itself could not run (its error is on stderr)}"
 fi
 
 echo "=== RMP Restore from $SRC ==="
@@ -225,9 +231,61 @@ elif [[ -f "${SRC}/qdrant.tar.gz" ]]; then
   { rm -rf "${RMP_DATA}/qdrant" && tar -xzf "${SRC}/qdrant.tar.gz" -C "${RMP_DATA}"; } || FAILED+=("qdrant")
 fi
 
+# Artifacts go back to the configured root, the one ops/backup.sh archives (artifact_store.root_path), which this step
+# replaces whole. Nothing validated that setting before, so the step first refuses a root that is not absolute, is /,
+# or is or holds the checkout, the data directory, the backup root or this backup, each compared by realpath -m.
+# Nothing under a refused root is touched. The archive holds one top-level directory, named as the directory the root
+# resolved to when the backup was made: it is extracted beside that directory, on the same filesystem, then put in its
+# place, so a symlinked root keeps its link.
+restore_artifacts() {
+  local root real path reason="" work
+  local -a top
+  root="$(cd "${RMP_ROOT}" \
+    && "${PY}" -c 'from app.config import get_artifact_store_config as c; print(c().get("root_path") or "")')" \
+    || { echo "artifacts: could not read the artifact root from settings" >&2; return 1; }
+  if [[ "${root}" != /* ]]; then
+    reason="it is not an absolute path"
+  else
+    real="$(realpath -m -- "${root}")"
+    if [[ "${real}" == / ]]; then
+      reason="it is /"
+    else
+      for path in "${RMP_ROOT}" "${RMP_DATA}" "${BACKUP_ROOT}" "${SRC}"; do
+        if ! path="$(realpath -m -- "${path}")" || [[ "${path}" == "${real}" || "${path}" == "${real}/"* ]]; then
+          reason="it is or holds ${path}"
+          break
+        fi
+      done
+    fi
+  fi
+  if [[ -n "${reason}" ]]; then
+    echo "artifacts: refusing to replace ${root}: ${reason}; restore artifacts.tar.gz by hand" >&2
+    return 1
+  fi
+  work="$(mktemp -d "$(dirname "${real}")/.$(basename "${real}").restoring.XXXXXX")" || return 1
+  if tar -xzf "${SRC}/artifacts.tar.gz" -C "${work}"; then
+    mapfile -t top < <(find "${work}" -mindepth 1 -maxdepth 1)
+    if (( ${#top[@]} != 1 )) || [[ ! -d "${top[0]}" || -L "${top[0]}" ]]; then
+      echo "artifacts: artifacts.tar.gz holds ${#top[@]} top-level entries, not one directory" >&2
+    else
+      # From here the old root may be gone: a failed step keeps the restored copy, the one the restore has left.
+      if ! rm -rf -- "${real}"; then
+        echo "artifacts: could not remove ${real}; the restored copy is kept in ${work}" >&2
+      elif ! mv -- "${top[0]}" "${real}"; then
+        echo "artifacts: could not move the restored copy into ${real}; it is kept in ${work}" >&2
+      else
+        rmdir -- "${work}"
+        return 0
+      fi
+      return 1
+    fi
+  fi
+  rm -rf -- "${work}"
+  return 1
+}
 if [[ -f "${SRC}/artifacts.tar.gz" ]]; then
   echo "Restoring artifacts..."
-  { rm -rf "${RMP_DATA}/artifacts" && tar -xzf "${SRC}/artifacts.tar.gz" -C "${RMP_DATA}"; } || FAILED+=("artifacts")
+  restore_artifacts || FAILED+=("artifacts")
 fi
 
 # OpenClaw's stores (sessions, transcripts, auth profiles, cron jobs), with the gateway stopped above. The tool checks

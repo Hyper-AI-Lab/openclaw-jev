@@ -14,22 +14,24 @@ Backups are stored in `/root/.openclaw/rmp/data/backups/<YYYYMMDDTHHMMSSZ>/`. Fi
 | `temporal.dump`, `temporal_visibility.dump` | Temporal's own Postgres databases: open workflows and their histories |
 | `qdrant-full.snapshot` | A full Qdrant snapshot taken through its API. It holds one snapshot per collection plus `config.json`. Its size and checksum are verified against Qdrant's report, and the copy on the server is deleted afterwards |
 | `qdrant.tar.gz` | Embedded-mode Qdrant only. **Backups made before 2026-10-08 hold no Qdrant data**: their `qdrant.tar.gz` is a 110-byte tar of an empty directory |
-| `artifacts.tar.gz` | The evidence store |
-| `openclaw-state/` | OpenClaw's agent and state SQLite stores, taken with the backup API and checksummed |
-| `temporal.db` | The legacy Temporal SQLite file from before Temporal moved to Postgres. It is no longer live |
-| `settings.json`, `openclaw.json`, `cron_jobs.json` | Config snapshots |
-| `manifest.json` | Contains `"failures"`, which is empty when every component succeeded |
+| `artifacts.tar.gz` | The evidence store: the artifact root the settings name (`artifact_store.root_path`), archived as one top-level directory named after the root, or, for a symlinked root, after the directory it resolves to. None while the store is disabled |
+| `openclaw-state/` | OpenClaw's agent and state SQLite stores, taken with the backup API and checksummed. They hold OpenClaw's cron jobs too |
+| `workspace.tar.gz` | Aura's workspace notes (`/root/.openclaw/workspace`), without `.git`, `moltmarket_venv`, `chat_logs` and `*.log` files. It holds the same classes of secrets as the OpenClaw store copies |
+| `settings.json`, `openclaw.json` | Config snapshots |
+| `manifest.json` | Format 2 (`app/production/backup_manifest.py`): `components` names each component's files, `files` gives each file's `bytes` and `sha256`, and `failures` is empty when every component succeeded. Backups made before it have no `format` and no file list |
 | `backup.log` | The run's log |
 
 **When a component fails:**
 - Every other component still runs.
+- A component also fails when one of its expected files is missing, empty or unreadable, or a dump or archive does not read back: each `*.dump` must read to its end with `pg_restore -f /dev/null`, and each `*.tar.gz` as a tar archive, gzip checksum included. With the artifact store disabled in settings, `artifacts` expects no file; with it enabled, a missing artifact root fails it.
 - The failure is listed in `manifest.json` and in the log.
 - The script exits 1, so `rmp-backup.service` shows as failed.
 - **No older backup is pruned.**
 
-Check the last run with `systemctl status rmp-backup.service`, then read the newest manifest:
+Check the last run with `systemctl status rmp-backup.service`, then verify the newest backup against its manifest, checksums included. It prints one problem per line, and nothing when the backup is complete:
 
 ```bash
+cd /root/.openclaw/rmp && venv/bin/python -m app.production.backup_manifest verify "$(ls -1d data/backups/2*/ | sort | tail -1)"
 jq . "$(ls -1d /root/.openclaw/rmp/data/backups/2*/ | sort | tail -1)manifest.json"
 ```
 
@@ -58,21 +60,29 @@ sudo -u postgres createuser --pwprompt temporal
 ```
 
 The script does the following:
-1. Asks for confirmation.
+1. Verifies the backup against its manifest, checksums included (`python -m app.production.backup_manifest verify`). When it does not verify, it prints `WARNING: this backup does not verify:` and one line per problem. When the check itself cannot run, for example on a new host whose venv is not built yet, that line is `the check itself could not run (its error is on stderr)`, and the check's own error, on stderr, comes just before the warning. A damaged backup may be the only one left, so it warns rather than refuses. Then it asks for confirmation.
 2. Takes the code-reload lock (`/run/rmp-code-reload.lock`) and holds it until it exits: a deploy waits for it, a code reload skips. It refuses before anything stops while the lock is held or an `aura-deploy-*` unit is active. The watchdog and the canary sentinel do not take the lock; step 3 stops their timers.
 3. Stops every writer: each active `rmp-*` timer, then the service it triggers (a running canary, janitor, watchdog or backup run ends), then `rmp-code-watch` and `openclaw-gateway` when active, then `rmp-api`, `rmp-worker` and `temporal`. `rmp-qdrant` keeps running for step 6. Then it checks for a deploy unit again, because rmp-api or rmp-worker may have launched one before they stopped. A failed stop, a deploy unit or a signal ends the restore here: once it has stopped a unit, it prints `Restore ended before its first database step (exit <n>): nothing was restored`, starts again what it stopped and exits non-zero.
 4. Restores `rmp_db` as an exact copy, through the postgres superuser (`ops/restore_pg_database.sh`). `pg_restore --clean --if-exists --create --exit-on-error -d postgres` drops the database and recreates it from its archive: its owner, encoding and settings, the `vector` extension, and nothing the dump lacks. The `rmp` role cannot do this: it has neither CREATEDB nor superuser. The first error stops it, so a `DROP DATABASE` refused because a session is still connected changes nothing.
 5. Restores both Temporal databases the same way.
 6. Restores Qdrant collection by collection into the **running** Qdrant (`ops/restore_qdrant_snapshot.sh`).
-7. Restores artifacts, OpenClaw's stores and settings. The stores (sessions, transcripts, auth profiles, cron jobs) are coupled to `rmp_db`, so they come back with it. `ops/backup_openclaw_state.py restore` checks every copy's checksum and integrity before it replaces anything, and refuses while the gateway runs.
+7. Restores artifacts, OpenClaw's stores and settings.
+   - Artifacts go back to the artifact root the live settings name, which the step replaces whole. It refuses a root that is not absolute, is `/`, or is or holds the checkout, the data directory, the backup root or the backup being restored (each compared by `realpath -m`). It then prints `artifacts: refusing to replace <root>: <reason>; restore artifacts.tar.gz by hand`, touches nothing under the root, and `artifacts` is not restored. To restore it by hand, `tar -tzf <backup>/artifacts.tar.gz | head -1` names the archive's one top-level directory, and `tar -xzf <backup>/artifacts.tar.gz -C <directory>` extracts it into the directory that should hold it. Otherwise it extracts the archive beside the root, checks that it holds exactly one top-level directory, removes the root and moves that directory into its place, whatever the root was called when the backup was made. A symlinked root keeps its link: the directory it resolves to is replaced.
+   - The stores (sessions, transcripts, auth profiles, cron jobs) are coupled to `rmp_db`, so they come back with it. `ops/backup_openclaw_state.py restore` checks every copy's checksum and integrity before it replaces anything, and refuses while the gateway runs.
 8. When every part was restored, starts what it stopped: `temporal`, `rmp-api`, `rmp-worker`, then the gateway and `rmp-code-watch`, then the timers. Then it runs the timer check, one `next: <timer>` line per timer. A timer whose interval passed during the restore runs its service at once and shows no next elapse until that run ends, so the restore waits up to 15 minutes for such a run. A `NO NEXT: <timer>` line left makes it exit 1. Then wait for the run to end, or re-arm the timer: `systemctl start <timer>`, and if it still has no next elapse, `systemctl start <stem>.service` once, in an idle window. The check is `systemctl list-timers 'rmp-*' --all --no-pager --no-legend | awk '{print ($1 == "-" ? "NO NEXT: " : "next: ") $(NF-1)}'`.
 
-**Not restored by the script:** `openclaw.json`. A verbatim copy undoes what RMP applied to it since the backup, so put it back by hand only when the live file is lost or damaged, then apply RMP's model policy to it again:
+**Not restored by the script:**
+- `openclaw.json`. A verbatim copy undoes what RMP applied to it since the backup, so put it back by hand only when the live file is lost or damaged, then apply RMP's model policy to it again:
 
-```bash
-cp -a <backup>/openclaw.json /root/.openclaw/openclaw.json
-cd /root/.openclaw/rmp && venv/bin/python -c 'from app.llm.model_policy import apply_openclaw_policy; print(apply_openclaw_policy()["changed"])'
-```
+  ```bash
+  cp -a <backup>/openclaw.json /root/.openclaw/openclaw.json
+  cd /root/.openclaw/rmp && venv/bin/python -c 'from app.llm.model_policy import apply_openclaw_policy; print(apply_openclaw_policy()["changed"])'
+  ```
+- `workspace.tar.gz`. The workspace notes are Aura's own working files, which a restore of the databases should not roll back. Put them back by hand when the live workspace is lost or damaged; files the archive holds replace the live ones, and the rest stay:
+
+  ```bash
+  tar -xzf <backup>/workspace.tar.gz -C /root/.openclaw
+  ```
 
 **If a part fails** after the first database step, or a signal ends the restore after that step and before its last (Ctrl-C, a `kill`, or an SSH session that hangs up), the restore starts nothing, because a store may be half restored: rmp-api runs `create_all` on `rmp_db` at start, and the watchdog would restart Temporal on a partial database. It exits non-zero and prints:
 - `Restore INCOMPLETE: not restored: …` for a failed part, and `Restore INCOMPLETE: it ended before its last step` when a signal ended it;
@@ -165,7 +175,9 @@ It drills the newest backup whose manifest has `"failures": []`; to drill anothe
 - something accepts connections on `127.0.0.1:6937`;
 - a container named `rmp-qdrant-drill` exists.
 
-**What it does:**
+**First it verifies the backup** against its manifest, every file's size and checksum. A problem is a `FAIL backup manifest: …` line, and the drill stops there (exit 1), before it creates anything.
+
+**What it does then:**
 1. A scratch directory `/var/tmp/rmp-restore-drill-*` (mode 0711), with `pg/` owned by postgres (mode 0700).
 2. A throwaway PostgreSQL 16 from the host's own binaries (`/usr/lib/postgresql/16/bin`): `initdb` and `pg_ctl` as postgres, socket only in `pg/`, port 55432, no TCP listener. Production's roles (today `rmp` and `temporal`) are created there `NOLOGIN`, so the archives' owners apply.
 3. A container `rmp-qdrant-drill` of the image `ops/start_qdrant.sh` runs, on `127.0.0.1:6937`, with 1 GiB and no volume. It requires a key made for this drill, which docker and the snapshot restore get through their environment and which is never printed. Port 6937 is in `coding.blocked_tcp_ports`, so aura-coder cannot reach the copy of Aura's memory, and `coding_isolation` in `make readiness` stays at `pass` while the drill runs.

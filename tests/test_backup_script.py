@@ -120,11 +120,18 @@ with open(os.path.join(os.environ["FAKE_STATE"], "sudo.log"), "a") as log:
 sys.exit(subprocess.run(args, input=data).returncode)
 '''
 
-# pg_restore of an archive of the fake pg_dump on stdin: PGDMP is rmp_db (its -f form), PGDMP-<db> a Temporal one.
+# pg_restore of an archive of the fake pg_dump: PGDMP is rmp_db (its -f form), PGDMP-<db> a Temporal one. A restore
+# reads it on stdin; the backup's read-back, pg_restore -f /dev/null <dump>, names it, and is recorded in
+# ${FAKE_STATE}/pg_restore.log. FAKE_PGRESTORE_FAIL=<db> fails either for that database.
 # FAKE_PGRESTORE_SIGNAL=<db>=<signal> sends the signal to the restore_backup.sh this call descends from while it
 # restores <db>, as a hung-up SSH session or a kill would.
 FAKE_PG_RESTORE = r'''#!/bin/sh
-archive="$(cat)"
+if [ "$1" = "-f" ]; then
+  printf '%s\n' "$*" >> "${FAKE_STATE}/pg_restore.log"
+  archive="$(cat "$3")"
+else
+  archive="$(cat)"
+fi
 db="${archive#PGDMP-}"
 [ "${archive}" = PGDMP ] && db=rmp_db
 if [ "${FAKE_PGRESTORE_SIGNAL%%=*}" = "${db}" ]; then
@@ -269,7 +276,7 @@ FAKES = {"curl": FAKE_CURL, "pg_dump": FAKE_PG_DUMP, "sudo": FAKE_SUDO, "pg_rest
          "systemctl": FAKE_SYSTEMCTL, "sleep": FAKE_SLEEP, "dropdb": FAKE_REFUSED, "createdb": FAKE_REFUSED,
          "openclaw": FAKE_OPENCLAW}
 # The fakes' logs, which each call of host.run() starts without.
-LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log", "curl-argv.log")
+LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log", "curl-argv.log", "pg_restore.log")
 
 
 def _store(path, rows):
@@ -311,6 +318,11 @@ def host(tmp_path):
               "openclaw.sqlite": home / "state" / "openclaw.sqlite"}
     for rows, store in enumerate(stores.values(), start=2):
         _store(store, range(rows))
+    (home / "openclaw.json").write_text("{}")
+    (home / "workspace").mkdir()
+    (home / "workspace" / "AGENTS.md").write_text("# Aura\n")
+    (data / "artifacts").mkdir()
+    (data / "artifacts" / "report.json").write_text("{}")
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"vector_memory": {"qdrant_mode": "server", "qdrant_host": "127.0.0.1", "qdrant_port": 6333}}))
     env = {**os.environ, "RMP_ROOT": str(REPO), "RMP_DATA_DIR": str(data), "RMP_BACKUP_ROOT": str(data / "backups"),
@@ -329,9 +341,9 @@ def host(tmp_path):
             (state / name).unlink(missing_ok=True)
         return run_env
 
-    def run(script=BACKUP, *args, answer="y\n", **extra):
-        result = subprocess.run(["bash", str(script), *args], env=prepared(script, extra), cwd=tmp_path, input=answer,
-                                capture_output=True, text=True, timeout=300)
+    def run(script=BACKUP, *args, answer="y\n", cwd=None, **extra):
+        result = subprocess.run(["bash", str(script), *args], env=prepared(script, extra), cwd=cwd or tmp_path,
+                                input=answer, capture_output=True, text=True, timeout=300)
         backups = data / "backups"
         stamps = sorted(p for p in backups.iterdir() if p.name[:2] == "20") if backups.is_dir() else []
         dest = stamps[-1] if stamps else None
@@ -371,6 +383,7 @@ def test_a_healthy_backup_takes_a_verified_qdrant_snapshot_and_dumps_temporal(ho
     assert (dest / "temporal.dump").read_bytes() == b"PGDMP-temporal"
     assert (dest / "temporal_visibility.dump").read_bytes() == b"PGDMP-temporal_visibility"
     assert tarfile.open(dest / "qdrant-full.snapshot").getnames()[1] == "config.json"
+    assert tarfile.open(dest / "artifacts.tar.gz").getnames() == ["artifacts", "artifacts/report.json"]
     assert not list(dest.glob("*.partial")) and not (dest / "qdrant.tar.gz").exists()
     assert [m for m, _ in calls] == ["GET", "GET", "POST", "GET", "DELETE"]
     assert calls[0][1].endswith("/readyz") and calls[2][1].endswith("/snapshots?wait=true")
@@ -378,10 +391,64 @@ def test_a_healthy_backup_takes_a_verified_qdrant_snapshot_and_dumps_temporal(ho
     assert oct((dest / "rmp_db.dump").stat().st_mode & 0o777) == "0o600"
 
 
+def test_a_healthy_backup_writes_a_manifest_that_lists_every_file(host):
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert {key: manifest[key] for key in ("format", "timestamp", "qdrant_mode")} == {
+        "format": 2, "timestamp": dest.name, "qdrant_mode": "server"}
+    assert manifest["components"] == {
+        "postgres": ["rmp_db.dump"], "temporal": ["temporal.dump", "temporal_visibility.dump"],
+        "qdrant": ["qdrant-full.snapshot"], "artifacts": ["artifacts.tar.gz"],
+        "openclaw-state": ["openclaw-state/manifest.json", "openclaw-state/openclaw-agent.sqlite",
+                           "openclaw-state/openclaw.sqlite"],
+        "workspace": ["workspace.tar.gz"], "settings": ["settings.json", "openclaw.json"]}
+    listed = [name for names in manifest["components"].values() for name in names]
+    assert manifest["files"] == {name: {"bytes": (dest / name).stat().st_size, "sha256": _sha256(dest / name)}
+                                 for name in listed}
+    # Every file the run made is listed, but its log and the manifest itself.
+    assert {str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()} == {*listed, "backup.log",
+                                                                                  "manifest.json"}
+    assert oct((dest / "manifest.json").stat().st_mode & 0o777) == "0o600"
+    # Each dump read to its end before the manifest was written.
+    assert (host.state / "pg_restore.log").read_text().splitlines() == [
+        f"-f /dev/null {dest / name}" for name in ("rmp_db.dump", "temporal.dump", "temporal_visibility.dump")]
+    # The check the programme runs on the next nightly backup.
+    verify = subprocess.run([sys.executable, "-m", "app.production.backup_manifest", "verify", str(dest)], cwd=REPO,
+                            capture_output=True, text=True, timeout=120)
+    assert verify.returncode == 0 and verify.stdout == "" and verify.stderr == ""
+
+
+def test_a_missing_component_fails_the_run_instead_of_being_skipped(host):
+    """A component that silently made nothing, such as a missing openclaw.json or an OpenClaw store that moved, fails
+    the run: exit 1, and no pruning."""
+    config = host.tmp / "openclaw" / "openclaw.json"
+    config.unlink()
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 1 and manifest["failures"] == ["settings"]
+    assert f"FAIL: settings: could not copy {config}" in result.stdout
+    assert "openclaw.json" in manifest["components"]["settings"] and "openclaw.json" not in manifest["files"]
+    assert "Backup INCOMPLETE: settings failed" in result.stdout
+    config.write_text("{}")
+    host.stores["openclaw-agent.sqlite"].unlink()
+    shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 1 and manifest["failures"] == ["openclaw-state"]
+    assert "FAIL: openclaw-state: openclaw-state/manifest.json does not list agent" in result.stderr
+    assert "FAIL: openclaw-state: openclaw-state/manifest.json does not list agent" in (dest / "backup.log").read_text()
+
+
+def test_a_dump_that_does_not_read_back_fails_the_backup_run(host):
+    result, dest, manifest, _ = host.run(FAKE_PGRESTORE_FAIL="temporal")
+    assert result.returncode == 1 and manifest["failures"] == ["temporal:temporal"]
+    assert "FAIL: temporal:temporal: temporal.dump does not read back" in result.stderr
+    assert manifest["files"]["temporal.dump"]["bytes"] == (dest / "temporal.dump").stat().st_size
+
+
 def test_the_script_does_not_depend_on_its_working_directory(host):
-    """rmp-backup.service starts it with no working directory: the run above already happens from tmp, not the repo."""
-    result, _, manifest, _ = host.run()
-    assert result.returncode == 0 and manifest["failures"] == []
+    """rmp-backup.service has no WorkingDirectory=, so systemd starts the script from /: its app imports resolve only
+    because it changes to the RMP root first."""
+    result, _, manifest, _ = host.run(cwd="/")
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("failure, words", [
@@ -423,6 +490,17 @@ def test_every_dump_bounds_its_lock_wait(host):
     assert "rmp_db" in dumps[0] and dumps[1][-1] == "temporal" and dumps[2][-1] == "temporal_visibility"
 
 
+def test_the_manifest_expects_a_dump_of_each_temporal_database_the_run_was_set_to_dump(host):
+    result, dest, manifest, _ = host.run(RMP_TEMPORAL_DBS="temporal")
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert manifest["components"]["temporal"] == ["temporal.dump"] and not (dest / "temporal_visibility.dump").exists()
+    # A run set to dump none has no Temporal backup: that fails the component.
+    shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+    result, dest, manifest, _ = host.run(RMP_TEMPORAL_DBS="")
+    assert result.returncode == 1 and manifest["failures"] == ["temporal"]
+    assert manifest["components"]["temporal"] == [] and not list(dest.glob("temporal*.dump"))
+
+
 def test_embedded_mode_archives_the_storage_directory(host):
     storage = host.tmp / "qdrant-embedded"
     (storage / "collection").mkdir(parents=True)
@@ -433,6 +511,206 @@ def test_embedded_mode_archives_the_storage_directory(host):
     assert result.returncode == 0 and manifest["failures"] == [], result.stdout
     assert "qdrant-embedded/collection/segment" in tarfile.open(dest / "qdrant.tar.gz").getnames()
     assert calls == []
+
+
+def test_the_legacy_temporal_sqlite_file_is_not_copied(host):
+    """data/temporal.db is dead since Temporal moved to Postgres: it stays on disk and is no longer copied."""
+    _store(host.tmp / "data" / "temporal.db", range(3))
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert not list(dest.glob("temporal.db*")) and (host.tmp / "data" / "temporal.db").is_file()
+
+
+def test_the_workspace_notes_are_archived_without_git_venv_chat_logs_or_logs(host):
+    workspace = host.tmp / "openclaw" / "workspace"
+    for name in (".git/config", "chat_logs/x", "moltmarket_venv/y", "a.log", "notes/b.log", "notes/plan.md"):
+        (workspace / name).parent.mkdir(parents=True, exist_ok=True)
+        (workspace / name).write_text(name)
+    (host.tmp / "openclaw" / "cron").mkdir()
+    (host.tmp / "openclaw" / "cron" / "jobs.json").write_text("{}")
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    with tarfile.open(dest / "workspace.tar.gz") as tar:
+        names = set(tar.getnames())
+    assert {"workspace", "workspace/AGENTS.md", "workspace/notes/plan.md"} <= names
+    assert not names & {"workspace/.git", "workspace/.git/config", "workspace/chat_logs", "workspace/chat_logs/x",
+                        "workspace/moltmarket_venv", "workspace/moltmarket_venv/y", "workspace/a.log",
+                        "workspace/notes/b.log"}
+    assert oct((dest / "workspace.tar.gz").stat().st_mode & 0o777) == "0o600"
+    # OpenClaw keeps its cron jobs in its state store, which openclaw-state/ holds.
+    assert not (dest / "cron_jobs.json").exists()
+    shutil.rmtree(workspace)
+    shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 1 and manifest["failures"] == ["workspace"]
+    assert f"FAIL: workspace: {workspace} is missing" in result.stdout and not (dest / "workspace.tar.gz").exists()
+
+
+def _artifact_store(host, **store):
+    """The live settings' artifact_store set to ``store``."""
+    host.settings.write_text(json.dumps({**json.loads(host.settings.read_text()), "artifact_store": store}))
+
+
+def test_a_missing_artifact_root_fails_the_artifacts_component(host):
+    """The root comes from the settings, and the backup never creates it: a store that moved is not skipped."""
+    root = host.tmp / "moved" / "store"
+    _artifact_store(host, root_path=str(root))
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 1 and manifest["failures"] == ["artifacts"]
+    assert f"FAIL: artifacts: the artifact root {root} is missing" in result.stdout
+    assert not root.exists() and not (dest / "artifacts.tar.gz").exists()
+    # A disabled store has nothing to archive, and that is no failure.
+    _artifact_store(host, enabled=False, root_path=str(root))
+    shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert not root.exists() and not (dest / "artifacts.tar.gz").exists()
+
+
+def test_a_moved_artifact_store_is_backed_up_and_restored(host):
+    """Settings name a root outside data/, under another name: the backup archives it, and the restore puts it back
+    there, from a backup made since the move and from one made before it."""
+    # The backup before the move, under an older stamp: the next run may start within the same second.
+    before_the_move = host.run()[1].rename(host.backups / "20261001T031500Z")
+    root = host.tmp / "elsewhere" / "evidence"
+    root.mkdir(parents=True)
+    (root / "report.json").write_text('{"v": 1}')
+    _artifact_store(host, root_path=str(root))
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert tarfile.open(dest / "artifacts.tar.gz").getnames() == ["evidence", "evidence/report.json"]
+    (root / "report.json").write_text('{"v": 2}')
+    (root / "added.json").write_text("{}")
+    result = host.restore(dest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(p.name for p in root.iterdir()) == ["report.json"]
+    assert (root / "report.json").read_text() == '{"v": 1}'
+    # Extracted beside the root, then moved into its place: nothing is left beside it.
+    assert [p.name for p in root.parent.iterdir()] == ["evidence"]
+    assert (host.tmp / "data" / "artifacts" / "report.json").read_text() == "{}"
+    # An archive made before the move holds the old root's name; it goes to the configured root all the same.
+    _artifact_store(host, root_path=str(root))
+    result = host.restore(before_the_move)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(p.name for p in root.iterdir()) == ["report.json"] and (root / "report.json").read_text() == "{}"
+    assert [p.name for p in root.parent.iterdir()] == ["evidence"]
+
+
+def test_a_symlinked_artifact_root_is_archived_as_its_directory_and_restored_through_its_link(host):
+    """tar stores a symlink operand as the link alone: the backup archives the directory the root resolves to, and the
+    restore replaces that directory and keeps the link."""
+    store = host.tmp / "disk" / "store"
+    store.mkdir(parents=True)
+    (store / "report.json").write_text('{"v": 1}')
+    root = host.tmp / "elsewhere" / "evidence"
+    root.parent.mkdir()
+    root.symlink_to(store)
+    _artifact_store(host, root_path=str(root))
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert tarfile.open(dest / "artifacts.tar.gz").getnames() == ["store", "store/report.json"]
+    (store / "report.json").write_text('{"v": 2}')
+    (store / "added.json").write_text("{}")
+    result = host.restore(dest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert root.is_symlink() and os.readlink(root) == str(store)
+    assert sorted(p.name for p in store.iterdir()) == ["report.json"]
+    assert (store / "report.json").read_text() == '{"v": 1}'
+    assert [p.name for p in store.parent.iterdir()] == ["store"]
+
+
+@pytest.mark.parametrize("entries, count", [(("artifacts/report.json", "stray.json"), 2), (("artifacts",), 1)])
+def test_an_artifacts_archive_without_exactly_one_top_level_directory_is_not_restored(host, entries, count):
+    """The archive's one top-level directory replaces the root; with any other shape the root stays as it is, and
+    nothing is left beside it. A lone top-level entry must be a directory itself, not a link to one."""
+    _, dest, _, _ = host.run()
+    root = host.tmp / "data" / "artifacts"
+    elsewhere = host.tmp / "elsewhere"
+    elsewhere.mkdir()
+    with tarfile.open(dest / "artifacts.tar.gz", "w:gz") as tar:
+        for name in entries:
+            info = tarfile.TarInfo(name)
+            if name == "artifacts":
+                info.type, info.linkname = tarfile.SYMTYPE, str(elsewhere)
+            tar.addfile(info, io.BytesIO(b""))
+    _artifact_store(host, root_path=str(root))
+    tree = {str(p): _sha256(p) if p.is_file() else None for p in root.parent.rglob("*")}
+    result = host.restore(dest)
+    assert result.returncode == 1
+    assert f"artifacts: artifacts.tar.gz holds {count} top-level entries, not one directory\n" in result.stderr
+    assert "Restore INCOMPLETE: not restored: artifacts\n" in result.stderr
+    assert {str(p): _sha256(p) if p.is_file() else None for p in root.parent.rglob("*")} == tree
+
+
+def test_a_failed_move_keeps_the_restored_artifacts_beside_the_root(host):
+    """Once the old root is removed, the restored copy is the only one on disk: a failed mv keeps it beside the root,
+    and the restore says where, instead of deleting it with its temporary directory."""
+    _, dest, _, _ = host.run()
+    root = host.tmp / "data" / "artifacts"
+    _artifact_store(host, root_path=str(root))
+    mv = host.tmp / "bin" / "mv"
+    mv.write_text("#!/bin/sh\necho 'mv: cannot move: Device or resource busy' >&2\nexit 1\n")
+    mv.chmod(0o755)
+    result = host.restore(dest)
+    assert result.returncode == 1
+    assert "Restore INCOMPLETE: not restored: artifacts\n" in result.stderr
+    [kept] = root.parent.glob(".artifacts.restoring.*")
+    assert (f"artifacts: could not move the restored copy into {root}; it is kept in {kept}\n") in result.stderr
+    assert (kept / "artifacts" / "report.json").read_text() == "{}" and not root.exists()
+
+
+@pytest.mark.parametrize("root", ["ancestor", "relative"])
+def test_the_restore_refuses_an_artifact_root_that_would_delete_more_than_artifacts(host, root):
+    """A root that holds the backups (here the data directory), or a relative one, which would resolve against
+    wherever the restore runs, is refused, and nothing under it is touched. / is not run as a case: a broken guard
+    would delete the host. The ancestor rule refuses it too, since / holds RMP_ROOT."""
+    _, dest, _, _ = host.run()
+    data = host.tmp / "data"
+    root, reason = ((str(data), f"it is or holds {os.path.realpath(data)}") if root == "ancestor"
+                    else ("data/artifacts", "it is not an absolute path"))
+    _artifact_store(host, root_path=root)
+    # Made since the backup: a restore of the root, refused or not, would remove it.
+    (data / "artifacts" / "live.json").write_text("{}")
+    tree = {str(p): _sha256(p) if p.is_file() else None for p in data.rglob("*")}
+    result = host.restore(dest)   # from tmp_path, where data/artifacts is the artifact store
+    assert result.returncode == 1
+    refusal = f"artifacts: refusing to replace {root}: {reason}; restore artifacts.tar.gz by hand\n"
+    assert refusal in result.stderr
+    assert "Restore INCOMPLETE: not restored: artifacts\n" in result.stderr.split(refusal, 1)[1]
+    assert {str(p): _sha256(p) if p.is_file() else None for p in data.rglob("*")} == tree
+
+
+@pytest.mark.parametrize("holds", ["the backup", "the backup root", "the data directory"])
+def test_the_restore_refuses_an_artifact_root_that_holds_a_guarded_path_without_being_one(host, holds):
+    """The ancestor rule on its own: each root here equals none of the checkout, the data directory, the backup root
+    and the backup restored, and holds one of them. None is tmp_path itself, whose removal by a broken guard would
+    take the fake tools with it."""
+    _, dest, _, _ = host.run()
+    src, extra = dest, {}
+    if holds == "the backup":
+        root = host.tmp / "rescue"
+        src = guarded = root / dest.name
+        shutil.copytree(dest, src)
+    elif holds == "the backup root":
+        root = host.tmp / "vault"
+        guarded = root / "backups"
+        shutil.copytree(dest, guarded / dest.name)
+        extra["RMP_BACKUP_ROOT"] = str(guarded)
+    else:
+        root = host.tmp / "deep"
+        guarded = root / "data"
+        shutil.copytree(host.tmp / "data" / "artifacts", guarded / "artifacts")
+        extra["RMP_DATA_DIR"] = str(guarded)
+    _artifact_store(host, root_path=str(root))
+    watched = (host.tmp / "data", root)
+    tree = {str(p): _sha256(p) if p.is_file() else None for d in watched for p in d.rglob("*")}
+    result = host.restore(src, **extra)
+    assert result.returncode == 1
+    refusal = (f"artifacts: refusing to replace {root}: it is or holds {os.path.realpath(guarded)}; "
+               "restore artifacts.tar.gz by hand\n")
+    assert refusal in result.stderr
+    assert "Restore INCOMPLETE: not restored: artifacts\n" in result.stderr.split(refusal, 1)[1]
+    assert {str(p): _sha256(p) if p.is_file() else None for d in watched for p in d.rglob("*")} == tree
 
 
 def _dated(root, days, old, failures=(), month="09"):
@@ -477,6 +755,27 @@ def test_a_failed_run_prunes_nothing(host):
     _dated(host.backups, range(1, 17), time.time() - 30 * 86400)
     result, _, _, _ = host.run(FAKE_QDRANT_CREATE_FAIL="1")
     assert result.returncode == 1 and "no older backup was pruned" in result.stdout
+    assert len([p for p in host.backups.iterdir() if p.name[:2] == "20"]) == 17
+
+
+def _python_without_the_manifest_module(host):
+    """An RMP_PYTHON that runs everything but ``-m app.production.backup_manifest``, which fails as a crash would."""
+    python = host.tmp / "python"
+    python.write_text('#!/bin/sh\nif [ "$1 $2" = "-m app.production.backup_manifest" ]; then\n'
+                      '  echo "Traceback: the manifest module crashed" >&2\n  exit 1\nfi\n'
+                      f'exec "{sys.executable}" "$@"\n')
+    python.chmod(0o755)
+    return str(python)
+
+
+def test_a_run_whose_manifest_is_not_written_fails_and_prunes_nothing(host):
+    """Without a manifest nothing records what the run holds: it is a failed run, whatever its components did."""
+    _dated(host.backups, range(1, 17), time.time() - 30 * 86400)
+    result, dest, manifest, _ = host.run(RMP_PYTHON=_python_without_the_manifest_module(host))
+    assert result.returncode == 1 and manifest is None and not list(dest.glob("manifest.json*"))
+    assert "FAIL: manifest: the manifest was not written" in result.stdout
+    assert "Backup INCOMPLETE: manifest failed" in result.stdout and "no older backup was pruned" in result.stdout
+    assert "the manifest module crashed" in result.stderr
     assert len([p for p in host.backups.iterdir() if p.name[:2] == "20"]) == 17
 
 
@@ -527,6 +826,46 @@ def test_the_snapshot_restore_sends_a_given_key_on_stdin_only(host):
         assert result.returncode == 0, result.stdout + result.stderr
         calls = host.log("curl-argv.log")
         assert len(calls) == 2 and not any("-K" in call["argv"] or call["headers"] for call in calls)
+
+
+def test_restore_warns_before_its_prompt_when_a_file_does_not_match_its_checksum(host):
+    """A disaster may leave only a damaged backup: the restore verifies it, warns before its prompt, and the operator
+    decides. The backup's path may be relative to where the restore runs."""
+    _, dest, _, _ = host.run()
+    dump = dest / "rmp_db.dump"
+    dump.write_bytes(dump.read_bytes()[:-1] + b"!")
+    for src in (dest, dest.relative_to(host.tmp)):
+        result = host.restore(src, answer="n\n")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.startswith("WARNING: this backup does not verify:\n"
+                                        "rmp_db.dump does not match its checksum\n"
+                                        f"=== RMP Restore from {src} ===\n"), result.stdout
+        assert host.log("systemctl.log") == [] and host.log("sudo.log") == []
+    # A backup made before manifest format 2 gets its note; one that verifies, no warning.
+    dump.write_bytes(b"PGDMP")
+    manifest = dest / "manifest.json"
+    complete = manifest.read_text()
+    manifest.write_text(json.dumps({"timestamp": dest.name, "failures": []}))
+    result = host.restore(dest, answer="n\n")
+    assert result.stdout.startswith("WARNING: this backup does not verify:\n"
+                                    "made before manifest format 2 (no file list)\n"
+                                    "=== RMP Restore from "), result.stdout
+    manifest.write_text(complete)
+    result = host.restore(dest, answer="n\n")
+    assert result.returncode == 0 and result.stdout.startswith("=== RMP Restore from "), result.stdout
+    assert "WARNING" not in result.stdout + result.stderr
+
+
+def test_restore_warns_before_its_prompt_when_the_check_itself_cannot_run(host):
+    """A fresh host whose venv is not built cannot run the check: the warning says so, and its error is on stderr."""
+    _, dest, _, _ = host.run()
+    result = host.restore(dest, answer="n\n", RMP_PYTHON=_python_without_the_manifest_module(host))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.startswith("WARNING: this backup does not verify:\n"
+                                    "the check itself could not run (its error is on stderr)\n"
+                                    "=== RMP Restore from "), result.stdout
+    assert "the manifest module crashed" in result.stderr
+    assert host.log("systemctl.log") == [] and host.log("sudo.log") == []
 
 
 def test_restore_recreates_each_database_from_its_dump_through_the_postgres_superuser(host):
