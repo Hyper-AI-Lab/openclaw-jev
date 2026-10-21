@@ -146,13 +146,15 @@ else
   fail qdrant "could not resolve Qdrant from settings (mode '${QDRANT_MODE}', '${QDRANT_WHERE}')"
 fi
 
-# Artifacts: the configured root, archived under its own name from its parent directory.
+# Artifacts: the configured root, archived from its parent directory under its own name. A symlinked root is archived
+# as the directory it resolves to, which the restore replaces: tar would store the link alone.
 if [[ "${ARTIFACTS}" == off ]]; then
   log "The artifact store is disabled: no artifacts to archive"
 elif [[ -d "${ARTIFACT_ROOT}" ]]; then
   log "Archiving artifacts from ${ARTIFACT_ROOT}..."
-  tar -czf "${DEST}/artifacts.tar.gz" -C "$(dirname "${ARTIFACT_ROOT}")" "$(basename "${ARTIFACT_ROOT}")" 2>>"${LOG}" \
-    || fail artifacts "tar of ${ARTIFACT_ROOT} failed"
+  ARTIFACT_DIR="$(realpath -- "${ARTIFACT_ROOT}" 2>>"${LOG}")" \
+    && tar -czf "${DEST}/artifacts.tar.gz" -C "$(dirname "${ARTIFACT_DIR}")" "$(basename "${ARTIFACT_DIR}")" \
+      2>>"${LOG}" || fail artifacts "tar of ${ARTIFACT_ROOT} failed"
 else
   fail artifacts "the artifact root ${ARTIFACT_ROOT} is missing"
 fi

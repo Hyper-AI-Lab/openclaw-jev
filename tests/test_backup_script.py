@@ -585,6 +585,29 @@ def test_a_moved_artifact_store_is_backed_up_and_restored(host):
     assert [p.name for p in root.parent.iterdir()] == ["evidence"]
 
 
+def test_a_symlinked_artifact_root_is_archived_as_its_directory_and_restored_through_its_link(host):
+    """tar stores a symlink operand as the link alone: the backup archives the directory the root resolves to, and the
+    restore replaces that directory and keeps the link."""
+    store = host.tmp / "disk" / "store"
+    store.mkdir(parents=True)
+    (store / "report.json").write_text('{"v": 1}')
+    root = host.tmp / "elsewhere" / "evidence"
+    root.parent.mkdir()
+    root.symlink_to(store)
+    _artifact_store(host, root_path=str(root))
+    result, dest, manifest, _ = host.run()
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert tarfile.open(dest / "artifacts.tar.gz").getnames() == ["store", "store/report.json"]
+    (store / "report.json").write_text('{"v": 2}')
+    (store / "added.json").write_text("{}")
+    result = host.restore(dest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert root.is_symlink() and os.readlink(root) == str(store)
+    assert sorted(p.name for p in store.iterdir()) == ["report.json"]
+    assert (store / "report.json").read_text() == '{"v": 1}'
+    assert [p.name for p in store.parent.iterdir()] == ["store"]
+
+
 def test_an_artifacts_archive_without_exactly_one_top_level_directory_is_not_restored(host):
     """The archive's one top-level directory replaces the root; with any other shape the root stays as it is, and
     nothing is left beside it."""

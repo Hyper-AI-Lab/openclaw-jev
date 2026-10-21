@@ -234,8 +234,9 @@ fi
 # Artifacts go back to the configured root, the one ops/backup.sh archives (artifact_store.root_path), which this step
 # replaces whole. Nothing validated that setting before, so the step first refuses a root that is not absolute, is /,
 # or is or holds the checkout, the data directory, the backup root or this backup, each compared by realpath -m.
-# Nothing under a refused root is touched. The archive holds one top-level directory, named as the root was when the
-# backup was made: it is extracted beside the root, on the same filesystem, then put in the root's place.
+# Nothing under a refused root is touched. The archive holds one top-level directory, named as the directory the root
+# resolved to when the backup was made: it is extracted beside that directory, on the same filesystem, then put in its
+# place, so a symlinked root keeps its link.
 restore_artifacts() {
   local root real path reason="" work
   local -a top
