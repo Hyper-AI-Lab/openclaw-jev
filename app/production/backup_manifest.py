@@ -4,7 +4,8 @@ One definition of a complete backup, for the backup that writes the manifest and
 restore (ops/restore_backup.sh) and the restore drill (ops/restore_drill.py) verify a backup with its checksums before
 they use it.
 
-    python -m app.production.backup_manifest write <dir> --temporal-dbs "<names>" --qdrant-mode <mode> --artifacts on|off [--failure <name>]...
+    python -m app.production.backup_manifest write <dir> --temporal-dbs "<names>" --qdrant-mode <mode>
+        --artifacts on|off [--failure <name>]...
     python -m app.production.backup_manifest verify <dir>
 
 ``write`` runs from the RMP checkout once every component has run. It prints the run's final failures on stdout,

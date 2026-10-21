@@ -166,8 +166,9 @@ log "Backing up OpenClaw stores..."
 # and log files. Restored by hand (docs/runbooks/backup-restore.md).
 if [[ -d "${OPENCLAW_HOME}/workspace" ]]; then
   log "Archiving the OpenClaw workspace..."
-  tar -czf "${DEST}/workspace.tar.gz" -C "${OPENCLAW_HOME}" --exclude=workspace/.git --exclude=workspace/moltmarket_venv \
-    --exclude=workspace/chat_logs --exclude='*.log' workspace 2>>"${LOG}" || fail workspace "tar of the workspace failed"
+  tar -czf "${DEST}/workspace.tar.gz" -C "${OPENCLAW_HOME}" --exclude=workspace/.git \
+    --exclude=workspace/moltmarket_venv --exclude=workspace/chat_logs --exclude='*.log' workspace 2>>"${LOG}" \
+    || fail workspace "tar of the workspace failed"
 else
   fail workspace "${OPENCLAW_HOME}/workspace is missing"
 fi

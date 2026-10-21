@@ -35,8 +35,10 @@ EXPECTED = [(name, component) for component, names in COMPONENTS.items() for nam
 FAKE_PG_RESTORE = r'''#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_STATE}/pg_restore.log"
 for a in "$@"; do last="$a"; done
-[ "$(basename "${last}")" = "${FAKE_PGRESTORE_FAIL:-}" ] && { echo "pg_restore: error: could not read block" >&2; exit 1; }
-exit 0
+if [ "$(basename "${last}")" = "${FAKE_PGRESTORE_FAIL:-}" ]; then
+  echo "pg_restore: error: could not read block" >&2
+  exit 1
+fi
 '''
 
 
