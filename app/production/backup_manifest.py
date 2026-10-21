@@ -157,9 +157,10 @@ def _file_problems(dest: Path, name: str, meta: object, hashes: bool) -> List[st
     size = path.stat().st_size
     if size == 0:
         return [f"{name} is empty"]
-    # A listed file without a size was missing or unreadable when the manifest was written, and its component failed.
+    # write() gives every file it lists a size unless the file was missing or unreadable, and then fails its component.
+    # A file here without one has nothing to be checked against.
     if not isinstance(meta, dict):
-        return []
+        return [f"{name} has no size in the manifest"]
     if size != meta.get("bytes"):
         return [f"{name} is {size} bytes, the manifest says {meta.get('bytes')}"]
     if hashes:

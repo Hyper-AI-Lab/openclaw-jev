@@ -206,6 +206,18 @@ def test_problems_reports_each_case(dest):
     assert bm.problems(dest, hashes=True) == ["no readable manifest.json"]
 
 
+def test_problems_reports_a_listed_file_the_manifest_gives_no_size(dest):
+    """A manifest that lists a file without its size and sha256 checks nothing of it, whatever its failures say."""
+    _write(dest)
+    manifest = json.loads((dest / "manifest.json").read_text())
+    del manifest["files"]["settings.json"]
+    (dest / "manifest.json").write_text(json.dumps(manifest))
+    assert bm.problems(dest, hashes=True) == ["settings.json has no size in the manifest"]
+    del manifest["files"]
+    (dest / "manifest.json").write_text(json.dumps(manifest))
+    assert bm.problems(dest, hashes=False) == [f"{name} has no size in the manifest" for name, _ in EXPECTED]
+
+
 def test_problems_reports_a_backup_made_before_format_2_with_its_failures(dest):
     """20261005T031502Z's shape: no failures key and a 110-byte qdrant.tar.gz; and a later one with failures."""
     shutil.rmtree(dest)
