@@ -967,6 +967,13 @@ def test_a_restic_round_trip_against_a_local_repository(host):
     restored = out / copied[-1].relative_to("/")
     assert manifest["files"] and all(_sha256(restored / name) == meta["sha256"]
                                      for name, meta in manifest["files"].items())
+    # The copy is made once the manifest is written: the restored copy verifies on its own, as the restore checks it
+    # first, and holds the manifest as written, before the run recorded the copy in it.
+    verify = subprocess.run([sys.executable, "-m", "app.production.backup_manifest", "verify", str(restored)], cwd=REPO,
+                            capture_output=True, text=True, timeout=120)
+    assert verify.returncode == 0 and verify.stdout == "" and verify.stderr == "", verify.stdout + verify.stderr
+    assert json.loads((restored / "manifest.json").read_text()) == {
+        name: value for name, value in manifest.items() if name != "offsite"}
     assert not any(password.read_text() in text for text in (result.stdout, result.stderr,
                                                              (copied[-1] / "backup.log").read_text()))
     # Each night's directory is a path of its own: grouped by host, the forget still keeps only the newest copies.
