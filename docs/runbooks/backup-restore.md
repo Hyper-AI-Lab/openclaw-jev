@@ -217,7 +217,7 @@ The drill copies each drilled backup through restic into a scratch repository an
 **RPO, RTO and retention:**
 - **RPO: 24 hours.** One backup runs a day, at 03:15 UTC (`rmp-backup.timer`), so a restore loses at most the day since then. This holds against damage inside the host's stores: corruption, a bad migration, an operator error. Against the loss of this disk there is no recovery point (K-7).
 - **RTO: 1 minute.** The drill's `restore duration` was 0 min 7 s on 2026-10-19 and 0 min 13 s on 2026-10-21 (after WP-12 batch 4), rounded up to whole minutes. It covers the restore of the three databases and of Qdrant on today's data. It leaves out stopping and starting the services, the artifacts and OpenClaw's stores, and the operator's own time. Each quarterly drill prints the duration again; update this number when it changes.
-- **Retention:** the newest 14 complete backups on this host (`KEEP=14` in `ops/backup.sh`; "Retention" above). Off the host, when switched on, the newest 14 copies (`--keep-last 14`).
+- **Retention:** the newest 14 complete backups on this host (`KEEP=14` in `ops/backup.sh`; "Retention" above). Off the host, when switched on, the newest 14 copies (`--keep-last 14`), complete or not. The copies of failed runs count towards them, so 14 failed nights in a row would leave no complete backup off the host, while this host still keeps its last 14.
 
 **To switch it on** (Kirill decides the destination and who holds the key):
 1. Write `/etc/rmp/restic.env`, owned by root with mode 0600: `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE` (a root-only 0600 file that holds the password) and the backend's variables.

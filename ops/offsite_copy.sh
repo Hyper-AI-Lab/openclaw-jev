@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The off-host copy of one backup of ops/backup.sh: restic copies the directory into its repository, encrypted on this
-# host, then forgets all but the newest copies this host made (RMP_OFFSITE_KEEP, 14, as many as backup.sh keeps
-# locally) and prunes what only those held. It groups by host: restic's default grouping by path would make each
-# night's directory a group of its own, and nothing would ever be forgotten.
+# host, then forgets all but the newest copies this host made, complete or not (RMP_OFFSITE_KEEP, 14), and prunes what
+# only those held. backup.sh copies a failed run too, so its copy counts here, while backup.sh's local KEEP=14 counts
+# complete backups only. It groups by host: restic's default grouping by path would make each night's directory a
+# group of its own, and nothing would ever be forgotten.
 #
 #   bash ops/offsite_copy.sh <backup dir>
 #
