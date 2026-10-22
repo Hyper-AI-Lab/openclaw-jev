@@ -223,7 +223,7 @@ The drill copies each drilled backup through restic into a scratch repository an
 1. Write `/etc/rmp/restic.env`, owned by root with mode 0600: `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE` (a root-only 0600 file that holds the password) and the backend's variables.
 2. Initialise the repository with it, which keeps every value off the command line: `( set -a; . /etc/rmp/restic.env; set +a; restic init )`.
 3. Keep a copy of the password off the host. Without it the copies cannot be read, and a lost disk takes the password file with it.
-4. Set `backup.offsite.enabled` to `true` in `settings.json`. The next nightly manifest says `"offsite": "copied"`.
+4. Set `backup.offsite.enabled` to `true` in `settings.json`. The next nightly manifest says `"offsite": "copied"`. From then on a failed copy fails the night's run as `offsite`, however complete the backup on this host: while the repository cannot be reached, no new backup counts as complete, so this host prunes nothing and keeps one more backup each night, and the drill by default drills the last complete backup from before the outage.
 
 To restore from the copy, with `/etc/rmp/restic.env` and the password file in place, run each restic command below as `( set -a; . /etc/rmp/restic.env; set +a; restic … )`. The newest copy is not always the one to restore: a failed run is copied too.
 1. `restic snapshots --tag rmp-backup` lists the copies, oldest first, each with its id and its backup's path.
