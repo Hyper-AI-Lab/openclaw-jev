@@ -225,4 +225,7 @@ The drill copies each drilled backup through restic into a scratch repository an
 3. Keep a copy of the password off the host. Without it the copies cannot be read, and a lost disk takes the password file with it.
 4. Set `backup.offsite.enabled` to `true` in `settings.json`. The next nightly manifest says `"offsite": "copied"`.
 
-To restore from the copy, with `/etc/rmp/restic.env` and the password file in place: `( set -a; . /etc/rmp/restic.env; set +a; restic restore latest --target <dir> )`. The backup comes back under `<dir>` at its own path, and `ops/restore_backup.sh` restores it from there, verifying it first, as above.
+To restore from the copy, with `/etc/rmp/restic.env` and the password file in place, run each restic command below as `( set -a; . /etc/rmp/restic.env; set +a; restic … )`. The newest copy is not always the one to restore: a failed run is copied too.
+1. `restic snapshots --tag rmp-backup` lists the copies, oldest first, each with its id and its backup's path.
+2. `restic dump <id> <path>/manifest.json` prints a copy's manifest. Pick the newest copy whose `failures` is `[]`.
+3. `restic restore <id> --target <dir>`. The backup comes back under `<dir>` at its own path, and `ops/restore_backup.sh` restores it from there, verifying it first, as above.
