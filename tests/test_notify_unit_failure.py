@@ -5,6 +5,7 @@ tmp_path. The keys are the ones notify_ops_slack sends each DM under (slack_idem
 and the text): a DM whose key was sent before is not sent again.
 """
 import json
+import os
 import re
 import subprocess
 import sys
@@ -148,9 +149,11 @@ def test_an_undelivered_dm_exits_1(sent, delivered, capsys):
 
 
 def test_the_script_runs_as_its_unit_starts_it_and_fails_when_no_dm_can_go_out(tmp_path):
-    """The template's command, with the suite's environment: its settings and OpenClaw config name no Slack token, so
-    the real notify_ops_slack sends nothing, and the exit code says so."""
-    run = subprocess.run([sys.executable, str(SCRIPT), PROBE], cwd=tmp_path, capture_output=True, text=True,
+    """The template's command, with the suite's environment and an OpenClaw config in tmp_path that does not exist: no
+    Slack token, so the real notify_ops_slack sends nothing, and the exit code says so. The production guard does not
+    see a child process, so the test itself makes sure there is no token."""
+    env = {**os.environ, "OPENCLAW_CONFIG_PATH": str(tmp_path / "openclaw.json")}
+    run = subprocess.run([sys.executable, str(SCRIPT), PROBE], cwd=tmp_path, env=env, capture_output=True, text=True,
                          timeout=120)
     assert run.returncode == 1, run.stderr
     assert run.stdout.splitlines()[-1] == "the DM did not go out"
