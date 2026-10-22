@@ -43,12 +43,22 @@ def backup_root() -> Path:
     return Path(os.environ.get("RMP_BACKUP_ROOT") or os.path.join(RMP_DATA_DIR, "backups"))
 
 
+def _stamp_time(name: str) -> Optional[datetime]:
+    """The UTC time a stamp names, or None for a name shaped like a stamp that is no date (20261399T000000Z): such a
+    directory must not stop the alert."""
+    try:
+        return datetime.strptime(name, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def backup_line(root: Path, now: datetime) -> str:
     """What the failed backup run left: the newest directory under ``root`` named like a stamp, when that stamp is
     less than RUN_WINDOW before ``now``. Other directories there, such as openclaw-state/, are never a run."""
-    runs = [path for path in root.iterdir() if path.is_dir() and STAMP.fullmatch(path.name)] if root.is_dir() else []
-    run = max(runs, key=lambda path: path.name, default=None)
-    if run is None or now - datetime.strptime(run.name, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc) >= RUN_WINDOW:
+    runs = [(when, path) for path in (root.iterdir() if root.is_dir() else ())
+            if path.is_dir() and STAMP.fullmatch(path.name) and (when := _stamp_time(path.name)) is not None]
+    when, run = max(runs, key=lambda found: found[1].name, default=(None, None))
+    if run is None or now - when >= RUN_WINDOW:
         return "no backup directory from this run"
     try:
         manifest = json.loads((run / MANIFEST).read_text(encoding="utf-8"))

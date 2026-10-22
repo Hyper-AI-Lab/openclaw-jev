@@ -115,6 +115,16 @@ def test_a_three_day_old_backup_directory_is_not_reported(sent, tmp_path):
     assert sent.dms[-1][0].splitlines()[1] == "Backup 20261022T013500Z: not backed up: qdrant"
 
 
+def test_a_directory_named_like_a_stamp_that_is_no_date_does_not_stop_the_alert(sent, tmp_path):
+    """20261399T000000Z has a stamp's shape and sorts above every real run: it is passed over, and the real run
+    below it is still reported, instead of the parse ending the script before any DM or alert."""
+    backup(tmp_path, "20261022T031502Z", ["qdrant"])
+    backup(tmp_path, "20261399T000000Z", ["workspace"])
+    assert notify.main([BACKUP], now=utc(22, 3, 40)) == 0
+    assert sent.dms[0][0].splitlines()[1] == "Backup 20261022T031502Z: not backed up: qdrant"
+    assert len(sent.alerts) == 1
+
+
 def test_the_incident_id_holds_the_unit_and_the_date_and_the_text_no_time_of_day(sent):
     assert notify.main([PROBE], now=datetime(2026, 10, 22, 13, 47, 9, tzinfo=timezone.utc)) == 0
     text = f"⚠️ {PROBE} failed (2026-10-22 UTC)\n" + CHECK.format(PROBE)

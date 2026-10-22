@@ -7,3 +7,6 @@ WorkingDirectory=/root/.openclaw/rmp
 Environment=PYTHONPATH=/root/.openclaw/rmp
 EnvironmentFile=-/etc/rmp/rmp.env
 ExecStart=/root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/notify_unit_failure.py %i
+# A oneshot has no start timeout by default: a DM that hangs (a receipt lookup behind a lock) would keep this instance
+# activating, and every later failure of the unit would join that stuck start instead of alerting.
+TimeoutStartSec=2min

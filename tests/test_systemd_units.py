@@ -187,6 +187,8 @@ def test_a_failed_backup_alerts_through_its_on_failure_unit():
         ("Environment", "PYTHONPATH=/root/.openclaw/rmp"),
         ("EnvironmentFile", "-/etc/rmp/rmp.env"),
         ("ExecStart", "/root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/notify_unit_failure.py %i"),
+        # Bounded: a hung DM must not leave the instance activating, which later failures would join silently.
+        ("TimeoutStartSec", "2min"),
     ]
     assert (REPO / "ops" / "notify_unit_failure.py").is_file()
     assert "Install" not in template
