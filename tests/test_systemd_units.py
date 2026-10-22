@@ -1,6 +1,6 @@
 """The tracked unit directory, ops/systemd/: every RMP unit of this host has its file there and nowhere else, each file
-has its sections, every timer is enabled, no key sync can block a start, the backup is bounded and ordered, and no code
-names a retired unit. Reads repo files only, never git."""
+has its sections, every timer is enabled, no key sync can block a start, the backup is bounded and ordered and alerts
+when it fails, and no code names a retired unit. Reads repo files only, never git."""
 import os
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -17,7 +17,8 @@ KEY_SYNC_UNITS = ("openclaw-gateway.service", "rmp-api.service", "rmp-worker.ser
 RUNTIME_DIRS = {"__pycache__", "node_modules", ".venv", "venv"}
 
 # The host's unit files on 2026-10-15, from systemctl list-unit-files 'rmp-*' 'aura-*' 'openclaw*' 'temporal*', plus
-# openclaw-gateway.service.d/50-oompolicy.conf, less temporal-dev.service and aura-web-stack.service, which WP-02 retires.
+# openclaw-gateway.service.d/50-oompolicy.conf, less temporal-dev.service and aura-web-stack.service, which WP-02 retires,
+# plus WP-12's alert template rmp-unit-failed@.service.
 INVENTORY = {
     "aura-coder-firewall.service",
     "aura-obscura.service",
@@ -46,6 +47,7 @@ INVENTORY = {
     "rmp-temporal-vacuum.timer",
     "rmp-temporal-watchdog.service",
     "rmp-temporal-watchdog.timer",
+    "rmp-unit-failed@.service",
     "rmp-worker.service",
     "temporal.service",
 }
@@ -172,6 +174,25 @@ def test_the_backup_is_bounded_and_starts_after_its_stores():
     after = {unit for key, value in sections["Unit"] if key == "After" for unit in value.split()}
     assert {"postgresql.service", "rmp-qdrant.service"} <= after
     assert dict(sections["Service"]).get("TimeoutStartSec") == "1h"
+
+
+def test_a_failed_backup_alerts_through_its_on_failure_unit():
+    """A failed or timed-out backup starts rmp-unit-failed@rmp-backup.service.service, whose script DMs Kirill (TRI-026).
+    Only OnFailure= starts the template: it has no [Install] and is not listed to be enabled."""
+    assert ("OnFailure", "rmp-unit-failed@%n.service") in _sections("rmp-backup.service")["Unit"]
+    template = _sections("rmp-unit-failed@.service")
+    assert template["Service"] == [
+        ("Type", "oneshot"),
+        ("WorkingDirectory", "/root/.openclaw/rmp"),
+        ("Environment", "PYTHONPATH=/root/.openclaw/rmp"),
+        ("EnvironmentFile", "-/etc/rmp/rmp.env"),
+        ("ExecStart", "/root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/notify_unit_failure.py %i"),
+        # Bounded: a hung DM must not leave the instance activating, which later failures would join silently.
+        ("TimeoutStartSec", "2min"),
+    ]
+    assert (REPO / "ops" / "notify_unit_failure.py").is_file()
+    assert "Install" not in template
+    assert "rmp-unit-failed@.service" not in _enabled_units()
 
 
 def test_no_code_names_a_retired_unit():
