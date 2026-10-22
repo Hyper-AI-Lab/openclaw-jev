@@ -208,7 +208,8 @@ fi
 # ${RESTIC_ENV}, which must belong to the user this runs as and be readable by no one else, and only in a subshell, so
 # its secrets reach restic and no other step; restic's output goes to the log. It runs after a local failure too: what
 # the run made is still worth having off the host. The manifest records off, copied or failed, and a failed copy fails
-# the run.
+# the run. So does a backup.offsite setting that cannot be read (its error is in the log): it may be one that asks for
+# the copy, and must not pass for one switched off.
 OFFSITE_STATE=off
 if [[ "${OFFSITE}" == on ]]; then
   log "Copying the backup off the host with restic..."
@@ -222,6 +223,9 @@ if [[ "${OFFSITE}" == on ]]; then
   else
     fail offsite "restic did not copy the backup (see backup.log)"
   fi
+elif [[ "${OFFSITE}" != off ]]; then
+  OFFSITE_STATE=failed
+  fail offsite "could not read backup.offsite from ${SETTINGS} (see backup.log)"
 fi
 log "Off-host copy: ${OFFSITE_STATE}"
 # A run whose manifest was not written has failed as manifest already, and has nothing to record it in.

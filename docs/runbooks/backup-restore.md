@@ -25,7 +25,7 @@ Backups are stored in `/root/.openclaw/rmp/data/backups/<YYYYMMDDTHHMMSSZ>/`. Fi
 - Every other component still runs.
 - A component also fails when one of its expected files is missing, empty or unreadable, or a dump or archive does not read back: each `*.dump` must read to its end with `pg_restore -f /dev/null`, and each `*.tar.gz` as a tar archive, gzip checksum included. With the artifact store disabled in settings, `artifacts` expects no file; with it enabled, a missing artifact root fails it.
 - The failure is listed in `manifest.json` and in the log.
-- With the off-host copy switched on, a copy that fails, or an env file that is missing, belongs to another user or is readable by others, is the failure `offsite`.
+- With the off-host copy switched on, a copy that fails, or an env file that is missing, belongs to another user or is readable by others, is the failure `offsite`. So is a `backup.offsite` setting that cannot be read, such as `"offsite": true` instead of an object.
 - The script exits 1, so `rmp-backup.service` shows as failed.
 - **No older backup is pruned.**
 
@@ -210,7 +210,7 @@ The step is built and tested, and switched off. When settings' `backup.offsite.e
 - `restic backup --tag rmp-backup --host <host>` copies the directory into the repository, encrypted on this host;
 - `restic forget --tag rmp-backup --host <host> --group-by host --keep-last 14 --prune` then keeps the newest 14 copies this host made. Grouped by host and path, restic's default, each night's directory would be a group of its own, and nothing would ever be forgotten.
 
-Its configuration lives only in `/etc/rmp/restic.env`: `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE` and the backend's variables, never in `settings.json`, which `GET /settings` returns. The backup reads the file only when it belongs to the user the backup runs as (root) and has mode 0600, and only in a subshell, so its variables reach restic and no other step; restic's output goes to `backup.log`. A missing file, a file with another owner or mode, or a failed copy fails the run as `offsite`. The copy runs after a local failure too. Each manifest's `offsite` says `off`, `copied` or `failed`; on this host it says `off`.
+Its configuration lives only in `/etc/rmp/restic.env`: `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE` and the backend's variables, never in `settings.json`, which `GET /settings` returns. The backup reads the file only when it belongs to the user the backup runs as (root) and has mode 0600, and only in a subshell, so its variables reach restic and no other step; restic's output goes to `backup.log`. A missing file, a file with another owner or mode, a failed copy, or a `backup.offsite` setting that cannot be read fails the run as `offsite`. The copy runs after a local failure too. Each manifest's `offsite` says `off`, `copied` or `failed`; on this host it says `off`.
 
 The drill copies each drilled backup through restic into a scratch repository and drills the copy restic restores ("Quarterly DR drill" above). From WP-12 batch 7, readiness reports the exception as the warning `offsite_backup`, the one warning the soak accepts (K-24).
 

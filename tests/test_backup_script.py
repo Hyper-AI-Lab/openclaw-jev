@@ -922,6 +922,21 @@ def test_an_env_file_readable_by_others_is_refused(host, case):
     assert f"FAIL: offsite: {reason}" in result.stdout
 
 
+@pytest.mark.parametrize("backup", [{"offsite": True}, "on"], ids=["offsite not an object", "backup not an object"])
+def test_an_offsite_setting_that_cannot_be_read_fails_the_copy(host, backup):
+    """A malformed setting may be one that asks for the copy: it fails the run instead of passing for a copy switched
+    off. The env file is never read, and Qdrant and the artifacts, read from the same settings first, are backed up."""
+    host.settings.write_text(json.dumps({**json.loads(host.settings.read_text()), "backup": backup}))
+    result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(host.tmp / "no-such-restic.env"))
+    assert result.returncode == 1
+    assert manifest["failures"] == ["offsite"] and manifest["offsite"] == "failed"
+    assert not (host.state / "restic.log").exists()
+    assert f"FAIL: offsite: could not read backup.offsite from {host.settings} (see backup.log)" in result.stdout
+    assert "AttributeError" in (dest / "backup.log").read_text()
+    assert manifest["components"]["qdrant"] == ["qdrant-full.snapshot"]
+    assert manifest["components"]["artifacts"] == ["artifacts.tar.gz"]
+
+
 def _wait_for_a_new_stamp(dest):
     """The stamp is per second: wait until the next backup gets a directory of its own."""
     while time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) <= dest.name:
