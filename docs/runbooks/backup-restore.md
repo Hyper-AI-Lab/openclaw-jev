@@ -28,6 +28,9 @@ Backups are stored in `/root/.openclaw/rmp/data/backups/<YYYYMMDDTHHMMSSZ>/`. Fi
 - With the off-host copy switched on, a copy that fails, or an env file that is missing, belongs to another user or is readable by others, is the failure `offsite`. So is a `backup.offsite` setting that cannot be read, such as `"offsite": true` instead of an object.
 - The script exits 1, so `rmp-backup.service` shows as failed.
 - **No older backup is pruned.**
+- **Kirill gets one ops DM for each failed run**, from `rmp-unit-failed@rmp-backup.service.service`, which the unit's `OnFailure=` starts. A run that times out (`TimeoutStartSec=1h`) fails the unit too. The DM (`ops/notify_unit_failure.py`) names the UTC date and the run, the newest backup directory when it is less than 2 hours old: its stamp and the components its manifest lists as failed, or that the run left no manifest. A manifest that lists none means the run failed after writing it. The DM holds no log line.
+  - The same alert for the same run is not sent twice. A failed re-run on the same day is another run, and sends its own DM.
+  - A DM that did not go out leaves the alert unit failed: `systemctl --failed` lists it, and `journalctl -u rmp-unit-failed@rmp-backup.service.service` shows the alert's text.
 
 Check the last run with `systemctl status rmp-backup.service`, then verify the newest backup against its manifest, checksums included. It prints one problem per line, and nothing when the backup is complete:
 
