@@ -1,6 +1,7 @@
 [Unit]
 Description=RMP daily backup
 After=network.target postgresql.service rmp-qdrant.service
+OnFailure=rmp-unit-failed@%n.service
 
 [Service]
 Type=oneshot

@@ -1,0 +1,9 @@
+[Unit]
+Description=Tell the operator that %i failed
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/.openclaw/rmp
+Environment=PYTHONPATH=/root/.openclaw/rmp
+EnvironmentFile=-/etc/rmp/rmp.env
+ExecStart=/root/.openclaw/rmp/venv/bin/python /root/.openclaw/rmp/ops/notify_unit_failure.py %i
