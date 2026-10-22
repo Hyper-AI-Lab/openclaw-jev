@@ -18,13 +18,14 @@ Backups are stored in `/root/.openclaw/rmp/data/backups/<YYYYMMDDTHHMMSSZ>/`. Fi
 | `openclaw-state/` | OpenClaw's agent and state SQLite stores, taken with the backup API and checksummed. They hold OpenClaw's cron jobs too |
 | `workspace.tar.gz` | Aura's workspace notes (`/root/.openclaw/workspace`), without `.git`, `moltmarket_venv`, `chat_logs` and `*.log` files. It holds the same classes of secrets as the OpenClaw store copies |
 | `settings.json`, `openclaw.json` | Config snapshots |
-| `manifest.json` | Format 2 (`app/production/backup_manifest.py`): `components` names each component's files, `files` gives each file's `bytes` and `sha256`, and `failures` is empty when every component succeeded. Backups made before it have no `format` and no file list |
+| `manifest.json` | Format 2 (`app/production/backup_manifest.py`): `components` names each component's files, `files` gives each file's `bytes` and `sha256`, `offsite` says whether the backup was copied off the host (`off`, `copied` or `failed`; see "Off-host copy" below), and `failures` is empty when every component succeeded. Backups made before it have no `format` and no file list |
 | `backup.log` | The run's log |
 
 **When a component fails:**
 - Every other component still runs.
 - A component also fails when one of its expected files is missing, empty or unreadable, or a dump or archive does not read back: each `*.dump` must read to its end with `pg_restore -f /dev/null`, and each `*.tar.gz` as a tar archive, gzip checksum included. With the artifact store disabled in settings, `artifacts` expects no file; with it enabled, a missing artifact root fails it.
 - The failure is listed in `manifest.json` and in the log.
+- With the off-host copy switched on, a copy that fails, or an env file that is missing, belongs to another user or is readable by others, is the failure `offsite`. So is a `backup.offsite` setting that cannot be read, such as `"offsite": true` instead of an object.
 - The script exits 1, so `rmp-backup.service` shows as failed.
 - **No older backup is pruned.**
 
@@ -158,7 +159,7 @@ So step 1 stops every `rmp-*` timer, as the restore does, which also keeps a bac
 
 ## Quarterly DR drill
 
-`ops/restore_drill.py` restores a backup into a scratch PostgreSQL and a scratch Qdrant, checks every store, and removes both. It restores nothing in production and only reads production's databases: the idle check counts the active user tasks, and one query lists the role names. Run it quarterly, and after any change to a backup or restore script, as root, on an idle host, outside the backup's window (03:00-03:45 UTC):
+`ops/restore_drill.py` copies a backup through a scratch restic repository, restores the copy into a scratch PostgreSQL and a scratch Qdrant, checks every store, and removes all of it. It restores nothing in production and only reads production's databases: the idle check counts the active user tasks, and one query lists the role names. Run it quarterly, and after any change to a backup or restore script, as root, on an idle host, outside the backup's window (03:00-03:45 UTC):
 
 ```bash
 cd /root/.openclaw/rmp && venv/bin/python ops/restore_drill.py
@@ -179,10 +180,11 @@ It drills the newest backup whose manifest has `"failures": []`; to drill anothe
 
 **What it does then:**
 1. A scratch directory `/var/tmp/rmp-restore-drill-*` (mode 0711), with `pg/` owned by postgres (mode 0700).
-2. A throwaway PostgreSQL 16 from the host's own binaries (`/usr/lib/postgresql/16/bin`): `initdb` and `pg_ctl` as postgres, socket only in `pg/`, port 55432, no TCP listener. Production's roles (today `rmp` and `temporal`) are created there `NOLOGIN`, so the archives' owners apply.
-3. A container `rmp-qdrant-drill` of the image `ops/start_qdrant.sh` runs, on `127.0.0.1:6937`, with 1 GiB and no volume. It requires a key made for this drill, which docker and the snapshot restore get through their environment and which is never printed. Port 6937 is in `coding.blocked_tcp_ports`, so aura-coder cannot reach the copy of Aura's memory, and `coding_isolation` in `make readiness` stays at `pass` while the drill runs.
-4. Restores `rmp_db`, `temporal` and `temporal_visibility` through `ops/restore_pg_database.sh`, the restore's own command, and the Qdrant snapshot through `ops/restore_qdrant_snapshot.sh`.
-5. Checks:
+2. The restic round trip, the off-host step on real data. In the scratch directory's `restic/` (mode 0700), a repository whose password is random and lives only in a 0600 file there, then `restic init`, `bash ops/offsite_copy.sh <backup>` (the step `ops/backup.sh` runs) and `restic restore latest --target <scratch>/from-restic`. The restored copy, under `from-restic/` at the backup's own path, must match the backup's manifest, checksums included: `ok restic round trip: <n> files, checksums match`. Every step after this one reads the restored copy. The drill never reads `/etc/rmp/restic.env`, and no `RESTIC_` variable of the caller's environment reaches restic. A missing restic, a failed step or a copy that does not verify is a `FAIL` line, and the steps after it then read the backup itself. The repository and the restored copy each take about the backup's size in `/var/tmp` until the cleanup.
+3. A throwaway PostgreSQL 16 from the host's own binaries (`/usr/lib/postgresql/16/bin`): `initdb` and `pg_ctl` as postgres, socket only in `pg/`, port 55432, no TCP listener. Production's roles (today `rmp` and `temporal`) are created there `NOLOGIN`, so the archives' owners apply.
+4. A container `rmp-qdrant-drill` of the image `ops/start_qdrant.sh` runs, on `127.0.0.1:6937`, with 1 GiB and no volume. It requires a key made for this drill, which docker and the snapshot restore get through their environment and which is never printed. Port 6937 is in `coding.blocked_tcp_ports`, so aura-coder cannot reach the copy of Aura's memory, and `coding_isolation` in `make readiness` stays at `pass` while the drill runs.
+5. Restores `rmp_db`, `temporal` and `temporal_visibility` through `ops/restore_pg_database.sh`, the restore's own command, and the Qdrant snapshot through `ops/restore_qdrant_snapshot.sh`.
+6. Checks:
    - each database's owner: `rmp_db` → `rmp`, `temporal` and `temporal_visibility` → `temporal`;
    - the `vector` extension in `rmp_db`;
    - every table's `count(*)` against the rows of its `COPY` block in `pg_restore --data-only -f - <dump>`;
@@ -190,7 +192,7 @@ It drills the newest backup whose manifest has `"failures": []`; to drill anothe
    - OpenClaw's store copies (`backup_openclaw_state.verify`);
    - every `*.tar.gz` read to its end.
 
-**Output:** one line per step and check, `ok …` or `FAIL <reason>`, with names and counts only. Expected: every line `ok`. The exit code is 0 only when every check passed. The last line is `restore duration: <m> min <s> s`, the time from the first database restore to the end of the Qdrant restore: the steps a real restore repeats on the same data, so it is the basis of the RTO.
+**Output:** one line per step and check, `ok …` or `FAIL <reason>`, with names and counts only. Expected: every line `ok`, the restic round trip included. The exit code is 0 only when every check passed. The last line is `restore duration: <m> min <s> s`, the time from the first database restore to the end of the Qdrant restore: the steps a real restore repeats on the same data, so it is the basis of the RTO (see "Off-host copy" below).
 
 **Cleanup:** however the drill ends, including a SIGTERM, Ctrl-C or a hung-up session, it runs `docker rm -f rmp-qdrant-drill`, `pg_ctl stop -m fast` and removes the scratch directory. Started under `nohup`, which ignores the hangup, it keeps running when the session ends (redirect its output, or nohup writes `nohup.out` into the live checkout). If the drill is killed hard (`kill -9`, a reboot), remove what it left:
 
@@ -199,3 +201,31 @@ docker rm -f rmp-qdrant-drill; for d in /var/tmp/rmp-restore-drill-*; do sudo -n
 ```
 
 A drill with a `FAIL` line means a store does not restore from that backup: diagnose it before relying on the backup, and before any change that needs a proven restore.
+
+## Off-host copy (accepted exception K-7)
+
+Backups stay on this host, by Kirill's decision: an accepted exception (K-7). A loss of this disk loses every backup.
+
+The step is built and tested, and switched off. When settings' `backup.offsite.enabled` is `true`, `ops/backup.sh` runs `ops/offsite_copy.sh <backup dir>` once the manifest is written:
+- `restic backup --tag rmp-backup --host <host>` copies the directory into the repository, encrypted on this host;
+- `restic forget --tag rmp-backup --host <host> --group-by host --keep-last 14 --prune` then keeps the newest 14 copies this host made. Grouped by host and path, restic's default, each night's directory would be a group of its own, and nothing would ever be forgotten.
+
+Its configuration lives only in `/etc/rmp/restic.env`: `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE` and the backend's variables, never in `settings.json`, which `GET /settings` returns. The backup reads the file only when it belongs to the user the backup runs as (root) and has mode 0600, and only in a subshell, so its variables reach restic and no other step; restic's output goes to `backup.log`. A missing file, a file with another owner or mode, a failed copy, or a `backup.offsite` setting that cannot be read fails the run as `offsite`. The copy runs after a local failure too. Each manifest's `offsite` says `off`, `copied` or `failed`; on this host it says `off`.
+
+The drill copies each drilled backup through restic into a scratch repository and drills the copy restic restores ("Quarterly DR drill" above). From WP-12 batch 7, readiness reports the exception as the warning `offsite_backup`, the one warning the soak accepts (K-24).
+
+**RPO, RTO and retention:**
+- **RPO: 24 hours.** One backup runs a day, at 03:15 UTC (`rmp-backup.timer`), so a restore loses at most the day since then. This holds against damage inside the host's stores: corruption, a bad migration, an operator error. Against the loss of this disk there is no recovery point (K-7).
+- **RTO: 1 minute.** The drill's `restore duration` was 0 min 7 s on 2026-10-19 and 0 min 13 s on 2026-10-21 (after WP-12 batch 4), rounded up to whole minutes. It covers the restore of the three databases and of Qdrant on today's data. It leaves out stopping and starting the services, the artifacts and OpenClaw's stores, and the operator's own time. Each quarterly drill prints the duration again; update this number when it changes.
+- **Retention:** the newest 14 complete backups on this host (`KEEP=14` in `ops/backup.sh`; "Retention" above). Off the host, when switched on, the newest 14 copies (`--keep-last 14`), complete or not. The copies of failed runs count towards them, so 14 failed nights in a row would leave no complete backup off the host, while this host still keeps its last 14.
+
+**To switch it on** (Kirill decides the destination and who holds the key):
+1. Write `/etc/rmp/restic.env`, owned by root with mode 0600: `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE` (a root-only 0600 file that holds the password) and the backend's variables.
+2. Initialise the repository with it, which keeps every value off the command line: `( set -a; . /etc/rmp/restic.env; set +a; restic init )`.
+3. Keep a copy of the password off the host. Without it the copies cannot be read, and a lost disk takes the password file with it.
+4. Set `backup.offsite.enabled` to `true` in `settings.json`. The next nightly manifest says `"offsite": "copied"`. From then on a failed copy fails the night's run as `offsite`, however complete the backup on this host: while the repository cannot be reached, no new backup counts as complete, so this host prunes nothing and keeps one more backup each night, and the drill by default drills the last complete backup from before the outage.
+
+To restore from the copy, with `/etc/rmp/restic.env` and the password file in place, run each restic command below as `( set -a; . /etc/rmp/restic.env; set +a; restic … )`. The newest copy is not always the one to restore: a failed run is copied too.
+1. `restic snapshots --tag rmp-backup` lists the copies, oldest first, each with its id and its backup's path.
+2. `restic dump <id> <path>/manifest.json` prints a copy's manifest. Pick the newest copy whose `failures` is `[]`.
+3. `restic restore <id> --target <dir>`. The backup comes back under `<dir>` at its own path, and `ops/restore_backup.sh` restores it from there, verifying it first, as above.

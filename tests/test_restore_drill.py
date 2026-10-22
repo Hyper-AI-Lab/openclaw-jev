@@ -5,10 +5,12 @@ the recording runner, which records its argv, environment and stdin and answers 
 scratch root are in tmp_path, and memory, idleness and the drill port come from injected probes. A real connect to
 6937 would be refused anyway: the production guard treats every blocked port as a service port.
 """
+import errno
 import io
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import stat
@@ -60,12 +62,15 @@ class Host:
     ``fail`` names a dump whose restore_pg_database.sh exits 1, ``counts`` overrides a database's count(*) answers,
     ``units`` is what systemctl lists as active coding units, ``containers`` what docker lists, and ``on`` maps a
     command's name to what to do while the runner handles it; what that returns, unless None, is the command's exit
-    code.
+    code. ops/offsite_copy.sh's call names the backup it copies, and restic's restore puts a copy of it under its
+    target at the backup's own path, as restic does: ``restored``. A symlink it was given comes back as the link alone,
+    as restic stores it.
     """
 
     def __init__(self, *, fail=None, counts=None, units="", containers="", on=None):
         self.fail, self.counts, self.units, self.containers = fail, counts or {}, units, containers
         self.on, self.calls = on or {}, []
+        self.copied = self.restored = None
 
     def __call__(self, argv, *, env=None, input=None):
         argv = list(argv)
@@ -81,6 +86,15 @@ class Host:
             return 0, self.units.encode()
         if name == "docker":
             return 0, {"ps": self.containers.encode(), "run": b"f00d\n"}.get(words[1], b"")
+        if name == "offsite_copy.sh":
+            self.copied = Path(words[2])
+        if name == "restic" and words[1] == "restore":
+            self.restored = Path(words[words.index("--target") + 1]) / self.copied.relative_to("/")
+            if self.copied.is_symlink():
+                self.restored.parent.mkdir(parents=True)
+                self.restored.symlink_to(os.readlink(self.copied))
+            else:
+                shutil.copytree(self.copied, self.restored)
         if name == "restore_pg_database.sh":
             return (1 if Path(words[2]).name == self.fail else 0), b""
         if name == "pg_restore":
@@ -204,6 +218,7 @@ def test_a_drill_of_a_whole_backup_checks_every_store_and_leaves_nothing_behind(
     assert lines[:-1] == [
         f"backup: {backup}",
         "ok backup manifest: every file's size and checksum match",
+        "ok restic round trip: 11 files, checksums match",
         "ok scratch postgres: port 55432, socket only, production's roles rmp, temporal NOLOGIN",
         "ok scratch qdrant: 127.0.0.1:6937, 1 GiB, no volume, a key of its own",
         "ok restore rmp_db",
@@ -228,9 +243,9 @@ def test_a_drill_of_a_whole_backup_checks_every_store_and_leaves_nothing_behind(
     # The roles are created on the scratch server only, without a login.
     create = [c.argv[-1] for c in host.named("psql") if "CREATE ROLE" in c.argv[-1]]
     assert create == ['CREATE ROLE "rmp" NOLOGIN; CREATE ROLE "temporal" NOLOGIN']
-    # The dumps are read as root, never through a server.
+    # The dumps are read as root, never through a server, from the copy restic restored.
     assert [c.argv for c in host.named("pg_restore")] == [
-        [f"{pg_bin}/pg_restore", "--data-only", "-f", "-", str(backup / f"{db}.dump")]
+        [f"{pg_bin}/pg_restore", "--data-only", "-f", "-", str(host.restored / f"{db}.dump")]
         for db in OWNERS]
     # Cleanup: the container, then the server, then the scratch directory.
     assert [c.argv for c in host.calls[-2:]] == [
@@ -284,7 +299,7 @@ def test_the_drill_only_ever_targets_its_scratch_instances(capsys, backup, scrat
     # Each dump through the restore's own command, pointed at the scratch server.
     restores = host.named("restore_pg_database.sh")
     assert [c.argv for c in restores] == [
-        ["bash", str(REPO / "ops" / "restore_pg_database.sh"), str(backup / f"{db}.dump")] for db in OWNERS]
+        ["bash", str(REPO / "ops" / "restore_pg_database.sh"), str(host.restored / f"{db}.dump")] for db in OWNERS]
     for call in restores:
         assert call.env["RMP_PG_SOCKET_DIR"] == str(pg) and call.env["RMP_PG_PORT"] == "55432"
     # Every docker call names the drill's container, never production's.
@@ -299,11 +314,111 @@ def test_the_drill_only_ever_targets_its_scratch_instances(capsys, backup, scrat
     assert run[-1] == drill.qdrant_image() and not any(word in ("-v", "--volume", "--mount") for word in run)
     # The Qdrant URL is the drill's, and the snapshot restore's work directory goes in the scratch directory.
     [qdrant] = host.named("restore_qdrant_snapshot.sh")
-    assert qdrant.argv[1:] == [str(REPO / "ops" / "restore_qdrant_snapshot.sh"), str(backup / "qdrant-full.snapshot"),
-                               "http://127.0.0.1:6937"]
+    assert qdrant.argv[1:] == [str(REPO / "ops" / "restore_qdrant_snapshot.sh"),
+                               str(host.restored / "qdrant-full.snapshot"), "http://127.0.0.1:6937"]
     assert qdrant.env["TMPDIR"] == str(pg.parent)
     assert {c.argv[-1].rsplit("/", 1)[0] for c in host.named("curl")} == {
         "http://127.0.0.1:6937", "http://127.0.0.1:6937/collections"}
+
+
+def test_the_drill_restores_from_its_scratch_restic_copy(capsys, backup, scratch_root, monkeypatch):
+    """ops/offsite_copy.sh, the step ops/backup.sh runs, copies the backup into a repository in the scratch directory,
+    and every leg after the round trip reads what restic restored from it. The caller's RESTIC_ variables, which could
+    name the off-host repository, never reach restic, and the repository's password lives only in its scratch file."""
+    monkeypatch.setenv("RESTIC_REPOSITORY_FILE", "/etc/rmp/restic-repository")
+    monkeypatch.setenv("RESTIC_PASSWORD", "the-off-host-password")
+    passwords, read = [], []
+
+    def password_file():
+        path = Path(host.calls[-1].env["RESTIC_PASSWORD_FILE"])
+        passwords.append((stat.S_IMODE(path.stat().st_mode), path.read_text()))
+
+    for module, name in ((drill.backup_openclaw_state, "verify"), (drill, "snapshot_collections"),
+                         (drill, "archive_entries")):
+        def reading(path, read_it=getattr(module, name)):
+            read.append(path)
+            return read_it(path)
+        monkeypatch.setattr(module, name, reading)
+    host = Host(on={"restic": password_file, "offsite_copy.sh": password_file})
+    code, lines = run_drill(capsys, backup, scratch_root, host)
+    assert code == 0, lines
+    assert lines[2] == "ok restic round trip: 11 files, checksums match"
+    scratch = Path(host.named("chown")[0].argv[-1]).parent
+    work, target = scratch / "restic", scratch / "from-restic"
+    calls = [c for c in host.calls if c.argv[0] == "restic" or c.argv[1:2] == [str(REPO / "ops" / "offsite_copy.sh")]]
+    assert [c.argv for c in calls] == [
+        ["restic", "init"],
+        ["bash", str(REPO / "ops" / "offsite_copy.sh"), str(backup)],
+        ["restic", "restore", "latest", "--target", str(target)]]
+    # Every restic call carries the scratch repository, its password file and cache, and restic's temporary files go
+    # in the scratch directory too.
+    for call in calls:
+        assert {name: value for name, value in call.env.items() if name.startswith("RESTIC_")} == {
+            "RESTIC_REPOSITORY": str(work / "repo"), "RESTIC_PASSWORD_FILE": str(work / "password"),
+            "RESTIC_CACHE_DIR": str(work / "cache")}
+        assert call.env["TMPDIR"] == str(work)
+    [(mode, password)] = set(passwords)
+    assert len(passwords) == 3 and mode == 0o600 and re.fullmatch(r"[0-9a-f]{64}", password)
+    # The database legs, and every other one, read the copy restic restored.
+    assert host.restored == target / backup.relative_to("/")
+    assert [c.argv[-1] for c in host.named("restore_pg_database.sh")] == [
+        str(host.restored / f"{db}.dump") for db in OWNERS]
+    assert [c.argv[-1] for c in host.named("pg_restore")] == [str(host.restored / f"{db}.dump") for db in OWNERS]
+    [qdrant] = host.named("restore_qdrant_snapshot.sh")
+    assert qdrant.argv[2] == str(host.restored / "qdrant-full.snapshot")
+    assert read == [host.restored / name for name in ("qdrant-full.snapshot", "openclaw-state", "artifacts.tar.gz",
+                                                      "workspace.tar.gz")]
+    # Nothing names the off-host copy's env file, and the password is on no command line and in no output line.
+    for call in host.calls:
+        assert not any("/etc/rmp/restic.env" in word or password in word for word in call.argv)
+        assert not any("/etc/rmp/restic.env" in value for value in (call.env or {}).values())
+    assert password not in "\n".join(lines)
+    assert list(scratch_root.iterdir()) == []
+
+
+def _restic_missing(backup):
+    """restic is not installed: running it raises, as subprocess.run does."""
+    def run():
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", "restic")
+    return {"restic": run}
+
+
+def _a_failed_copy(backup):
+    return {"offsite_copy.sh": lambda: 1}
+
+
+def _a_dump_that_changes_while_it_is_copied(backup):
+    """The restored copy then does not match the manifest, which was checked before the copy."""
+    def change():
+        dump = backup / "temporal.dump"
+        dump.write_bytes(dump.read_bytes()[:-1] + b"!")
+    return {"offsite_copy.sh": change}
+
+
+# Each way the round trip fails: what the runner does, the calls of restic and ops/offsite_copy.sh, and the FAIL line.
+FAILED_ROUND_TRIPS = [
+    ("restic missing", _restic_missing, ["restic"], "restic round trip: restic is not installed"),
+    ("a failed copy", _a_failed_copy, ["restic", "offsite_copy.sh"], "restic round trip: offsite_copy.sh exited 1"),
+    ("a copy that does not verify", _a_dump_that_changes_while_it_is_copied, ["restic", "offsite_copy.sh", "restic"],
+     "restic round trip: temporal.dump does not match its checksum"),
+]
+
+
+@pytest.mark.parametrize("case, on, calls, failure", FAILED_ROUND_TRIPS, ids=[trip[0] for trip in FAILED_ROUND_TRIPS])
+def test_a_failed_restic_round_trip_fails_the_drill_whose_legs_then_read_the_backup_itself(
+        capsys, backup, scratch_root, case, on, calls, failure):
+    host = Host(on=on(backup))
+    code, lines = run_drill(capsys, backup, scratch_root, host)
+    assert code == 1
+    assert [line for line in lines if line.startswith("FAIL")] == [f"FAIL {failure}"]
+    assert [Path(c.argv[1] if c.argv[0] == "bash" else c.argv[0]).name for c in host.calls
+            if c.argv[0] == "restic" or c.argv[1:2] == [str(REPO / "ops" / "offsite_copy.sh")]] == calls
+    # Every other leg runs, on the backup itself.
+    assert [c.argv[-1] for c in host.named("restore_pg_database.sh")] == [str(backup / f"{db}.dump") for db in OWNERS]
+    assert [c.argv[2] for c in host.named("restore_qdrant_snapshot.sh")] == [str(backup / "qdrant-full.snapshot")]
+    assert {"ok qdrant collections: 2, as in the snapshot", "ok openclaw-state: agent, state, checksums match, "
+            "quick_check ok", "ok archive workspace.tar.gz: 2 entries, read to its end"} <= set(lines)
+    assert list(scratch_root.iterdir()) == []
 
 
 def test_the_drill_runs_the_qdrant_image_of_start_qdrant():
@@ -445,9 +560,11 @@ def test_a_damaged_store_copy_or_archive_fails_its_check(capsys, backup, scratch
     archive.write_bytes(archive.read_bytes()[:-8])
     # A manifest written after the damage describes the damaged files: only the drill's own checks see it.
     _manifest(backup)
-    code, lines = run_drill(capsys, backup, scratch_root, Host())
+    host = Host()
+    code, lines = run_drill(capsys, backup, scratch_root, host)
     assert code == 1
-    assert f"FAIL openclaw-state: {copy} does not match its manifest checksum" in lines
+    restored = host.restored / copy.relative_to(backup)
+    assert f"FAIL openclaw-state: {restored} does not match its manifest checksum" in lines
     assert "FAIL archive artifacts.tar.gz: does not read to its end (EOFError)" in lines
 
 
@@ -543,7 +660,29 @@ def test_a_backup_given_by_a_relative_path_is_drilled_by_its_absolute_path(capsy
     host = Host()
     code, lines = run_drill(capsys, backup, scratch_root, host, argv=[backup.name])
     assert code == 0 and lines[0] == f"backup: {backup}"
-    assert [c.argv[-1] for c in host.named("restore_pg_database.sh")] == [str(backup / f"{db}.dump") for db in OWNERS]
+    [copy] = host.named("offsite_copy.sh")
+    assert copy.argv[-1] == str(backup)
+    assert [c.argv[-1] for c in host.named("restore_pg_database.sh")] == [
+        str(host.restored / f"{db}.dump") for db in OWNERS]
+
+
+@pytest.mark.parametrize("found", ["given", "the newest"])
+def test_a_symlinked_backup_is_drilled_by_the_directory_it_resolves_to(capsys, backup, scratch_root, tmp_path, found):
+    """restic stores a symlink it is given as the link alone: a round trip through one would copy nothing, and every
+    later leg would read the original through the restored link."""
+    link = tmp_path / "drill-this" if found == "given" else backup.parent / "20261020T031502Z"
+    link.symlink_to(backup)
+    assert found == "given" or drill.newest_clean(backup.parent) == link
+    host = Host()
+    code, lines = run_drill(capsys, backup, scratch_root, host, argv=[str(link)] if found == "given" else [])
+    assert code == 0, lines
+    assert lines[0] == f"backup: {backup}" and lines[2] == "ok restic round trip: 11 files, checksums match"
+    [copy] = host.named("offsite_copy.sh")
+    assert copy.argv[-1] == str(backup)
+    scratch = Path(host.named("chown")[0].argv[-1]).parent
+    assert host.restored == scratch / "from-restic" / backup.relative_to("/")
+    assert [c.argv[-1] for c in host.named("restore_pg_database.sh")] == [
+        str(host.restored / f"{db}.dump") for db in OWNERS]
 
 
 def test_the_drill_port_is_closed_to_aura_coder_and_its_key_never_reaches_argv(capsys, backup, scratch_root):

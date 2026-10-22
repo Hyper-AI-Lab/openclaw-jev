@@ -6,11 +6,12 @@ they use it.
 
     python -m app.production.backup_manifest write <dir> --temporal-dbs "<names>" --qdrant-mode <mode>
         --artifacts on|off [--failure <name>]...
+    python -m app.production.backup_manifest offsite <dir> off|copied|failed
     python -m app.production.backup_manifest verify <dir>
 
 ``write`` runs from the RMP checkout once every component has run. It prints the run's final failures on stdout,
-space-separated, and the reason for each failure it adds on stderr. ``verify`` prints one problem per line and exits 1
-when there are any.
+space-separated, and the reason for each failure it adds on stderr. ``offsite`` then records what became of the
+backup's off-host copy (ops/offsite_copy.sh). ``verify`` prints one problem per line and exits 1 when there are any.
 """
 from __future__ import annotations
 
@@ -42,6 +43,10 @@ OPENCLAW_STORES = ("agent", "state")
 # The files read back before the manifest is written: pg_dump's archives and the tar archives.
 READ_BACK = (".dump", ".tar.gz")
 LEGACY = "made before manifest format 2 (no file list)"
+# What became of the backup's off-host copy: not a component, a field of its own. "off" while settings'
+# backup.offsite.enabled is not true, an accepted exception (K-7). A failed copy is also the run failure "offsite".
+OFFSITE = "offsite"
+OFFSITE_STATES = ("off", "copied", "failed")
 
 
 def _sha256(path: Path) -> str:
@@ -68,6 +73,16 @@ def read_back(path: Path) -> bool:
         return True
     except (OSError, EOFError, tarfile.TarError, zlib.error):
         return False
+
+
+def offsite_config() -> dict:
+    """Whether ops/backup.sh copies each backup off the host with restic: settings' backup.offsite.enabled, false
+    unless set. It stays unset on this host, an accepted exception (K-7). app.config is imported here only: writing,
+    recording and verifying a manifest need nothing else of RMP's."""
+    from app.config import load_settings
+
+    offsite = (load_settings().get("backup") or {}).get("offsite") or {}
+    return {"enabled": bool(offsite.get("enabled", False))}
 
 
 def _named(failures: Sequence[str], name: str) -> bool:
@@ -143,11 +158,31 @@ def write(dest: Path, *, failures: Sequence[str], temporal_dbs: Sequence[str], q
                 fail(part, f"{name} does not read back")
     manifest = {"format": FORMAT, "timestamp": dest.name, "host": socket.gethostname(), "qdrant_mode": qdrant_mode,
                 "components": components, "files": files, "failures": failures}
-    # Whole or not at all: a reader never sees half a manifest, and the backup's exit removes a partial one.
+    _save(dest, manifest)
+    return manifest
+
+
+def record_offsite(dest: Path, state: str) -> dict:
+    """Record in ``dest/manifest.json`` what became of the backup's off-host copy, ``off``, ``copied`` or ``failed``,
+    and return the manifest. A failed copy also fails the run: ``offsite`` joins its failures, once."""
+    if state not in OFFSITE_STATES:
+        raise ValueError(f"the off-host copy is {' or '.join(OFFSITE_STATES)}, not {state!r}")
+    dest = Path(dest)
+    manifest = json.loads((dest / MANIFEST).read_text(encoding="utf-8"))
+    failures = manifest.pop("failures")
+    if state == "failed" and OFFSITE not in failures:
+        failures.append(OFFSITE)
+    manifest.pop(OFFSITE, None)
+    manifest.update({OFFSITE: state, "failures": failures})
+    _save(dest, manifest)
+    return manifest
+
+
+def _save(dest: Path, manifest: dict) -> None:
+    """Whole or not at all: a reader never sees half a manifest, and the backup's exit removes a partial one."""
     partial = dest / f"{MANIFEST}.partial"
     partial.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     os.replace(partial, dest / MANIFEST)
-    return manifest
 
 
 def _file_problems(dest: Path, name: str, meta: object, hashes: bool) -> List[str]:
@@ -226,6 +261,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     make.add_argument("--qdrant-mode", required=True, help="the mode Qdrant ran in: server or embedded")
     make.add_argument("--artifacts", required=True, choices=("on", "off"), help="whether the artifact store is on")
     make.add_argument("--failure", action="append", default=[], help="a component the run failed (repeatable)")
+    offsite = sub.add_parser("offsite", help="record what became of the backup's off-host copy")
+    offsite.add_argument("dir", type=Path)
+    offsite.add_argument("state", choices=OFFSITE_STATES)
     sub.add_parser("verify", help="check a backup against its manifest, checksums included").add_argument(
         "dir", type=Path)
     args = parser.parse_args(argv)
@@ -233,6 +271,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         manifest = write(args.dir, failures=args.failure, temporal_dbs=args.temporal_dbs.split(),
                          qdrant_mode=args.qdrant_mode, artifacts_enabled=args.artifacts == "on")
         print(" ".join(manifest["failures"]))
+        return 0
+    if args.action == "offsite":
+        record_offsite(args.dir, args.state)
         return 0
     found = problems(args.dir, hashes=True)
     for problem in found:

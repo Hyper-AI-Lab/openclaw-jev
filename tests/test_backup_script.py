@@ -1,9 +1,11 @@
-"""ops/backup.sh and the restore scripts end to end, against fake pg_dump, pg_restore, sudo, systemctl and Qdrant API.
+"""ops/backup.sh and the restore scripts end to end, against fake pg_dump, pg_restore, sudo, systemctl, restic and
+Qdrant API.
 
 The scripts run from outside the checkout (as rmp-backup.service does, with no working directory), with their data,
 settings and OpenClaw home in the test's tmp tree, so nothing live is read. A script runs only when every tool it
 could reach on the host resolves to its fake, and a restore only when it takes every path it writes from the
-environment: the production guard does not see a child process's own calls.
+environment: the production guard does not see a child process's own calls. One test runs the real restic, against a
+repository in its tmp tree.
 """
 import fcntl
 import hashlib
@@ -11,7 +13,9 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -40,6 +44,8 @@ STOPS = [*(unit for timer in TIMERS for unit in (timer, timer.replace(".timer", 
          "rmp-code-watch", "openclaw-gateway", "rmp-api", "rmp-worker", "temporal"]
 # What it starts again, in dependency order.
 STARTS = ["temporal", "rmp-api", "rmp-worker", "openclaw-gateway", "rmp-code-watch", *TIMERS]
+# The host's restic, found before any test puts its fakes on a PATH; None where it is not installed, as in CI.
+RESTIC = shutil.which("restic")
 
 FAKE_CURL = r'''#!/usr/bin/env python3
 """curl, as far as the scripts use it against Qdrant's API. FAKE_QDRANT_* variables choose failures. Each call's argv
@@ -272,11 +278,23 @@ elif verb == "list-timers":
         print(f"{upcoming} Mon 2026-10-19 03:15:00 UTC 18h ago {t} {service(t)}")
 '''
 
+FAKE_RESTIC = r'''#!/usr/bin/env python3
+"""restic, as ops/offsite_copy.sh runs it: each call's argv, and the RESTIC_* and AWS_* variables it got, are recorded
+in ${FAKE_STATE}/restic.log. FAKE_RESTIC_FAIL=<command> fails that command, as an unreachable repository would."""
+import json, os, sys
+with open(os.path.join(os.environ["FAKE_STATE"], "restic.log"), "a") as log:
+    log.write(json.dumps({"argv": sys.argv[1:], "env": {name: value for name, value in os.environ.items()
+                                                         if name.startswith(("RESTIC_", "AWS_"))}}) + "\n")
+if os.environ.get("FAKE_RESTIC_FAIL") == sys.argv[1]:
+    print("Fatal: unable to open config file: Stat: connection refused", file=sys.stderr)
+    sys.exit(1)
+'''
+
 FAKES = {"curl": FAKE_CURL, "pg_dump": FAKE_PG_DUMP, "sudo": FAKE_SUDO, "pg_restore": FAKE_PG_RESTORE,
          "systemctl": FAKE_SYSTEMCTL, "sleep": FAKE_SLEEP, "dropdb": FAKE_REFUSED, "createdb": FAKE_REFUSED,
-         "openclaw": FAKE_OPENCLAW}
+         "openclaw": FAKE_OPENCLAW, "restic": FAKE_RESTIC}
 # The fakes' logs, which each call of host.run() starts without.
-LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log", "curl-argv.log", "pg_restore.log")
+LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log", "curl-argv.log", "pg_restore.log", "restic.log")
 
 
 def _store(path, rows):
@@ -787,6 +805,197 @@ def test_a_second_run_while_one_holds_the_lock_exits_without_touching_anything(h
         result, dest, _, calls = host.run()
     assert result.returncode == 1 and "another backup is running" in result.stderr
     assert dest is None and calls == []
+
+
+def _offsite(host, enabled):
+    """The live settings' backup.offsite.enabled set to ``enabled``."""
+    host.settings.write_text(json.dumps({**json.loads(host.settings.read_text()),
+                                         "backup": {"offsite": {"enabled": enabled}}}))
+
+
+def _restic_env(host, mode=0o600, **variables):
+    """The off-host copy's env file, as /etc/rmp/restic.env holds it, with ``mode``."""
+    path = host.tmp / "restic.env"
+    path.write_text("".join(f"{name}={value}\n" for name, value in variables.items()))
+    path.chmod(mode)
+    return path
+
+
+def _s3_variables(host):
+    """What an env file for an S3 bucket holds; the values are made up."""
+    return {"RESTIC_REPOSITORY": "s3:https://s3.example.net/rmp-backups",
+            "RESTIC_PASSWORD_FILE": str(host.tmp / "restic-password"),
+            "AWS_ACCESS_KEY_ID": "made-up-access-key-id", "AWS_SECRET_ACCESS_KEY": "made-up-secret-access-key"}
+
+
+def test_the_offsite_copy_is_off_by_default_and_the_manifest_says_so(host):
+    """Accepted exception K-7: unless backup.offsite.enabled is true, restic never runs and its env file is never
+    read."""
+    for setting in ("unset", "false"):
+        if setting == "false":
+            _offsite(host, False)
+        result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(host.tmp / "no-such-restic.env"))
+        assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+        assert manifest["offsite"] == "off" and "Off-host copy: off" in result.stdout
+        assert not (host.state / "restic.log").exists()
+        shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+
+
+def _python_counting_restic_variables(host):
+    """An RMP_PYTHON that records, for each run, how many RESTIC_ and AWS_ variables its environment holds."""
+    python = host.tmp / "python"
+    python.write_text('#!/bin/sh\nenv | grep -c -E "^(RESTIC|AWS)_" >> "${FAKE_STATE}/python-env.log"\n'
+                      f'exec "{sys.executable}" "$@"\n')
+    python.chmod(0o755)
+    return str(python)
+
+
+def test_the_offsite_copy_runs_restic_with_the_env_file(host):
+    _offsite(host, True)
+    variables = _s3_variables(host)
+    env_file = _restic_env(host, **variables)
+    inherited = {name: None for name in os.environ if name.startswith(("RESTIC_", "AWS_"))}
+    result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(env_file),
+                                         RMP_PYTHON=_python_counting_restic_variables(host), **inherited)
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert manifest["offsite"] == "copied"
+    calls = host.log("restic.log")
+    hostname = socket.gethostname()
+    assert [call["argv"] for call in calls] == [
+        ["backup", "--quiet", "--tag", "rmp-backup", "--host", hostname, str(dest)],
+        ["forget", "--quiet", "--tag", "rmp-backup", "--host", hostname, "--group-by", "host", "--keep-last", "14",
+         "--prune"]]
+    # The file's variables reach restic, and its values reach no command line, no output and no log.
+    for call in calls:
+        assert {name: call["env"].get(name) for name in variables} == variables
+    shown = result.stdout + result.stderr + (dest / "backup.log").read_text()
+    for value in variables.values():
+        assert value not in shown and not any(value in word for call in calls for word in call["argv"])
+    # Read in a subshell, they reach no other step: not the manifest's record of the copy, nor the pruning after it.
+    counts = (host.state / "python-env.log").read_text().split()
+    assert len(counts) >= 5 and set(counts) == {"0"}
+    # The copy runs after a local failure too.
+    shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+    result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(env_file), FAKE_QDRANT_DOWN="1")
+    assert result.returncode == 1 and manifest["failures"] == ["qdrant"] and manifest["offsite"] == "copied"
+    assert [call["argv"][0] for call in host.log("restic.log")] == ["backup", "forget"]
+
+
+def test_a_failed_offsite_copy_fails_the_run(host):
+    _dated(host.backups, range(1, 17), time.time() - 30 * 86400)
+    _offsite(host, True)
+    result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(_restic_env(host, **_s3_variables(host))),
+                                         FAKE_RESTIC_FAIL="backup")
+    assert result.returncode == 1
+    assert manifest["failures"] == ["offsite"] and manifest["offsite"] == "failed"
+    assert [call["argv"][0] for call in host.log("restic.log")] == ["backup"]
+    assert "FAIL: offsite: restic did not copy the backup (see backup.log)" in result.stdout
+    assert "Backup INCOMPLETE: offsite failed" in result.stdout and "no older backup was pruned" in result.stdout
+    # restic's own message goes to the log, not to the journal.
+    assert "Fatal: unable to open config file" in (dest / "backup.log").read_text()
+    assert "Fatal" not in result.stdout + result.stderr
+    assert len([p for p in host.backups.iterdir() if p.name[:2] == "20"]) == 17
+
+
+@pytest.mark.parametrize("case", ["readable by its group", "owned by another user", "missing"])
+def test_an_env_file_readable_by_others_is_refused(host, case):
+    """The env file holds the repository's secrets: one that is missing, that another user may read, or that belongs
+    to someone else is never read, and the copy fails."""
+    _offsite(host, True)
+    mode = 0o640 if case == "readable by its group" else 0o600
+    env_file = _restic_env(host, mode=mode, **_s3_variables(host))
+    runs_as = os.getuid()
+    if case == "owned by another user":
+        # The run believes it runs as another user: giving the file away would need root.
+        runs_as += 1
+        fake_id = host.tmp / "bin" / "id"
+        fake_id.write_text(f'#!/bin/sh\n[ "$*" = -u ] && echo {runs_as} || exec /usr/bin/id "$@"\n')
+        fake_id.chmod(0o755)
+    elif case == "missing":
+        env_file.unlink()
+    result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(env_file))
+    assert result.returncode == 1
+    assert manifest["failures"] == ["offsite"] and manifest["offsite"] == "failed"
+    assert not (host.state / "restic.log").exists()
+    reason = (f"{env_file} is missing" if case == "missing" else
+              f"refusing {env_file}: its owner and mode are '{os.getuid()} {mode:o}', not '{runs_as} 600'")
+    assert f"FAIL: offsite: {reason}" in result.stdout
+
+
+@pytest.mark.parametrize("backup", [{"offsite": True}, "on"], ids=["offsite not an object", "backup not an object"])
+def test_an_offsite_setting_that_cannot_be_read_fails_the_copy(host, backup):
+    """A malformed setting may be one that asks for the copy: it fails the run instead of passing for a copy switched
+    off. The env file is never read, and Qdrant and the artifacts, read from the same settings first, are backed up."""
+    host.settings.write_text(json.dumps({**json.loads(host.settings.read_text()), "backup": backup}))
+    result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(host.tmp / "no-such-restic.env"))
+    assert result.returncode == 1
+    assert manifest["failures"] == ["offsite"] and manifest["offsite"] == "failed"
+    assert not (host.state / "restic.log").exists()
+    assert f"FAIL: offsite: could not read backup.offsite from {host.settings} (see backup.log)" in result.stdout
+    assert "AttributeError" in (dest / "backup.log").read_text()
+    assert manifest["components"]["qdrant"] == ["qdrant-full.snapshot"]
+    assert manifest["components"]["artifacts"] == ["artifacts.tar.gz"]
+
+
+def _wait_for_a_new_stamp(dest):
+    """The stamp is per second: wait until the next backup gets a directory of its own."""
+    while time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) <= dest.name:
+        time.sleep(0.1)
+
+
+@pytest.mark.skipif(RESTIC is None, reason="restic is not installed")
+def test_a_restic_round_trip_against_a_local_repository(host):
+    """The real restic, against a repository in tmp_path: two nights' backups copied, the newest restored whole. The
+    fake directory's restic is the host's binary here, the one tool of a backup run that is not a fake."""
+    fake_restic = host.tmp / "bin" / "restic"
+    fake_restic.unlink()
+    fake_restic.symlink_to(RESTIC)
+    work = host.tmp / "restic"
+    work.mkdir(mode=0o700)
+    password = work / "password"
+    password.write_text(secrets.token_hex(32))
+    password.chmod(0o600)
+    variables = {"RESTIC_REPOSITORY": str(work / "repo"), "RESTIC_PASSWORD_FILE": str(password),
+                 "RESTIC_CACHE_DIR": str(work / "cache")}
+    env_file = _restic_env(host, **variables)
+    restic_env = {**{name: value for name, value in os.environ.items() if not name.startswith("RESTIC_")}, **variables}
+
+    def restic(*args):
+        return subprocess.run([RESTIC, *args], env=restic_env, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=300, check=True).stdout
+
+    restic("init")
+    _offsite(host, True)
+    copied = []
+    for _ in range(2):
+        if copied:
+            _wait_for_a_new_stamp(copied[-1])
+        result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(env_file))
+        assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+        assert manifest["offsite"] == "copied"
+        copied.append(dest)
+    snapshots = json.loads(restic("snapshots", "--json"))
+    assert sorted((s["paths"], s["tags"], s["hostname"]) for s in snapshots) == [
+        ([str(dest)], ["rmp-backup"], socket.gethostname()) for dest in copied]
+    out = host.tmp / "out"
+    restic("restore", "latest", "--target", str(out))
+    restored = out / copied[-1].relative_to("/")
+    assert manifest["files"] and all(_sha256(restored / name) == meta["sha256"]
+                                     for name, meta in manifest["files"].items())
+    # The copy is made once the manifest is written: the restored copy verifies on its own, as the restore checks it
+    # first, and holds the manifest as written, before the run recorded the copy in it.
+    verify = subprocess.run([sys.executable, "-m", "app.production.backup_manifest", "verify", str(restored)], cwd=REPO,
+                            capture_output=True, text=True, timeout=120)
+    assert verify.returncode == 0 and verify.stdout == "" and verify.stderr == "", verify.stdout + verify.stderr
+    assert json.loads((restored / "manifest.json").read_text()) == {
+        name: value for name, value in manifest.items() if name != "offsite"}
+    assert not any(password.read_text() in text for text in (result.stdout, result.stderr,
+                                                             (copied[-1] / "backup.log").read_text()))
+    # Each night's directory is a path of its own: grouped by host, the forget still keeps only the newest copies.
+    _wait_for_a_new_stamp(copied[-1])
+    result, dest, manifest, _ = host.run(RMP_RESTIC_ENV=str(env_file), RMP_OFFSITE_KEEP="1")
+    assert result.returncode == 0 and manifest["offsite"] == "copied", result.stdout + result.stderr
+    assert [s["paths"] for s in json.loads(restic("snapshots", "--json"))] == [[str(dest)]]
 
 
 def test_restore_uploads_every_collection_of_a_full_snapshot(host):

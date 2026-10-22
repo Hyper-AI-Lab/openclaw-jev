@@ -2080,3 +2080,100 @@ Nothing under `app/`, so the deploy restarts nothing.
 **Four-layout verify** (HEAD `74b5655`): default, live, coding-job and direct each gave 1507 passed, 1 skipped, leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. The runs took 13–15 min each.
 
 **Host step plan** (an adjustment, logged): run one backup through `rmp-backup.service` right after the deploy, while idle, instead of waiting for the nightly run. Then `backup_manifest verify` on it, then the drill on it, which exercises WP12-12 on real data. The nightly run is checked too.
+
+## 2026-10-21 22:39 UTC · PR #40 open; restic installed for WP-12 batch 5 (host step WP12-15, pre-approved)
+
+**PR #40** (batch 4) is open and bound; CI is pending.
+
+**Host step WP12-15, "before the merge":**
+- **Install:** `apt-get install -y --no-install-recommends restic` gave `restic 0.16.4-2ubuntu0.24.04.3` (noble-updates/security) at `/usr/bin/restic`, the version the spec names.
+- **Deviation:** `--no-install-recommends`. Without it apt also installs three documentation packages (`fonts-lato`, `fonts-font-awesome`, `sphinx-rtd-theme-common`), which restic does not need.
+- **needrestart:** in list-only mode it named `systemd-manager` and `dbus` but restarted nothing. All runtime services are still active.
+- **Why now:** the round-trip test of batch 5 must run, not skip, in every harness layout, so the binary must exist before the implementer runs it.
+- **Rollback:** `apt-get remove -y restic`, after batch 5 is reverted.
+
+## 2026-10-21 22:52 UTC · WP-12 batch 4 deployed; first format-2 backup verified and drilled; B1-05, B4b-05 and offrepo-openclaw-home-R6 closed
+
+**PR #40:** CI `test` SUCCESS on head `203f82a`; `origin/main` unchanged at `2a253b6`; no other open PRs. Squash-merged as `62c292a`.
+
+**Deploy:** `deployed`; **restarted rmp-api and rmp-worker**; health, readiness and the canary passed; no units.
+
+**Host step:** 22:51Z, idle (0 user tasks, no coding units).
+1. **Backup:** `systemctl start rmp-backup.service` gave Result=success and status 0 in 21 s.
+   - Backup `20261021T225123Z`, 502 MB.
+   - It has `workspace.tar.gz` (231 KB), and no `temporal.db` and no `cron_jobs.json`.
+   - Pruning kept 14.
+2. **`backup_manifest verify`:** printed nothing, rc 0.
+   - Format 2, `qdrant_mode` server, `failures` [].
+   - All seven components present.
+   - All 11 files carry bytes and sha256.
+3. **Drill** (`ops/restore_drill.py`, the newest clean backup): every line `ok`, exit 0.
+   - The new first line: `ok backup manifest: every file's size and checksum match`.
+   - `rmp_db`: 20 tables, 60575 rows; `temporal`: 39 tables, 8067 rows; `temporal_visibility`: 3 tables, 315 rows. Owners and `vector` are correct.
+   - Qdrant: 4 collections (memories 2687, deep 1433, task registry 252, mem0migrations 1).
+   - openclaw-state ok; `artifacts.tar.gz` 29 entries; `workspace.tar.gz` 234 entries.
+   - **`restore duration: 0 min 13 s`.**
+   - Nothing left behind; all services active.
+
+**Ledger** (spec §7, "after batch 4"):
+- **closed:** B1-05, B4b-05 and offrepo-openclaw-home-R6. Safe Harbor is retired under K-11 (WP-22), not backed up.
+
+**Rollback:** revert `62c292a`. Format-2 backups stay restorable by the old scripts.
+
+**Next:** batch 5 (restic, built and switched off).
+
+## 2026-10-21 22:53 UTC · WP-12 batch 5 started
+
+- **Branch:** `aura/wp-12-5-offsite` from `62c292a`.
+- **Items:** WP12-14 and WP12-15, Tier 1 (secret handling, K-7):
+  - the restic off-host step, built, tested and switched off;
+  - the manifest's `offsite` field;
+  - the runbook's RPO, RTO (from the drills, 7 s and 13 s, so 1 min) and retention;
+  - a real restic round trip in the tests, and a restic leg in the drill.
+- **Workflow:** run `wf_b4e61152-feb`.
+- **Deploy:** restarts rmp-api and rmp-worker.
+- **Host step:** the drill again, with the restic round trip on real data.
+
+## 2026-10-22 05:15 UTC · WP-12 batch 5 resumed after the usage limit; a side request from Kirill
+
+**Batch 5:** run `wf_b4e61152-feb` stopped at the session limit during the round-2 correctness re-review. By then the implementer (7 commits) and round 1 had finished, and fix round 1 had made 4 commits: `7f258b1`, `1f33e66`, `df29838` and `89fa542`. The tree was clean and no scratch copies or verify scopes were left. Resumed from cache.
+
+**Side request (Kirill, outside the plan):** the lab's PI, owner of the Claude Team org `NCU_OIST`, asked what Anthropic's email "make Claude an expert on NCU_OIST" means, and what the best connector setting for the lab is.
+
+A research workflow is running (`wf_23d1046b-703`): three web researchers and one synthesis. It changes nothing on the host or in the repo.
+
+## 2026-10-22 05:51 UTC · Side request answered: Claude Team connectors for NCU_OIST
+
+- **Research:** `wf_23d1046b-703`, then adversarial verification `wf_68201526-802`.
+- **Result:** of 15 load-bearing claims, 10 were confirmed and 5 were partly confirmed (corrected); none were refuted.
+- **Records:** findings, sources and verdicts are in `research/claude-team-connectors-2026-10-22.md`.
+- **Recommendation given to Kirill:**
+  - connect nothing yet;
+  - turn off "Rate chats", write organization instructions, and keep the Owners few;
+  - ask OIST IT, because the Microsoft 365 connector needs Entra Global Administrator consent, Slack needs workspace-admin approval, and OIST PRP 17.3.17 forbids external providers accessing OIST e-mail servers;
+  - check the Team plan for scientists.
+- **Scope:** no host or repository change.
+
+## 2026-10-22 12:39 UTC · WP-12 batch 5 reviewed
+
+**Workflow `wf_b4e61152-feb`** (resumed after the usage limit): `approved: true`.
+- **Implementer:** 7 commits.
+- **Round 1:** both reviewers approved, with non-blocking points: the after-write ordering not pinned, the retention wording, a symlinked backup, a malformed setting. Fixed in `7f258b1`, `1f33e66`, `df29838` and `89fa542`.
+- **Round 2:** both approved, with non-blocking points: `latest` may be an incomplete copy; the switch-on consequence. Fixed in `8e62f17` and `2fe9e3b`.
+- **Round 3:** both approved.
+- **Spec:** amendment 6 (§14).
+
+**Process note, my error:** round 2 reported untracked `dl/` and `scripts/` folders in `/root/work/wp-01`, created at 07:18–07:23 while my connector-research workflow ran, so its agents wrote into the clone. They were gone before my check, and the tree is clean. **From now on, research workflows run from a scratch directory, never from a repository clone.**
+
+**Four-layout verify:** running.
+
+## 2026-10-22 13:40 UTC · WP-12 batch 5 verified
+
+**Four-layout verify** (HEAD `2fe9e3b`): default, live, coding-job and direct each gave 1529 passed, 1 skipped. The only skip is the `RMP_QDRANT_IT` opt-in, so the **real restic round trip ran in every layout**. Leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. Each run took about 15 min. Summary in `research/wp12-b5-verify-summary.txt`.
+
+**Diff** (13 commits on `62c292a`):
+- `ops/offsite_copy.sh` (new), `ops/backup.sh`, `ops/restore_drill.py`, `app/production/backup_manifest.py`;
+- `settings.example.json`, the runbook, `ARCHITECTURE.md`;
+- the tests.
+
+The deploy restarts rmp-api and rmp-worker.

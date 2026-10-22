@@ -4,6 +4,8 @@
 # app/production/backup_manifest.py) lists each component's files with their sizes and sha256, and the failures: each
 # component that failed, or whose expected file is missing, empty or does not read back. After a failure no older
 # backup is pruned, and the script exits 1, so rmp-backup.service shows the run as failed instead of passing.
+# With settings' backup.offsite.enabled, ops/offsite_copy.sh then copies the backup off the host with restic; it stays
+# off on this host, an accepted exception (K-7), and the manifest says "offsite": "off".
 # Restore: ops/restore_backup.sh (runbook: docs/runbooks/backup-restore.md).
 set -euo pipefail
 umask 077
@@ -18,6 +20,8 @@ TEMPORAL_DBS="${RMP_TEMPORAL_DBS-temporal temporal_visibility}"
 PG_DB="${PGDATABASE:-rmp_db}"
 PG_USER="${PGUSER:-rmp}"
 KEEP=14
+# The off-host copy's repository, password and backend variables; read only when the copy is on.
+RESTIC_ENV="${RMP_RESTIC_ENV:-/etc/rmp/restic.env}"
 FAILURES=()
 QDRANT_URL=""
 QDRANT_SNAP=""
@@ -73,10 +77,11 @@ for db in ${TEMPORAL_DBS}; do
   fi
 done
 
-# What the settings say of Qdrant (its mode, and its address or path) and of the artifact store (on or off, and its
-# root). Read only: get_artifact_root would create a missing root.
+# What the settings say of Qdrant (its mode, and its address or path), of the artifact store (on or off, and its root)
+# and of the off-host copy (on or off). Read only: get_artifact_root would create a missing root.
 CFG="$("${PY}" -c '
 from app.config import get_artifact_store_config, get_vector_memory_config
+from app.production.backup_manifest import offsite_config
 c = get_vector_memory_config()
 mode = (c.get("qdrant_mode") or "embedded").strip().lower()
 server = mode == "server" or bool(c.get("qdrant_host"))
@@ -85,11 +90,13 @@ print("http://%s:%d" % (c.get("qdrant_host") or "127.0.0.1", int(c.get("qdrant_p
 a = get_artifact_store_config()
 print("on" if a.get("enabled", True) else "off")
 print(a.get("root_path") or "")
+print("on" if offsite_config()["enabled"] else "off")
 ' 2>>"${LOG}" || true)"
 QDRANT_MODE="$(sed -n 1p <<<"${CFG}")"
 QDRANT_WHERE="$(sed -n 2p <<<"${CFG}")"
 ARTIFACTS="$(sed -n 3p <<<"${CFG}")"
 ARTIFACT_ROOT="$(sed -n 4p <<<"${CFG}")"
+OFFSITE="$(sed -n 5p <<<"${CFG}")"
 
 # Qdrant. In server mode a full snapshot through Qdrant's API is consistent, unlike a tar of live storage.
 qdrant_snapshot() {
@@ -195,6 +202,36 @@ if written="$({ "${PY}" -m app.production.backup_manifest write "${DEST}" --temp
   read -r -a FAILURES <<<"${written}"
 else
   fail manifest "the manifest was not written"
+fi
+
+# The off-host copy (ops/offsite_copy.sh, restic), when the settings switch it on. Its configuration is read only from
+# ${RESTIC_ENV}, which must belong to the user this runs as and be readable by no one else, and only in a subshell, so
+# its secrets reach restic and no other step; restic's output goes to the log. It runs after a local failure too: what
+# the run made is still worth having off the host. The manifest records off, copied or failed, and a failed copy fails
+# the run. So does a backup.offsite setting that cannot be read (its error is in the log): it may be one that asks for
+# the copy, and must not pass for one switched off.
+OFFSITE_STATE=off
+if [[ "${OFFSITE}" == on ]]; then
+  log "Copying the backup off the host with restic..."
+  OFFSITE_STATE=failed
+  if [[ ! -f "${RESTIC_ENV}" ]]; then
+    fail offsite "${RESTIC_ENV} is missing"
+  elif OWNER_MODE="$(stat -c '%u %a' "${RESTIC_ENV}")"; [[ "${OWNER_MODE}" != "$(id -u) 600" ]]; then
+    fail offsite "refusing ${RESTIC_ENV}: its owner and mode are '${OWNER_MODE}', not '$(id -u) 600'"
+  elif ( set -a; . "${RESTIC_ENV}"; set +a; bash "${RMP_ROOT}/ops/offsite_copy.sh" "${DEST}" ) >>"${LOG}" 2>&1; then
+    OFFSITE_STATE=copied
+  else
+    fail offsite "restic did not copy the backup (see backup.log)"
+  fi
+elif [[ "${OFFSITE}" != off ]]; then
+  OFFSITE_STATE=failed
+  fail offsite "could not read backup.offsite from ${SETTINGS} (see backup.log)"
+fi
+log "Off-host copy: ${OFFSITE_STATE}"
+# A run whose manifest was not written has failed as manifest already, and has nothing to record it in.
+if [[ -f "${DEST}/manifest.json" ]]; then
+  "${PY}" -m app.production.backup_manifest offsite "${DEST}" "${OFFSITE_STATE}" 2>>"${LOG}" \
+    || fail manifest "the manifest does not record the off-host copy (${OFFSITE_STATE})"
 fi
 
 du -sh "${DEST}" | tee -a "${LOG}"

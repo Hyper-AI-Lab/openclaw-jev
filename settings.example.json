@@ -37,6 +37,11 @@
     "enabled": true,
     "root_path": "/root/.openclaw/rmp/data/artifacts"
   },
+  "backup": {
+    "offsite": {
+      "enabled": false
+    }
+  },
   "production": {
     "scanner_auto_restart": false,
     "scanner_managed_ids": [],
