@@ -50,8 +50,8 @@ def sent(monkeypatch, tmp_path):
     return record
 
 
-def utc(day, hour, minute):
-    return datetime(2026, 10, day, hour, minute, tzinfo=timezone.utc)
+def utc(day, hour, minute, second=0):
+    return datetime(2026, 10, day, hour, minute, second, tzinfo=timezone.utc)
 
 
 def backup(tmp_path, stamp, failures=None):
@@ -80,9 +80,13 @@ def test_a_fresh_backup_with_failures_names_them(sent, tmp_path):
     assert sent.alerts == [("unit.failed", text, {"severity": "error", "context": {"unit": BACKUP}})]
 
 
-def test_a_fresh_backup_directory_without_a_manifest_says_the_run_stopped_early(sent, tmp_path):
+@pytest.mark.parametrize("manifest", [None, '{"format": 2, "failures": ["qd'], ids=["missing", "unparsable"])
+def test_a_fresh_backup_directory_without_a_manifest_says_the_run_stopped_early(sent, tmp_path, manifest):
+    """A manifest that does not parse counts as none, and the DM still goes out."""
     backup(tmp_path, "20261021T031502Z", [])
-    backup(tmp_path, "20261022T031502Z")
+    run = backup(tmp_path, "20261022T031502Z")
+    if manifest is not None:
+        (run / "manifest.json").write_text(manifest)
     assert notify.main([BACKUP], now=utc(22, 4, 15)) == 0
     assert sent.dms[0][0].splitlines()[1:] == [
         "Backup 20261022T031502Z: the run left no manifest (it stopped before the end)", CHECK.format(BACKUP)]
@@ -101,11 +105,13 @@ def test_a_three_day_old_backup_directory_is_not_reported(sent, tmp_path):
     backup(tmp_path, "20261019T031502Z", ["qdrant"])
     (tmp_path / "backups" / "openclaw-state").mkdir()
     assert notify.main([BACKUP], now=utc(22, 3, 40)) == 0
-    # Two hours after its stamp, a run is no longer the one that just failed.
+    # Two hours after its stamp, a run is no longer the one that just failed; a second earlier, it still is.
     backup(tmp_path, "20261022T013500Z", ["qdrant"])
     assert notify.main([BACKUP], now=utc(22, 3, 35)) == 0
     for text, _ in sent.dms:
         assert text.splitlines()[1:] == ["no backup directory from this run", CHECK.format(BACKUP)]
+    assert notify.main([BACKUP], now=utc(22, 3, 34, 59)) == 0
+    assert sent.dms[-1][0].splitlines()[1] == "Backup 20261022T013500Z: not backed up: qdrant"
 
 
 def test_the_incident_id_holds_the_unit_and_the_date_and_the_text_no_time_of_day(sent):
