@@ -2177,3 +2177,70 @@ A research workflow is running (`wf_23d1046b-703`): three web researchers and on
 - the tests.
 
 The deploy restarts rmp-api and rmp-worker.
+
+## 2026-10-22 14:47 UTC · PR #41 merged; deploy waits on GitHub's queue; WP-12 batch 6 started
+
+**PR #41:** CI `test` passed in 5 min 26 s on head `1fa6453`; `origin/main` unchanged at `62c292a`; no other open PRs. Squash-merged as `e5b4c9d`.
+
+**Deploy:** not started yet. CI on `main` for `e5b4c9d` has sat `queued` in GitHub's runner queue since 14:37Z, and `watch_main` deploys only after it passes. Aura is idle. A background watch on `result.json` is running.
+
+**Kirill** asked me to check CI myself rather than wait for him. I did, with `aura-github gh pr checks`.
+
+**Batch 6:**
+- **Branch:** `aura/wp-12-6-onfailure` from `e5b4c9d`.
+- **Item:** WP12-16 (TRI-026), the `OnFailure=` alert unit, Tier 1.
+- **Workflow:** run `wf_a315b863-1f2`.
+- **Memory at its start:** 4.5 GB available. Its harness runs may overlap batch 5's short drill; the drill refuses below 2 GiB.
+- **Kirill was told in advance** about the one probe DM, `rmp-wp12-onfailure-probe.service`, that batch 6's host step sends.
+
+## 2026-10-22 14:53 UTC · WP-12 batch 5 deployed; the drill's restic round trip on real data passes
+
+**Deploy** (14:51Z, once GitHub's queued CI on `main` passed): `deployed` `e5b4c9d`; **restarted rmp-api and rmp-worker**; health, readiness and the canary passed; no units.
+
+**Host step WP12-15** (the drill again, at `e5b4c9d`), on backup `20261022T031503Z` (the 03:15Z nightly, made with batch 4's code). 4.4 GB available. Every line `ok`, exit 0:
+- `ok backup manifest`, which also confirms batch 4's nightly check: the first nightly format-2 backup verifies;
+- **`ok restic round trip: 11 files, checksums match`**, which is K-7's "tested against a local repository" on real data;
+- all legs run from the restored copy:
+  - `rmp_db`: 20 tables, 60655 rows; `temporal`: 39 tables, 7975 rows; `temporal_visibility`: 3 tables, 312 rows;
+  - owners and `vector` correct;
+  - Qdrant: 4 collections (2688, 1433, 252, 1);
+  - openclaw-state ok; both archives read to the end;
+- `restore duration: 0 min 14 s`.
+
+Nothing was left behind (no drill container, no scratch directory), and all services are active.
+
+**Ledger:** progress on ops-deploy-R2 (the restic step built, tested and switched off; readiness follows in batch 7).
+
+**Rollback:** revert `e5b4c9d`.
+
+## 2026-10-22 21:53 UTC · WP-12 batch 6 reviewed; two failure-path fixes by me
+
+**Workflow `wf_a315b863-1f2`:** `approved: true`.
+- **Implementer:** 3 commits. Its read-only dry-run comparison lists exactly `new: rmp-unit-failed@.service` and `changed: rmp-backup.service`.
+- **Round 1:** both reviewers approved, with non-blocking points. Fix round: `7727922`, `ddbc02d`, `c004a8e`.
+- **Rounds 2 and 3:** both approved, with non-blocking points.
+
+**Fixed by me, `3f7aaba`:**
+- `TimeoutStartSec=2min` on the alert template, so a hung DM cannot block every later alert;
+- a stamp-shaped directory name that is not a real date no longer crashes the alert;
+- tests for both; the probe that reverts both fails both; `systemd-analyze verify` passes on the template instance.
+
+**Residual ledgered:** `WP12-b6-postgres-down-alert` (WP-03). No DM can go out while Postgres is down.
+
+**Spec:** amendment 7 (§15).
+
+**Four-layout verify:** next.
+
+## 2026-10-22 22:51 UTC · WP-12 batch 5's drill logged; batch 6 verified
+
+**Four-layout verify** (HEAD `3f7aaba`): default, live, coding-job and direct each gave 1542 passed, 1 skipped (the `RMP_QDRANT_IT` opt-in), leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. Summary in `research/wp12-b6-verify-summary.txt`.
+
+The first attempt did not run: the background command started in the programme folder, which is no git repository, and its `git log` stopped the chain. I reran it with `git -C`.
+
+**Diff** (7 commits on `e5b4c9d`):
+- `ops/systemd/rmp-backup.service` (OnFailure);
+- `ops/systemd/rmp-unit-failed@.service` (new);
+- `ops/notify_unit_failure.py` (new);
+- the two test files and the runbook.
+
+The deploy restarts nothing; the units are installed by `install_units` afterwards.
