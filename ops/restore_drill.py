@@ -579,11 +579,13 @@ def main(argv: Optional[Sequence[str]] = None, *, run: Run = _run, probes: Optio
                         help='the backup directory to drill (default: the newest whose manifest has "failures": [])')
     args = parser.parse_args(argv)
     root = backups or Path(RMP_DATA_DIR) / "backups"
-    # Absolute: every command runs from /.
-    backup = args.backup.absolute() if args.backup else newest_clean(root)
+    backup = args.backup or newest_clean(root)
     if backup is None:
         print(f'refused: no backup under {root} has a manifest with "failures": []')
         return 2
+    # Resolved: every command runs from /, and restic stores a symlink it is given as the link alone. A round trip
+    # through a link would copy nothing, and every later leg would read the original through the restored link.
+    backup = backup.resolve()
     if not backup.is_dir():
         print(f"refused: {backup} is not a directory")
         return 2

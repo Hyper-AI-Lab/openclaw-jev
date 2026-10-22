@@ -63,7 +63,8 @@ class Host:
     ``units`` is what systemctl lists as active coding units, ``containers`` what docker lists, and ``on`` maps a
     command's name to what to do while the runner handles it; what that returns, unless None, is the command's exit
     code. ops/offsite_copy.sh's call names the backup it copies, and restic's restore puts a copy of it under its
-    target at the backup's own path, as restic does: ``restored``.
+    target at the backup's own path, as restic does: ``restored``. A symlink it was given comes back as the link alone,
+    as restic stores it.
     """
 
     def __init__(self, *, fail=None, counts=None, units="", containers="", on=None):
@@ -89,7 +90,11 @@ class Host:
             self.copied = Path(words[2])
         if name == "restic" and words[1] == "restore":
             self.restored = Path(words[words.index("--target") + 1]) / self.copied.relative_to("/")
-            shutil.copytree(self.copied, self.restored)
+            if self.copied.is_symlink():
+                self.restored.parent.mkdir(parents=True)
+                self.restored.symlink_to(os.readlink(self.copied))
+            else:
+                shutil.copytree(self.copied, self.restored)
         if name == "restore_pg_database.sh":
             return (1 if Path(words[2]).name == self.fail else 0), b""
         if name == "pg_restore":
@@ -657,6 +662,25 @@ def test_a_backup_given_by_a_relative_path_is_drilled_by_its_absolute_path(capsy
     assert code == 0 and lines[0] == f"backup: {backup}"
     [copy] = host.named("offsite_copy.sh")
     assert copy.argv[-1] == str(backup)
+    assert [c.argv[-1] for c in host.named("restore_pg_database.sh")] == [
+        str(host.restored / f"{db}.dump") for db in OWNERS]
+
+
+@pytest.mark.parametrize("found", ["given", "the newest"])
+def test_a_symlinked_backup_is_drilled_by_the_directory_it_resolves_to(capsys, backup, scratch_root, tmp_path, found):
+    """restic stores a symlink it is given as the link alone: a round trip through one would copy nothing, and every
+    later leg would read the original through the restored link."""
+    link = tmp_path / "drill-this" if found == "given" else backup.parent / "20261020T031502Z"
+    link.symlink_to(backup)
+    assert found == "given" or drill.newest_clean(backup.parent) == link
+    host = Host()
+    code, lines = run_drill(capsys, backup, scratch_root, host, argv=[str(link)] if found == "given" else [])
+    assert code == 0, lines
+    assert lines[0] == f"backup: {backup}" and lines[2] == "ok restic round trip: 11 files, checksums match"
+    [copy] = host.named("offsite_copy.sh")
+    assert copy.argv[-1] == str(backup)
+    scratch = Path(host.named("chown")[0].argv[-1]).parent
+    assert host.restored == scratch / "from-restic" / backup.relative_to("/")
     assert [c.argv[-1] for c in host.named("restore_pg_database.sh")] == [
         str(host.restored / f"{db}.dump") for db in OWNERS]
 
