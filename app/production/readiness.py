@@ -351,6 +351,40 @@ def check_backups(max_hours: int = BACKUP_MAX_HOURS) -> CheckResult:
     )
 
 
+def check_offsite_backup() -> CheckResult:
+    """The off-host copy of each backup (ops/offsite_copy.sh). Switched off, it is the accepted exception K-7: a
+    warning for as long as it lasts, the one warning the soak accepts (K-24), never a failure."""
+    if not backup_manifest.offsite_config()["enabled"]:
+        return CheckResult(
+            "offsite_backup",
+            "warn",
+            "Off-host copy switched off: backups stay on this host (accepted exception K-7)",
+            {"accepted_exception": "K-7", "enabled": False},
+        )
+    newest = backup_manifest.newest(Path(BACKUP_ROOT))
+    if newest is None:
+        return CheckResult(
+            "offsite_backup",
+            "warn",
+            "No backup with a manifest, so none was copied off the host",
+            {"enabled": True},
+        )
+    manifest = _read_json(str(newest / backup_manifest.MANIFEST))
+    if isinstance(manifest, dict) and manifest.get(backup_manifest.OFFSITE) == "copied":
+        return CheckResult(
+            "offsite_backup",
+            "pass",
+            f"The newest backup {newest.name} was copied off the host",
+            {"enabled": True, "latest": newest.name},
+        )
+    return CheckResult(
+        "offsite_backup",
+        "warn",
+        f"The newest backup {newest.name} was not copied off the host",
+        {"enabled": True, "latest": newest.name},
+    )
+
+
 def _temporal_journal_mode(db_path: str) -> str:
     try:
         import sqlite3
@@ -857,6 +891,7 @@ async def run_all_checks() -> Dict[str, Any]:
         check_slack_configured(),
         check_slack_sockets(),
         check_backups(),
+        check_offsite_backup(),
         check_temporal_persistence(),
         check_telemetry_export(),
         check_vector_memory(),

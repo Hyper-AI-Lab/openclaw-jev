@@ -19,6 +19,7 @@ from app.production.readiness import (
     check_artifact_store,
     check_backups,
     check_development_mode,
+    check_offsite_backup,
     get_last_backup_info,
     run_all_checks,
 )
@@ -114,9 +115,11 @@ async def test_run_all_checks_structure(tmp_path, monkeypatch):
     assert "openai_key" in names
     assert "slack_sockets" in names
     assert "safe_harbor" in names
+    assert "offsite_backup" in names
     statuses = {c["name"]: c["status"] for c in result["checks"]}
-    # Without a backup the backups check warns, and a warning blocks nothing.
-    assert statuses["backups"] == "warn" and "backups" not in result["blocking_failures"]
+    # Without a backup the backups check warns, the off-host copy is the K-7 warning, and a warning blocks nothing.
+    assert statuses["backups"] == statuses["offsite_backup"] == "warn"
+    assert not {"backups", "offsite_backup"} & set(result["blocking_failures"])
     # Each probe was refused, and the check that made it reports the service as out of reach.
     assert {name: statuses[name] for name in ("systemd_services", "rmp_health", "temporal", "temporal_persistence",
                                               "task_registry_vector", "stuck_workflows", "host_file_drift")} == {
@@ -530,3 +533,50 @@ def test_a_directory_named_like_a_stamp_that_is_no_date_does_not_break_readiness
     _warns(backups / "20991399T000000Z", "its name is no date")
     info = get_last_backup_info()
     assert (info["timestamp"], info["age_hours"]) == (None, None)
+
+
+def test_the_offsite_copy_warns_as_the_k7_exception_while_off(backups, tmp_path, monkeypatch):
+    _backup(backups, 2)
+    for settings in ({}, {"backup": {"offsite": {"enabled": False}}}):
+        _stored_settings(tmp_path, monkeypatch, settings)
+        r = check_offsite_backup()
+        assert (r.name, r.status, r.message, r.details) == (
+            "offsite_backup", "warn", "Off-host copy switched off: backups stay on this host (accepted exception K-7)",
+            {"accepted_exception": "K-7", "enabled": False})
+
+
+def test_an_enabled_offsite_copy_passes_when_the_newest_backup_was_copied(backups, tmp_path, monkeypatch):
+    _stored_settings(tmp_path, monkeypatch, {"backup": {"offsite": {"enabled": True}}})
+    r = check_offsite_backup()
+    assert (r.status, r.message, r.details) == (
+        "warn", "No backup with a manifest, so none was copied off the host", {"enabled": True})
+    older = _backup(backups, 26)
+    bm.record_offsite(older, "copied")
+    r = check_offsite_backup()
+    assert (r.name, r.status, r.message, r.details) == (
+        "offsite_backup", "pass", f"The newest backup {older.name} was copied off the host",
+        {"enabled": True, "latest": older.name})
+    # Only the newest backup counts: one not copied, or whose copy failed, warns.
+    newer = _backup(backups, 2)
+    for state in ("off", "failed"):
+        bm.record_offsite(newer, state)
+        r = check_offsite_backup()
+        assert (r.status, r.message) == ("warn", f"The newest backup {newer.name} was not copied off the host")
+        assert r.details == {"enabled": True, "latest": newer.name}
+
+
+def test_the_backup_warnings_fail_no_deploy(backups, monkeypatch):
+    """The deploy gate reads the readiness endpoint and counts failed checks only, so the permanent K-7 warning and a
+    backup warning never revert a deploy."""
+    import io
+    import urllib.request
+    from dataclasses import asdict
+
+    from app.coding import deploy_checks
+
+    _backup(backups, 2, failures=["qdrant"])
+    checks = [check_backups(), check_offsite_backup()]
+    assert [(c.name, c.status) for c in checks] == [("backups", "warn"), ("offsite_backup", "warn")]
+    report = json.dumps({"checks": [asdict(c) for c in checks]}).encode()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout: io.BytesIO(report))
+    assert deploy_checks.readiness_failures() == []
