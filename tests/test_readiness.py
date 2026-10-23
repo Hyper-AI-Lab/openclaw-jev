@@ -5,17 +5,22 @@ import json
 import os
 import shutil
 import subprocess
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from temporalio.client import Client
 
+from app.production import backup_manifest as bm
 from app.production.readiness import (
     CheckResult,
     check_api_key,
     check_artifact_store,
+    check_backups,
     check_development_mode,
+    check_offsite_backup,
+    get_last_backup_info,
     run_all_checks,
 )
 
@@ -98,6 +103,7 @@ async def test_run_all_checks_structure(tmp_path, monkeypatch):
     monkeypatch.setattr(builtins, "open", no_unit_file)
     # The main_deployed invariant asks GitHub with this host's token; tests have none, as CI and coding units.
     monkeypatch.setattr(workspace, "TOKEN_FILE", tmp_path / "github_pat")
+    monkeypatch.setattr(rd, "BACKUP_ROOT", str(tmp_path / "backups"))
 
     result = await run_all_checks()
     assert "checks" in result
@@ -109,8 +115,12 @@ async def test_run_all_checks_structure(tmp_path, monkeypatch):
     assert "openai_key" in names
     assert "slack_sockets" in names
     assert "safe_harbor" in names
-    # Each probe was refused, and the check that made it reports the service as out of reach.
+    assert "offsite_backup" in names
     statuses = {c["name"]: c["status"] for c in result["checks"]}
+    # Without a backup the backups check warns, the off-host copy is the K-7 warning, and a warning blocks nothing.
+    assert statuses["backups"] == statuses["offsite_backup"] == "warn"
+    assert not {"backups", "offsite_backup"} & set(result["blocking_failures"])
+    # Each probe was refused, and the check that made it reports the service as out of reach.
     assert {name: statuses[name] for name in ("systemd_services", "rmp_health", "temporal", "temporal_persistence",
                                               "task_registry_vector", "stuck_workflows", "host_file_drift")} == {
         "systemd_services": "fail", "rmp_health": "fail", "temporal": "fail", "temporal_persistence": "warn",
@@ -404,3 +414,209 @@ def test_registry_freshness_counts_finished_user_tasks_only(tmp_path, monkeypatc
         db.commit()
     r = check_task_registry_index_fresh()
     assert r.status == "warn" and "5/10 finished user tasks" in r.message
+
+
+@pytest.fixture
+def backups(tmp_path, monkeypatch):
+    """BACKUP_ROOT in tmp_path, and the settings there: Qdrant runs as a server."""
+    from app.production import readiness as rd
+
+    root = tmp_path / "backups"
+    root.mkdir()
+    monkeypatch.setattr(rd, "BACKUP_ROOT", str(root))
+    _stored_settings(tmp_path, monkeypatch, {"vector_memory": {"qdrant_mode": "server"}})
+    return root
+
+
+def _backup(root, hours_ago, *, qdrant_mode="server", failures=()):
+    """A backup that ops/backup.sh started ``hours_ago``, with its format-2 manifest: every component's files, the
+    run's ``failures``, and the off-host copy off. rmp_db.dump holds 3 MiB."""
+    dest = root / f"{datetime.now(timezone.utc) - timedelta(hours=hours_ago):%Y%m%dT%H%M%SZ}"
+    (dest / "openclaw-state").mkdir(parents=True)
+    files = {"rmp_db.dump": b"PGDMP" + bytes(3 << 20), "temporal.dump": b"PGDMP temporal",
+             "temporal_visibility.dump": b"PGDMP temporal_visibility", "artifacts.tar.gz": b"\x1f\x8b artifacts",
+             "workspace.tar.gz": b"\x1f\x8b workspace", "settings.json": b"{}", "openclaw.json": b"{}",
+             "openclaw-state/openclaw-agent.sqlite": b"SQLite format 3 agent",
+             "openclaw-state/openclaw.sqlite": b"SQLite format 3 state",
+             # 20261005T031502Z's Qdrant copy, from before the server snapshot, is a 110-byte qdrant.tar.gz.
+             bm.QDRANT_FILES[qdrant_mode]: b"snapshot" if qdrant_mode == "server" else b"\x1f\x8b" + bytes(108)}
+    for name, data in files.items():
+        (dest / name).write_bytes(data)
+    (dest / "openclaw-state" / "manifest.json").write_text(json.dumps(
+        {"files": {"agent": {"file": "openclaw-agent.sqlite"}, "state": {"file": "openclaw.sqlite"}}}))
+    bm.write(dest, failures=list(failures), temporal_dbs=["temporal", "temporal_visibility"], qdrant_mode=qdrant_mode,
+             artifacts_enabled=True, read_back=lambda path: True)
+    bm.record_offsite(dest, "off")
+    return dest
+
+
+def _warns(dest, *problems):
+    """check_backups' warning for the backup in ``dest``, and the same problems on the dashboard."""
+    r = check_backups()
+    assert (r.name, r.status, r.message) == ("backups", "warn", f"Backup {dest.name}: {'; '.join(problems)}")
+    assert r.details == {"latest": dest.name, "problems": list(problems)}
+    info = get_last_backup_info()
+    assert (info["found"], info["id"], info["problems"]) == (True, dest.name, list(problems))
+
+
+def test_a_complete_fresh_backup_passes(backups):
+    dest = _backup(backups, 2)
+    r = check_backups()
+    assert (r.name, r.status, r.message, r.details) == (
+        "backups", "pass", f"Backup {dest.name} verified: 7 components, 3 MB, 2.0h old", {"latest": dest.name})
+    # The dashboard's keys, with the same backup and its problems.
+    taken = datetime.strptime(dest.name, "%Y%m%dT%H%M%SZ")
+    assert get_last_backup_info() == {
+        "found": True, "id": dest.name, "timestamp": f"{taken:%Y-%m-%dT%H:%M:%SZ}",
+        "age_hours": pytest.approx(2, abs=0.01), "manifest": json.loads((dest / "manifest.json").read_text()),
+        "path": str(dest), "problems": []}
+
+
+def test_a_backup_with_manifest_failures_warns(backups):
+    """R-127's and R-132's closing test."""
+    dest = _backup(backups, 2, failures=["qdrant", "temporal:temporal"])
+    _warns(dest, "failed: qdrant, temporal:temporal")
+
+
+def test_a_legacy_qdrant_tar_in_server_mode_warns(backups, tmp_path, monkeypatch):
+    dest = _backup(backups, 2, qdrant_mode="embedded")
+    assert json.loads((dest / "manifest.json").read_text())["components"]["qdrant"] == ["qdrant.tar.gz"]
+    assert (dest / "qdrant.tar.gz").stat().st_size == 110
+    _warns(dest, "Qdrant runs as a server but this backup holds qdrant.tar.gz")
+    # The mode is the settings': with Qdrant embedded, the same backup is complete.
+    _stored_settings(tmp_path, monkeypatch, {"vector_memory": {"qdrant_mode": "embedded"}})
+    assert check_backups().status == "pass"
+
+
+def test_a_backup_from_before_manifest_format_2_warns(backups):
+    """20261005T031502Z's shape: a manifest without failures or a file list, and a 110-byte qdrant.tar.gz. It is made
+    fresh here, so its format alone warns."""
+    dest = backups / f"{datetime.now(timezone.utc) - timedelta(hours=2):%Y%m%dT%H%M%SZ}"
+    dest.mkdir()
+    (dest / "qdrant.tar.gz").write_bytes(b"\x1f\x8b" + bytes(108))
+    (dest / "manifest.json").write_text(json.dumps({"timestamp": dest.name, "components": ["postgres", "qdrant"]}))
+    _warns(dest, "made before manifest format 2 (no file list)")
+
+
+def test_a_file_that_changed_size_warns(backups):
+    dest = _backup(backups, 2)
+    size = (dest / "temporal.dump").stat().st_size
+    with open(dest / "temporal.dump", "ab") as dump:
+        dump.write(b"more")
+    _warns(dest, f"temporal.dump is {size + 4} bytes, the manifest says {size}")
+
+
+def test_a_backup_older_than_26_hours_warns(backups):
+    dest = _backup(backups, 27)
+    _warns(dest, "27.0h old")
+    assert check_backups(max_hours=28).status == "pass"
+    _backup(backups, 25)
+    assert check_backups().status == "pass"
+
+
+def test_a_fresher_non_backup_directory_does_not_count(backups):
+    """The newest directory with a manifest is no backup unless it is named like a stamp, and the newest stamp is no
+    backup until its run wrote the manifest."""
+    dest = _backup(backups, 72)
+    three_days_ago = (datetime.now(timezone.utc) - timedelta(hours=72)).timestamp()
+    os.utime(dest, (three_days_ago, three_days_ago))
+    fresh = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    for name in ("openclaw-state", f"openclaw-update-{fresh}"):
+        (backups / name).mkdir()
+        (backups / name / "manifest.json").write_text("{}")
+    (backups / fresh).mkdir()
+    _warns(dest, "72.0h old")
+
+
+def test_a_directory_named_like_a_stamp_that_is_no_date_does_not_break_readiness(backups):
+    shutil.copytree(_backup(backups, 2), backups / "20991399T000000Z")
+    _warns(backups / "20991399T000000Z", "its name is no date")
+    info = get_last_backup_info()
+    assert (info["timestamp"], info["age_hours"]) == (None, None)
+
+
+def test_readiness_checks_sizes_and_never_hashes(backups):
+    """D-5: hashing every file of a 500 MB backup would block the event loop readiness runs on. A file whose content
+    changed at the same size passes readiness; the restore and the drill, which hash, catch it."""
+    dest = _backup(backups, 2)
+    (dest / "temporal.dump").write_bytes(b"PGDMP temporaX")
+    assert check_backups().status == "pass"
+    assert "temporal.dump does not match its checksum" in bm.problems(dest, hashes=True)
+
+
+def test_no_backup_warns_and_the_dashboard_finds_none(backups):
+    (backups / "openclaw-state").mkdir()
+    r = check_backups()
+    assert (r.name, r.status, r.message, r.details) == (
+        "backups", "warn", "No backup with a manifest — run ops/backup.sh", {"path": str(backups)})
+    assert get_last_backup_info() == {"found": False, "path": str(backups), "problems": []}
+
+
+def test_a_backup_stamped_in_the_future_warns(backups):
+    """A stamp ahead of the clock sorts above every real run and would hide them: it is a problem, not a pass with a
+    negative age. A few minutes of skew are not."""
+    _backup(backups, 1)
+    _backup(backups, -2 / 60)
+    assert check_backups().status == "pass"
+    ahead = _backup(backups, -48)
+    _warns(ahead, "its stamp is 48.0h in the future")
+
+
+@pytest.mark.parametrize("backup", [{"offsite": True}, "yes", {"offsite": "on"}])
+def test_an_unreadable_offsite_setting_warns_instead_of_breaking_readiness(backups, tmp_path, monkeypatch, backup):
+    """A hand-edited backup.offsite that is not an object made offsite_config() raise, which would fail readiness for
+    every consumer, the deploy gate first. ops/backup.sh fails each run as offsite meanwhile."""
+    _backup(backups, 2)
+    _stored_settings(tmp_path, monkeypatch, {"vector_memory": {"qdrant_mode": "server"}, "backup": backup})
+    r = check_offsite_backup()
+    assert (r.name, r.status, r.message, r.details) == (
+        "offsite_backup", "warn",
+        "backup.offsite in settings.json cannot be read, so each backup run fails as offsite until it is fixed",
+        {"enabled": None})
+
+
+def test_the_offsite_copy_warns_as_the_k7_exception_while_off(backups, tmp_path, monkeypatch):
+    _backup(backups, 2)
+    for settings in ({}, {"backup": {"offsite": {"enabled": False}}}):
+        _stored_settings(tmp_path, monkeypatch, settings)
+        r = check_offsite_backup()
+        assert (r.name, r.status, r.message, r.details) == (
+            "offsite_backup", "warn", "Off-host copy switched off: backups stay on this host (accepted exception K-7)",
+            {"accepted_exception": "K-7", "enabled": False})
+
+
+def test_an_enabled_offsite_copy_passes_when_the_newest_backup_was_copied(backups, tmp_path, monkeypatch):
+    _stored_settings(tmp_path, monkeypatch, {"backup": {"offsite": {"enabled": True}}})
+    r = check_offsite_backup()
+    assert (r.status, r.message, r.details) == (
+        "warn", "No backup with a manifest, so none was copied off the host", {"enabled": True})
+    older = _backup(backups, 26)
+    bm.record_offsite(older, "copied")
+    r = check_offsite_backup()
+    assert (r.name, r.status, r.message, r.details) == (
+        "offsite_backup", "pass", f"The newest backup {older.name} was copied off the host",
+        {"enabled": True, "latest": older.name})
+    # Only the newest backup counts: one not copied, or whose copy failed, warns.
+    newer = _backup(backups, 2)
+    for state in ("off", "failed"):
+        bm.record_offsite(newer, state)
+        r = check_offsite_backup()
+        assert (r.status, r.message) == ("warn", f"The newest backup {newer.name} was not copied off the host")
+        assert r.details == {"enabled": True, "latest": newer.name}
+
+
+def test_the_backup_warnings_fail_no_deploy(backups, monkeypatch):
+    """The deploy gate reads the readiness endpoint and counts failed checks only, so the permanent K-7 warning and a
+    backup warning never revert a deploy."""
+    import io
+    import urllib.request
+    from dataclasses import asdict
+
+    from app.coding import deploy_checks
+
+    _backup(backups, 2, failures=["qdrant"])
+    checks = [check_backups(), check_offsite_backup()]
+    assert [(c.name, c.status) for c in checks] == [("backups", "warn"), ("offsite_backup", "warn")]
+    report = json.dumps({"checks": [asdict(c) for c in checks]}).encode()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout: io.BytesIO(report))
+    assert deploy_checks.readiness_failures() == []

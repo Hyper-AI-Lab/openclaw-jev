@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +27,7 @@ from app.config import (
     is_vector_memory_enabled,
     load_settings,
 )
+from app.production import backup_manifest
 
 RMP_API = "http://127.0.0.1:8000"
 TEMPORAL_ADDR = "localhost:7233"
@@ -40,6 +41,10 @@ SYSTEMD_UNITS = [
 # Inactive, these only warn: Aura stays online without them.
 WARN_UNITS = ["aura-web-backends.service"]
 BACKUP_ROOT = os.path.join(RMP_DATA_DIR, "backups")
+# The backup runs nightly; past this age the newest one is overdue.
+BACKUP_MAX_HOURS = 26
+# How far ahead of the clock a backup's stamp may be before readiness reports it.
+BACKUP_FUTURE_SKEW_HOURS = 5 / 60
 MEMORY_CANARY_RESULT_PATH = os.path.join(RMP_DATA_DIR, "last_memory_canary.json")
 HEALTH_CANARY_RESULT_PATH = os.path.join(RMP_DATA_DIR, "last_health_canary.json")
 
@@ -270,30 +275,46 @@ def check_settings_integrity() -> CheckResult:
     )
 
 
+def _newest_backup(max_hours: int) -> Optional[Dict[str, Any]]:
+    """The newest backup, or None: the newest directory named like a stamp that holds a manifest
+    (backup_manifest.newest), not the newest directory, which openclaw-state/ beside the backups can be. Its age comes
+    from its stamp. Its problems are its manifest's, checked without hashes: hashing every file would block the event
+    loop readiness runs on, and the restore and the drill check them. Being older than ``max_hours`` is one more."""
+    newest = backup_manifest.newest(Path(BACKUP_ROOT))
+    if newest is None:
+        return None
+    mode = (load_settings().get("vector_memory", {}).get("qdrant_mode") or "embedded").strip().lower()
+    problems = backup_manifest.problems(newest, hashes=False, qdrant_mode=mode)
+    try:
+        taken = datetime.strptime(newest.name, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        # Named like a stamp but no date (20261399T000000Z): ops/backup.sh never makes one, and it must not break
+        # readiness.
+        return {"path": newest, "taken": None, "age_hours": None, "problems": [*problems, "its name is no date"]}
+    age_hours = (datetime.now(timezone.utc) - taken).total_seconds() / 3600
+    if age_hours > max_hours:
+        problems.append(f"{age_hours:.1f}h old")
+    elif age_hours < -BACKUP_FUTURE_SKEW_HOURS:
+        # A stamp ahead of the clock (a skewed clock, or a directory made by hand) sorts above every real run and
+        # would hide them, a failed one included.
+        problems.append(f"its stamp is {-age_hours:.1f}h in the future")
+    return {"path": newest, "taken": taken, "age_hours": age_hours, "problems": problems}
+
+
 def get_last_backup_info() -> Dict[str, Any]:
-    """Latest backup directory metadata for dashboards."""
-    if not os.path.isdir(BACKUP_ROOT):
-        return {"found": False, "path": BACKUP_ROOT}
-    latest: Optional[datetime] = None
-    latest_name = ""
-    for name in os.listdir(BACKUP_ROOT):
-        path = os.path.join(BACKUP_ROOT, name)
-        if os.path.isdir(path):
-            mtime = datetime.utcfromtimestamp(os.path.getmtime(path))
-            if latest is None or mtime > latest:
-                latest = mtime
-                latest_name = name
-    if latest is None:
-        return {"found": False, "path": BACKUP_ROOT}
-    manifest = _read_json(os.path.join(BACKUP_ROOT, latest_name, "manifest.json"))
-    age_hours = (datetime.utcnow() - latest).total_seconds() / 3600
+    """The newest backup, as the backups check finds it, for the dashboard."""
+    backup = _newest_backup(BACKUP_MAX_HOURS)
+    if backup is None:
+        return {"found": False, "path": BACKUP_ROOT, "problems": []}
+    path, taken = backup["path"], backup["taken"]
     return {
         "found": True,
-        "id": latest_name,
-        "timestamp": latest.isoformat() + "Z",
-        "age_hours": round(age_hours, 2),
-        "manifest": manifest,
-        "path": os.path.join(BACKUP_ROOT, latest_name),
+        "id": path.name,
+        "timestamp": f"{taken:%Y-%m-%dT%H:%M:%SZ}" if taken is not None else None,
+        "age_hours": round(backup["age_hours"], 2) if taken is not None else None,
+        "manifest": _read_json(str(path / backup_manifest.MANIFEST)),
+        "path": str(path),
+        "problems": backup["problems"],
     }
 
 
@@ -305,38 +326,79 @@ def readiness_score(summary: Dict[str, int]) -> int:
     return int(round(100 * summary.get("pass", 0) / total))
 
 
-def check_backup_recency(max_hours: int = 26) -> CheckResult:
-    if not os.path.isdir(BACKUP_ROOT):
+def check_backups(max_hours: int = BACKUP_MAX_HOURS) -> CheckResult:
+    """The newest backup is complete by its manifest, and recent. Warn-level for good: a failed backup is not caused
+    by a deploy, so it must not revert one or make production_ready false; its OnFailure= alert carries the urgency."""
+    backup = _newest_backup(max_hours)
+    if backup is None:
         return CheckResult(
             "backups",
             "warn",
-            "No backup directory yet — run ops/backup.sh",
+            "No backup with a manifest — run ops/backup.sh",
             {"path": BACKUP_ROOT},
         )
-    latest: Optional[datetime] = None
-    latest_name = ""
-    for name in os.listdir(BACKUP_ROOT):
-        path = os.path.join(BACKUP_ROOT, name)
-        if os.path.isdir(path):
-            mtime = datetime.utcfromtimestamp(os.path.getmtime(path))
-            if latest is None or mtime > latest:
-                latest = mtime
-                latest_name = name
-    if latest is None:
-        return CheckResult("backups", "warn", "No backups found")
-    age = datetime.utcnow() - latest
-    if age > timedelta(hours=max_hours):
+    stamp, problems = backup["path"].name, backup["problems"]
+    if problems:
         return CheckResult(
             "backups",
             "warn",
-            f"Latest backup {latest_name} is {age.total_seconds() / 3600:.1f}h old",
-            {"latest": latest_name, "age_hours": age.total_seconds() / 3600},
+            f"Backup {stamp}: {'; '.join(problems)}",
+            {"latest": stamp, "problems": problems},
         )
+    # Without problems the manifest is format 2, and every file it lists has its size, equal to the file's.
+    manifest = _read_json(str(backup["path"] / backup_manifest.MANIFEST))
+    listed = [names for names in manifest["components"].values() if isinstance(names, list) and names]
+    size_mb = sum(manifest["files"][name]["bytes"] for names in listed for name in names) / (1 << 20)
     return CheckResult(
         "backups",
         "pass",
-        f"Latest backup {latest_name} ({age.total_seconds() / 3600:.1f}h ago)",
-        {"latest": latest_name},
+        f"Backup {stamp} verified: {len(listed)} components, {size_mb:.0f} MB, {backup['age_hours']:.1f}h old",
+        {"latest": stamp},
+    )
+
+
+def check_offsite_backup() -> CheckResult:
+    """The off-host copy of each backup (ops/offsite_copy.sh). Switched off, it is the accepted exception K-7: a
+    warning for as long as it lasts, the one warning the soak accepts (K-24), never a failure."""
+    try:
+        enabled = backup_manifest.offsite_config()["enabled"]
+    except (AttributeError, TypeError):
+        # A hand-edited backup.offsite that is not an object: ops/backup.sh fails each run as offsite until it is
+        # fixed. Readiness says so instead of raising, which would fail every consumer, the deploy gate first.
+        return CheckResult(
+            "offsite_backup",
+            "warn",
+            "backup.offsite in settings.json cannot be read, so each backup run fails as offsite until it is fixed",
+            {"enabled": None},
+        )
+    if not enabled:
+        return CheckResult(
+            "offsite_backup",
+            "warn",
+            "Off-host copy switched off: backups stay on this host (accepted exception K-7)",
+            {"accepted_exception": "K-7", "enabled": False},
+        )
+    newest = backup_manifest.newest(Path(BACKUP_ROOT))
+    if newest is None:
+        return CheckResult(
+            "offsite_backup",
+            "warn",
+            "No backup with a manifest, so none was copied off the host",
+            {"enabled": True},
+        )
+    manifest = _read_json(str(newest / backup_manifest.MANIFEST))
+    if isinstance(manifest, dict) and manifest.get(backup_manifest.OFFSITE) == "copied":
+        return CheckResult(
+            "offsite_backup",
+            "pass",
+            f"The newest backup {newest.name} was copied off the host",
+            {"enabled": True, "latest": newest.name},
+        )
+    return CheckResult(
+        "offsite_backup",
+        "warn",
+        f"The newest backup {newest.name} was not copied off the host",
+        {"enabled": True, "latest": newest.name},
     )
 
 
@@ -845,7 +907,8 @@ async def run_all_checks() -> Dict[str, Any]:
         check_settings_integrity(),
         check_slack_configured(),
         check_slack_sockets(),
-        check_backup_recency(),
+        check_backups(),
+        check_offsite_backup(),
         check_temporal_persistence(),
         check_telemetry_export(),
         check_vector_memory(),

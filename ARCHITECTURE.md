@@ -737,7 +737,7 @@ Scanner catalog synced by RMP (`app/scanners/`) when `development_mode: false`.
 | Deep memory | ✅ readiness checks and invariants in `app/deep_memory/health.py`; `GET /api/deep_memory/status` |
 | Prometheus `/metrics` | ✅ |
 | Hourly canary | ✅ `:07` past each hour |
-| Daily backup | ✅ `ops/backup.sh` |
+| Daily backup | ✅ `ops/backup.sh`; readiness validates the newest backup's manifest (`backups`, warn only): its recorded failures, its components, each file's size, and the backup's age |
 | Runbooks | ✅ `docs/runbooks/` |
 | OTLP trace backend | ⚠️ `make observability` brings up Phoenix + an OTel collector, but `telemetry.otlp_endpoint` is empty on this host, so traces stay in-process (readiness warns) |
 | Production Temporal | One official server on Postgres. Not a cluster and not Temporal Cloud. |

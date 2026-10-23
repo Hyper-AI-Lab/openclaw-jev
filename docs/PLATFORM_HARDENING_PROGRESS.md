@@ -2244,3 +2244,105 @@ The first attempt did not run: the background command started in the programme f
 - the two test files and the runbook.
 
 The deploy restarts nothing; the units are installed by `install_units` afterwards.
+
+## 2026-10-22 23:04 UTC · WP-12 batch 6 deployed, its units installed and the alert probed end to end; TRI-026 closed
+
+**PR #42:** CI `test` passed in 5 min 15 s on head `30f1b75`, checked by me with `gh pr checks --watch` as Kirill asked. `origin/main` unchanged at `e5b4c9d`; no other open PRs. Squash-merged as `4858f91`.
+
+**Deploy:** `deployed`; restarted nothing; canary ok. `units` names `rmp-backup.service` and `rmp-unit-failed@.service`, not installed.
+
+**Install** (WP-02 §3 convention, with ARCHITECTURE's `systemd-run … install_units.py` command), at 23:03Z:
+1. **Dry run:** `head: 4858f9109613…`; exactly `changed: rmp-backup.service` and `new: rmp-unit-failed@.service`, each naming `4858f91`.
+2. **Review:** `diff -u` shows only the `OnFailure=rmp-unit-failed@%n.service` line, and the 12-line template as merged in PR #42. Both trace to that reviewed PR.
+3. **Before `--apply`:** idle (0 user tasks); the timer check gives 8 `next:`.
+4. **`--apply --head 4858f9109613b0779475a6064811cacd2987ff12`:** installed both files.
+   - Backup: `/var/backups/rmp-units/20261022T230333Z`.
+   - **Rollback:** `cp -a /var/backups/rmp-units/20261022T230333Z/. /etc/systemd/system/ && rm -f /etc/systemd/system/rmp-unit-failed@.service && systemctl daemon-reload`.
+   - Nothing restarted.
+5. **After:** the timer check gives 8 `next:`. `systemctl show -p OnFailure rmp-backup.service` prints `OnFailure=rmp-unit-failed@rmp-backup.service.service`.
+
+**End-to-end probe:**
+- `systemd-run --unit=rmp-wp12-onfailure-probe --property=OnFailure=rmp-unit-failed@rmp-wp12-onfailure-probe.service.service /bin/false`.
+- The alert instance ended `Result=success`; its journal shows the text and "the DM went out".
+- **Kirill**, told in advance, received the probe DM.
+- `reset-failed` cleared the probe. `systemctl --failed` is now empty; the earlier `fwupd-refresh` failure has cleared too.
+
+**Ledger:** **TRI-026 closed** (spec §7, "after batch 6").
+
+## 2026-10-22 23:24 UTC · WP-12 batch 7 started (manual pipeline: the Workflow hook timed out twice)
+
+- **Branch:** `aura/wp-12-7-readiness` from `4858f91`.
+- **Items:** WP12-17 and WP12-18, Tier 1:
+  - readiness validates the newest backup's manifest;
+  - `offsite_backup` is the one K-7 warning.
+- **Pipeline:** the Workflow tool's PreToolUse hook timed out twice, the intermittent fault seen before. I used the fallback: `render.js` rendered the workflow's exact prompts into `/root/.cache/wp-batch-manual/wp12-b7/`, and the implementer now runs as a background subagent. The Tier-1 reviewers (correctness, closure) follow the same way.
+
+## 2026-10-23 00:38 UTC · WP-12 batch 7 implemented; round-1 reviews running
+
+**Implementer** (manual pipeline): 2 commits.
+- `f156ab0` (WP12-17): `check_backups` validates the newest manifest. The age comes from the stamp, the Qdrant mode from settings, and `get_last_backup_info` keeps its keys and adds `problems`.
+- `896d072` (WP12-18): `check_offsite_backup`, the K-7 warning.
+
+**Tests:** all the named tests, plus `test_the_backup_warnings_fail_no_deploy` (both warnings through `deploy_checks.readiness_failures` give `[]`) and the no-date stamp guard. 11 mutation probes caught.
+
+**Consumer audit:** the deploy gate counts only new fails; `production_ready` and `go_live_ready` count only fails; the dashboard turns amber on a warning (display only); healthcheck and go_live read `blocking_failures`; the evaluator's tool and the sentinel are unaffected (the sentinel reads invariants only). None treats a warning as a failure.
+
+**Deviations:**
+- an enabled copy with no backup at all gives its own warning;
+- a stamp-shaped name that is no date gives the problem "its name is no date", where the parse would have raised and broken readiness and the deploy gate;
+- details the spec left open are filled in.
+
+**Four layouts:** each gave 1553 passed, 1 skipped, exit 0.
+
+**Round 1:** the correctness and closure reviewers run in parallel as subagents, from the rendered prompts with the implementer's report embedded.
+
+## 2026-10-23 01:02 UTC · WP-12 batch 7: round 1 approved; my fixes for its points; round-2 re-review and verify running
+
+**Round 1:** correctness and closure both approve; no blocking finding. Each confirmed again that no readiness consumer treats a warning as a failure. Their non-blocking points:
+- D-5 (readiness never hashes) was not pinned: `hashes=True` survived every test.
+- A malformed hand-edited `backup.offsite` (`true`, `"yes"`, `"on"`) made `offsite_config()` raise out of `run_all_checks`. The readiness endpoint would return 500, the deploy gate would revert, and healthcheck and go_live would fail.
+- A backup stamped in the future passed with a negative age and hid newer runs.
+- The exact no-backup message was untested.
+- The dashboard showed "nullh ago"; the not-found result had no `problems` key.
+
+**Fixed by me, `bfa8d1c`:** all five.
+- **D-5:** a test pins that a same-size content change passes readiness, while the hashed check catches it.
+- **Malformed setting:** `check_offsite_backup` catches it and warns "backup.offsite in settings.json cannot be read…", details `{enabled: None}`.
+- **Future stamp:** more than 5 min ahead (`BACKUP_FUTURE_SKEW_HOURS`) is a problem.
+- **No-backup message:** tested; the not-found result returns `problems: []`.
+- **Dashboard:** shows "age unknown".
+- **Mutation probes**, each caught: `hashes=True`, the future check removed, the guard removed, the `problems` key dropped.
+
+**Round 2:** one adversarial re-review of `bfa8d1c` is running, alongside my four-layout verify.
+
+## 2026-10-23 01:10 UTC · WP-12 batch 7 round 2 approved
+
+**Round-2 adversarial re-review of `bfa8d1c`:** approve.
+- All five points are closed; four are pinned by mutation-caught tests.
+- `ops/backup.sh` failing each run as `offsite` on a malformed setting is confirmed.
+- `run_all_checks` completes with `"backup": "yes"`.
+- The 5-min future skew is sane: every writer to `data/backups` stamps in UTC, and `backups` is warn-level.
+
+**Non-blocking, accepted:**
+- the `TypeError` arm's attribution, unreachable via `run_all_checks`;
+- a non-string `qdrant_mode` and a hand-made malformed manifest, which predate this fix and need root hand-edits;
+- the dashboard fix is untested, since the repo has no JS harness.
+
+The settings-shape class is ledgered as `WP12-b7-malformed-settings-readiness` (WP-29, the settings schema).
+
+**Four-layout verify** on `bfa8d1c`: running.
+
+## 2026-10-23 01:43 UTC · WP-12 batch 7: PR opened while the last two verify layouts run; merge automated on all-green (Kirill: "merge yourself")
+
+**Four-layout verify** (HEAD `bfa8d1c`):
+- default: 1559 passed, 1 skipped, node 58/58, leftovers 0, clean, none, exit 0;
+- live: the same;
+- coding-job and direct: still running.
+
+**Merge plan:** at Kirill's request, merges continue without his relay. A background job merges with `--squash` only when:
+1. all four verify layouts report `verify: exit 0`;
+2. the PR's CI `test` check passes;
+3. `origin/main` is still `4858f91`;
+4. no other PR is open.
+
+It then waits for the deploy. If any condition fails, it stops and does not merge. The final layouts and the merge are logged in the next entry.
