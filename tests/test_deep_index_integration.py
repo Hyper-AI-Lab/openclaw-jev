@@ -1,4 +1,8 @@
-"""The hybrid index against the real local Qdrant, on a throwaway collection (RMP_QDRANT_IT=1)."""
+"""The hybrid index against the real local Qdrant, on a throwaway collection (RMP_QDRANT_IT=1).
+
+Against a Qdrant that requires its API key, export QDRANT_API_KEY first: the suite sets it empty when it is absent, so
+the client sends no key and never reads /etc/rmp/rmp.env.
+"""
 import hashlib
 import os
 import random

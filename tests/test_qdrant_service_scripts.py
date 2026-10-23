@@ -300,6 +300,28 @@ def test_the_whole_store_procedure_keeps_the_sentinel_and_the_backup_away_from_a
     assert check[-1] > start_timers and check[-1] == max(at(r"\b(?:systemctl|docker) "))
 
 
+def test_the_runbook_keys_the_one_off_by_name_and_sends_calls_by_hand_through_qdrant_curl():
+    """The one-off restore container joins Docker's default bridge like rmp-qdrant, so it gets the same key: its value
+    from the shell's environment, read as the start script reads it, and only its name on docker's command line. The
+    shell drops it before rmp-qdrant starts again, and nothing prints it. Every call to Qdrant by hand goes through
+    ops/qdrant_curl.sh."""
+    runbook = (REPO / "docs" / "runbooks" / "backup-restore.md").read_text()
+    section = runbook.split("**Whole store from scratch", 1)[1].split("\n## ", 1)[0]
+    exported = section.index('   export QDRANT__SERVICE__API_KEY="$(cd /root/.openclaw/rmp && venv/bin/python -c '
+                             "'from app.memory.vector import qdrant_api_key; print(qdrant_api_key())')\"")
+    created = section.index("docker create --name rmp-qdrant-from-snapshot \\\n")
+    create = section[created:section.index("--force-snapshot\n", created)]
+    assert exported < created and "\n     -e QDRANT__SERVICE__API_KEY \\\n" in create
+    assert "QDRANT__SERVICE__API_KEY=" not in create
+    assert re.findall(r"\$\{#?QDRANT__SERVICE__API_KEY\}", section) == ["${#QDRANT__SERVICE__API_KEY}"]
+    removed = section.rindex("docker rm rmp-qdrant-from-snapshot")
+    unset = section.index("\n   unset QDRANT__SERVICE__API_KEY\n")
+    assert removed < unset < section.index("\n   systemctl start rmp-qdrant\n")
+    lines = [line for block in re.findall(r"```bash\n(.*?)```", runbook, re.S) for line in block.splitlines()]
+    by_hand = [line for line in lines if "curl" in line and re.search(r":633[34]\b", line)]
+    assert by_hand and all("bash ops/qdrant_curl.sh " in line for line in by_hand)
+
+
 def test_r148_cites_the_start_scripts_loopback_ports():
     """docs/VISION_CONFORMANCE.md's R-148 row gives start_qdrant.sh's -p flags as the evidence that Qdrant publishes
     only on loopback; the line it cites holds them."""
