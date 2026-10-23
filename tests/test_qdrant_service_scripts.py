@@ -117,7 +117,8 @@ def qdrant(tmp_path):
     for name, body in FAKES.items():
         (fake / name).write_text(body)
         (fake / name).chmod(0o755)
-    env = {**os.environ, "RMP_DATA_DIR": str(data), "RMP_PYTHON": sys.executable,
+    # No key unless a test gives one, whatever the suite inherited.
+    env = {**os.environ, "RMP_DATA_DIR": str(data), "RMP_PYTHON": sys.executable, "QDRANT_API_KEY": "",
            "PATH": f"{fake}:{os.environ['PATH']}", "FAKE_STATE": str(state)}
 
     def run(script, container, one_off=False, **extra):
@@ -171,7 +172,7 @@ def test_start_recreates_the_container_from_its_flags(qdrant):
     # Graceful: stop before rm, and never a forced removal; and no compose anywhere.
     for call in present + absent:
         assert not {"-f", "--force"} & set(call) and not any("compose" in word for word in call)
-    # Without a key (the suite's QDRANT_API_KEY is empty), docker gets none and curl sends none.
+    # Without a key (the fixture's QDRANT_API_KEY is empty), docker gets none and curl sends none.
     assert qdrant.docker_env()[-1] is None
     assert qdrant.log("curl.log") == ["-sf http://127.0.0.1:6333/readyz"] and not qdrant.log("curl-headers.log")
 

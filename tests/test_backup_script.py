@@ -353,9 +353,10 @@ def host(tmp_path):
     (data / "artifacts" / "report.json").write_text("{}")
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"vector_memory": {"qdrant_mode": "server", "qdrant_host": "127.0.0.1", "qdrant_port": 6333}}))
+    # No Qdrant key unless a test gives one, whatever the suite inherited.
     env = {**os.environ, "RMP_ROOT": str(REPO), "RMP_DATA_DIR": str(data), "RMP_BACKUP_ROOT": str(data / "backups"),
            "RMP_PYTHON": sys.executable, "RMP_SETTINGS_PATH": str(settings), "OPENCLAW_HOME": str(home),
-           "RMP_CODE_RELOAD_LOCK": str(tmp_path / "code-reload.lock"),
+           "RMP_CODE_RELOAD_LOCK": str(tmp_path / "code-reload.lock"), "QDRANT_API_KEY": "",
            "PATH": f"{fake}:{os.environ['PATH']}", "FAKE_STATE": str(state)}
     for name in ("PGPASSWORD", "RMP_PG_SOCKET_DIR", "RMP_PG_PORT"):
         env.pop(name, None)
