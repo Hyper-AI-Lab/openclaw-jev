@@ -21,6 +21,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 START = REPO / "ops" / "start_qdrant.sh"
 STOP = REPO / "ops" / "stop_qdrant.sh"
+BACKUP = REPO / "ops" / "backup.sh"
+RESTORE_QDRANT = REPO / "ops" / "restore_qdrant_snapshot.sh"
 INSPECT = ["container", "inspect", "rmp-qdrant"]
 ONE_OFF = "rmp-qdrant-from-snapshot"
 INSPECT_ONE_OFF = ["container", "inspect", ONE_OFF]
@@ -215,6 +217,19 @@ def test_start_reads_the_key_from_the_file_once_and_hands_it_to_every_readiness_
     assert qdrant.log("curl.log") == ["-K - -sf http://127.0.0.1:6333/readyz"] * 3
     assert qdrant.log("curl-headers.log") == [f"api-key: {KEY}"] * 3 and qdrant.log("sleep.log") == ["1", "1"]
     assert KEY not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("script", [START, BACKUP, RESTORE_QDRANT], ids=lambda script: script.name)
+def test_the_scripts_call_qdrant_only_through_qdrant_curl(script):
+    """The start's readiness wait, the backup and the snapshot restore run no curl of their own: every call goes through
+    ops/qdrant_curl.sh, directly or through the qcurl wrapper, so only that script hands the key to curl. Their own curl
+    fed the same header would pass every test that runs them against the fakes."""
+    code = [line for line in script.read_text().splitlines() if not line.lstrip().startswith("#")]
+    assert [line for line in code if re.search(r"\bcurl\b", line)] == []
+    through = [line for line in code if "qdrant_curl.sh" in line]
+    assert through and all('bash "${RMP_ROOT}/ops/qdrant_curl.sh" ' in line for line in through)
+    if any(re.search(r"\bqcurl\b", line) for line in code):
+        assert through == ['qcurl() { bash "${RMP_ROOT}/ops/qdrant_curl.sh" "$@"; }']
 
 
 def test_a_key_that_cannot_be_read_fails_the_start_before_it_touches_the_container(qdrant, tmp_path):
