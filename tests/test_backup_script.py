@@ -1049,15 +1049,16 @@ def test_restore_fails_loudly_when_an_upload_fails_or_the_file_is_not_a_snapshot
 
 def test_the_snapshot_restore_sends_a_given_key_on_stdin_only(host):
     """The restore drill keys its scratch Qdrant: the key reaches curl on stdin, never on a command line any local user
-    can read."""
+    can read, and the output does not show it."""
     _, dest, _, _ = host.run()
     snapshot = str(dest / "qdrant-full.snapshot")
-    result, _, _, _ = host.run(RESTORE_QDRANT, snapshot, "http://127.0.0.1:6937", QDRANT_API_KEY="dummy")
+    result, _, _, _ = host.run(RESTORE_QDRANT, snapshot, "http://127.0.0.1:6937", QDRANT_API_KEY=QDRANT_KEY)
     assert result.returncode == 0, result.stdout + result.stderr
     calls = host.log("curl-argv.log")
     assert [call["argv"][-1].split("/")[-1].split("?")[0] for call in calls] == ["readyz", "upload"]
-    assert all(call["argv"][:2] == ["-K", "-"] and call["headers"] == ["api-key: dummy"] for call in calls)
-    assert not any("dummy" in word for call in calls for word in call["argv"])
+    assert all(call["argv"][:2] == ["-K", "-"] and call["headers"] == [f"api-key: {QDRANT_KEY}"] for call in calls)
+    assert not any(QDRANT_KEY in word for call in calls for word in call["argv"])
+    assert QDRANT_KEY not in result.stdout + result.stderr
     # Empty, there is no key. The suite never runs a script without the variable, which would read /etc/rmp/rmp.env.
     result, _, _, _ = host.run(RESTORE_QDRANT, snapshot, "http://127.0.0.1:6937", QDRANT_API_KEY="")
     assert result.returncode == 0, result.stdout + result.stderr
