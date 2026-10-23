@@ -44,7 +44,9 @@ def test_vector_service_nvidia_embedder_config():
     assert cfg["llm"]["config"]["openai_base_url"] == "https://integrate.api.nvidia.com/v1"
 
 
-def test_vector_service_qdrant_server_config():
+def test_vector_service_qdrant_server_config(monkeypatch):
+    # Without a key, whatever the suite inherited: with one, the config holds a URL in place of host and port.
+    monkeypatch.setenv("QDRANT_API_KEY", "")
     svc = VectorMemoryService(
         {
             "enabled": True,
