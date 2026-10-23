@@ -1,7 +1,11 @@
 """Task registry vector store — query_points API."""
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from app.task_registry import vector_store
+
+SERVER = {"qdrant_mode": "server", "qdrant_host": "127.0.0.1", "qdrant_port": 6333, "qdrant_grpc_port": 6334}
 
 
 def test_normalize_query_hits_filters_by_score():
@@ -47,3 +51,24 @@ def test_search_similar_tasks_uses_query_points():
     assert "timeout" in call_kw
     assert len(hits) == 1
     assert hits[0]["task_id"] == "abc"
+
+
+def test_the_registry_client_sends_the_key_over_http(monkeypatch):
+    """With QDRANT_API_KEY the client sends it in the api-key header, on REST and on gRPC, and stays on plain HTTP: a key
+    alone would turn qdrant_client to HTTPS, which the local server does not speak. No request is made."""
+    monkeypatch.setattr(vector_store, "get_vector_memory_config", lambda: SERVER)
+    monkeypatch.setattr(vector_store, "_grpc_port_open", lambda host, port: (host, port) == ("127.0.0.1", 6334))
+    monkeypatch.setattr(vector_store, "_client", None)
+    monkeypatch.setenv("QDRANT_API_KEY", "k")
+    with pytest.warns(UserWarning, match="Api key is used with an insecure connection"):
+        client = vector_store._get_qdrant_client()
+    remote = client._client
+    assert remote.rest_uri == "http://127.0.0.1:6333" and remote._scheme == "http" and not remote._https
+    assert remote._rest_headers["api-key"] == "k" and ("api-key", "k") in remote._grpc_headers
+    assert remote._prefer_grpc and remote._grpc_port == 6334
+
+    monkeypatch.setattr(vector_store, "_client", None)
+    monkeypatch.setenv("QDRANT_API_KEY", "")
+    remote = vector_store._get_qdrant_client()._client
+    assert remote.rest_uri == "http://127.0.0.1:6333" and "api-key" not in remote._rest_headers
+    assert not any(name == "api-key" for name, _ in remote._grpc_headers)
