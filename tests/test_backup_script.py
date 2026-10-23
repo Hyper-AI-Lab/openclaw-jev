@@ -548,6 +548,25 @@ def test_every_qdrant_call_of_a_backup_sends_the_key_on_stdin_only(host):
     assert len(sent) == len(calls) == 5 and not any("-K" in call["argv"] or call["headers"] for call in sent)
 
 
+def test_a_backup_without_the_variable_sends_the_key_from_the_file_through_qdrant_curl(host):
+    """rmp-backup.service loads no environment file, so the nightly backup runs without QDRANT_API_KEY. Each of its
+    calls to Qdrant goes through ops/qdrant_curl.sh, which reads the key from /etc/rmp/rmp.env with qdrant_api_key() in
+    RMP_ROOT (a fake interpreter here; every other step runs in the real one), and sends it on curl's stdin. No command
+    line holds it, and neither does the output, the log or any file of the backup."""
+    python = _python_reading_the_key_file(host.tmp / "bin", QDRANT_FILE_KEY)
+    result, dest, manifest, calls = host.run(QDRANT_API_KEY=None, RMP_PYTHON=str(python),
+                                             FAKE_QDRANT_STALE="full-snapshot-old.snapshot")
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert [m for m, _ in calls] == ["GET", "GET", "DELETE", "POST", "GET", "DELETE"]
+    sent = host.log("curl-argv.log")
+    assert len(sent) == 6 and all(call["argv"][:2] == ["-K", "-"] for call in sent)
+    assert all(call["headers"] == [f"api-key: {QDRANT_FILE_KEY}"] for call in sent)
+    assert not any(QDRANT_FILE_KEY in word for call in sent for word in call["argv"])
+    assert QDRANT_FILE_KEY not in result.stdout + result.stderr
+    assert not [p for p in dest.rglob("*") if p.is_file() and QDRANT_FILE_KEY.encode() in p.read_bytes()]
+    assert (host.state / "python.log").read_text().splitlines() == [f"{REPO}|{READ_KEY}"] * 6
+
+
 def test_a_failed_postgres_dump_is_reported_not_swallowed(host):
     result, dest, manifest, _ = host.run(FAKE_PGDUMP_FAIL="1")
     assert result.returncode == 1 and manifest["failures"] == ["postgres", "temporal:temporal", "temporal:temporal_visibility"]
