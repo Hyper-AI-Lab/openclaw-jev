@@ -2346,3 +2346,196 @@ The settings-shape class is ledgered as `WP12-b7-malformed-settings-readiness` (
 4. no other PR is open.
 
 It then waits for the deploy. If any condition fails, it stops and does not merge. The final layouts and the merge are logged in the next entry.
+
+## 2026-10-23 02:07 UTC · WP-12 batch 7 merged by the gated job and deployed; live readiness as predicted; ops-deploy-R4 closed
+
+**Four-layout verify** (HEAD `bfa8d1c`): coding-job and direct finished, 1559 passed, 1 skipped, leftovers 0, exit 0. All four layouts are green. Summary in `research/wp12-b7-verify-summary.txt`.
+
+**Gated merge job:**
+- 4 of 4 verify layouts exit 0;
+- CI `test` SUCCESS on PR head `0a17e6a`, equal to the local HEAD;
+- `origin/main` still `4858f91`;
+- one open PR.
+
+It squash-merged PR #43 as `0f18531`.
+
+**Deploy:** `deployed`; **restarted rmp-api and rmp-worker**; health, readiness and the canary passed.
+
+**Host step, live readiness via the API:**
+- `backups`: **pass**, "Backup 20261022T031503Z verified: 7 components, 501 MB, 22.9h old";
+- `offsite_backup`: **warn**, "Off-host copy switched off: backups stay on this host (accepted exception K-7)", `{accepted_exception: K-7, enabled: false}`;
+- `production_ready` true; `blocking_failures` []; non-pass checks: `offsite_backup` and `telemetry` only;
+- dashboard `last_backup`: found, id `20261022T031503Z`, `problems` [].
+
+**Ledger:** **ops-deploy-R4 closed** (spec §7, "after batch 7").
+
+**Rollback:** revert `0f18531`.
+
+**Next:** batch 8 (WP12-19), the Qdrant API key. Its host step restarts rmp-qdrant, which needs Kirill's OK.
+
+## 2026-10-23 02:07 UTC · WP-12 batch 8 started (the Workflow hook works again)
+
+- **Branch:** `aura/wp-12-8-qdrant-key` from `0f18531`.
+- **Item:** WP12-19 (AS-21), Qdrant requires an API key. Tier 1, security.
+- **Workflow:** run `wf_9e66a7fc-979`.
+- **Added to the task:** a read-only **audit of every Qdrant client on the host**, not only in the repo: OpenClaw config and plugins, web-stack, workspace scripts, units, cron. Any client outside the repo that the key would lock out blocks the restart.
+- **Also added:** the runbook's one-off `rmp-qdrant-from-snapshot` container gets the key, as Amendment 2 noted.
+
+**Host steps:**
+1. Before the merge: append a generated key to `/etc/rmp/rmp.env`, with checks that print counts only and never a value.
+2. After the deploy, with Kirill's OK: `systemctl restart rmp-qdrant`, then the checks:
+   - unkeyed requests are refused;
+   - keyed requests give 200;
+   - `docker inspect` shows the key variable (counted, no value);
+   - the three vector checks pass.
+
+## 2026-10-23 02:10 UTC · Kirill's OK for batch 8's host steps (K-37)
+
+Kirill: "OK for the key and the Qdrant restart". Recorded as **K-37** in `decisions.md`.
+
+It covers two steps:
+- the `QDRANT_API_KEY` append to `/etc/rmp/rmp.env` before the merge, with count-only checks;
+- one `systemctl restart rmp-qdrant` after the deploy, while idle.
+
+Conditions: the batch is reviewed, and the host-wide client audit shows nothing outside the repo would be locked out. Batch 8's workflow `wf_9e66a7fc-979` is running.
+
+## 2026-10-23 04:05 UTC · WP-12 batch 8 resumed after the usage limit
+
+**Run `wf_9e66a7fc-979`:** the implementer stopped at the session limit after 48 min. It left five commits and a clean tree, and no report, so the client audit's result is unknown:
+- `63779b0`: the suite environment;
+- `e9224ec`: the clients send the key;
+- `7d04fc2`: `qdrant_curl.sh`, with backup and restore going through it;
+- `5c6507f`: the start script and R-148;
+- `16a9b45`: the docs.
+
+**Cleanup:** an orphaned scratch copy from an interrupted probe, `/root/.cache/wp-scratch.YqUUk0`, was removed. It was a copy; the clone was untouched.
+
+**Backup:** `/root/.cache/wp12-b8-wip-0405/`.
+
+**Relaunch:** run `wf_0ab8a0e6-445`, whose resume note asks the implementer to:
+- review the five commits critically;
+- finish the tests;
+- do and report the host-wide client audit in full;
+- run the four layouts.
+
+K-37's host steps wait for the review and the audit.
+
+## 2026-10-23 14:05 UTC · Kirill's security question: Contabo's PHP advisory, and Node.js
+
+**Batch 8 status first:** run `wf_0ab8a0e6-445` finished the implementation and round 1. That includes the host-wide client audit, which found **no Qdrant client outside the repo that the key would lock out**. Fix round 1 stopped at the session limit, and the batch is paused while Kirill's request is handled; it will be resumed from the cache.
+
+**PHP** (Contabo's email about CVE-2026-109618 and CVE-2026-109619): **not installed on this host.** There is no php, php-fpm or php-cgi binary, no php, apache2 or mod_php package, and no `/etc/php`. Not affected.
+
+**Node.js:**
+- **Installed:** v24.21.0 from NodeSource (`nodejs 24.21.0-1nodesource1`); the apt candidate is 24.22.1. It runs the OpenClaw gateway as root, the node test suite, and node in coding jobs.
+- **Updates:** NodeSource is not covered by unattended-upgrades, so Node is updated by hand.
+
+**Exposure:**
+- only sshd listens publicly; UFW allows only 22/tcp;
+- no Docker container publishes a public port;
+- every service, the gateway included, listens on loopback.
+
+**Ubuntu patching:** unattended-upgrades installs security updates daily; the last run was 2026-10-23 06:04 (libnss3, zlib). All 90 pending upgrades come from `noble-updates`, none from `noble-security`.
+
+**Research workflow** `wf_ad9110de-3e1`, on official sources only:
+- Node.js security releases after 24.21.0, their CVEs and their applicability here;
+- whether the PHP advisory is genuine, from php.net.
+
+**Process lapse:** I launched it with my shell in the repo clone. I'll check the clone for untracked files afterwards; from now on research launches from a scratch directory.
+
+## 2026-10-23 14:17 UTC · Node.js and PHP advisories: research verified; recommendation to Kirill
+
+**Research** `wf_ad9110de-3e1`: two researchers and a verifier who re-fetched every source. The clone was checked afterwards: no untracked files. Saved in `research/node-php-advisories-2026-10-23.md`.
+
+**PHP:** the advisory is genuine; php.net's 2026-10-21 advisory and Ubuntu USN-8948-1 match the email. This host has no PHP, so it is not affected. The email's sender could not be verified from outside, but it asks for nothing.
+
+**Node.js:**
+- **The release:** 24.22.1, published 2026-10-21, is the only v24 security release since 24.21.0. It fixes 8 CVEs on 24.x; the highest is High.
+  - The one that matters here is **CVE-2026-111497**, Brotli, CVSS 4.0 9.2: a crafted compressed response can cause remote code execution in any Node process that downloads it. No open port is needed, and the gateway runs as root.
+  - The others are TLS hostname bypasses that need a malicious or man-in-the-middle server, and the keep-alive and undici bugs.
+  - CISA: no known exploitation, not automatable.
+- **Not affected:** the gateway's loopback server; none of the fixes is in the HTTP server or parser.
+- **Recommendation:** `apt-get install --only-upgrade nodejs=24.22.1-1nodesource1` at the next idle window this week, then restart the gateway; High, not an emergency.
+  - **Rollback:** reinstall 24.21.0 with `--allow-downgrades`; the old `.deb` is in the apt cache.
+  - OpenClaw's Node requirement (>=24.16.0 <25) is still met; native add-ons need no rebuild.
+- **Residual:** OpenClaw's bundled undici 8.10.2 is the global dispatcher, so its connection-level bugs (DoS) stay until an OpenClaw release bundles undici 8.12.2 or later. The newest, 2026.10.6, bundles 8.11.2 and needs node >= 24.22.1.
+
+**Ledger:** `OPS-2026-10-23-node-24.22.1` (high, WP-22) and `OPS-2026-10-23-openclaw-undici` (medium, WP-22).
+
+**Kirill:** asked for the OK and a window, because the gateway restart takes Aura offline briefly (K-4).
+
+## 2026-10-23 14:24 UTC · Node.js updated to 24.22.1 under K-38; Aura back, verified
+
+**K-38:** Kirill chose "Yes, next idle window". Recorded in `decisions.md`.
+
+**Run** (14:18Z; idle: 0 user tasks, no coding units, outside the backup window):
+1. **Backup:** `systemctl start rmp-backup.service` succeeded; backup `20261023T141811Z` verifies (`failures` [], `offsite: off`, batch 5's field).
+2. **Update:** `apt-get install --only-upgrade nodejs=24.22.1-1nodesource1`. Only `nodejs` changed; needrestart (list-only) restarted nothing.
+   - `node -v` gives v24.22.1; `process.versions`: openssl 3.5.9, undici 7.30.1, ares 1.34.9 (brotli 1.2.0, patched in place).
+   - The rollback package `/var/cache/apt/archives/nodejs_24.21.0-1nodesource1_amd64.deb` is present.
+3. **`systemctl restart openclaw-gateway`** at 14:19:46Z: new MainPID 1241165 on `/usr/bin/node`, no restart loops.
+   - **Found:** RMP's own long-lived Node helper (`app/openclaw_gateway.mjs`, started by rmp-api at 04:05) still ran the old, deleted binary.
+   - `systemctl restart rmp-api` (still idle) moved it onto the new one. Afterwards no Node process runs a deleted binary; rmp-worker, rmp-code-watch and aura-web-backends hold none.
+4. **Checks:**
+   - API `/health` 200; manual canary CANARY OK (a task completed through the gateway).
+   - The **first readiness call failed `openclaw_gateway`**, only because it ran before the gateway's HTTP server was up. The gateway logged "http server listening (6 plugins…; 70.7s)" at 14:22:09Z. Re-run: `openclaw_gateway` pass, `production_ready` true, non-pass only `offsite_backup` (K-7) and `telemetry`.
+   - **Slack:** socket mode connected at 14:22:39Z, after one provider restart by the gateway's health monitor; no errors in the gateway log since the restart.
+5. **Downtime:** about 3 min (14:19:46–14:22:39Z), not the "under a minute" I told Kirill. The gateway needs about 70 s for HTTP and about 3 min until Slack connects; future estimates use these numbers.
+
+**Rollback (not needed):** `apt-get install --allow-downgrades nodejs=24.21.0-1nodesource1 && apt-mark hold nodejs`, then restart `openclaw-gateway` and `rmp-api`.
+
+**Ledger:**
+- `OPS-2026-10-23-node-24.22.1` **closed**;
+- `OPS-2026-10-23-openclaw-undici` stays open (WP-22): watch for an OpenClaw release that bundles undici 8.12.2 or later.
+
+**Next:** resume WP-12 batch 8 from the cache of `wf_0ab8a0e6-445`, starting at its fix round 1.
+
+## 2026-10-23 20:22 UTC · WP-12 batch 8 approved
+
+**Run `wf_0ab8a0e6-445`** (resumed twice after usage limits): `approved: true`, 13 commits.
+
+**Round 1:**
+- correctness approved;
+- closure had two blocking findings: the tests did not prove that the backup and the snapshot restore reach Qdrant through `qdrant_curl.sh`, or that they fall back to the file's key, which is the production path, since the units do not load `rmp.env`.
+
+**Fix round 1:** `ebc5434`, `00d01ca` (the readiness wait reuses the key it read, so no Python start per check), `166b9e8`, `c6c0d36`.
+
+**Round 2:** both approved. **Fix round 2:** `e3bc82e` (a test pins that the start, the backup and the restore call curl only through `qdrant_curl.sh`) and `194e4a7`.
+
+**Round 3:** both approved.
+
+**Client audit**, host-wide and read-only: **no client outside the repo would be refused.** All repo clients are keyed, except the dormant `make migrate-qdrant` tool, ledgered as `WP12-b8-migrate-qdrant-unkeyed` (WP-29).
+- `rmp-backup.service` and `rmp-qdrant.service` read the key from the file as root.
+- rmp-api, rmp-worker and the other units load `rmp.env`.
+
+**Cleanup:** removed an orphaned scratch copy, `/root/.cache/wp-scratch.ca2qtJ`, left by the interrupted reviewer.
+
+**Four-layout verify:** running. Then the K-37 host steps.
+
+## 2026-10-23 20:22 UTC · WP12-19 host step 1 (K-37): QDRANT_API_KEY appended to /etc/rmp/rmp.env
+
+**Before:**
+- `grep -c '^QDRANT_API_KEY='` gives 0, so there was no key yet;
+- `grep -c '^DATABASE_URL=postgres'` gives 1;
+- 3 lines, `root:root 600`.
+
+**Rollback copy:** `/root/attic/rmp.env.pre-qdrant-key.20261023T202220Z`, root-only, mode 0600, in the 0700 attic. It will be deleted once batch 8 has settled, after the next morning's checks.
+
+**Append:** `( umask 077; printf '\nQDRANT_API_KEY=%s\n' "$(openssl rand -hex 32)" >> /etc/rmp/rmp.env )`.
+
+**After:**
+- key lines 1; `DATABASE_URL` lines 1 (unchanged); 5 lines (blank line plus key); `root:root 600`;
+- the value is 64 characters long;
+- the batch's `qdrant_api_key()` (clone code, variable unset) reads a 64-character hex key from the file.
+
+No value was printed or stored anywhere else.
+
+**Effect now:** none. The running units loaded their environment at start, the deployed code ignores the variable, and Qdrant is still keyless.
+
+**Rollback step 1:** `sed -i '/^QDRANT_API_KEY=/d' /etc/rmp/rmp.env`, or restore the copy.
+
+## 2026-10-23 21:24 UTC · WP-12 batch 8 verified
+
+**Four-layout verify** (HEAD `194e4a7`): default, live, coding-job and direct each gave 1573 passed, 1 skipped, leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. The runs happened after the key was appended to `/etc/rmp/rmp.env`, so the suite is confirmed not to read it. Summary in `research/wp12-b8-verify-summary.txt`.
+
+**Next:** a PR with the gated merge job. Then the deploy restarts rmp-api and rmp-worker with the key, followed by the K-37 Qdrant restart while idle.
