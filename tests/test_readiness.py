@@ -535,6 +535,46 @@ def test_a_directory_named_like_a_stamp_that_is_no_date_does_not_break_readiness
     assert (info["timestamp"], info["age_hours"]) == (None, None)
 
 
+def test_readiness_checks_sizes_and_never_hashes(backups):
+    """D-5: hashing every file of a 500 MB backup would block the event loop readiness runs on. A file whose content
+    changed at the same size passes readiness; the restore and the drill, which hash, catch it."""
+    dest = _backup(backups, 2)
+    (dest / "temporal.dump").write_bytes(b"PGDMP temporaX")
+    assert check_backups().status == "pass"
+    assert "temporal.dump does not match its checksum" in bm.problems(dest, hashes=True)
+
+
+def test_no_backup_warns_and_the_dashboard_finds_none(backups):
+    (backups / "openclaw-state").mkdir()
+    r = check_backups()
+    assert (r.name, r.status, r.message, r.details) == (
+        "backups", "warn", "No backup with a manifest — run ops/backup.sh", {"path": str(backups)})
+    assert get_last_backup_info() == {"found": False, "path": str(backups), "problems": []}
+
+
+def test_a_backup_stamped_in_the_future_warns(backups):
+    """A stamp ahead of the clock sorts above every real run and would hide them: it is a problem, not a pass with a
+    negative age. A few minutes of skew are not."""
+    _backup(backups, 1)
+    _backup(backups, -2 / 60)
+    assert check_backups().status == "pass"
+    ahead = _backup(backups, -48)
+    _warns(ahead, "its stamp is 48.0h in the future")
+
+
+@pytest.mark.parametrize("backup", [{"offsite": True}, "yes", {"offsite": "on"}])
+def test_an_unreadable_offsite_setting_warns_instead_of_breaking_readiness(backups, tmp_path, monkeypatch, backup):
+    """A hand-edited backup.offsite that is not an object made offsite_config() raise, which would fail readiness for
+    every consumer, the deploy gate first. ops/backup.sh fails each run as offsite meanwhile."""
+    _backup(backups, 2)
+    _stored_settings(tmp_path, monkeypatch, {"vector_memory": {"qdrant_mode": "server"}, "backup": backup})
+    r = check_offsite_backup()
+    assert (r.name, r.status, r.message, r.details) == (
+        "offsite_backup", "warn",
+        "backup.offsite in settings.json cannot be read, so each backup run fails as offsite until it is fixed",
+        {"enabled": None})
+
+
 def test_the_offsite_copy_warns_as_the_k7_exception_while_off(backups, tmp_path, monkeypatch):
     _backup(backups, 2)
     for settings in ({}, {"backup": {"offsite": {"enabled": False}}}):

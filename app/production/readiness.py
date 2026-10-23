@@ -43,6 +43,8 @@ WARN_UNITS = ["aura-web-backends.service"]
 BACKUP_ROOT = os.path.join(RMP_DATA_DIR, "backups")
 # The backup runs nightly; past this age the newest one is overdue.
 BACKUP_MAX_HOURS = 26
+# How far ahead of the clock a backup's stamp may be before readiness reports it.
+BACKUP_FUTURE_SKEW_HOURS = 5 / 60
 MEMORY_CANARY_RESULT_PATH = os.path.join(RMP_DATA_DIR, "last_memory_canary.json")
 HEALTH_CANARY_RESULT_PATH = os.path.join(RMP_DATA_DIR, "last_health_canary.json")
 
@@ -292,6 +294,10 @@ def _newest_backup(max_hours: int) -> Optional[Dict[str, Any]]:
     age_hours = (datetime.now(timezone.utc) - taken).total_seconds() / 3600
     if age_hours > max_hours:
         problems.append(f"{age_hours:.1f}h old")
+    elif age_hours < -BACKUP_FUTURE_SKEW_HOURS:
+        # A stamp ahead of the clock (a skewed clock, or a directory made by hand) sorts above every real run and
+        # would hide them, a failed one included.
+        problems.append(f"its stamp is {-age_hours:.1f}h in the future")
     return {"path": newest, "taken": taken, "age_hours": age_hours, "problems": problems}
 
 
@@ -299,7 +305,7 @@ def get_last_backup_info() -> Dict[str, Any]:
     """The newest backup, as the backups check finds it, for the dashboard."""
     backup = _newest_backup(BACKUP_MAX_HOURS)
     if backup is None:
-        return {"found": False, "path": BACKUP_ROOT}
+        return {"found": False, "path": BACKUP_ROOT, "problems": []}
     path, taken = backup["path"], backup["taken"]
     return {
         "found": True,
@@ -354,7 +360,18 @@ def check_backups(max_hours: int = BACKUP_MAX_HOURS) -> CheckResult:
 def check_offsite_backup() -> CheckResult:
     """The off-host copy of each backup (ops/offsite_copy.sh). Switched off, it is the accepted exception K-7: a
     warning for as long as it lasts, the one warning the soak accepts (K-24), never a failure."""
-    if not backup_manifest.offsite_config()["enabled"]:
+    try:
+        enabled = backup_manifest.offsite_config()["enabled"]
+    except (AttributeError, TypeError):
+        # A hand-edited backup.offsite that is not an object: ops/backup.sh fails each run as offsite until it is
+        # fixed. Readiness says so instead of raising, which would fail every consumer, the deploy gate first.
+        return CheckResult(
+            "offsite_backup",
+            "warn",
+            "backup.offsite in settings.json cannot be read, so each backup run fails as offsite until it is fixed",
+            {"enabled": None},
+        )
+    if not enabled:
         return CheckResult(
             "offsite_backup",
             "warn",

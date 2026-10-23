@@ -459,7 +459,7 @@
                 const backupHint = document.getElementById('stat-backup-hint');
                 if (backup.found) {
                     backupEl.textContent = backup.id || 'ok';
-                    backupHint.textContent = `${backup.age_hours}h ago`;
+                    backupHint.textContent = backup.age_hours == null ? 'age unknown' : `${backup.age_hours}h ago`;
                 } else {
                     backupEl.textContent = 'none';
                     backupHint.textContent = 'Run ops/backup.sh';
