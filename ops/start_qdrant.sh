@@ -16,8 +16,8 @@
 #
 # Qdrant's API key is qdrant_api_key()'s (app/memory/vector.py): QDRANT_API_KEY from the environment when it is set,
 # else the one in /etc/rmp/rmp.env. With one, the container requires it of every request: docker takes its value from
-# this script's environment, so only the variable's name is on docker's command line, and the readiness wait sends it
-# through ops/qdrant_curl.sh.
+# this script's environment, so only the variable's name is on docker's command line, and the readiness wait hands the
+# same key to ops/qdrant_curl.sh in QDRANT_API_KEY, so no check reads the file again.
 set -euo pipefail
 
 RMP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -61,13 +61,13 @@ docker run -d --name "${CONTAINER}" --restart unless-stopped \
   "${IMAGE}" >/dev/null
 
 for _ in $(seq 1 30); do
-  if bash "${RMP_ROOT}/ops/qdrant_curl.sh" -sf "http://127.0.0.1:6333/readyz" >/dev/null 2>&1; then
+  if QDRANT_API_KEY="${KEY}" bash "${RMP_ROOT}/ops/qdrant_curl.sh" -sf "http://127.0.0.1:6333/readyz" >/dev/null 2>&1; then
     echo "Qdrant ready at http://127.0.0.1:6333"
     exit 0
   fi
   sleep 1
 done
 
-echo "Qdrant failed to become ready after 30 checks" >&2
+echo "Qdrant failed to become ready within 30s" >&2
 docker logs --tail 30 "${CONTAINER}" >&2 || true
 exit 1
