@@ -13,8 +13,15 @@ set -euo pipefail
 RMP_ROOT="${RMP_ROOT:-/root/.openclaw/rmp}"
 PY="${RMP_PYTHON:-${RMP_ROOT}/venv/bin/python}"
 
-key="$(cd "${RMP_ROOT}" && "${PY}" -c 'from app.memory.vector import qdrant_api_key; print(qdrant_api_key())')" \
-  || { echo "qdrant_curl: could not read Qdrant's API key" >&2; exit 1; }
+# Set, even to "", the variable is the key, stripped, as qdrant_api_key() takes it. Only without it does Python run
+# qdrant_api_key() to read the file: its imports cost about 1.5 s, which every call to Qdrant would pay again.
+if [[ -n "${QDRANT_API_KEY+set}" ]]; then
+  key="${QDRANT_API_KEY#"${QDRANT_API_KEY%%[![:space:]]*}"}"
+  key="${key%"${key##*[![:space:]]}"}"
+else
+  key="$(cd "${RMP_ROOT}" && "${PY}" -c 'from app.memory.vector import qdrant_api_key; print(qdrant_api_key())')" \
+    || { echo "qdrant_curl: could not read Qdrant's API key" >&2; exit 1; }
+fi
 if [[ -n "${key}" ]]; then
   exec curl -K - "$@" <<<"header = \"api-key: ${key}\""
 fi
