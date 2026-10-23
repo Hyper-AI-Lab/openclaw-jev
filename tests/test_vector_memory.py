@@ -1,5 +1,7 @@
+import builtins
 from unittest.mock import patch
 
+from app.memory import vector
 from app.memory.mistral_embed import MistralEmbeddings
 from app.memory.nvidia_embed import NvidiaEmbeddings
 from app.memory.vector import VectorMemoryService, _read_mistral_key
@@ -42,7 +44,9 @@ def test_vector_service_nvidia_embedder_config():
     assert cfg["llm"]["config"]["openai_base_url"] == "https://integrate.api.nvidia.com/v1"
 
 
-def test_vector_service_qdrant_server_config():
+def test_vector_service_qdrant_server_config(monkeypatch):
+    # Without a key, whatever the suite inherited: with one, the config holds a URL in place of host and port.
+    monkeypatch.setenv("QDRANT_API_KEY", "")
     svc = VectorMemoryService(
         {
             "enabled": True,
@@ -63,6 +67,63 @@ def test_vector_service_qdrant_server_config():
     assert vs["port"] == 6333
     assert "path" not in vs
     assert vs["collection_name"] == "rmp_memories"
+
+
+def test_vector_service_qdrant_server_config_sends_the_key(monkeypatch):
+    """With a key, mem0 gets an http:// URL and the key: with host and port, qdrant_client would turn to HTTPS against
+    the plain-HTTP server. Without one, host and port as before."""
+    svc = VectorMemoryService(
+        {
+            "enabled": True,
+            "qdrant_mode": "server",
+            "qdrant_host": "127.0.0.1",
+            "qdrant_port": 6333,
+            "embedder_provider": "nvidia",
+            "embedder_model": "nvidia/nv-embed-v1",
+            "embedding_dims": 4096,
+            "collection_name": "rmp_memories",
+        }
+    )
+    monkeypatch.setenv("QDRANT_API_KEY", "k")
+    with patch("app.memory.vector._read_nvidia_key", return_value="test-nvidia-key"):
+        vs = svc._build_mem0_config()["vector_store"]["config"]
+    assert vs["url"] == "http://127.0.0.1:6333" and vs["api_key"] == "k"
+    assert not {"host", "port", "path"} & set(vs)
+    assert vs["collection_name"] == "rmp_memories"
+
+    monkeypatch.setenv("QDRANT_API_KEY", "")
+    with patch("app.memory.vector._read_nvidia_key", return_value="test-nvidia-key"):
+        vs = svc._build_mem0_config()["vector_store"]["config"]
+    assert (vs["host"], vs["port"]) == ("127.0.0.1", 6333)
+    assert not {"url", "api_key", "path"} & set(vs)
+
+
+def test_qdrant_api_key_prefers_the_environment_and_never_reads_the_file_when_set(monkeypatch, tmp_path):
+    assert vector.RMP_ENV_PATH == "/etc/rmp/rmp.env"
+    opened = []
+    real_open = builtins.open
+
+    def recording_open(file, *args, **kwargs):
+        opened.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", recording_open)
+    missing = tmp_path / "missing.env"
+    monkeypatch.setattr(vector, "RMP_ENV_PATH", str(missing))
+    monkeypatch.setenv("QDRANT_API_KEY", "")
+    assert vector.qdrant_api_key() == ""
+    monkeypatch.setenv("QDRANT_API_KEY", " from-the-environment\n")
+    assert vector.qdrant_api_key() == "from-the-environment"
+    assert str(missing) not in opened
+
+    env_file = tmp_path / "rmp.env"
+    env_file.write_text("QDRANT_API_KEY=older\nDATABASE_URL=sqlite://\n\nQDRANT_API_KEY= newest \n")
+    monkeypatch.setattr(vector, "RMP_ENV_PATH", str(env_file))
+    monkeypatch.delenv("QDRANT_API_KEY")
+    assert vector.qdrant_api_key() == "newest"
+    assert [path for path in opened if path in (str(env_file), str(missing))] == [str(env_file)]
+    monkeypatch.setattr(vector, "RMP_ENV_PATH", str(missing))
+    assert vector.qdrant_api_key() == ""
 
 
 def test_vector_service_mistral_embedder_config():

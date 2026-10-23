@@ -638,6 +638,7 @@ Core entities: `Task`, `ProcessRun`, `Step`, `Observation`, `Event`, `MemoryItem
 |---------|-------|
 | Qdrant mode | **server** (Docker on `127.0.0.1:6333`) |
 | Qdrant data | `/root/.openclaw/rmp/data/qdrant-server` (bind mount) |
+| API key | `QDRANT_API_KEY` in `/etc/rmp/rmp.env` (`qdrant_api_key()` in `app/memory/vector.py`: the environment first, then the file). Every client and script sends it: Mem0, the registry client on REST and gRPC, and the scripts through `ops/qdrant_curl.sh`, which puts it on curl's stdin. `ops/start_qdrant.sh` gives it to the container by name. Qdrant refuses requests without it |
 | Collection | `rmp_memories_openai_3small` |
 | Embedder | OpenAI `text-embedding-3-small` (1536-d). NVIDIA NIM embedders remain HTTP 410 EOL. See live `settings.json` `vector_memory.*` |
 | Config | `settings.json` → `vector_memory.*` |

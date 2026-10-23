@@ -47,6 +47,12 @@ jq . "$(ls -1d /root/.openclaw/rmp/data/backups/2*/ | sort | tail -1)manifest.js
 
 **Qdrant snapshots:** the backup deletes every *full* snapshot it finds on the Qdrant server, because only this script makes them. Keep a hand-made full snapshot elsewhere.
 
+**Qdrant's API key:** Qdrant refuses a request without its key, `QDRANT_API_KEY` in `/etc/rmp/rmp.env`. The backup and the restore send it through `ops/qdrant_curl.sh`, and every call to Qdrant by hand goes through it too. It takes curl's arguments and sends the key on curl's stdin, never on a command line, which any local user can read:
+
+```bash
+cd /root/.openclaw/rmp && bash ops/qdrant_curl.sh -fsS http://127.0.0.1:6333/collections
+```
+
 ## Restore
 
 A restore takes Aura offline: it needs Kirill's OK and an idle window.
@@ -126,10 +132,12 @@ So step 1 stops every `rmp-*` timer, as the restore does, which also keeps a bac
    docker inspect -f '{{.State.Running}}' rmp-qdrant
    ```
    It must print `false`, or fail with no such object where `rmp-qdrant` does not exist (step 3 says what to do then). If it prints `true`, Qdrant still runs on the storage: do not go on. `journalctl -u rmp-qdrant -n 20` shows why the stop failed; fix that, run `docker stop rmp-qdrant` and check again.
-3. Restore the storage with a one-off container named `rmp-qdrant-from-snapshot`, never `rmp-qdrant`. It mounts the same storage directory and the snapshot, publishes no port, and runs the image on `ops/start_qdrant.sh`'s `IMAGE=` line, the one step 4 runs on the restored storage, which the first line reads and prints. Create it first: from then on `ops/start_qdrant.sh` refuses to start `rmp-qdrant`. Then ask whether `rmp-qdrant` runs or is starting, which something may have caused since step 2:
+3. Restore the storage with a one-off container named `rmp-qdrant-from-snapshot`, never `rmp-qdrant`. It mounts the same storage directory and the snapshot, publishes no port, and runs the image on `ops/start_qdrant.sh`'s `IMAGE=` line, the one step 4 runs on the restored storage, which the first line reads and prints. It joins Docker's default bridge like `rmp-qdrant`, so it requires the same key, and no copy of Aura's memory without the key appears there: the second line puts the key into this shell's environment, read as `ops/start_qdrant.sh` reads it, and `docker create` takes its value from there (`-e QDRANT__SERVICE__API_KEY`), so only its name is on a command line. That line prints the key's length, `64`, never the key; `0` would mean that `/etc/rmp/rmp.env` holds no `QDRANT_API_KEY`, so that `rmp-qdrant` has none either. Create the one-off first: from then on `ops/start_qdrant.sh` refuses to start `rmp-qdrant`. Then ask whether `rmp-qdrant` runs or is starting, which something may have caused since step 2:
    ```bash
    image="$(sed -n 's/^IMAGE="\(.*\)"$/\1/p' /root/.openclaw/rmp/ops/start_qdrant.sh)"; echo "${image}"
+   export QDRANT__SERVICE__API_KEY="$(cd /root/.openclaw/rmp && venv/bin/python -c 'from app.memory.vector import qdrant_api_key; print(qdrant_api_key())')"; echo "${#QDRANT__SERVICE__API_KEY}"
    docker create --name rmp-qdrant-from-snapshot \
+     -e QDRANT__SERVICE__API_KEY \
      -v /root/.openclaw/rmp/data/qdrant-server:/qdrant/storage \
      -v <backup>/qdrant-full.snapshot:/qdrant/full.snapshot:ro \
      "${image}" \
@@ -149,8 +157,9 @@ So step 1 stops every `rmp-*` timer, as the restore does, which also keeps a bac
    docker stop rmp-qdrant-from-snapshot && docker rm rmp-qdrant-from-snapshot
    ```
    If `docker inspect -f '{{.State.Status}}' rmp-qdrant-from-snapshot` prints `exited` before that line appears, the restore failed, and the storage may hold some collections from the snapshot and not others: `docker logs rmp-qdrant-from-snapshot` says why. Remove the container with the same command and run the whole first block of this step again, with the same backup or an older one, so that both questions come after the create again. Go on to step 4 only after the `docker logs` line printed `1`. If the host reboots during the procedure, start again at step 1, because a boot arms the timers again; step 3 then finds the old one-off as above.
-4. Start Qdrant, which recreates `rmp-qdrant` on the restored storage. Then readiness shows `vector_memory`, `task_registry_vector` and `vector_sync` at `pass`:
+4. Remove the key from this shell's environment, and start Qdrant, which recreates `rmp-qdrant` on the restored storage. Then readiness shows `vector_memory`, `task_registry_vector` and `vector_sync` at `pass`:
    ```bash
+   unset QDRANT__SERVICE__API_KEY
    systemctl start rmp-qdrant
    cd /root/.openclaw/rmp && make -s readiness | python3 -c 'import json,sys; d=json.load(sys.stdin); print({c["name"]: c["status"] for c in d["checks"] if c["name"] in ("vector_memory","task_registry_vector","vector_sync")})'
    ```

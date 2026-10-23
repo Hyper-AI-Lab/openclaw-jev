@@ -515,7 +515,8 @@ def production_values(environ: Mapping[str, str], guard: Guard) -> List[Tuple[st
 
 
 def suite_environment(environ: Mapping[str, str], root: PathArg, repo_root: PathArg) -> Dict[str, str]:
-    """What the conftest sets: a default for each path variable ``environ`` lacks, and always the test database.
+    """What the conftest sets: a default for each path variable ``environ`` lacks, an empty Qdrant API key unless one
+    is inherited, and always the test database.
 
     Each variable defaults on its own, so an inherited one never decides another's value.
     """
@@ -529,6 +530,10 @@ def suite_environment(environ: Mapping[str, str], root: PathArg, repo_root: Path
         "AURA_CODE_ROOT": root / "aura-code",
     }
     environment = {name: str(value) for name, value in defaults.items() if name not in environ}
+    # Without the variable, app.memory.vector.qdrant_api_key() falls back to reading /etc/rmp/rmp.env, in the suite and
+    # in every script a test runs, which inherit it.
+    if "QDRANT_API_KEY" not in environ:
+        environment["QDRANT_API_KEY"] = ""
     # The app's default URL, and the one /etc/rmp/rmp.env exports, is the live database on this host.
     environment["DATABASE_URL"] = f"sqlite+aiosqlite:///{root / 'unmocked.db'}"
     return environment

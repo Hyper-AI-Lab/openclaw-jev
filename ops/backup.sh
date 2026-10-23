@@ -40,12 +40,14 @@ mkdir -p "${DEST}"
 
 log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "${LOG}"; }
 fail() { FAILURES+=("$1"); log "FAIL: $1: $2"; }
+# Every Qdrant call. ops/qdrant_curl.sh sends Qdrant's API key, when it has one, on curl's stdin.
+qcurl() { bash "${RMP_ROOT}/ops/qdrant_curl.sh" "$@"; }
 
 # A snapshot this run created is a full copy of the vector store inside the container: remove it however the run ends.
 cleanup() {
   rm -f "${DEST:-/nonexistent}"/*.partial
   if [[ -n "${QDRANT_SNAP}" ]]; then
-    curl -fsS -m 60 -X DELETE "${QDRANT_URL}/snapshots/${QDRANT_SNAP}" >/dev/null 2>>"${LOG}" \
+    qcurl -fsS -m 60 -X DELETE "${QDRANT_URL}/snapshots/${QDRANT_SNAP}" >/dev/null 2>>"${LOG}" \
       || log "WARN: could not delete Qdrant snapshot ${QDRANT_SNAP}; the next run removes it"
     QDRANT_SNAP=""
   fi
@@ -104,17 +106,17 @@ qdrant_snapshot() {
   local -a meta
   QDRANT_URL="${url}"
   # After a boot the timer fires a missed run early: give Qdrant a minute to come up.
-  curl -fsS -m 10 --retry 12 --retry-delay 5 --retry-all-errors -o /dev/null "${url}/readyz" 2>>"${LOG}" \
+  qcurl -fsS -m 10 --retry 12 --retry-delay 5 --retry-all-errors -o /dev/null "${url}/readyz" 2>>"${LOG}" \
     || { fail qdrant "Qdrant at ${url} is not ready"; return 0; }
   # Full snapshots on the server come only from this script; any found now were left by a run that was killed.
   local listed
-  listed="$(curl -fsS -m 30 "${url}/snapshots" 2>>"${LOG}")" || log "WARN: could not list Qdrant's full snapshots"
+  listed="$(qcurl -fsS -m 30 "${url}/snapshots" 2>>"${LOG}")" || log "WARN: could not list Qdrant's full snapshots"
   for stale in $("${PY}" -c 'import json, sys; t = sys.stdin.read().strip(); print("\n".join(s["name"] for s in (json.loads(t).get("result") or []) if t))' <<<"${listed:-}" 2>>"${LOG}"); do
-    curl -fsS -m 60 -X DELETE "${url}/snapshots/${stale}" >/dev/null 2>>"${LOG}" \
+    qcurl -fsS -m 60 -X DELETE "${url}/snapshots/${stale}" >/dev/null 2>>"${LOG}" \
       && log "removed stale Qdrant snapshot ${stale}" || log "WARN: could not remove stale Qdrant snapshot ${stale}"
   done
   log "Snapshotting Qdrant at ${url}..."
-  body="$(curl -fsS -m 900 -X POST "${url}/snapshots?wait=true" 2>>"${LOG}")" \
+  body="$(qcurl -fsS -m 900 -X POST "${url}/snapshots?wait=true" 2>>"${LOG}")" \
     || { fail qdrant "the full snapshot was not created"; return 0; }
   mapfile -t meta < <("${PY}" -c '
 import json, sys
@@ -125,7 +127,7 @@ print(r["name"]); print(int(r["size"])); print(r.get("checksum") or "")' <<<"${b
     return 0
   fi
   QDRANT_SNAP="${meta[0]}"
-  if ! curl -fsS -m 900 -o "${part}" "${url}/snapshots/${QDRANT_SNAP}" 2>>"${LOG}"; then
+  if ! qcurl -fsS -m 900 -o "${part}" "${url}/snapshots/${QDRANT_SNAP}" 2>>"${LOG}"; then
     rm -f "${part}"; fail qdrant "the download of ${QDRANT_SNAP} failed"; return 0
   fi
   got="$(stat -c %s "${part}" 2>/dev/null || echo 0)"

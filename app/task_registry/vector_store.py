@@ -7,7 +7,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from app.config import get_task_registry_config, get_vector_memory_config, is_vector_memory_enabled
-from app.memory.vector import embed_query_text
+from app.memory.vector import embed_query_text, qdrant_api_key
 
 logger = logging.getLogger("rmp.task_registry.vector")
 
@@ -45,6 +45,12 @@ def _get_qdrant_client():
                 "port": http_port,
                 "check_compatibility": False,
             }
+            api_key = qdrant_api_key()
+            if api_key:
+                # Sent on REST and gRPC alike. A key alone would turn the client to HTTPS, which this server does not
+                # speak.
+                kwargs["api_key"] = api_key
+                kwargs["https"] = False
             if _grpc_port_open(host, grpc_port):
                 kwargs["grpc_port"] = grpc_port
                 kwargs["prefer_grpc"] = True

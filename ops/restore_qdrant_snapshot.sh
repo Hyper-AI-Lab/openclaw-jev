@@ -7,27 +7,23 @@
 # snapshot per collection (`<collection>-<peer id>-<date>.snapshot`), and each of those restores through the API,
 # into the live server, replacing the collection's data (priority=snapshot).
 #
-# With QDRANT_API_KEY set and not empty, every call sends it in Qdrant's api-key header. The restore drill
-# (ops/restore_drill.py) passes its scratch Qdrant's key this way.
+# Every call sends Qdrant's API key, when it has one, through ops/qdrant_curl.sh: QDRANT_API_KEY from the environment
+# when it is set, else the one in /etc/rmp/rmp.env. The restore drill (ops/restore_drill.py) passes its scratch Qdrant's
+# key in QDRANT_API_KEY, which wins over the file.
 set -euo pipefail
+
+RMP_ROOT="${RMP_ROOT:-/root/.openclaw/rmp}"
 
 die() { echo "[restore-qdrant] ERROR: $*" >&2; exit 1; }
 
 # Every Qdrant call. The key reaches curl as a config line on stdin, never on its command line, which any local user
 # can read.
-qcurl() {
-  if [[ -n "${QDRANT_API_KEY:-}" ]]; then
-    curl -K - "$@" <<<"header = \"api-key: ${QDRANT_API_KEY}\""
-  else
-    curl "$@"
-  fi
-}
+qcurl() { bash "${RMP_ROOT}/ops/qdrant_curl.sh" "$@"; }
 
 SNAPSHOT="${1:-}"
 URL="${2:-}"
 [[ -s "${SNAPSHOT}" ]] || die "usage: $0 <qdrant-full.snapshot> [qdrant url]; '${SNAPSHOT}' is missing or empty"
 if [[ -z "${URL}" ]]; then
-  RMP_ROOT="${RMP_ROOT:-/root/.openclaw/rmp}"
   PY="${RMP_PYTHON:-${RMP_ROOT}/venv/bin/python}"
   URL="$(cd "${RMP_ROOT}" && "${PY}" -c '
 from app.config import get_vector_memory_config

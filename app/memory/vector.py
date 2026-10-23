@@ -15,6 +15,8 @@ logger = logging.getLogger("rmp.vector_memory")
 
 DEFAULT_QDRANT_PATH = os.path.join(RMP_DATA_DIR, "qdrant")
 DEFAULT_COLLECTION = "rmp_memories"
+# The Qdrant server's API key lives here as QDRANT_API_KEY, next to DATABASE_URL (app/db/database.py).
+RMP_ENV_PATH = "/etc/rmp/rmp.env"
 
 _service: Optional["VectorMemoryService"] = None
 _lock = threading.Lock()
@@ -37,6 +39,15 @@ def _load_env_file(path: str) -> Dict[str, str]:
     except OSError:
         pass
     return values
+
+
+def qdrant_api_key() -> str:
+    """The key the Qdrant server requires, or "" when it has none. QDRANT_API_KEY from the environment when it is set,
+    even to "" (RMP's units load it from /etc/rmp/rmp.env; the test suite sets it empty, so nothing it runs reads that
+    file), else the file's last QDRANT_API_KEY= line. Never logged."""
+    if "QDRANT_API_KEY" in os.environ:
+        return os.environ["QDRANT_API_KEY"].strip()
+    return _load_env_file(RMP_ENV_PATH).get("QDRANT_API_KEY", "")
 
 
 def _read_profile_key(provider: str) -> str:
@@ -125,8 +136,16 @@ class VectorMemoryService:
             "on_disk": True,
         }
         if mode == "server" or self.config.get("qdrant_host"):
-            base["host"] = self.config.get("qdrant_host", "127.0.0.1")
-            base["port"] = int(self.config.get("qdrant_port", 6333))
+            host = self.config.get("qdrant_host", "127.0.0.1")
+            port = int(self.config.get("qdrant_port", 6333))
+            api_key = qdrant_api_key()
+            if api_key:
+                # With host and port, qdrant_client turns to HTTPS once it has a key; this server speaks plain HTTP.
+                base["url"] = f"http://{host}:{port}"
+                base["api_key"] = api_key
+            else:
+                base["host"] = host
+                base["port"] = port
             return base
         qdrant_path = self.config.get("qdrant_path", DEFAULT_QDRANT_PATH)
         os.makedirs(qdrant_path, exist_ok=True)

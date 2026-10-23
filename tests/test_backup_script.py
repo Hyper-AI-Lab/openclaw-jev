@@ -14,6 +14,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -30,6 +31,7 @@ BACKUP = REPO / "ops" / "backup.sh"
 RESTORE = REPO / "ops" / "restore_backup.sh"
 RESTORE_PG = REPO / "ops" / "restore_pg_database.sh"
 RESTORE_QDRANT = REPO / "ops" / "restore_qdrant_snapshot.sh"
+QDRANT_CURL = REPO / "ops" / "qdrant_curl.sh"
 # Every path the restore writes or locks comes from one of these, each with a default (the names of ops/backup.sh and
 # of the code reload's lock).
 RESTORE_PATHS = ("RMP_ROOT", "RMP_DATA_DIR", "RMP_SETTINGS_PATH", "RMP_PYTHON", "RMP_CODE_RELOAD_LOCK")
@@ -44,6 +46,12 @@ STOPS = [*(unit for timer in TIMERS for unit in (timer, timer.replace(".timer", 
          "rmp-code-watch", "openclaw-gateway", "rmp-api", "rmp-worker", "temporal"]
 # What it starts again, in dependency order.
 STARTS = ["temporal", "rmp-api", "rmp-worker", "openclaw-gateway", "rmp-code-watch", *TIMERS]
+# A dummy Qdrant API key: a script run with it must send it on curl's stdin and never show it.
+QDRANT_KEY = "dummy-qdrant-key-" + secrets.token_hex(8)
+# The dummy key a fake interpreter reads in place of /etc/rmp/rmp.env's, for a script run without QDRANT_API_KEY.
+QDRANT_FILE_KEY = "dummy-file-key-" + secrets.token_hex(8)
+# What ops/qdrant_curl.sh runs, in RMP_ROOT, to read the key when QDRANT_API_KEY is unset.
+READ_KEY = "-c from app.memory.vector import qdrant_api_key; print(qdrant_api_key())"
 # The host's restic, found before any test puts its fakes on a PATH; None where it is not installed, as in CI.
 RESTIC = shutil.which("restic")
 
@@ -294,7 +302,8 @@ FAKES = {"curl": FAKE_CURL, "pg_dump": FAKE_PG_DUMP, "sudo": FAKE_SUDO, "pg_rest
          "systemctl": FAKE_SYSTEMCTL, "sleep": FAKE_SLEEP, "dropdb": FAKE_REFUSED, "createdb": FAKE_REFUSED,
          "openclaw": FAKE_OPENCLAW, "restic": FAKE_RESTIC}
 # The fakes' logs, which each call of host.run() starts without.
-LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log", "curl-argv.log", "pg_restore.log", "restic.log")
+LOGS = ("systemctl.log", "sudo.log", "sleep.log", "refused.log", "curl-argv.log", "pg_restore.log", "restic.log",
+        "python.log")
 
 
 def _store(path, rows):
@@ -312,13 +321,38 @@ def _store(path, rows):
 def _runs_only_against_fakes(script, env, fake):
     """The precondition of every script run here: each tool it could reach on the host resolves to its fake, and a
     restore takes every path it writes from the environment. A restore that hard-codes a production path is never
-    executed: in a direct session it would remove the live artifacts and copy over the live settings."""
+    executed: in a direct session it would remove the live artifacts and copy over the live settings. Every Qdrant call
+    goes through ops/qdrant_curl.sh, which runs the checkout and the interpreter the environment names and reads the
+    key from /etc/rmp/rmp.env unless QDRANT_API_KEY is set: a script runs only with the variable set, or with an
+    interpreter that is one of the test's fakes."""
     if script.name == RESTORE.name:
         text = script.read_text()
         for name in RESTORE_PATHS:
             assert re.search(rf'^[A-Z_]+="\$\{{{name}:-', text, re.M), f"{script} hard-codes the path {name} sets"
+    assert "QDRANT_API_KEY" in env or Path(env["RMP_PYTHON"]).parent == fake, \
+        "without QDRANT_API_KEY, ops/qdrant_curl.sh reads the key from /etc/rmp/rmp.env"
+    for path, name in ((RESTORE_QDRANT, "RMP_ROOT"), (QDRANT_CURL, "RMP_ROOT"), (QDRANT_CURL, "RMP_PYTHON")):
+        assert re.search(rf'^[A-Z_]+="\$\{{{name}:-', path.read_text(), re.M), f"{path} hard-codes {name}"
     for tool in FAKES:
         assert shutil.which(tool, path=env["PATH"]) == str(fake / tool), f"{tool} does not resolve to its fake"
+
+
+def _python_reading_the_key_file(fake, key):
+    """RMP_PYTHON for a script run without QDRANT_API_KEY, in ``fake`` as the precondition requires. Code that calls
+    qdrant_api_key() prints ``key``, in place of the one in /etc/rmp/rmp.env, and records its working directory and
+    arguments in ${FAKE_STATE}/python.log; any other code runs in this interpreter with QDRANT_API_KEY empty, so nothing
+    it runs reads that file."""
+    python = fake / "python-reading-the-key-file"
+    python.write_text(f"""#!/bin/sh
+case "$1:$2" in
+  -c:*qdrant_api_key*) printf '%s|%s\\n' "$PWD" "$*" >> "${{FAKE_STATE}}/python.log"; echo {key}; exit 0 ;;
+esac
+QDRANT_API_KEY=""
+export QDRANT_API_KEY
+exec {shlex.quote(sys.executable)} "$@"
+""")
+    python.chmod(0o755)
+    return python
 
 
 @pytest.fixture
@@ -343,9 +377,10 @@ def host(tmp_path):
     (data / "artifacts" / "report.json").write_text("{}")
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"vector_memory": {"qdrant_mode": "server", "qdrant_host": "127.0.0.1", "qdrant_port": 6333}}))
+    # No Qdrant key unless a test gives one, whatever the suite inherited.
     env = {**os.environ, "RMP_ROOT": str(REPO), "RMP_DATA_DIR": str(data), "RMP_BACKUP_ROOT": str(data / "backups"),
            "RMP_PYTHON": sys.executable, "RMP_SETTINGS_PATH": str(settings), "OPENCLAW_HOME": str(home),
-           "RMP_CODE_RELOAD_LOCK": str(tmp_path / "code-reload.lock"),
+           "RMP_CODE_RELOAD_LOCK": str(tmp_path / "code-reload.lock"), "QDRANT_API_KEY": "",
            "PATH": f"{fake}:{os.environ['PATH']}", "FAKE_STATE": str(state)}
     for name in ("PGPASSWORD", "RMP_PG_SOCKET_DIR", "RMP_PG_PORT"):
         env.pop(name, None)
@@ -491,6 +526,45 @@ def test_snapshots_left_by_a_killed_run_are_removed_first_and_a_failed_delete_is
     assert ["DELETE", calls[2][1]] == calls[2] and calls[2][1].endswith("/snapshots/full-snapshot-old.snapshot")
     result, _, manifest, _ = host.run(FAKE_QDRANT_DELETE_FAIL="1")
     assert result.returncode == 0 and "could not delete Qdrant snapshot" in result.stdout
+
+
+def test_every_qdrant_call_of_a_backup_sends_the_key_on_stdin_only(host):
+    """With a key, each call to Qdrant's API (readyz, the stale snapshots' listing and removal, the snapshot, its
+    download and its removal) sends it in the api-key header read from curl's stdin. No command line holds it, and
+    neither does the output, the log or any file of the backup. Without a key the calls are plain curl."""
+    result, dest, manifest, calls = host.run(QDRANT_API_KEY=QDRANT_KEY, FAKE_QDRANT_STALE="full-snapshot-old.snapshot")
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert [m for m, _ in calls] == ["GET", "GET", "DELETE", "POST", "GET", "DELETE"]
+    sent = host.log("curl-argv.log")
+    assert len(sent) == 6 and all(call["argv"][:2] == ["-K", "-"] for call in sent)
+    assert all(call["headers"] == [f"api-key: {QDRANT_KEY}"] for call in sent)
+    assert not any(QDRANT_KEY in word for call in sent for word in call["argv"])
+    assert QDRANT_KEY not in result.stdout + result.stderr
+    assert not [p for p in dest.rglob("*") if p.is_file() and QDRANT_KEY.encode() in p.read_bytes()]
+    shutil.rmtree(dest)  # a second run within the same second would reuse its directory
+    result, _, manifest, calls = host.run(QDRANT_API_KEY="")
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    sent = host.log("curl-argv.log")
+    assert len(sent) == len(calls) == 5 and not any("-K" in call["argv"] or call["headers"] for call in sent)
+
+
+def test_a_backup_without_the_variable_sends_the_key_from_the_file_through_qdrant_curl(host):
+    """rmp-backup.service loads no environment file, so the nightly backup runs without QDRANT_API_KEY. Each of its
+    calls to Qdrant goes through ops/qdrant_curl.sh, which reads the key from /etc/rmp/rmp.env with qdrant_api_key() in
+    RMP_ROOT (a fake interpreter here; every other step runs in the real one), and sends it on curl's stdin. No command
+    line holds it, and neither does the output, the log or any file of the backup."""
+    python = _python_reading_the_key_file(host.tmp / "bin", QDRANT_FILE_KEY)
+    result, dest, manifest, calls = host.run(QDRANT_API_KEY=None, RMP_PYTHON=str(python),
+                                             FAKE_QDRANT_STALE="full-snapshot-old.snapshot")
+    assert result.returncode == 0 and manifest["failures"] == [], result.stdout + result.stderr
+    assert [m for m, _ in calls] == ["GET", "GET", "DELETE", "POST", "GET", "DELETE"]
+    sent = host.log("curl-argv.log")
+    assert len(sent) == 6 and all(call["argv"][:2] == ["-K", "-"] for call in sent)
+    assert all(call["headers"] == [f"api-key: {QDRANT_FILE_KEY}"] for call in sent)
+    assert not any(QDRANT_FILE_KEY in word for call in sent for word in call["argv"])
+    assert QDRANT_FILE_KEY not in result.stdout + result.stderr
+    assert not [p for p in dest.rglob("*") if p.is_file() and QDRANT_FILE_KEY.encode() in p.read_bytes()]
+    assert (host.state / "python.log").read_text().splitlines() == [f"{REPO}|{READ_KEY}"] * 6
 
 
 def test_a_failed_postgres_dump_is_reported_not_swallowed(host):
@@ -1021,20 +1095,58 @@ def test_restore_fails_loudly_when_an_upload_fails_or_the_file_is_not_a_snapshot
 
 def test_the_snapshot_restore_sends_a_given_key_on_stdin_only(host):
     """The restore drill keys its scratch Qdrant: the key reaches curl on stdin, never on a command line any local user
-    can read."""
+    can read, and the output does not show it. An operator's restore runs without QDRANT_API_KEY: each call then goes
+    through ops/qdrant_curl.sh, which reads the key from /etc/rmp/rmp.env with qdrant_api_key() in RMP_ROOT (a fake
+    interpreter here), and sends it the same way."""
     _, dest, _, _ = host.run()
     snapshot = str(dest / "qdrant-full.snapshot")
-    result, _, _, _ = host.run(RESTORE_QDRANT, snapshot, "http://127.0.0.1:6937", QDRANT_API_KEY="dummy")
-    assert result.returncode == 0, result.stdout + result.stderr
-    calls = host.log("curl-argv.log")
-    assert [call["argv"][-1].split("/")[-1].split("?")[0] for call in calls] == ["readyz", "upload"]
-    assert all(call["argv"][:2] == ["-K", "-"] and call["headers"] == ["api-key: dummy"] for call in calls)
-    assert not any("dummy" in word for call in calls for word in call["argv"])
-    for unset in (None, ""):
-        result, _, _, _ = host.run(RESTORE_QDRANT, snapshot, "http://127.0.0.1:6937", QDRANT_API_KEY=unset)
+    python, ran = _python_reading_the_key_file(host.tmp / "bin", QDRANT_FILE_KEY), host.state / "python.log"
+    for given, key, reads in ((QDRANT_KEY, QDRANT_KEY, 0), (None, QDRANT_FILE_KEY, 2)):
+        result, _, _, _ = host.run(RESTORE_QDRANT, snapshot, "http://127.0.0.1:6937", QDRANT_API_KEY=given,
+                                   RMP_PYTHON=str(python))
         assert result.returncode == 0, result.stdout + result.stderr
         calls = host.log("curl-argv.log")
-        assert len(calls) == 2 and not any("-K" in call["argv"] or call["headers"] for call in calls)
+        assert [call["argv"][-1].split("/")[-1].split("?")[0] for call in calls] == ["readyz", "upload"]
+        assert all(call["argv"][:2] == ["-K", "-"] and call["headers"] == [f"api-key: {key}"] for call in calls)
+        assert not any(key in word for call in calls for word in call["argv"])
+        assert key not in result.stdout + result.stderr
+        assert (ran.read_text().splitlines() if ran.exists() else []) == [f"{REPO}|{READ_KEY}"] * reads
+    # Empty, there is no key.
+    result, _, _, _ = host.run(RESTORE_QDRANT, snapshot, "http://127.0.0.1:6937", QDRANT_API_KEY="")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = host.log("curl-argv.log")
+    assert len(calls) == 2 and not any("-K" in call["argv"] or call["headers"] for call in calls)
+
+
+def test_qdrant_curl_sends_the_key_on_stdin_and_fails_when_it_cannot_read_it(host):
+    """ops/qdrant_curl.sh, every script's Qdrant call and the operator's, resolves the key as qdrant_api_key() does.
+    QDRANT_API_KEY, when it is set, even to "", is the key, stripped, and no interpreter starts. Without it, RMP_PYTHON
+    runs qdrant_api_key() in RMP_ROOT, which reads /etc/rmp/rmp.env; a fake interpreter stands in for it here. curl gets
+    the key as a config line on stdin and every other argument as given, and a key it cannot read is a failed call."""
+    url = "http://127.0.0.1:6333/readyz"
+    fake, ran = host.tmp / "bin", host.state / "python.log"
+    python = _python_reading_the_key_file(fake, QDRANT_FILE_KEY)
+    broken = fake / "python-that-fails"
+    broken.write_text("#!/bin/sh\nexit 1\n")
+    broken.chmod(0o755)
+
+    result, _, _, _ = host.run(QDRANT_CURL, "-fsS", url, QDRANT_API_KEY=f" {QDRANT_KEY}\n", RMP_PYTHON=str(python))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert host.log("curl-argv.log") == [{"argv": ["-K", "-", "-fsS", url], "headers": [f"api-key: {QDRANT_KEY}"]}]
+    assert QDRANT_KEY not in result.stdout + result.stderr
+    result, _, _, _ = host.run(QDRANT_CURL, "-fsS", url, QDRANT_API_KEY="", RMP_PYTHON=str(python))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert host.log("curl-argv.log") == [{"argv": ["-fsS", url], "headers": []}]
+    assert not ran.exists()
+
+    result, _, _, _ = host.run(QDRANT_CURL, "-fsS", url, QDRANT_API_KEY=None, RMP_PYTHON=str(python))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ran.read_text().splitlines() == [f"{REPO}|{READ_KEY}"]
+    assert host.log("curl-argv.log") == [{"argv": ["-K", "-", "-fsS", url], "headers": [f"api-key: {QDRANT_FILE_KEY}"]}]
+    assert QDRANT_FILE_KEY not in result.stdout + result.stderr
+    result, _, _, _ = host.run(QDRANT_CURL, "-fsS", url, QDRANT_API_KEY=None, RMP_PYTHON=str(broken))
+    assert result.returncode == 1 and "qdrant_curl: could not read Qdrant's API key" in result.stderr
+    assert host.log("curl-argv.log") == []
 
 
 def test_restore_warns_before_its_prompt_when_a_file_does_not_match_its_checksum(host):
