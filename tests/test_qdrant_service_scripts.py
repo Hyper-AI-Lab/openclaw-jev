@@ -1,15 +1,18 @@
 """ops/start_qdrant.sh and ops/stop_qdrant.sh, rmp-qdrant.service's start and stop, against a fake docker and curl.
 
-The fake docker records each call's argv and keeps whether the container rmp-qdrant exists in a state file; the fake
-curl answers Qdrant's readyz while it does. The storage is under RMP_DATA_DIR in tmp_path. A script runs only when
-every tool it could reach on the host resolves to its fake and the start takes its storage from RMP_DATA_DIR: the
-production guard does not see a child process's own calls.
+The fake docker records each call's argv and the Qdrant key its environment holds, and keeps whether the container
+rmp-qdrant exists in a state file; the fake curl answers Qdrant's readyz while it does, and records the api-key header
+it read from stdin. The storage is under RMP_DATA_DIR in tmp_path. A script runs only when every tool it could reach on
+the host resolves to its fake, the start takes its storage from RMP_DATA_DIR, and QDRANT_API_KEY is set, so the key is
+never read from /etc/rmp/rmp.env: the production guard does not see a child process's own calls.
 """
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -22,12 +25,15 @@ ONE_OFF = "rmp-qdrant-from-snapshot"
 INSPECT_ONE_OFF = ["container", "inspect", ONE_OFF]
 TIMERS = sorted(u for u in (REPO / "ops" / "systemd" / "enabled-units.txt").read_text().splitlines()
                 if u.endswith(".timer"))
+# A dummy Qdrant API key: a start with it must pass it to docker by name and to curl on stdin, and never show it.
+KEY = "dummy-qdrant-key-" + secrets.token_hex(8)
 # docker run's message when the port is taken, one way a run fails.
 RUN_FAILED = ("docker: Error response from daemon: driver failed programming external connectivity on endpoint "
               "rmp-qdrant: Bind for 127.0.0.1:6333 failed: port is already allocated.")
 
 FAKE_DOCKER = r'''#!/usr/bin/env python3
-"""docker, as far as the Qdrant scripts use it. Every call's argv goes to ${FAKE_STATE}/docker.log; rmp-qdrant exists
+"""docker, as far as the Qdrant scripts use it. Every call's argv goes to ${FAKE_STATE}/docker.log, and the value of
+QDRANT__SERVICE__API_KEY in its environment (null when unset) to ${FAKE_STATE}/docker-env.log; rmp-qdrant exists
 while ${FAKE_STATE}/container does, and another container <name> while ${FAKE_STATE}/container-<name> does.
 FAKE_DOCKER_FAIL=<run|stop> fails that command with docker's message."""
 import json, os, sys
@@ -37,6 +43,8 @@ name = args[-1] if verb in ("inspect", "stop", "rm", "logs") else "rmp-qdrant"
 container = os.path.join(state, "container" if name == "rmp-qdrant" else "container-" + name)
 with open(os.path.join(state, "docker.log"), "a") as log:
     log.write(json.dumps(args) + "\n")
+with open(os.path.join(state, "docker-env.log"), "a") as log:
+    log.write(json.dumps(os.environ.get("QDRANT__SERVICE__API_KEY")) + "\n")
 if os.environ.get("FAKE_DOCKER_FAIL") == verb:
     print(os.environ["FAKE_DOCKER_MESSAGE"], file=sys.stderr)
     sys.exit(125 if verb == "run" else 1)
@@ -70,9 +78,13 @@ with open(os.path.join(os.environ["FAKE_STATE"], "docker.log"), "a") as log:
 sys.exit(1)
 '''
 
-# curl -sf http://127.0.0.1:6333/readyz: ready while the container exists.
+# curl -sf http://127.0.0.1:6333/readyz: ready while the container exists. The header lines of a config read from stdin
+# (-K -) go to curl-headers.log.
 FAKE_CURL = r'''#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_STATE}/curl.log"
+if [ "$1" = "-K" ] && [ "$2" = "-" ]; then
+  sed -n 's/^header = "\(.*\)"$/\1/p' >> "${FAKE_STATE}/curl-headers.log"
+fi
 case "$*" in
   *http://127.0.0.1:6333/readyz*) [ -e "${FAKE_STATE}/container" ] && exit 0; exit 7 ;;
 esac
@@ -88,9 +100,11 @@ FAKES = {"docker": FAKE_DOCKER, "docker-compose": FAKE_DOCKER_COMPOSE, "curl": F
 
 def _runs_only_against_fakes(script, env, fake):
     """The precondition of every script run here: each tool it could reach on the host resolves to its fake, and the
-    start takes its storage from RMP_DATA_DIR. A start that hard-codes the live storage is never executed."""
+    start takes its storage from RMP_DATA_DIR. A start that hard-codes the live storage is never executed. Nor does one
+    run without QDRANT_API_KEY, which the start and ops/qdrant_curl.sh would otherwise read from /etc/rmp/rmp.env."""
     if script == START:
         assert re.search(r'^DATA_DIR="\$\{RMP_DATA_DIR:-', script.read_text(), re.M), f"{script} hard-codes its data"
+    assert "QDRANT_API_KEY" in env, "without QDRANT_API_KEY, the key is read from /etc/rmp/rmp.env"
     for tool in FAKES:
         assert shutil.which(tool, path=env["PATH"]) == str(fake / tool), f"{tool} does not resolve to its fake"
 
@@ -103,14 +117,16 @@ def qdrant(tmp_path):
     for name, body in FAKES.items():
         (fake / name).write_text(body)
         (fake / name).chmod(0o755)
-    env = {**os.environ, "RMP_DATA_DIR": str(data), "PATH": f"{fake}:{os.environ['PATH']}", "FAKE_STATE": str(state)}
+    env = {**os.environ, "RMP_DATA_DIR": str(data), "RMP_PYTHON": sys.executable,
+           "PATH": f"{fake}:{os.environ['PATH']}", "FAKE_STATE": str(state)}
 
     def run(script, container, one_off=False, **extra):
         """``script`` with the container present or not, and the one-off restore container too; the fakes' logs start
         empty."""
         run_env = {**env, **extra}
         _runs_only_against_fakes(script, run_env, fake)
-        for name in ("docker.log", "curl.log", "sleep.log", "container", f"container-{ONE_OFF}"):
+        for name in ("docker.log", "docker-env.log", "curl.log", "curl-headers.log", "sleep.log", "container",
+                     f"container-{ONE_OFF}"):
             (state / name).unlink(missing_ok=True)
         if container:
             (state / "container").touch()
@@ -125,15 +141,17 @@ def qdrant(tmp_path):
 
     return type("Qdrant", (), {"run": staticmethod(run), "log": staticmethod(log),
                                "docker": staticmethod(lambda: [json.loads(line) for line in log("docker.log")]),
+                               "docker_env": staticmethod(lambda: [json.loads(line) for line in log("docker-env.log")]),
                                "exists": staticmethod(lambda: (state / "container").exists()),
                                "storage": data / "qdrant-server"})
 
 
-def _run_argv(storage):
-    """The docker run of rmp-qdrant: the flags the live container has."""
+def _run_argv(storage, keyed=False):
+    """The docker run of rmp-qdrant: the flags the live container has, and with a key its variable's name alone."""
     return ["run", "-d", "--name", "rmp-qdrant", "--restart", "unless-stopped",
             "-p", "127.0.0.1:6333:6333", "-p", "127.0.0.1:6334:6334",
-            "-v", f"{storage}:/qdrant/storage", "-e", "QDRANT__SERVICE__GRPC_PORT=6334", "qdrant/qdrant:v1.17.0"]
+            "-v", f"{storage}:/qdrant/storage", "-e", "QDRANT__SERVICE__GRPC_PORT=6334",
+            *(["-e", "QDRANT__SERVICE__API_KEY"] if keyed else []), "qdrant/qdrant:v1.17.0"]
 
 
 def test_start_recreates_the_container_from_its_flags(qdrant):
@@ -153,6 +171,35 @@ def test_start_recreates_the_container_from_its_flags(qdrant):
     # Graceful: stop before rm, and never a forced removal; and no compose anywhere.
     for call in present + absent:
         assert not {"-f", "--force"} & set(call) and not any("compose" in word for word in call)
+    # Without a key (the suite's QDRANT_API_KEY is empty), docker gets none and curl sends none.
+    assert qdrant.docker_env()[-1] is None
+    assert qdrant.log("curl.log") == ["-sf http://127.0.0.1:6333/readyz"] and not qdrant.log("curl-headers.log")
+
+
+def test_start_gives_the_container_the_key_by_name_and_sends_it_to_curl_on_stdin(qdrant):
+    """With a key (QDRANT_API_KEY, resolved by qdrant_api_key()), docker run names QDRANT__SERVICE__API_KEY and takes
+    its value from the environment, and the readiness wait sends it on curl's stdin: no command line holds it, and the
+    output does not show it."""
+    result = qdrant.run(START, container=True, QDRANT_API_KEY=f" {KEY}\n")
+    assert result.returncode == 0, result.stderr
+    calls = qdrant.docker()
+    assert calls == [INSPECT_ONE_OFF, INSPECT, ["stop", "rmp-qdrant"], ["rm", "rmp-qdrant"],
+                     _run_argv(qdrant.storage, keyed=True)]
+    assert qdrant.docker_env()[-1] == KEY
+    assert qdrant.log("curl.log") == ["-K - -sf http://127.0.0.1:6333/readyz"]
+    assert qdrant.log("curl-headers.log") == [f"api-key: {KEY}"]
+    assert not any(KEY in word for call in calls for word in call)
+    assert not any(KEY in line for line in qdrant.log("curl.log"))
+    assert KEY not in result.stdout + result.stderr
+
+
+def test_a_key_that_cannot_be_read_fails_the_start_before_it_touches_the_container(qdrant, tmp_path):
+    broken = tmp_path / "python-that-fails"
+    broken.write_text("#!/bin/sh\nexit 1\n")
+    broken.chmod(0o755)
+    result = qdrant.run(START, container=True, RMP_PYTHON=str(broken))
+    assert result.returncode == 1 and "could not read Qdrant's API key; rmp-qdrant is left as it is" in result.stderr
+    assert qdrant.docker() == [INSPECT_ONE_OFF] and qdrant.exists() and not qdrant.log("curl.log")
 
 
 def test_a_failed_docker_run_fails_the_start(qdrant):

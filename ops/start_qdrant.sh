@@ -13,10 +13,16 @@
 # a boot, `make qdrant`, `make migrate-qdrant` and a start by hand. So the procedure that keeps Qdrant stopped while it
 # rebuilds the storage (docs/runbooks/backup-restore.md, "Whole store from scratch") stops every rmp-* timer first, and
 # this start refuses, whatever asks for it, while that procedure's container rmp-qdrant-from-snapshot exists.
+#
+# Qdrant's API key is qdrant_api_key()'s (app/memory/vector.py): QDRANT_API_KEY from the environment when it is set,
+# else the one in /etc/rmp/rmp.env. With one, the container requires it of every request: docker takes its value from
+# this script's environment, so only the variable's name is on docker's command line, and the readiness wait sends it
+# through ops/qdrant_curl.sh.
 set -euo pipefail
 
 RMP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="${RMP_DATA_DIR:-${RMP_ROOT}/data}"
+PY="${RMP_PYTHON:-${RMP_ROOT}/venv/bin/python}"
 STORAGE="${DATA_DIR}/qdrant-server"
 IMAGE="qdrant/qdrant:v1.17.0"
 CONTAINER="rmp-qdrant"
@@ -27,6 +33,15 @@ if docker container inspect "${ONE_OFF}" >/dev/null 2>&1; then
   echo "refused: ${ONE_OFF} exists and rebuilds ${STORAGE}; start rmp-qdrant once it is removed" \
     "(docs/runbooks/backup-restore.md, \"Whole store from scratch\")" >&2
   exit 1
+fi
+
+# Read before the running container is touched: a key that cannot be read fails the start and leaves Qdrant as it is.
+KEY="$(cd "${RMP_ROOT}" && "${PY}" -c 'from app.memory.vector import qdrant_api_key; print(qdrant_api_key())')" \
+  || { echo "could not read Qdrant's API key; rmp-qdrant is left as it is" >&2; exit 1; }
+KEY_ARGS=()
+if [[ -n "${KEY}" ]]; then
+  export QDRANT__SERVICE__API_KEY="${KEY}"
+  KEY_ARGS=(-e QDRANT__SERVICE__API_KEY)
 fi
 
 mkdir -p "${STORAGE}"
@@ -42,17 +57,17 @@ fi
 docker run -d --name "${CONTAINER}" --restart unless-stopped \
   -p 127.0.0.1:6333:6333 -p 127.0.0.1:6334:6334 \
   -v "${STORAGE}:/qdrant/storage" \
-  -e QDRANT__SERVICE__GRPC_PORT=6334 \
+  -e QDRANT__SERVICE__GRPC_PORT=6334 ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} \
   "${IMAGE}" >/dev/null
 
 for _ in $(seq 1 30); do
-  if curl -sf "http://127.0.0.1:6333/readyz" >/dev/null 2>&1; then
+  if bash "${RMP_ROOT}/ops/qdrant_curl.sh" -sf "http://127.0.0.1:6333/readyz" >/dev/null 2>&1; then
     echo "Qdrant ready at http://127.0.0.1:6333"
     exit 0
   fi
   sleep 1
 done
 
-echo "Qdrant failed to become ready within 30s" >&2
+echo "Qdrant failed to become ready after 30 checks" >&2
 docker logs --tail 30 "${CONTAINER}" >&2 || true
 exit 1
