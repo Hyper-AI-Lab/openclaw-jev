@@ -121,6 +121,7 @@ def test_each_variable_defaults_on_its_own(inherited, tmp_path):
         "AURA_CODE_ROOT": str(root / "aura-code"),
     }
     expected = {name: value for name, value in defaults.items() if name != inherited}
+    expected["QDRANT_API_KEY"] = ""
     expected["DATABASE_URL"] = f"sqlite+aiosqlite:///{root / 'unmocked.db'}"
     assert suite_environment({inherited: str(tmp_path / "inherited")}, root, repo) == expected
 

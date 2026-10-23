@@ -125,6 +125,20 @@ def test_each_consumer_accepts_the_suite_defaults_and_refuses_an_inherited_produ
         assert guard.denies(repo / "data") and guard.denies(repo / "settings.json")
 
 
+def test_the_suite_sets_an_empty_qdrant_key_unless_one_is_inherited(tmp_path):
+    """qdrant_api_key() reads /etc/rmp/rmp.env only when QDRANT_API_KEY is unset: the suite and every script a test
+    runs see it set, empty unless the caller gave one, which stays as it is."""
+    root, repo = tmp_path / "root", tmp_path / "repo"
+    assert suite_environment({}, root, repo)["QDRANT_API_KEY"] == ""
+    for inherited in ("dummy", ""):
+        environ = {"QDRANT_API_KEY": inherited}
+        assert "QDRANT_API_KEY" not in suite_environment(environ, root, repo)
+        environ.update(suite_environment(environ, root, repo))
+        assert environ["QDRANT_API_KEY"] == inherited
+    # This session's conftest applied it.
+    assert "QDRANT_API_KEY" in os.environ
+
+
 def checking(tmp_path):
     """A guard over the real denied roots for pure checks: its repo is tmp_path/repo, and only tmp_path is allowed."""
     return Guard(DENIED_ROOTS, (tmp_path,), tmp_path / "repo")
