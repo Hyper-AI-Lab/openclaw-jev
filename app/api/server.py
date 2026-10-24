@@ -1726,6 +1726,16 @@ async def cron_reconcile(db: AsyncSession = Depends(get_db)):
     return await reconcile_cron_once(db)
 
 
+def _dashboard_stats(tasks) -> Dict[str, int]:
+    """The dashboard's task counters, for the page and for /api/dashboard-data."""
+    return {
+        "total": len(tasks),
+        "running": sum(1 for t in tasks if t.status == TaskStatus.RUNNING),
+        "completed": sum(1 for t in tasks if t.status == TaskStatus.COMPLETED),
+        "failed": sum(1 for t in tasks if t.status == TaskStatus.FAILED),
+    }
+
+
 @app.get("/api/dashboard-data")
 async def dashboard_data(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Task).order_by(Task.created_at.desc()).limit(50))
@@ -1743,12 +1753,9 @@ async def dashboard_data(db: AsyncSession = Depends(get_db)):
     ]
     return {
         "tasks": task_list,
-        "stats": {
-            "total": len(tasks),
-            "running": sum(1 for t in tasks if t.status == TaskStatus.RUNNING),
-            "completed": sum(1 for t in tasks if t.status == TaskStatus.COMPLETED),
-            "failed": sum(1 for t in tasks if t.status == TaskStatus.FAILED),
-        },
+        "stats": _dashboard_stats(tasks),
+        # The dashboard's Cancel and Retry buttons follow these sets, so it names no status itself.
+        "status_sets": {"cancellable": sorted(WORKFLOW_OWNED), "retryable": sorted(TERMINAL)},
         "model": _read_current_model(),
         "model_catalog": MODEL_CATALOG,
         "settings": _without_secrets(load_settings()),
@@ -1771,6 +1778,7 @@ async def dashboard(request: Request, db: AsyncSession = Depends(get_db)):
         {
             "request": request,
             "tasks": tasks,
+            "stats": _dashboard_stats(tasks),
             "model": _read_current_model(),
             "model_catalog": MODEL_CATALOG,
             "settings": load_settings(),
