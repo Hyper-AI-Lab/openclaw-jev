@@ -334,7 +334,8 @@ def test_each_rule_passes_its_negative(rule, source, path):
 
 def test_no_status_literal_outside_the_vocabulary():
     modules = [(rel, tree) for rel, tree in _parsed(*(REPO / root for root in GUARDED)) if not rel.startswith(EXEMPT)]
-    # The walk reached every guarded root: a walk that finds no file would pass on anything.
-    assert {"app/api/server.py", "ops/temporal_purge_running.py", "worker.py"} <= {rel for rel, _ in modules}
+    # The walk parsed a module under every guarded root: a walk that finds no file would pass on anything.
+    unreached = [root for root in GUARDED if not any(rel == root or rel.startswith(root + "/") for rel, _ in modules)]
+    assert not unreached, f"the guard parsed no module under {unreached}"
     found = [f"{rel}:{line} {rule}" for rel, tree in modules for line, rule in violations(tree, rel)]
     assert not found, "task, run or step status literals outside app/status.py:\n" + "\n".join(found)
