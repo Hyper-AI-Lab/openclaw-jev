@@ -16,7 +16,7 @@ from app.config import RMP_DATA_DIR as _RMP_DATA_DIR, RMP_ROOT as _RMP_ROOT
 from app.production.alerting import send_alert
 from app.production.ops_notify import notify_ops_slack
 from app.llm.quota_broker import reap_stale_llm_slots_sync, seconds_until_any_key_ready
-from app.status import ACTIVE, IN_PROGRESS, TaskStatus
+from app.status import ACTIVE, IDLE_BLOCKING, IN_PROGRESS, TaskStatus
 
 logger = logging.getLogger("rmp.canary_sentinel")
 
@@ -319,13 +319,18 @@ def _record_remediation(key: str = "restart_runtime") -> None:
 
 
 def count_active_user_tasks_sync(*, strict: bool = False) -> int:
-    """Count non-terminal user tasks that would be hurt by a worker restart.
+    """Count the user tasks that a worker restart would hurt: those in ``IDLE_BLOCKING``.
+
+    ``IDLE_BLOCKING`` leaves out ``deploying``, because the self-deploy waits for idle while its own task is
+    deploying, and ``blocked``, because a queued or usage-paused coding job holds no run that a restart would hurt.
+    Internal tasks (canaries, heartbeats) are not counted.
 
     ``strict`` raises when the lookup fails, so a caller about to restart can
     treat an unknown count as busy instead of idle.
     """
+    engine = None
     try:
-        from sqlalchemy import create_engine, text
+        from sqlalchemy import bindparam, create_engine, text
 
         from app.db.database import DATABASE_URL
         from app.notification_policy import is_internal_task
@@ -334,10 +339,10 @@ def count_active_user_tasks_sync(*, strict: bool = False) -> int:
         engine = create_engine(sync_url)
         with engine.connect() as conn:
             rows = conn.execute(
-                text(
-                    "SELECT id, task_type, goal FROM tasks "
-                    "WHERE status IN ('running', 'created', 'pending_user_input')"
-                )
+                text("SELECT id, task_type, goal FROM tasks WHERE status IN :statuses").bindparams(
+                    bindparam("statuses", expanding=True)
+                ),
+                {"statuses": sorted(IDLE_BLOCKING)},
             ).fetchall()
         count = 0
         for _id, task_type, goal in rows:
@@ -350,6 +355,9 @@ def count_active_user_tasks_sync(*, strict: bool = False) -> int:
             raise
         logger.warning("count_active_user_tasks_sync failed: %s", exc)
         return 0
+    finally:
+        if engine is not None:
+            engine.dispose()
 
 
 def cancel_task_sync(task_id: str, reason: str = "canary_timeout") -> bool:

@@ -322,3 +322,45 @@ def test_evaluate_llm_usage_flags_a_large_live_context(monkeypatch):
     issue = canary_sentinel.evaluate_llm_usage()
     assert issue is not None
     assert "75,000 context tokens" in issue.message
+
+
+def test_the_idle_gate_counts_exactly_idle_blocking(tmp_path, monkeypatch):
+    """The deploy's idle gate counts user tasks in IDLE_BLOCKING: not deploying (the self-deploy's own task), not
+    blocked (a queued coding job), not a finished task and not a canary."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import Session
+
+    from app.db import database
+    from app.db.models import Base, Task
+    from app.production import canary_sentinel
+    from app.status import IDLE_BLOCKING, TaskStatus
+
+    url = f"sqlite:///{tmp_path / 'idle.db'}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine, tables=[Task.__table__])
+    monkeypatch.setattr(database, "DATABASE_URL", url)
+
+    def seed(*statuses):
+        with Session(engine) as db:
+            db.add_all([Task(id=f"user-{status}", goal=f"Plan the trip ({status})", task_type="user", status=status)
+                        for status in statuses])
+            db.commit()
+
+    with Session(engine) as db:
+        db.add(Task(id="canary", goal="RMP CANARY: Reply with exactly CANARY_OK on its own line. No tools.",
+                    task_type="canary", status=TaskStatus.RUNNING))
+        db.commit()
+    seed(TaskStatus.DEPLOYING, TaskStatus.BLOCKED)
+    assert canary_sentinel.count_active_user_tasks_sync(strict=True) == 0
+
+    seed(*(status for status in TaskStatus if status not in (TaskStatus.DEPLOYING, TaskStatus.BLOCKED)))
+    engine.dispose()
+    assert IDLE_BLOCKING == {"created", "running", "pending_user_input"}
+    assert canary_sentinel.count_active_user_tasks_sync() == len(IDLE_BLOCKING)
+    assert canary_sentinel.count_active_user_tasks_sync(strict=True) == len(IDLE_BLOCKING)
+
+    monkeypatch.setattr(database, "DATABASE_URL", f"sqlite:///{tmp_path / 'missing' / 'idle.db'}")
+    with pytest.raises(OperationalError):
+        canary_sentinel.count_active_user_tasks_sync(strict=True)
+    assert canary_sentinel.count_active_user_tasks_sync() == 0
