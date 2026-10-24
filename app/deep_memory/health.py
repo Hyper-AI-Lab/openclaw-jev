@@ -272,7 +272,7 @@ async def run_readiness_checks() -> List[CheckResult]:
 async def check_task_documents() -> CheckResult:
     """Every user task that finished since go-live has an enriched task document within 30 minutes."""
     from app.deep_memory.ingest import document_id, ingestible, task_source_key
-    from app.orchestrator.decision_engine import TERMINAL_STATUSES
+    from app.status import TERMINAL
 
     if not get_deep_memory_config().get("enabled"):
         return CheckResult("task_documents", "pass", "Deep memory disabled", {})
@@ -283,7 +283,7 @@ async def check_task_documents() -> CheckResult:
             return CheckResult("task_documents", "pass", "Nothing ingested yet", {})
         tasks = (await db.execute(
             select(Task).where(
-                Task.status.in_(TERMINAL_STATUSES), Task.created_at >= live_since,
+                Task.status.in_(TERMINAL), Task.created_at >= live_since,
                 Task.updated_at >= _since(), Task.updated_at < now - timedelta(minutes=ENRICH_WITHIN_MIN))
         )).scalars().all()
         user = [t for t in tasks if ingestible(t)]
@@ -304,7 +304,7 @@ async def check_claude_records() -> CheckResult:
     """Every user task that finished with Claude work has that work in its task document within 30 minutes."""
     from app.coding.records import has_records
     from app.deep_memory.ingest import document_id, ingestible, task_source_key
-    from app.orchestrator.decision_engine import TERMINAL_STATUSES
+    from app.status import TERMINAL
 
     if not get_deep_memory_config().get("enabled"):
         return CheckResult("claude_records", "pass", "Deep memory disabled", {})
@@ -312,7 +312,7 @@ async def check_claude_records() -> CheckResult:
     async with AsyncSessionLocal() as db:
         tasks = (await db.execute(
             select(Task).where(
-                Task.status.in_(TERMINAL_STATUSES), Task.updated_at >= _since(),
+                Task.status.in_(TERMINAL), Task.updated_at >= _since(),
                 Task.updated_at < now - timedelta(minutes=ENRICH_WITHIN_MIN))
         )).scalars().all()
         worked = [t for t in tasks if ingestible(t) and await asyncio.to_thread(has_records, t.id)]

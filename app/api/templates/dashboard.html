@@ -105,15 +105,15 @@
             </div>
             <div class="stat-card">
                 <div class="label">Running</div>
-                <div class="value running" id="stat-running">{{ tasks|selectattr('status', 'equalto', 'running')|list|length }}</div>
+                <div class="value running" id="stat-running">{{ stats.running }}</div>
             </div>
             <div class="stat-card">
                 <div class="label">Completed</div>
-                <div class="value completed" id="stat-completed">{{ tasks|selectattr('status', 'equalto', 'completed')|list|length }}</div>
+                <div class="value completed" id="stat-completed">{{ stats.completed }}</div>
             </div>
             <div class="stat-card">
                 <div class="label">Failed</div>
-                <div class="value failed" id="stat-failed">{{ tasks|selectattr('status', 'equalto', 'failed')|list|length }}</div>
+                <div class="value failed" id="stat-failed">{{ stats.failed }}</div>
             </div>
             <div class="stat-card">
                 <div class="label">Active LLM Model</div>
@@ -343,12 +343,15 @@
             });
         }
 
+        // The statuses whose tasks can be cancelled or retried, as the last /api/dashboard-data named them.
+        let statusSets = {cancellable: [], retryable: []};
+
         function isActiveStatus(status) {
-            return ['running', 'pending', 'pending_user_input', 'created'].includes(status);
+            return statusSets.cancellable.includes(status);
         }
 
         function canRetry(status) {
-            return ['failed', 'stopped_by_user', 'completed'].includes(status);
+            return statusSets.retryable.includes(status);
         }
 
         function actionButtons(task) {
@@ -406,6 +409,7 @@
             try {
                 const resp = await fetch('/api/dashboard-data');
                 const data = await resp.json();
+                statusSets = data.status_sets;
 
                 document.getElementById('stat-total').textContent = data.stats.total;
                 document.getElementById('stat-running').textContent = data.stats.running;

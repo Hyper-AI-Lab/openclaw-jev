@@ -13,14 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_task_registry_config
 from app.db.database import AsyncSessionLocal
 from app.db.models import Task, TaskRegistryEntry
+from app.status import WORKFLOW_OWNED
 from app.task_registry.session_identity import active_task_lookup_keys, dialogue_lookup_keys
 from app.task_registry.vector_store import search_similar_tasks
 
 logger = logging.getLogger("rmp.task_registry.retriever")
-
-ACTIVE_STATUSES = frozenset(
-    {"created", "running", "pending", "pending_user_input", "blocked", "needs_replan"}
-)
 
 
 def _apply_temporal_decay(
@@ -76,7 +73,7 @@ async def fetch_active_tasks(
     host_wide: bool = False,
 ) -> List[Dict[str, Any]]:
     async def _query(session: AsyncSession) -> List[Dict[str, Any]]:
-        q = select(Task).where(Task.status.in_(list(ACTIVE_STATUSES)))
+        q = select(Task).where(Task.status.in_(list(WORKFLOW_OWNED)))
         if session_key and not host_wide:
             keys = active_task_lookup_keys(session_key)
             if keys:

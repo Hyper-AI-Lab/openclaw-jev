@@ -768,7 +768,7 @@ def check_task_registry_index_fresh() -> CheckResult:
     from app.db.models import Task, TaskRegistryEntry
     from app.notification_policy import is_internal_task
     from app.orchestrator.decision_engine import INTAKE_PLACEHOLDER
-    from app.task_registry.indexer import TERMINAL_STATUSES
+    from app.status import TERMINAL
 
     cfg = get_task_registry_config()
     if not cfg.get("enabled", True):
@@ -781,7 +781,7 @@ def check_task_registry_index_fresh() -> CheckResult:
         with engine.connect() as conn:
             ended = conn.execute(
                 select(Task.id, Task.goal, Task.task_type, Task.supplementary_context).where(
-                    Task.status.in_(list(TERMINAL_STATUSES)), Task.created_at >= cutoff
+                    Task.status.in_(list(TERMINAL)), Task.created_at >= cutoff
                 )
             ).all()
             indexed = set(conn.execute(select(TaskRegistryEntry.task_id)).scalars())

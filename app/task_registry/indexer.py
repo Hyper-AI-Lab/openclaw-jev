@@ -6,14 +6,11 @@ import logging
 from typing import Optional
 
 from app.config import get_task_registry_config, is_vector_memory_enabled
+from app.status import TERMINAL
 from app.task_registry.summary import upsert_registry_entry
 from app.task_registry.vector_store import upsert_task_vector
 
 logger = logging.getLogger("rmp.task_registry.indexer")
-
-TERMINAL_STATUSES = frozenset(
-    {"completed", "failed", "stopped_by_user", "cancelled", "compensated"}
-)
 
 
 async def index_terminal_task(task_id: str, *, require_vector: bool = False) -> Optional[str]:
@@ -26,7 +23,7 @@ async def index_terminal_task(task_id: str, *, require_vector: bool = False) -> 
     summary = await build_task_summary(task_id)
     if not summary:
         return None
-    if summary.get("terminal_status") not in TERMINAL_STATUSES:
+    if summary.get("terminal_status") not in TERMINAL:
         logger.debug("Skip registry index for non-terminal task %s", task_id)
         return None
     from app.notification_policy import is_internal_task

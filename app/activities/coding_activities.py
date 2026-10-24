@@ -23,12 +23,10 @@ from temporalio import activity
 
 from app.coding import deploy, prompts, runner, stream, verify, workspace
 from app.coding.units import RUNS_DIR
+from app.status import ACTIVE
 from app.telemetry import traced_activity
 
 SLOT_FILE = RUNS_DIR / "coding-slot.json"
-# "deploying": the deploy unit owns the task after the hand-off, and holds the slot until the report run ends.
-ACTIVE_TASK_STATUSES = frozenset({"created", "running", "pending", "pending_user_input", "blocked", "needs_replan",
-                                  "deploying"})
 POLL_SEC = 2.0
 LIVENESS_SEC = 180
 NOTICE_SEC = 900
@@ -91,7 +89,9 @@ async def _task_active(task_id: str) -> bool:
 
     async with AsyncSessionLocal() as db:
         task = await db.get(Task, task_id)
-    return task is not None and task.status in ACTIVE_TASK_STATUSES
+    # ACTIVE holds "deploying": the deploy unit owns the task after the hand-off, and holds the slot until the report
+    # run ends.
+    return task is not None and task.status in ACTIVE
 
 
 @traced_activity("coding.settings")

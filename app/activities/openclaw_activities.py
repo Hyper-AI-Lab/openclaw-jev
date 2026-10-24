@@ -38,6 +38,7 @@ from app.notification_policy import (
     sanitize_user_facing_text,
     should_deliver_slack,
 )
+from app.status import AGENT_STEP_OUTCOMES
 from app.telemetry import traced_activity
 
 # Only these stop reasons indicate a final assistant turn worth evaluating.
@@ -822,14 +823,7 @@ async def parse_agent_evaluation(payload: Dict[str, Any]) -> Dict[str, str]:
 
     if facts.get("step_complete") or facts.get("deliverable"):
         result = {"status": "completed", "reason": legacy_reason or "Facts indicate complete"}
-    elif legacy_status in (
-        "completed",
-        "pending",
-        "failed",
-        "stopped_by_user",
-        "blocked",
-        "needs_replan",
-    ):
+    elif legacy_status in AGENT_STEP_OUTCOMES:
         result = {"status": legacy_status, "reason": legacy_reason}
     else:
         text_lower = text.lower()

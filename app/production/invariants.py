@@ -17,9 +17,9 @@ from app.deep_memory.health import INVARIANT_CHECKS as DEEP_MEMORY_INVARIANTS
 from app.db.models import Event, Task, VectorOutbox
 from app.memory.hygiene import canary_text_rows, internal_traces
 from app.notification_policy import is_internal_task
-from app.orchestrator.decision_engine import TERMINAL_STATUSES
 from app.production.readiness import CheckResult
 from app.reconciler import ORPHAN_EVENTS
+from app.status import ACTIVE, TERMINAL, TaskStatus
 
 WINDOW_HOURS = 24
 # A run writes its resubmission after its terminal status.
@@ -27,7 +27,7 @@ SETTLE_MINUTES = 2
 OUTBOX_OVERDUE_MINUTES = 15
 OUTBOX_POISON_ATTEMPTS = 5
 ANSWERED_EVENTS = ("evaluator.accept", "evaluator.escalate", "task.messages_resubmitted")
-CLOSED_ON_REQUEST = ("stopped_by_user", "cancelled")
+CLOSED_ON_REQUEST = (TaskStatus.STOPPED_BY_USER, TaskStatus.CANCELLED)
 
 
 def _since() -> datetime:
@@ -46,7 +46,7 @@ async def check_judged_deliveries() -> CheckResult:
         rows = (
             await db.execute(
                 select(Task.id, Task.goal, Task.task_type).where(
-                    Task.status == "completed", Task.updated_at >= _since(), ~accepted
+                    Task.status == TaskStatus.COMPLETED, Task.updated_at >= _since(), ~accepted
                 )
             )
         ).all()
@@ -77,7 +77,7 @@ async def check_attached_messages() -> CheckResult:
                 .where(
                     attach.event_type == "intake.attach",
                     attach.occurred_at >= _since(),
-                    Task.status.in_(TERMINAL_STATUSES),
+                    Task.status.in_(TERMINAL),
                     Task.status.notin_(CLOSED_ON_REQUEST),
                     Task.updated_at < datetime.utcnow() - timedelta(minutes=SETTLE_MINUTES),
                     ~answered,
@@ -276,7 +276,7 @@ async def check_direct_units() -> CheckResult:
             statuses = dict((await db.execute(
                 select(Task.id, Task.status).where(Task.id.in_({u["task_id"] for u in units}))
             )).all())
-    orphaned = [u["unit"] for u in units if statuses.get(u["task_id"], "missing") in (*TERMINAL_STATUSES, "missing")]
+    orphaned = [u["unit"] for u in units if statuses.get(u["task_id"], "missing") in (*TERMINAL, "missing")]
     if orphaned:
         return CheckResult("direct_units", "fail", f"direct Claude turn(s) without a live task: {', '.join(orphaned)}",
                            {"units": orphaned})
@@ -304,7 +304,6 @@ async def check_main_deployed() -> CheckResult:
 
 async def check_coding_units() -> CheckResult:
     """No Claude Code unit runs without a live coding task."""
-    from app.activities.coding_activities import ACTIVE_TASK_STATUSES
     from app.production.coding_readiness import live_units
 
     units = [u for u in await asyncio.to_thread(live_units) if u["kind"] == "claude"]
@@ -314,7 +313,7 @@ async def check_coding_units() -> CheckResult:
             statuses = dict((await db.execute(
                 select(Task.id, Task.status).where(Task.id.in_({u["task_id"] for u in units}))
             )).all())
-    orphaned = [u["unit"] for u in units if statuses.get(u["task_id"]) not in ACTIVE_TASK_STATUSES]
+    orphaned = [u["unit"] for u in units if statuses.get(u["task_id"]) not in ACTIVE]
     if orphaned:
         return CheckResult("coding_units", "fail", f"Claude Code unit(s) without a live task: {', '.join(orphaned)}",
                            {"units": orphaned})

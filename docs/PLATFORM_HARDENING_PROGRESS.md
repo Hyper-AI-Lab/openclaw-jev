@@ -2539,3 +2539,176 @@ No value was printed or stored anywhere else.
 **Four-layout verify** (HEAD `194e4a7`): default, live, coding-job and direct each gave 1573 passed, 1 skipped, leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. The runs happened after the key was appended to `/etc/rmp/rmp.env`, so the suite is confirmed not to read it. Summary in `research/wp12-b8-verify-summary.txt`.
 
 **Next:** a PR with the gated merge job. Then the deploy restarts rmp-api and rmp-worker with the key, followed by the K-37 Qdrant restart while idle.
+
+## 2026-10-23 21:37 UTC · WP-12 batch 8 deployed; Qdrant keyed (K-37); authz-secrets-21 closed
+
+**Gated merge job:** CI `test` SUCCESS on PR head `7693375`, equal to the local HEAD; `main` still `0f18531`; one open PR. It squash-merged PR #44 as `122d49a`.
+
+**Deploy:** `deployed`; **restarted rmp-api and rmp-worker**, which now send the key to a still keyless Qdrant; health, readiness and the canary passed.
+
+**Host step 3 (K-37)**, at 21:35Z:
+- **Pre-checks:**
+  - the live checkout is at `122d49a` with the new `start_qdrant.sh` and `qdrant_curl.sh`;
+  - idle: 0 user tasks, no coding units;
+  - rmp-api and rmp-worker each hold the variable (counted, 1 each);
+  - no one-off container; the old container holds no key (count 0).
+- **`systemctl restart rmp-qdrant`:** rc 0, 21:35:46–21:35:53, about 7 s of downtime.
+  - The container was created at `2026-10-23T21:35:51Z`; restart policy `unless-stopped`, ports 127.0.0.1:6333/6334 and image `qdrant/qdrant:v1.17.0` are unchanged.
+- **Checks:**
+  - unkeyed `GET /collections` gives **401**;
+  - `ops/qdrant_curl.sh` gives **200**;
+  - the container's `QDRANT__SERVICE__API_KEY` count is 1; no 64-hex value is in its argv.
+  - `make -s readiness` and the API readiness both show `vector_memory`, `task_registry_vector` (gRPC) and `vector_sync` **pass**.
+  - `production_ready` true; non-pass only `offsite_backup` (K-7) and `telemetry`.
+  - Canary success.
+  - Collections green: memories 2695, deep 1433, task registry 252, mem0migrations 1.
+- **Rollback:** `sed -i '/^QDRANT_API_KEY=/d' /etc/rmp/rmp.env`, then `systemctl restart rmp-qdrant` with Kirill's OK; then revert `122d49a`.
+
+**Ledger** (spec §7):
+- **closed:** **authz-secrets-21**;
+- **notes:** R-127, R-132 and R-137 "WP-12 part delivered"; TRI-089 "backup lines of ARCHITECTURE.md updated by WP-12".
+- `phaseA/VISION_CONFORMANCE.md` R-148 repointed to `ops/start_qdrant.sh:58`, matching the repo copy.
+- **Still to do:** spec §7's R-132 "Open" list trim in `docs/VISION_CONFORMANCE.md` happens at the next docs change (WP-30).
+
+**Remaining host step 4, next morning:**
+1. The 03:15Z nightly backup, the first with the key, must have `failures: []`.
+2. The drill must pass.
+3. Then delete the rollback copy `/root/attic/rmp.env.pre-qdrant-key.20261023T202220Z`.
+
+A one-shot background check is scheduled for after 03:40Z.
+
+## 2026-10-23 21:38 UTC · Next WP: the ordering cycle resolved (rule 43); WP-04 spec started
+
+**The cycle:** taken whole, WP-04a closes a cycle: rule 3 (26 before 04a), rule 6 (04a before 09) and WP-26's table dependency on WP-09.
+
+**Resolution** (`ordering.md` rule 43), from the rules' own wording:
+1. WP-04 without the transition-log table (status enum and sets, compare-and-set, 4b's one Temporal client);
+2. WP-09;
+3. WP-26;
+4. 04a's transition log.
+
+No new decision was needed.
+
+**Spec workflow** `wp-spec` for WP-04: launched from a scratch directory, with the clone detached at `origin/main` `122d49a` (read-only).
+
+## 2026-10-24 00:02 UTC · WP-04 spec resumed after the usage limit
+
+**Run `wf_c83b201c-4d7`:** the spec writer stopped at the session limit after 46 min. It left a complete-looking draft, `specs/WP-04.md`: 1357 lines, sections 0–8, items WP04-01…34 in 9 batches.
+- **Batches 1–4 can run now:** the vocabulary and sets including `IDLE_BLOCKING`, the workflow vocabulary, guarded compare-and-set transitions, and 4b's one Temporal client.
+- **Batch 5**, the transition log, waits for WP-26.
+- **Batches 6–9 (4c)** wait for WP-14, WP-05, WP-13 and WP-09.
+
+**Copy of the draft:** `/root/.cache/WP-04.draft-*.md`.
+
+**Relaunch:** run `wf_3bebce1c-68a`, whose resume note tells the writer to verify and finish the draft in place rather than start over. Then the critic and the revision follow.
+
+**Morning check:** the WP-12 host step 4 job is still sleeping until 03:40Z.
+
+## 2026-10-24 01:04 UTC · WP-04 spec complete (writer, critic, revision)
+
+**Run `wf_3bebce1c-68a`:** the writer verified and finished the draft in place.
+
+**Critic:** "revise", with 8 gaps:
+1. **Cancellation as an error.** In temporalio 1.23 a cancel during an awaited activity raises `ActivityError` with a `CancelledError` cause. RMP's broad handlers would then compensate, DM Kirill, or run extra turns.
+   - Fix: `is_cancelled_exception` in every handler, under `patched("cancel-cleanup")`. Batch 8 now runs before batch 7.
+2. **The `TEMPORAL_ADDRESS` probe** could not see `EnvironmentFile=` variables.
+   - Fix: a `systemd-run` probe with both env files that prints presence only.
+3. **Stop target selection.** A newer cron task could take Kirill's stop.
+   - Fix: one precedence rule, so a stop prefers his task; canary and heartbeat reservations are excluded.
+4. **A stop racing a workflow start.**
+   - Fix: `start_checked` re-reads the task after the start.
+5. **R-04's closing test.**
+6. **The refusal log line** used by batch 3's host step.
+7. **The sentinel tests' files.**
+8. **Batch 6** is the programme's first gateway restart.
+
+**Revision:** `specs/WP-04.md`, 1782 lines, 34 items in 9 batches.
+- **Run now, before WP-09:** batches 1–4 (vocabulary and sets; workflow vocabulary; guarded compare-and-set transitions; one Temporal client).
+- **Wait:**
+  - batches 6, 8, 7 (4c) wait for WP-14;
+  - batch 9 waits for WP-09 and batch 6;
+  - batch 5 (transition log, `events.actor`) waits for WP-26.
+- **Open questions:** none for Kirill. Two host-step contingencies are recorded: batch 4's env probe, and batch 6's restart timing.
+
+**Next:** batch 1 starts now. Its merge waits for WP-12's host step 4 (03:40Z), per the batch table and rule 19.
+
+## 2026-10-24 05:02 UTC · WP-12 complete: host step 4 passed (the first keyed nightly backup, verified and drilled)
+
+**Host step 4** (the background check at 03:40Z):
+- **Nightly backup** `20261024T031520Z`, the first since Qdrant requires the key: `rmp-backup.service` Result=success; `failures` []; `offsite: off`; `backup_manifest verify` rc 0. The snapshot API works with the key, through `qdrant_curl.sh` and the file fallback.
+- **Drill** on it: every line `ok`, exit 0.
+  - backup manifest; restic round trip (11 files);
+  - `rmp_db` 20 tables / 61485 rows, `temporal` 39 / 8343, `temporal_visibility` 3 / 324;
+  - Qdrant 4 collections (2696 / 1433 / 252 / 1), restored with the drill's own key;
+  - openclaw-state; both archives;
+  - `restore duration: 0 min 21 s`.
+  - Nothing left behind.
+
+**Cleanup:** the rollback copy `/root/attic/rmp.env.pre-qdrant-key.20261023T202220Z` was deleted with `shred -u`, as planned.
+
+**WP-12 is done:** 8 batches, PRs #37–#44, every host step logged.
+
+**Batch 1 of WP-04:** its implementer stopped at the session limit after 10 min. Resuming next.
+
+## 2026-10-24 05:02 UTC · WP-04 batch 1 resumed after the usage limit
+
+**Run `wf_a3e61336-e59`:** the implementer stopped after 10 min.
+- **State:** no commits; 15 tracked files changed (149+/203−); two new files, `app/status.py` and `tests/test_status_vocabulary.py`.
+- **Backup:** `/root/.cache/wp04-b1-wip-*/` (tracked patch plus the untracked files).
+- **Resumed from cache:** the implementer's step 0 reviews uncommitted work critically before continuing.
+
+## 2026-10-24 10:02 UTC · WP-04 batch 1: implemented and reviewed (round 1); fix round resumed after the usage limit
+
+**Implementer:** 12 commits, `4212bbd`…`65e9cc2`.
+- `app/status.py`: TaskStatus, RunState and StepStatus enums, plus their sets, `IDLE_BLOCKING` included.
+- 106 status lines in 20 files now go through the vocabulary.
+- The idle gate binds `IDLE_BLOCKING`.
+- `GET /tasks/{id}` returns `terminal`; the canary fails at once on a terminal status other than completed.
+- The dashboard takes its sets from the API.
+- The AST guard is in.
+- **Behaviour fixes**, each with a test that fails on `122d49a`:
+  - `/retry` runs only finished tasks;
+  - suspend-all also cancels queued coding tasks;
+  - a cancelled close clears the next check;
+  - the reconciler no longer rewrites a canceled run.
+- **Harness:** 1645 passed, 1 skipped in every layout.
+
+**Round 1:** both reviewers asked for changes, with one shared blocking finding. Commit `e826c09` deleted a module's `TERMINAL_TASK` set but left one use of it, so the janitor's purge would raise `NameError` on every run without `--force-recovery`. The closure reviewer added two `datetime.utcnow()` calls in new tests (spec §0). Non-blocking points: a payload without a state rewrote a stored run spelling; G2 missed `.not_in()`.
+
+**Fix round 1:** stopped at the usage limit after 4 commits, which cover every point:
+- `5de52e1` (the NameError);
+- `457e475` (map only a given state);
+- `5147c16` (naive UTC from `now(timezone.utc)`);
+- `2ce44be` (`.not_in()`, and the walk must reach each root).
+
+The tree is clean. **Resumed from cache:** the fixer re-runs, then the round-2 reviews.
+
+## 2026-10-24 14:29 UTC · WP-04 batch 1 approved
+
+**Run `wf_a3e61336-e59`** (resumed after the usage limit): `approved: true`, 17 commits.
+- **Fix round 1:** finished, with the 4 commits already logged.
+- **Round 2:** both reviewers approved. One non-blocking point: the empty-walk check named three files, one of which WP-08 and WP-27 may remove. Fixed in `05127a2`, which checks for a parsed module under each guarded root instead.
+- **Round 3:** both approved.
+
+**My four-layout verify:** running.
+
+## 2026-10-24 15:42 UTC · WP-04 batch 1 verified
+
+**Four-layout verify** (HEAD `05127a2`): default, live, coding-job and direct each gave 1650 passed, 1 skipped, leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. Each run took 17–19 min. Summary in `research/wp04-b1-verify-summary.txt`.
+
+**Next:** PR with the gated merge; the deploy restarts rmp-api and rmp-worker; then the host steps (the strict idle count, the next `CANARY OK`).
+
+## 2026-10-24 15:48 UTC · PR #45: CI failed once; the gate held; a latent dependency-drift bug found and fixed
+
+**The failure:** the gated merge job stopped without merging, because CI `test` failed. The one failure was the new `test_the_dashboard_page_counts_from_the_stats`, with Jinja raising `TypeError: unhashable type: 'dict'`.
+
+**Cause:**
+- `requirements.txt` does not pin Starlette. Production's venv has `starlette 0.52.1`; CI's fresh install resolved `1.10.0`.
+- Starlette 1.x removed `TemplateResponse(name, context)`, and the `/` route still used it.
+- So **any fresh install (CI, or a venv rebuild) breaks the dashboard page**. This batch only added the first test that renders `/`.
+
+**Fix** `e80e183`: the request-first `TemplateResponse(request, "dashboard.html", {...})`, valid on both versions.
+- **Verified:** `tests/test_dashboard.py` passes here (0.52.1). CI (1.10.0) re-runs on the pushed head.
+- **Not re-run:** the full four-layout verify. The change is one call in the `/` route, and the earlier four-layout run covers the rest of the head.
+
+**Ledger:** `WP04-b1-starlette-drift` (medium, WP-09). WP-09's hashed lock must pin every dependency to what production runs.

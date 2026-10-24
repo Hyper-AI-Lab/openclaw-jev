@@ -14,7 +14,8 @@ from sqlalchemy import select
 from app.config import get_task_registry_config
 from app.db.database import AsyncSessionLocal, engine
 from app.db.models import Task, TaskRegistryEntry
-from app.task_registry.indexer import index_terminal_task, TERMINAL_STATUSES
+from app.status import TERMINAL
+from app.task_registry.indexer import index_terminal_task
 from app.task_registry.vector_store import upsert_task_vector
 
 
@@ -67,7 +68,7 @@ async def _missing_task_ids(cutoff: datetime, limit: int | None) -> list[str]:
         q = (
             select(Task.id)
             .where(
-                Task.status.in_(list(TERMINAL_STATUSES)),
+                Task.status.in_(list(TERMINAL)),
                 Task.created_at >= cutoff,
                 Task.id.not_in(existing),
             )
@@ -84,7 +85,7 @@ async def _all_task_ids(cutoff: datetime, limit: int | None) -> list[str]:
         q = (
             select(Task.id)
             .where(
-                Task.status.in_(list(TERMINAL_STATUSES)),
+                Task.status.in_(list(TERMINAL)),
                 Task.created_at >= cutoff,
             )
             .order_by(Task.created_at.asc())

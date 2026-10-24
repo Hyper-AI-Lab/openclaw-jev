@@ -12,14 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Event, Observation, ProcessRun, Task, TaskRegistryEntry
 from app.metrics import inc as metrics_inc
 from app.orchestrator.process_brief import with_catchup
+from app.status import TERMINAL, TaskStatus
 from app.task_registry.intake_audit import record_intake_decision
 from app.task_registry.messages import add_task_message
 
 logger = logging.getLogger("rmp.intake_handlers")
 
-TERMINAL = frozenset(
-    {"completed", "failed", "stopped_by_user", "cancelled", "compensated"}
-)
 _SILENT_TAGS = frozenset({"canary", "system", "heartbeat", "intake-smoke"})
 
 
@@ -295,7 +293,7 @@ async def handle_intake_outcome(
                 )
             catchup = signals[0]["catchup"]
             if existing and intake_clarify:
-                existing.status = "created"
+                existing.status = TaskStatus.CREATED
                 ctx["intake_clarify"] = False
                 ctx["answered_at"] = datetime.utcnow().isoformat()
                 existing.supplementary_context = ctx
@@ -343,7 +341,7 @@ async def handle_intake_outcome(
             openclaw_session_key=session_key,
             task_type="user",
             goal=intent,
-            status="pending_user_input",
+            status=TaskStatus.PENDING_USER_INPUT,
             task_kind="one_shot",
             intake_decision_id=decision_id,
             next_check_at=now + timedelta(minutes=30),
@@ -405,7 +403,7 @@ async def handle_intake_outcome(
             openclaw_session_key=session_key,
             task_type="user",
             goal=intent,
-            status="completed",
+            status=TaskStatus.COMPLETED,
             task_kind="one_shot",
             intake_decision_id=decision_id,
             supplementary_context={"intake_ack": True, "skip_kind": effective},
@@ -454,7 +452,7 @@ async def handle_intake_outcome(
             result = await db.execute(select(Task).where(Task.id == tid))
             old = result.scalar_one_or_none()
             if old and old.status not in TERMINAL:
-                old.status = "failed"
+                old.status = TaskStatus.FAILED
                 old.next_check_at = None
             db.add(
                 Event(
@@ -493,7 +491,7 @@ async def handle_intake_outcome(
             result = await db.execute(select(Task).where(Task.id == tid))
             old = result.scalar_one_or_none()
             if old and old.status not in TERMINAL:
-                old.status = "failed"
+                old.status = TaskStatus.FAILED
                 old.next_check_at = None
         return None  # fall through to create
 

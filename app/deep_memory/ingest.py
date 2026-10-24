@@ -52,6 +52,7 @@ from app.memory.policy import redact_secrets
 from app.notification_policy import is_internal_task
 from app.orchestrator.decision_engine import INTAKE_PLACEHOLDER
 from app.orchestrator.prompt_policy import USER_TIMEZONE
+from app.status import TERMINAL
 
 logger = logging.getLogger("rmp.deep_memory.ingest")
 
@@ -433,7 +434,7 @@ async def _path_history(db: AsyncSession, task: Task) -> Tuple[str, List[Tuple[s
     """The task's route through RMP, and (related task id, relation) pairs from its intake."""
     lines = [f"Task {task.id[:8]} ({task.task_type or 'user'}): {_clip(task.goal or '', 400)}"]
     ctx = task.supplementary_context or {}
-    ended = task.updated_at if task.status in ("completed", "failed", "stopped_by_user", "cancelled", "compensated") else None
+    ended = task.updated_at if task.status in TERMINAL else None
     status = f"Status: {task.status}"
     if ctx.get("closed_reason"):
         status += f" ({ctx['closed_reason']})"
