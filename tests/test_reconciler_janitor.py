@@ -332,3 +332,53 @@ async def test_reconciler_indexes_the_tasks_it_completes_after_commit():
     assert stats["registry_indexed"] == 2
     assert [c[0] for c in order.mock_calls] == ["commit", "index", "index"]
     assert [c.args[0] for c in index.await_args_list] == ["orphan-reply", "stale-done"]
+
+
+async def test_a_cancelled_run_of_a_completed_workflow_stays_cancelled(tmp_path):
+    """The stale repair completes the task of a completed workflow and closes its open runs; a run that already ended
+    (here canceled) keeps its state."""
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+    from temporalio.client import WorkflowExecutionStatus
+
+    from app import reconciler
+    from app.db.models import Base, Event, ProcessRun, Task
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'stale.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=[Task.__table__, ProcessRun.__table__, Event.__table__])
+    factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    stale = datetime.utcnow() - timedelta(minutes=STALE_TASK_MINUTES + 5)
+    async with factory() as db:
+        db.add_all([
+            Task(id="stale-done", goal="Summarize my inbox", task_type="user", status="created", updated_at=stale),
+            ProcessRun(id="run-canceled", task_id="stale-done", current_state="canceled"),
+            ProcessRun(id="run-open", task_id="stale-done", current_state="running"),
+        ])
+        await db.commit()
+    client = MagicMock()
+    client.get_workflow_handle.return_value.describe = AsyncMock(
+        return_value=MagicMock(status=WorkflowExecutionStatus.COMPLETED))
+
+    try:
+        with patch("app.config.is_development_mode", return_value=False), \
+             patch.object(reconciler, "reap_stale_llm_slots_sync", return_value=[]), \
+             patch.object(reconciler, "_get_temporal", new_callable=AsyncMock, return_value=client), \
+             patch.object(reconciler, "AsyncSessionLocal", factory), \
+             patch.object(reconciler, "_close_orphaned_coding_tasks", new_callable=AsyncMock, return_value=[]), \
+             patch.object(reconciler, "_end_claude_sessions_of_finished_tasks", AsyncMock(return_value=0)), \
+             patch.object(reconciler, "_recover_orphaned_session_reply", new_callable=AsyncMock, return_value=None), \
+             patch.object(reconciler, "_cleanup_orphan_plan_children", new_callable=AsyncMock, return_value=0), \
+             patch.object(reconciler, "_notify_repair", new_callable=AsyncMock), \
+             patch("app.task_registry.hooks.index_terminal_task_async", new_callable=AsyncMock):
+            stats = await reconciler.reconcile_once()
+
+        async with factory() as db:
+            status = (await db.execute(select(Task.status).where(Task.id == "stale-done"))).scalar_one()
+            runs = dict((await db.execute(select(ProcessRun.id, ProcessRun.current_state))).all())
+    finally:
+        await engine.dispose()
+
+    assert stats["repaired"] == 1 and status == "completed"
+    assert runs == {"run-canceled": "canceled", "run-open": "completed"}

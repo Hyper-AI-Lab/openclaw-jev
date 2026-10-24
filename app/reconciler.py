@@ -12,8 +12,8 @@ from app.db.models import Event, ProcessRun, Task
 from app.llm.quota_broker import reap_stale_llm_slots_sync
 from app.metrics import inc as metrics_inc
 from app.notification_policy import is_internal_task
-from app.orchestrator.decision_engine import TERMINAL_STATUSES
 from app.production.alerting import send_alert
+from app.status import IN_PROGRESS, RUN_STATE_FOR_TASK_STATUS, RUN_TERMINAL, TERMINAL, RunState, TaskStatus
 
 logger = logging.getLogger("rmp.reconciler")
 
@@ -24,22 +24,6 @@ STUCK_REPAIR_MINUTES = 45
 # Recover completed OpenClaw replies quickly after worker crashes mid-notify.
 ORPHAN_REPLY_MIN_AGE_SEC = 90
 ORPHAN_REPLY_MAX_AGE_MINUTES = 30
-
-RUN_TERMINAL_STATES = (
-    "completed",
-    "failed_terminal",
-    "stopped_by_user",
-    "canceled",
-    "compensated",
-    "superseded",
-)
-RUN_STATE_FOR_TASK_STATUS = {
-    "completed": "completed",
-    "failed": "failed_terminal",
-    "cancelled": "canceled",
-    "stopped_by_user": "stopped_by_user",
-    "compensated": "compensated",
-}
 
 _temporal_client: Client | None = None
 
@@ -106,7 +90,7 @@ async def _end_claude_sessions_of_finished_tasks(db) -> int:
     statuses = dict(rows.all())
     ended = 0
     for session in open_sessions:
-        if statuses.get(session["task_id"]) in TERMINAL_STATUSES:
+        if statuses.get(session["task_id"]) in TERMINAL:
             await asyncio.to_thread(direct.end, session["id"], "task finished")
             ended += 1
     return ended
@@ -119,14 +103,14 @@ async def _close_orphaned_coding_tasks(client: Client, db, now: datetime, stats:
 
     coding_runs = select(ProcessRun.task_id).where(ProcessRun.process_type == CODING_PROCESS)
     rows = await db.execute(
-        select(Task).where(Task.id.in_(coding_runs), Task.status.notin_(TERMINAL_STATUSES))
+        select(Task).where(Task.id.in_(coding_runs), Task.status.notin_(TERMINAL))
     )
     closed = []
     for task in rows.scalars().all():
         if task.updated_at and now - task.updated_at < timedelta(seconds=ORPHAN_REPLY_MIN_AGE_SEC):
             continue
         # After the hand-off the deploy unit owns the task; it starts the reply run when it is done.
-        deploying = task.status == "deploying"
+        deploying = task.status == TaskStatus.DEPLOYING
         if deploying and (now - task.updated_at < DEPLOY_GRACE
                           or await asyncio.to_thread(runner_unit_active, f"aura-deploy-{task.id}")):
             continue
@@ -139,8 +123,9 @@ async def _close_orphaned_coding_tasks(client: Client, db, now: datetime, stats:
         if desc is not None and desc.status == WorkflowExecutionStatus.RUNNING:
             continue
         stopped = await asyncio.to_thread(stop_task_units, task.id)
-        await finalize_task_failure({"task_id": task.id, "task_status": "failed", "process_state": "failed_terminal"})
-        task.status = "failed"
+        await finalize_task_failure({"task_id": task.id, "task_status": TaskStatus.FAILED,
+                                     "process_state": RunState.FAILED_TERMINAL})
+        task.status = TaskStatus.FAILED
         task.next_check_at = None
         db.add(
             Event(
@@ -207,7 +192,7 @@ async def _recover_orphaned_session_reply(
     """
     if _task_is_internal(task):
         return None
-    if task.status not in ("running", "created"):
+    if task.status not in IN_PROGRESS:
         return None
     if not task.updated_at:
         return None
@@ -257,9 +242,9 @@ async def _recover_orphaned_session_reply(
         from app.activities.db_activities import finalize_task_failure
 
         await finalize_task_failure(
-            {"task_id": task.id, "task_status": "failed", "process_state": "failed_terminal"}
+            {"task_id": task.id, "task_status": TaskStatus.FAILED, "process_state": RunState.FAILED_TERMINAL}
         )
-        task.status = "failed"
+        task.status = TaskStatus.FAILED
         task.next_check_at = None
         await _notify_repair(
             task,
@@ -356,9 +341,9 @@ async def _repair_stuck_running_task(
     """Active repair: terminate RUNNING workflows stuck > STUCK_REPAIR_MINUTES."""
     if _task_is_internal(task):
         return False
-    if task.status not in ("running", "created"):
+    if task.status not in IN_PROGRESS:
         return False
-    if task.status == "pending_user_input":
+    if task.status == TaskStatus.PENDING_USER_INPUT:
         return False
     repair_threshold = now - timedelta(minutes=STUCK_REPAIR_MINUTES)
     if task.updated_at and task.updated_at >= repair_threshold:
@@ -396,7 +381,7 @@ async def _repair_stuck_running_task(
     runs = pr_result.scalars().all()
     process_run_id = runs[0].id if runs else None
     has_progress = any(
-        run.current_state not in ("created", "running", "waiting_agent")
+        run.current_state not in (RunState.CREATED, RunState.RUNNING)
         for run in runs
     )
 
@@ -408,17 +393,17 @@ async def _repair_stuck_running_task(
                 "reason": f"Workflow stuck >{STUCK_REPAIR_MINUTES}m — reconciler terminated",
             }
         )
-        task.status = "compensated"
+        task.status = TaskStatus.COMPENSATED
     else:
         await finalize_task_failure(
             {
                 "task_id": task.id,
                 "process_run_id": process_run_id,
-                "task_status": "failed",
-                "process_state": "failed_terminal",
+                "task_status": TaskStatus.FAILED,
+                "process_state": RunState.FAILED_TERMINAL,
             }
         )
-        task.status = "failed"
+        task.status = TaskStatus.FAILED
 
     task.next_check_at = None
     stats["repaired"] += 1
@@ -463,21 +448,15 @@ async def count_stuck_running_workflows() -> int:
             async with AsyncSessionLocal() as db:
                 result = await db.execute(select(Task).where(Task.id == task_id))
                 task = result.scalar_one_or_none()
-                if task is None or task.status in (
-                    "completed",
-                    "failed",
-                    "compensated",
-                    "stopped_by_user",
-                    "cancelled",
-                ):
+                if task is None or task.status in TERMINAL:
                     count += 1
                 elif recall:
                     continue
-                elif task.status == "running":
+                elif task.status == TaskStatus.RUNNING:
                     threshold = datetime.utcnow() - timedelta(minutes=STUCK_REPAIR_MINUTES)
                     if task.updated_at and task.updated_at < threshold:
                         count += 1
-                elif task.status == "created":
+                elif task.status == TaskStatus.CREATED:
                     threshold = datetime.utcnow() - timedelta(minutes=STUCK_REPAIR_MINUTES)
                     if task.updated_at and task.updated_at < threshold:
                         count += 1
@@ -519,7 +498,7 @@ async def reconcile_once() -> dict:
         stats["claude_sessions_closed"] = await _end_claude_sessions_of_finished_tasks(db)
         # Fast path: OpenClaw finished but worker died before Slack notify.
         orphan_candidates = await db.execute(
-            select(Task).where(Task.status.in_(["running", "created"]))
+            select(Task).where(Task.status.in_(IN_PROGRESS))
         )
         for task in orphan_candidates.scalars().all():
             if await _recover_orphaned_session_reply(client, db, task, now, stats) == "failed":
@@ -527,7 +506,7 @@ async def reconcile_once() -> dict:
 
         stuck_result = await db.execute(
             select(Task).where(
-                Task.status.in_(["running", "created"]),
+                Task.status.in_(IN_PROGRESS),
                 Task.updated_at < repair_threshold,
             )
         )
@@ -536,7 +515,7 @@ async def reconcile_once() -> dict:
 
         result = await db.execute(
             select(Task).where(
-                Task.status.in_(["running", "pending_user_input", "created"]),
+                Task.status.in_(IN_PROGRESS | {TaskStatus.PENDING_USER_INPUT}),
                 Task.updated_at < threshold,
             )
         )
@@ -544,7 +523,7 @@ async def reconcile_once() -> dict:
         stats["stale_tasks"] = len(stale_tasks)
 
         for task in stale_tasks:
-            if task.status == "running" and task.updated_at < repair_threshold:
+            if task.status == TaskStatus.RUNNING and task.updated_at < repair_threshold:
                 continue
             metrics_inc("stale_detected")
             wf_id = f"workflow-{task.id}"
@@ -553,19 +532,14 @@ async def reconcile_once() -> dict:
             try:
                 desc = await handle.describe()
                 if desc.status == WorkflowExecutionStatus.COMPLETED:
-                    task.status = "completed"
+                    task.status = TaskStatus.COMPLETED
                     task.next_check_at = None
                     pr = await db.execute(
                         select(ProcessRun).where(ProcessRun.task_id == task.id)
                     )
                     for run in pr.scalars().all():
-                        if run.current_state not in (
-                            "completed",
-                            "failed_terminal",
-                            "stopped_by_user",
-                            "compensated",
-                        ):
-                            run.current_state = "completed"
+                        if run.current_state not in RUN_TERMINAL:
+                            run.current_state = RunState.COMPLETED
                             run.ended_at = now
                             run.lease_owner = None
                     stats["repaired"] += 1
@@ -593,12 +567,12 @@ async def reconcile_once() -> dict:
                 ):
                     # A terminated run was ended by an operator, script or repair, not by Kirill's "stop".
                     terminal = (
-                        "cancelled"
+                        TaskStatus.CANCELLED
                         if desc.status == WorkflowExecutionStatus.TERMINATED
-                        else "failed"
+                        else TaskStatus.FAILED
                     )
                     task.status = terminal
-                    if terminal == "cancelled":
+                    if terminal == TaskStatus.CANCELLED:
                         task.supplementary_context = {
                             **(task.supplementary_context or {}),
                             "closed_reason": "workflow_terminated",
@@ -607,15 +581,9 @@ async def reconcile_once() -> dict:
                     pr = await db.execute(
                         select(ProcessRun).where(ProcessRun.task_id == task.id)
                     )
-                    proc_state = "canceled" if terminal == "cancelled" else "failed_terminal"
+                    proc_state = RUN_STATE_FOR_TASK_STATUS[terminal]
                     for run in pr.scalars().all():
-                        if run.current_state not in (
-                            "completed",
-                            "failed_terminal",
-                            "stopped_by_user",
-                            "compensated",
-                            "canceled",
-                        ):
+                        if run.current_state not in RUN_TERMINAL:
                             run.current_state = proc_state
                             run.ended_at = now
                             run.lease_owner = None
@@ -640,7 +608,7 @@ async def reconcile_once() -> dict:
             except Exception as e:
                 logger.debug("Workflow describe failed for %s: %s", task.id, e)
 
-            if task.status == "pending_user_input":
+            if task.status == TaskStatus.PENDING_USER_INPUT:
                 from app.task_registry.intake_handlers import maybe_remind_intake_clarify
 
                 reminded = await maybe_remind_intake_clarify(task, now)
@@ -692,13 +660,13 @@ async def reconcile_once() -> dict:
 
         pr_result = await db.execute(
             select(ProcessRun).where(
-                ProcessRun.current_state.notin_(RUN_TERMINAL_STATES),
+                ProcessRun.current_state.notin_(RUN_TERMINAL),
                 ProcessRun.next_check_at < now,
             )
         )
         for run in pr_result.scalars().all():
             run.next_check_at = now + timedelta(minutes=5)
-            if run.current_state in ("waiting_external", "blocked"):
+            if run.current_state in (RunState.WAITING_EXTERNAL, RunState.BLOCKED):
                 try:
                     handle = client.get_workflow_handle(f"workflow-{run.task_id}")
                     await handle.signal("user_input", "[RECONCILER] External wait check-in.")
@@ -723,8 +691,8 @@ async def close_runs_of_ended_tasks(db, now: datetime) -> int:
         select(ProcessRun, Task.status)
         .join(Task, Task.id == ProcessRun.task_id)
         .where(
-            ProcessRun.current_state.notin_(RUN_TERMINAL_STATES),
-            Task.status.in_(TERMINAL_STATUSES),
+            ProcessRun.current_state.notin_(RUN_TERMINAL),
+            Task.status.in_(TERMINAL),
         )
     )
     closed = 0
