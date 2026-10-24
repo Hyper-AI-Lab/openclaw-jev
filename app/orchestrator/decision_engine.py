@@ -3,27 +3,18 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-TERMINAL_STATUSES = frozenset(
-    {"completed", "failed", "stopped_by_user", "compensated", "cancelled"}
-)
+from app.status import AGENT_STEP_OUTCOMES, StepStatus
+
 # closed_reason of a request's intake reservation once intake handled the message elsewhere.
 INTAKE_PLACEHOLDER = "intake_placeholder"
 # closed_reason of a task whose accepted reply Slack refused for good.
 SLACK_DELIVERY_FAILED = "slack_delivery_failed"
-RETRYABLE_STATUSES = frozenset({"pending", "needs_replan"})
+RETRYABLE_STATUSES = frozenset({StepStatus.PENDING, StepStatus.NEEDS_REPLAN})
 
 
 def normalize_agent_status(raw_status: str) -> str:
-    status = (raw_status or "pending").strip().lower()
-    allowed = {
-        "completed",
-        "pending",
-        "failed",
-        "stopped_by_user",
-        "blocked",
-        "needs_replan",
-    }
-    return status if status in allowed else "pending"
+    status = (raw_status or StepStatus.PENDING).strip().lower()
+    return status if status in AGENT_STEP_OUTCOMES else StepStatus.PENDING
 
 
 def decide_step_outcome(

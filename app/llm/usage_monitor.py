@@ -530,14 +530,14 @@ def _ended_task_ids_sync(task_ids: List[str]) -> set:
         from sqlalchemy import create_engine, text
 
         from app.db.database import DATABASE_URL
-        from app.orchestrator.decision_engine import TERMINAL_STATUSES
+        from app.status import TERMINAL
 
         engine = create_engine(DATABASE_URL.replace("+asyncpg", "+psycopg2"))
         try:
             with engine.connect() as conn:
                 rows = conn.execute(
                     text("SELECT id::text FROM tasks WHERE id::text = ANY(:ids) AND status = ANY(:ended)"),
-                    {"ids": list(task_ids), "ended": list(TERMINAL_STATUSES)},
+                    {"ids": list(task_ids), "ended": list(TERMINAL)},
                 ).fetchall()
         finally:
             engine.dispose()

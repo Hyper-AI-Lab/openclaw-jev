@@ -23,6 +23,7 @@ from app.config import (
     OPENCLAW_HOME,
     RMP_DATA_DIR,
 )
+from app.status import TERMINAL
 
 logger = logging.getLogger("rmp.llm_quota")
 
@@ -49,9 +50,6 @@ RESERVE_WAIT_LOG_SEC = 2.0
 RMP_TASK_SESSION_RE = re.compile(
     r"rmp_task_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.IGNORECASE,
-)
-TERMINAL_TASK_STATUSES = frozenset(
-    {"completed", "failed", "compensated", "stopped_by_user", "cancelled"}
 )
 DEFAULT_STALE_SLOT_MS = 90 * 60 * 1000
 # Canary/system/intake sessions must not pin LLM slots for long — they starve user work.
@@ -858,7 +856,7 @@ def reap_stale_llm_slots_sync(max_age_ms: int = DEFAULT_STALE_SLOT_MS) -> List[s
             status = _lookup_task_status_sync(task_id)
             if status is None:
                 reason = "missing_task"
-            elif status in TERMINAL_TASK_STATUSES:
+            elif status in TERMINAL:
                 reason = f"task_{status}"
             else:
                 # Look up canary-ish goals cheaply via session key only above;
