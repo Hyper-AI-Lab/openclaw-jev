@@ -1,5 +1,5 @@
 """The status vocabulary (app/status.py), its named sets, and the guard that keeps every task, run and step status
-literal outside workflow code in it."""
+literal in it, workflow code included."""
 import ast
 import json
 import re
@@ -188,9 +188,10 @@ def test_no_stored_status_is_renamed():
 
 
 # The guard (specs/WP-04.md D-4). A vocabulary value is any TaskStatus, RunState or StepStatus value. The scanners'
-# track statuses are not task statuses and retire with the scanners (K-31); app/workflows/ joins the guard with WP04-11.
+# track statuses are not task statuses and retire with the scanners (K-31).
 GUARDED = ("app", "ops", "worker.py")
-EXEMPT = ("app/status.py", "app/scanners/", "app/workflows/")
+EXEMPT = ("app/status.py", "app/scanners/")
+WORKFLOW_CODE = "app/workflows/"
 ROWS = {"Task": "status", "ProcessRun": "current_state", "Step": "status"}
 STATUS_ATTRIBUTES = frozenset({"status", "current_state"})
 COMPARISONS = (ast.Eq, ast.NotEq, ast.In, ast.NotIn)
@@ -199,6 +200,13 @@ MEMBERSHIP_CALLS = ("in_", "notin_", "not_in")
 COLLECTIONS = (ast.Set, ast.Tuple, ast.List)
 STATUS_WORD = re.compile(r"status|current_state", re.IGNORECASE)
 QUOTED_VALUE = re.compile("'(?:" + "|".join(sorted(VOCABULARY)) + ")'")
+# G7's contexts in workflow code: the activities whose payload carries a status, the calls that schedule them and
+# the payload keys that hold it, and the workflows' own status helpers.
+STATUS_ACTIVITIES = frozenset({
+    "update_task_status", "update_process_state", "finalize_task_failure", "execute_compensation", "record_step"})
+ACTIVITY_CALLS = frozenset({"execute_activity", "start_activity"})
+STATUS_KEYS = frozenset({"status", "task_status", "state", "process_state"})
+STATUS_HELPERS = frozenset({"_status", "_close", "_ask", "_stop_task"})
 
 
 def _string(node):
@@ -230,11 +238,16 @@ def _status_attribute(node):
     return isinstance(node, ast.Attribute) and node.attr in STATUS_ATTRIBUTES
 
 
+def _leaves(node):
+    """The expressions a value can evaluate to: itself, or both branches of a conditional."""
+    if isinstance(node, ast.IfExp):
+        return _leaves(node.body) + _leaves(node.orelse)
+    return [node]
+
+
 def _assigned_values(node):
     """The constants an assigned expression can evaluate to: itself, or both branches of a conditional."""
-    if isinstance(node, ast.IfExp):
-        return _assigned_values(node.body) + _assigned_values(node.orelse)
-    return [node.value] if _string(node) else []
+    return [leaf.value for leaf in _leaves(node) if _string(leaf)]
 
 
 def _imports_a_row(tree):
@@ -254,8 +267,86 @@ def _model_defaults(tree):
                 yield stmt.lineno
 
 
+def _vocabulary_value(node):
+    return _string(node) and node.value in VOCABULARY
+
+
+def _key(node):
+    return node.value if _string(node) else None
+
+
+def _called(call):
+    """``f`` for ``f(...)`` and ``x.f(...)``."""
+    func = call.func
+    return func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+
+
+def _status_read(node):
+    """The name ``status``, ``<x>.get("status")`` or ``<x>["status"]``."""
+    if isinstance(node, ast.Name):
+        return node.id == "status"
+    if isinstance(node, ast.Call):
+        return _called(node) == "get" and bool(node.args) and _key(node.args[0]) == "status"
+    return isinstance(node, ast.Subscript) and _key(node.slice) == "status"
+
+
+def _activity_payload(call):
+    """The dict a status activity is given: ``workflow.execute_activity(<status activity>, {...}, ...)``."""
+    func, args = call.func, call.args
+    if (isinstance(func, ast.Attribute) and func.attr in ACTIVITY_CALLS and isinstance(func.value, ast.Name)
+            and func.value.id == "workflow" and len(args) >= 2 and isinstance(args[0], ast.Name)
+            and args[0].id in STATUS_ACTIVITIES and isinstance(args[1], ast.Dict)):
+        return args[1]
+    return None
+
+
+def workflow_status_values(tree, is_status):
+    """G7 (workflow code): (clause, node) for every value ``is_status`` accepts in a status context.
+
+    ``is_status`` says what a status value is: a vocabulary string for the guard, an app.status member for the
+    lifecycle test (tests/test_lifecycles.py). A conditional expression counts by each of its branches.
+    """
+    found = []
+
+    def take(clause, node):
+        found.extend((clause, leaf) for leaf in _leaves(node) if is_status(leaf))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            payload = _activity_payload(node)
+            if payload is not None:
+                for key, value in zip(payload.keys, payload.values):
+                    if _key(key) in STATUS_KEYS:
+                        take("G7a", value)
+            if _called(node) in STATUS_HELPERS:
+                for arg in [*node.args, *(keyword.value for keyword in node.keywords)]:
+                    take("G7c", arg)
+        if isinstance(node, ast.Dict):
+            entries = {_key(key): value for key, value in zip(node.keys, node.values)}
+            if "status" in entries and ("task_id" in entries or "step_id" in entries):
+                take("G7b", entries["status"])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in STATUS_HELPERS:
+            for default in [*node.args.defaults, *node.args.kw_defaults]:
+                if default is not None:
+                    take("G7c", default)
+        if isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+            for op, left, right in zip(node.ops, operands, operands[1:]):
+                if not isinstance(op, COMPARISONS):
+                    continue
+                for side, other in ((left, right), (right, left)):
+                    compared = list(other.elts) if isinstance(other, COLLECTIONS) else [other]
+                    if _status_read(side) and compared and all(is_status(value) for value in compared):
+                        found.extend(("G7d", value) for value in compared)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id.endswith("status") for target in targets):
+                take("G7e", node.value)
+    return found
+
+
 def violations(tree, path):
-    """Sorted (line, rule) pairs of G1-G6 in one module."""
+    """Sorted (line, rule) pairs of G1-G6 in one module, and of G7 when it is workflow code."""
     found = set()
     imports_a_row = _imports_a_row(tree)
     for node in ast.walk(tree):
@@ -285,14 +376,15 @@ def violations(tree, path):
                             and any(v in VOCABULARY for v in _assigned_values(value))):
                         found.add((node.lineno, "G4"))
         if isinstance(node, ast.Call):
-            func = node.func
-            row = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+            row = _called(node)
             if row in ROWS and any(k.arg in STATUS_ATTRIBUTES and _string(k.value) for k in node.keywords):
                 found.add((node.lineno, "G5"))
         if _string(node) and STATUS_WORD.search(node.value) and QUOTED_VALUE.search(node.value):
             found.add((node.lineno, "G6"))
     if path == "app/db/models.py":
         found.update((line, "G5") for line in _model_defaults(tree))
+    if path.startswith(WORKFLOW_CODE):
+        found.update((value.lineno, clause) for clause, value in workflow_status_values(tree, _vocabulary_value))
     return sorted(found)
 
 
@@ -315,6 +407,18 @@ def _rules(source, path="app/example.py"):
     ("G5", 'class ProcessRun(Base):\n    current_state = Column(String, default="created")', "app/db/models.py"),
     ("G6", 'text("SELECT id FROM tasks WHERE status = \'running\'")', "app/example.py"),
     ("G6", 'sql = "UPDATE process_runs SET current_state = \'canceled\' WHERE id = :id"', "ops/example.py"),
+    ("G7a", 'workflow.execute_activity(update_process_state, {"process_run_id": run_id, "state": "awaiting_approval"})',
+     "app/workflows/example.py"),
+    ("G7a", 'workflow.start_activity(finalize_task_failure, {"process_run_id": run_id,\n'
+            '    "process_state": "failed_terminal" if hard else "compensated"})', "app/workflows/example.py"),
+    ("G7b", 'result = {"status": "compensated", "task_id": task_id, "step": step.name}', "app/workflows/example.py"),
+    ("G7b", 'return {"status": "pending", "reason": why, "text": "", "step_id": step_id}', "app/workflows/example.py"),
+    ("G7c", 'await self._close("cancelled", "canceled")', "app/workflows/example.py"),
+    ("G7c", 'async def _stop_task(self, task_id, status="stopped_by_user"):\n    pass', "app/workflows/example.py"),
+    ("G7d", 'if result.get("status") != "completed":\n    pass', "app/workflows/example.py"),
+    ("G7d", 'if quality["status"] in ("failed", "stopped_by_user"):\n    pass', "app/workflows/example.py"),
+    ("G7e", 'step_status = "completed" if done else ("failed" if broken else decision["status"])',
+     "app/workflows/example.py"),
 ])
 def test_each_rule_flags_its_snippet(rule, source, path):
     assert rule in _rules(source, path)
@@ -327,6 +431,18 @@ def test_each_rule_flags_its_snippet(rule, source, path):
     ("G4", 'result = {"status": "failed", "summary": "main moved while the deploy waited"}', "app/coding/deploy.py"),
     ("G5", 'db.add(DeepContextReport(id=rid, status="failed"))', "app/activities/deep_memory_activities.py"),
     ("G6", 'text("SELECT count(*) FROM tasks WHERE status IN :statuses")', "app/production/canary_sentinel.py"),
+    # A deep-recall report's status, sent to an activity that writes no task, run or step status.
+    ("G7a", 'workflow.execute_activity(settle_recall_report, {"report_id": rid, "status": "cancelled"})',
+     "app/workflows/recall_phase.py"),
+    # A deploy result names no task or step.
+    ("G7b", 'shipped = {"status": "failed", "summary": "Shipping failed; nothing was deployed."}',
+     "app/workflows/coding_task.py"),
+    ("G7c", 'await self._settle_recall("none", status="cancelled", reason=reason)', "app/workflows/recall_phase.py"),
+    ("G7d", 'if report.get("status") in ("failed", "timeout"):\n    pass', "app/workflows/example.py"),
+    # The default of a read is no write.
+    ("G7e", 'status = result.get("status", "pending")', "app/workflows/catalog_task.py"),
+    # G7 covers workflow code only.
+    ("G7b", 'return {"status": "cancelled", "task_id": task_id}', "app/api/server.py"),
 ])
 def test_each_rule_passes_its_negative(rule, source, path):
     assert not _rules(source, path)
