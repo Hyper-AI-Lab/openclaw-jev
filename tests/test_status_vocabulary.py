@@ -217,6 +217,7 @@ STATUS_ACTIVITIES = frozenset({
 ACTIVITY_CALLS = frozenset({"execute_activity", "start_activity"})
 STATUS_KEYS = frozenset({"status", "task_status", "state", "process_state"})
 STATUS_HELPERS = frozenset({"_status", "_close", "_ask", "_stop_task"})
+ENUM_NAMES = frozenset(enum.__name__ for enum in ENUMS)
 
 
 def _string(node):
@@ -281,6 +282,11 @@ def _vocabulary_value(node):
     return _string(node) and node.value in VOCABULARY
 
 
+def status_member(node):
+    """An app.status member written out: ``TaskStatus.RUNNING``."""
+    return isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in ENUM_NAMES
+
+
 def _key(node):
     return node.value if _string(node) else None
 
@@ -313,7 +319,7 @@ def _activity_payload(call):
 def workflow_status_values(tree, is_status):
     """G7 (workflow code): (clause, node) for every value ``is_status`` accepts in a status context.
 
-    ``is_status`` says what a status value is: a vocabulary string for the guard, an app.status member for the
+    ``is_status`` picks the values reported: a vocabulary string for the guard, an app.status member for the
     lifecycle test (tests/test_lifecycles.py). A conditional expression counts by each of its branches.
     """
     found = []
@@ -346,8 +352,10 @@ def workflow_status_values(tree, is_status):
                     continue
                 for side, other in ((left, right), (right, left)):
                     compared = list(other.elts) if isinstance(other, COLLECTIONS) else [other]
-                    if _status_read(side) and compared and all(is_status(value) for value in compared):
-                        found.extend(("G7d", value) for value in compared)
+                    # Strings and members alike make a status comparison, so a half-converted tuple shows its strings.
+                    if (_status_read(side) and compared
+                            and all(_vocabulary_value(value) or status_member(value) for value in compared)):
+                        found.extend(("G7d", value) for value in compared if is_status(value))
         if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if any(isinstance(target, ast.Name) and target.id.endswith("status") for target in targets):
@@ -427,6 +435,8 @@ def _rules(source, path="app/example.py"):
     ("G7c", 'async def _stop_task(self, task_id, status="stopped_by_user"):\n    pass', "app/workflows/example.py"),
     ("G7d", 'if result.get("status") != "completed":\n    pass', "app/workflows/example.py"),
     ("G7d", 'if quality["status"] in ("failed", "stopped_by_user"):\n    pass', "app/workflows/example.py"),
+    # Half converted: a member next to a string does not hide the string.
+    ("G7d", 'if status in (StepStatus.FAILED, "blocked"):\n    pass', "app/workflows/example.py"),
     ("G7e", 'step_status = "completed" if done else ("failed" if broken else decision["status"])',
      "app/workflows/example.py"),
 ])
@@ -449,6 +459,8 @@ def test_each_rule_flags_its_snippet(rule, source, path):
      "app/workflows/coding_task.py"),
     ("G7c", 'await self._settle_recall("none", status="cancelled", reason=reason)', "app/workflows/recall_phase.py"),
     ("G7d", 'if report.get("status") in ("failed", "timeout"):\n    pass', "app/workflows/example.py"),
+    ("G7d", 'if result.get("status") in (TaskStatus.FAILED, TaskStatus.COMPENSATED):\n    pass',
+     "app/workflows/example.py"),
     # The default of a read is no write.
     ("G7e", 'status = result.get("status", "pending")', "app/workflows/catalog_task.py"),
     # G7 covers workflow code only.

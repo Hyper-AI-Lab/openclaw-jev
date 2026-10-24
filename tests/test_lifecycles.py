@@ -8,18 +8,12 @@ import pytest
 from temporalio import workflow
 
 import worker
-from app.status import LIFECYCLES, NO_TASK_STATUS, TERMINAL, WAITING, RunState, StepStatus, TaskStatus
-from tests.test_status_vocabulary import workflow_status_values
+from app.status import LIFECYCLES, NO_TASK_STATUS, TERMINAL, WAITING, RunState, TaskStatus
+from tests.test_status_vocabulary import status_member, workflow_status_values
 
-ENUMS = {enum.__name__: enum for enum in (TaskStatus, RunState, StepStatus)}
 # By Temporal workflow type name, the name LIFECYCLES and NO_TASK_STATUS use; a @workflow.defn(name=...) makes it
 # differ from the class name.
 REGISTERED = {workflow._Definition.must_from_class(cls).name: cls for cls in worker.WORKFLOWS}
-
-
-def _member(node):
-    """An app.status member written out: ``TaskStatus.RUNNING``."""
-    return isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in ENUMS
 
 
 def _workflow_classes(workflow_class):
@@ -30,7 +24,7 @@ def _workflow_classes(workflow_class):
 def _named(workflow_class):
     """The TaskStatus and RunState members in G7's contexts across the type's workflow classes."""
     members = {(node.value.id, node.attr) for cls in _workflow_classes(workflow_class)
-               for _clause, node in workflow_status_values(ast.parse(inspect.getsource(cls)), _member)}
+               for _clause, node in workflow_status_values(ast.parse(inspect.getsource(cls)), status_member)}
     return ({TaskStatus[name] for enum, name in members if enum == "TaskStatus"},
             {RunState[name] for enum, name in members if enum == "RunState"})
 
