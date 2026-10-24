@@ -194,6 +194,8 @@ EXEMPT = ("app/status.py", "app/scanners/", "app/workflows/")
 ROWS = {"Task": "status", "ProcessRun": "current_state", "Step": "status"}
 STATUS_ATTRIBUTES = frozenset({"status", "current_state"})
 COMPARISONS = (ast.Eq, ast.NotEq, ast.In, ast.NotIn)
+# .in_() and SQLAlchemy's two spellings of its negation, .notin_() and 2.0's .not_in().
+MEMBERSHIP_CALLS = ("in_", "notin_", "not_in")
 COLLECTIONS = (ast.Set, ast.Tuple, ast.List)
 STATUS_WORD = re.compile(r"status|current_state", re.IGNORECASE)
 QUOTED_VALUE = re.compile("'(?:" + "|".join(sorted(VOCABULARY)) + ")'")
@@ -269,7 +271,7 @@ def violations(tree, path):
                         found.add((node.lineno, "G2"))
                     if imports_a_row and _status_attribute(side) and _all_vocabulary(other):
                         found.add((node.lineno, "G3"))
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("in_", "notin_")
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in MEMBERSHIP_CALLS
                 and _column(node.func.value) and any(_holds_a_string(arg) for arg in node.args)):
             found.add((node.lineno, "G2"))
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -304,6 +306,7 @@ def _rules(source, path="app/example.py"):
     ("G2", 'select(Task).where(Task.status == "running")', "app/example.py"),
     ("G2", 'select(Step).where(Step.status.in_(["running", "pending"]))', "app/example.py"),
     ("G2", 'select(ProcessRun).where(ProcessRun.current_state.notin_(("canceled",)))', "app/example.py"),
+    ("G2", 'select(Task).where(Task.status.not_in(("canceled",)))', "app/example.py"),
     ("G3", 'from app.db.models import Task\nif task.status == "completed":\n    pass', "app/example.py"),
     ("G3", 'from app.db.models import Step\nok = step.status != "pending"', "app/example.py"),
     ("G4", 'task.status = "failed"', "app/example.py"),
@@ -330,7 +333,8 @@ def test_each_rule_passes_its_negative(rule, source, path):
 
 
 def test_no_status_literal_outside_the_vocabulary():
-    found = [f"{rel}:{line} {rule}"
-             for rel, tree in _parsed(*(REPO / root for root in GUARDED)) if not rel.startswith(EXEMPT)
-             for line, rule in violations(tree, rel)]
+    modules = [(rel, tree) for rel, tree in _parsed(*(REPO / root for root in GUARDED)) if not rel.startswith(EXEMPT)]
+    # The walk reached every guarded root: a walk that finds no file would pass on anything.
+    assert {"app/api/server.py", "ops/temporal_purge_running.py", "worker.py"} <= {rel for rel, _ in modules}
+    found = [f"{rel}:{line} {rule}" for rel, tree in modules for line, rule in violations(tree, rel)]
     assert not found, "task, run or step status literals outside app/status.py:\n" + "\n".join(found)
