@@ -19,6 +19,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from app.notification_policy import is_internal_task
     from app.orchestrator.decision_engine import SLACK_DELIVERY_FAILED
+    from app.status import RunState, TaskStatus
     from app.task_registry.stop_command import is_whole_message_stop
 
 # Waits between evaluator attempts that produced no verdict: about two hours in all.
@@ -62,8 +63,8 @@ class EvaluatorRetry:
             {
                 "task_id": notify_payload["task_id"],
                 "process_run_id": self.process_run_id,
-                "task_status": "failed",
-                "process_state": "failed_terminal",
+                "task_status": TaskStatus.FAILED,
+                "process_state": RunState.FAILED_TERMINAL,
                 "closed_reason": SLACK_DELIVERY_FAILED,
             },
             start_to_close_timeout=timedelta(seconds=10),
@@ -131,8 +132,8 @@ class EvaluatorRetry:
             {
                 "task_id": task_id,
                 "process_run_id": self.process_run_id,
-                "task_status": "failed",
-                "process_state": "failed_terminal",
+                "task_status": TaskStatus.FAILED,
+                "process_state": RunState.FAILED_TERMINAL,
             },
             start_to_close_timeout=timedelta(seconds=10),
         )
@@ -165,7 +166,7 @@ class EvaluatorRetry:
             start_to_close_timeout=timedelta(seconds=10),
         )
         return {
-            "status": "failed",
+            "status": TaskStatus.FAILED,
             "task_id": task_id,
             "reason": "evaluator_unavailable",
             "user_notified": notified,
