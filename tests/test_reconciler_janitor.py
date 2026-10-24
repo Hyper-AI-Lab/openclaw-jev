@@ -337,6 +337,8 @@ async def test_reconciler_indexes_the_tasks_it_completes_after_commit():
 async def test_a_cancelled_run_of_a_completed_workflow_stays_cancelled(tmp_path):
     """The stale repair completes the task of a completed workflow and closes its open runs; a run that already ended
     (here canceled) keeps its state."""
+    from datetime import timezone
+
     from sqlalchemy import select
     from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
     from sqlalchemy.orm import sessionmaker
@@ -349,7 +351,7 @@ async def test_a_cancelled_run_of_a_completed_workflow_stays_cancelled(tmp_path)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all, tables=[Task.__table__, ProcessRun.__table__, Event.__table__])
     factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    stale = datetime.utcnow() - timedelta(minutes=STALE_TASK_MINUTES + 5)
+    stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=STALE_TASK_MINUTES + 5)
     async with factory() as db:
         db.add_all([
             Task(id="stale-done", goal="Summarize my inbox", task_type="user", status="created", updated_at=stale),

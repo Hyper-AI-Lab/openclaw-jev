@@ -3,7 +3,7 @@ literal outside workflow code in it."""
 import ast
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -138,7 +138,8 @@ async def test_a_call_without_a_state_keeps_the_stored_spelling(runs):
 
 async def test_a_cancelled_close_clears_the_next_check(runs):
     async with runs() as db:
-        db.add(Task(id="t2", goal="g", status="running", next_check_at=datetime.utcnow() + timedelta(minutes=60)))
+        next_check_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=60)
+        db.add(Task(id="t2", goal="g", status="running", next_check_at=next_check_at))
         await db.commit()
 
     with patch("app.task_registry.hooks.index_terminal_task_async", new_callable=AsyncMock) as index:
