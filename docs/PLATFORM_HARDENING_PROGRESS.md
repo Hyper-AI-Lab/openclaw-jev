@@ -2697,3 +2697,18 @@ The tree is clean. **Resumed from cache:** the fixer re-runs, then the round-2 r
 **Four-layout verify** (HEAD `05127a2`): default, live, coding-job and direct each gave 1650 passed, 1 skipped, leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. Each run took 17–19 min. Summary in `research/wp04-b1-verify-summary.txt`.
 
 **Next:** PR with the gated merge; the deploy restarts rmp-api and rmp-worker; then the host steps (the strict idle count, the next `CANARY OK`).
+
+## 2026-10-24 15:48 UTC · PR #45: CI failed once; the gate held; a latent dependency-drift bug found and fixed
+
+**The failure:** the gated merge job stopped without merging, because CI `test` failed. The one failure was the new `test_the_dashboard_page_counts_from_the_stats`, with Jinja raising `TypeError: unhashable type: 'dict'`.
+
+**Cause:**
+- `requirements.txt` does not pin Starlette. Production's venv has `starlette 0.52.1`; CI's fresh install resolved `1.10.0`.
+- Starlette 1.x removed `TemplateResponse(name, context)`, and the `/` route still used it.
+- So **any fresh install (CI, or a venv rebuild) breaks the dashboard page**. This batch only added the first test that renders `/`.
+
+**Fix** `e80e183`: the request-first `TemplateResponse(request, "dashboard.html", {...})`, valid on both versions.
+- **Verified:** `tests/test_dashboard.py` passes here (0.52.1). CI (1.10.0) re-runs on the pushed head.
+- **Not re-run:** the full four-layout verify. The change is one call in the `/` route, and the earlier four-layout run covers the rest of the head.
+
+**Ledger:** `WP04-b1-starlette-drift` (medium, WP-09). WP-09's hashed lock must pin every dependency to what production runs.
