@@ -2,7 +2,7 @@
 # Hourly RMP canary — lightweight task proving OpenClaw dispatch path is alive.
 set -euo pipefail
 
-RMP_ROOT="/root/.openclaw/rmp"
+RMP_ROOT="${RMP_ROOT:-/root/.openclaw/rmp}"
 SETTINGS="${RMP_ROOT}/settings.json"
 API_KEY="${RMP_API_KEY:-$(python3 -c "import json; print(json.load(open('${SETTINGS}'))['api_key'])")}"
 HOUR="$(date -u +%Y%m%dT%H%M)"
@@ -98,20 +98,25 @@ for i in $(seq 1 "${MAX_POLLS}"); do
     echo "  poll ${i}: empty response"
     continue
   fi
-  STATUS=$(printf '%s' "${BODY}" | python3 -c "import json,sys
+  # "<status>|yes" when the API says the status is terminal, "<status>|no" otherwise.
+  PARSED=$(printf '%s' "${BODY}" | python3 -c "import json,sys
 try:
-    print(json.load(sys.stdin).get('status',''))
+    task = json.load(sys.stdin)
+    print(task.get('status',''), 'yes' if task.get('terminal') is True else 'no', sep='|')
 except Exception:
-    print('')" || true)
+    print('|no')" || true)
+  IFS='|' read -r STATUS TERMINAL <<< "${PARSED}"
   echo "  poll ${i}: ${STATUS:-unparsed}"
   if [[ "$STATUS" == "completed" ]]; then
     write_result completed "${TASK_ID}"
     echo "CANARY OK"
     exit 0
   fi
-  if [[ "$STATUS" == "failed" ]]; then
-    write_result failed "${TASK_ID}" "task failed"
-    echo "CANARY FAIL: task failed"
+  # Any other terminal status (failed, compensated, cancelled, stopped_by_user) ends the canary now: nothing is left
+  # to wait for or to cancel.
+  if [[ "$TERMINAL" == "yes" ]]; then
+    write_result failed "${TASK_ID}" "task ${STATUS}"
+    echo "CANARY FAIL: task ${STATUS}"
     run_sentinel
     exit 1
   fi

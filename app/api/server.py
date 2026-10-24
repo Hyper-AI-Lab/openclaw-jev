@@ -910,6 +910,7 @@ async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db)):
     return {
         "task_id": task.id,
         "status": task.status,
+        "terminal": task.status in TERMINAL,
         "goal": task.goal,
         "task_type": task.task_type,
         "created_at": task.created_at.isoformat() if task.created_at else None,

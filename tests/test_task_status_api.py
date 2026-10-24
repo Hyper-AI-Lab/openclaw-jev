@@ -1,5 +1,5 @@
-"""The task routes read statuses through app.status: /retry runs only a finished task, and suspend-all cancels every
-task whose workflow it terminates."""
+"""The task routes read statuses through app.status: GET /tasks/{id} says whether a status is terminal, /retry runs
+only a finished task, and suspend-all cancels every task whose workflow it terminates."""
 import httpx
 import pytest
 from sqlalchemy import select
@@ -50,6 +50,17 @@ async def seed(factory, **statuses):
 async def stored(factory, tid):
     async with factory() as db:
         return (await db.execute(select(Task.status).where(Task.id == tid))).scalar_one()
+
+
+async def test_task_status_says_terminal(api):
+    client, factory, _ = api
+    await seed(factory, done="compensated", live="running")
+
+    done = (await client.get("/tasks/done")).json()
+    live = (await client.get("/tasks/live")).json()
+
+    assert done["status"] == "compensated" and done["terminal"] is True
+    assert live["status"] == "running" and live["terminal"] is False
 
 
 async def test_retry_refuses_a_task_that_is_not_finished(api):
