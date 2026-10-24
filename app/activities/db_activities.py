@@ -229,12 +229,11 @@ async def update_process_state(payload: Dict[str, Any]) -> bool:
         run = result.scalar_one_or_none()
         if not run:
             return False
-        state = payload.get("state", run.current_state)
-        # A task spelling is stored as the run's (rule 16): the catalog's _stop_task sends the task's "cancelled",
-        # and a run is "canceled".
-        if state not in RunState:
-            state = RUN_STATE_FOR_TASK_STATUS.get(state, state)
-        run.current_state = state
+        if "state" in payload:
+            # A task spelling handed in is stored as the run's (rule 16): the catalog's _stop_task sends the task's
+            # "cancelled", and a run is "canceled". Without a state, the stored spelling stays as it is.
+            state = payload["state"]
+            run.current_state = state if state in RunState else RUN_STATE_FOR_TASK_STATUS.get(state, state)
         if payload.get("ended"):
             run.ended_at = datetime.utcnow()
             run.lease_owner = None

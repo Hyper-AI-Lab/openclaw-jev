@@ -122,6 +122,20 @@ async def test_a_task_spelling_is_stored_as_the_run_spelling(runs):
     assert run.current_state == "canceled" and run.ended_at is not None
 
 
+async def test_a_call_without_a_state_keeps_the_stored_spelling(runs):
+    """Only a state handed in is mapped: a run already stored with a task spelling is not rewritten (rule 16)."""
+    async with runs() as db:
+        db.add_all([Task(id="t3", goal="g", status="cancelled"),
+                    ProcessRun(id="r3", task_id="t3", current_state="cancelled", lease_owner="worker-1")])
+        await db.commit()
+
+    assert await db_activities.update_process_state({"process_run_id": "r3", "release_lease": True})
+
+    async with runs() as db:
+        run = (await db.execute(select(ProcessRun).where(ProcessRun.id == "r3"))).scalar_one()
+    assert run.current_state == "cancelled" and run.lease_owner is None
+
+
 async def test_a_cancelled_close_clears_the_next_check(runs):
     async with runs() as db:
         db.add(Task(id="t2", goal="g", status="running", next_check_at=datetime.utcnow() + timedelta(minutes=60)))
