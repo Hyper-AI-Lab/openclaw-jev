@@ -157,7 +157,7 @@ _GENERIC = Lifecycle(
 )
 
 # Each task workflow type's lifecycle, by its workflow type name. tests/test_lifecycles.py pins that each type's code
-# writes only what it declares. WP-14 reads the waits to take long human waits out of IDLE_BLOCKING.
+# names only what it declares. WP-14 reads the waits to take long human waits out of IDLE_BLOCKING.
 LIFECYCLES = MappingProxyType({
     "GenericTaskWorkflow": _GENERIC,
     "CatalogTaskWorkflow": Lifecycle(
