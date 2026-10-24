@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 from sqlalchemy import select
 
 from app.config import get_task_registry_config
+from app.status import TaskStatus
 
 
 def derive_recurrence_key(
@@ -145,7 +146,7 @@ async def supersede_decision(
     from app.db.database import AsyncSessionLocal
     from app.db.models import TaskRegistryEntry
 
-    failed_statuses = frozenset({"failed", "failed_terminal", "compensated"})
+    failed_statuses = frozenset({TaskStatus.FAILED, TaskStatus.COMPENSATED})
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(TaskRegistryEntry)

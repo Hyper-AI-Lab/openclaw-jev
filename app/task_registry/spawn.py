@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.activities.db_activities import ensure_process_run
 from app.db.database import AsyncSessionLocal
 from app.db.models import ProcessRun, Task
+from app.status import RUN_TERMINAL, WORKFLOW_OWNED, TaskStatus
 from app.temporal_control import (
     signal_spawn_leg,
     start_task_workflow,
@@ -17,11 +18,6 @@ from app.temporal_control import (
 )
 
 logger = logging.getLogger("rmp.task_registry.spawn")
-
-_TERMINAL_PROCESS = frozenset(
-    {"completed", "failed", "failed_terminal", "canceled", "compensated", "superseded"}
-)
-_ACTIVE_TASK = frozenset({"created", "running", "pending_user_input", "blocked"})
 
 
 async def spawn_process_for_task(
@@ -52,7 +48,7 @@ async def spawn_process_for_task(
         ptype = process_type or task.task_type or "generic_task"
         is_durable = (task.task_kind or "") == "durable"
 
-        if latest and latest.current_state not in _TERMINAL_PROCESS:
+        if latest and latest.current_state not in RUN_TERMINAL:
             if is_durable and await workflow_is_running(task_id):
                 process_run_id = await ensure_process_run(
                     {
@@ -89,8 +85,8 @@ async def spawn_process_for_task(
             }
         )
 
-        if task.status not in _ACTIVE_TASK:
-            task.status = "running"
+        if task.status not in WORKFLOW_OWNED:
+            task.status = TaskStatus.RUNNING
             task.next_check_at = None
 
         workflow_started = False

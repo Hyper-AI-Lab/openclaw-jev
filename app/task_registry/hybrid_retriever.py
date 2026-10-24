@@ -10,18 +10,16 @@ import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import AsyncSessionLocal
 from app.notification_policy import is_internal_task
+from app.status import WORKFLOW_OWNED, TaskStatus
 
 logger = logging.getLogger("rmp.hybrid_retriever")
 
 RRF_K = 60
-ACTIVE_STATUSES = frozenset(
-    {"created", "running", "pending", "pending_user_input", "blocked", "needs_replan"}
-)
 _FTS_WORD = re.compile(r"[^\W_]{3,}", re.UNICODE)
 MAX_FTS_WORDS = 16
 FTS_DAYS = 90
@@ -46,13 +44,13 @@ def reciprocal_rank_fusion(
 
 def status_boost(status: Optional[str], *, age_days: float = 0.0) -> float:
     st = (status or "").lower()
-    if st in {"running", "created", "pending"}:
+    if st in (TaskStatus.RUNNING, TaskStatus.CREATED):
         return 1.35
-    if st in {"blocked", "needs_replan", "pending_user_input"}:
+    if st in (TaskStatus.BLOCKED, TaskStatus.PENDING_USER_INPUT):
         return 1.25
-    if st in {"completed"} and age_days <= 7:
+    if st == TaskStatus.COMPLETED and age_days <= 7:
         return 1.10
-    if st in {"failed", "compensated", "cancelled"}:
+    if st in (TaskStatus.FAILED, TaskStatus.COMPENSATED, TaskStatus.CANCELLED):
         return 0.95
     return 1.0
 
@@ -104,7 +102,7 @@ async def search_fts(
                ts_rank(to_tsvector('english', coalesce(goal,'')), q.query) AS rank
         FROM tasks, websearch_to_tsquery('english', :q) AS q(query)
         WHERE to_tsvector('english', coalesce(goal,'')) @@ q.query
-          AND status IN ('created','running','pending','pending_user_input','blocked','needs_replan')
+          AND status IN :active
           AND coalesce(task_type, '') NOT IN ('canary', 'heartbeat')
           AND updated_at >= :since
           -- An intake reservation is the incoming request itself, not existing work.
@@ -112,7 +110,7 @@ async def search_fts(
         ORDER BY rank DESC
         LIMIT :lim
         """
-    )
+    ).bindparams(bindparam("active", value=sorted(WORKFLOW_OWNED), expanding=True))
     sql_msgs = text(
         """
         SELECT m.task_id, left(m.content, 400) AS snippet, t.status, t.task_type,
@@ -382,7 +380,7 @@ async def assemble_evidence_pack(
             tid = row.get("task_id")
             if tid in live:
                 row["workflow_running"] = live[tid]
-                if row.get("status") in ACTIVE_STATUSES and not live[tid]:
+                if row.get("status") in WORKFLOW_OWNED and not live[tid]:
                     row["stale"] = True
 
     return {

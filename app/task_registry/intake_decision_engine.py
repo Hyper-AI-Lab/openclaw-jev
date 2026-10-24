@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from app.config import get_task_registry_config, get_task_registry_intake_mode
 from app.notification_policy import INTERNAL_TAGS, is_internal_task
 from app.orchestrator.execution_mode import intake_llm_failed, resolve_execution_mode
+from app.status import TaskStatus
 from app.task_registry.session_identity import session_keys_equivalent
 
 VALID_DECISIONS = frozenset(
@@ -80,10 +81,10 @@ def _single_clear_active_target(
     """One running/blocked target on this session — not a pending clarify."""
     candidates = []
     for t in _same_session_actives(active, session_key):
-        st = (t.get("status") or "running").lower()
-        if st in {"pending_user_input"}:
+        st = (t.get("status") or TaskStatus.RUNNING).lower()
+        if st == TaskStatus.PENDING_USER_INPUT:
             continue
-        if st in {"created", "running", "pending", "blocked", "needs_replan"} or not st:
+        if st in (TaskStatus.CREATED, TaskStatus.RUNNING, TaskStatus.BLOCKED) or not st:
             candidates.append(t)
     if len(candidates) == 1:
         return candidates[0]
@@ -96,7 +97,7 @@ def _pending_clarify_target(
     pending = [
         t
         for t in _same_session_actives(active, session_key)
-        if (t.get("status") or "").lower() == "pending_user_input"
+        if (t.get("status") or "").lower() == TaskStatus.PENDING_USER_INPUT
     ]
     flagged = [t for t in pending if t.get("intake_clarify")]
     if len(flagged) == 1:
