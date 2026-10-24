@@ -60,6 +60,7 @@ with workflow.unsafe.imports_passed_through():
         ensure_brief_header,
         format_user_catchup,
     )
+    from app.status import RunState, StepStatus, TaskStatus
     from app.workflows.judgment import EvaluatorRetry
     from app.workflows.recall_phase import DeepRecallPhase
     from app.workflows.timeouts import AURA_TURN
@@ -108,7 +109,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
             self.user_inputs.append(message)
 
     async def _stop_task(
-        self, task_id: str, session_key: str, stop_message: str, status: str = "stopped_by_user"
+        self, task_id: str, session_key: str, stop_message: str, status: str = TaskStatus.STOPPED_BY_USER
     ) -> Dict[str, Any]:
         await workflow.execute_activity(
             update_task_status,
@@ -155,7 +156,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
     ) -> Dict[str, Any]:
         """After a completed catalog leg, wait for spawn_leg and continue-as-new."""
         await self._drop_recall("catalog leg finished")
-        if task_kind != "durable" or result.get("status") != "completed":
+        if task_kind != "durable" or result.get("status") != TaskStatus.COMPLETED:
             return result
         while not self._cancel_requested:
             await workflow.wait_condition(
@@ -268,7 +269,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
 
             await workflow.execute_activity(
                 update_task_status,
-                {"task_id": task_id, "status": "running", "next_check_minutes": 10},
+                {"task_id": task_id, "status": TaskStatus.RUNNING, "next_check_minutes": 10},
                 start_to_close_timeout=timedelta(seconds=10),
             )
             recall_cfg = payload.get("deep_recall") or {}
@@ -302,7 +303,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
         if durable_leg:
             await workflow.execute_activity(
                 update_task_status,
-                {"task_id": task_id, "status": "running", "next_check_minutes": 10},
+                {"task_id": task_id, "status": TaskStatus.RUNNING, "next_check_minutes": 10},
                 start_to_close_timeout=timedelta(seconds=10),
             )
 
@@ -333,7 +334,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         update_process_state,
                         {
                             "process_run_id": self.process_run_id,
-                            "state": "awaiting_approval",
+                            "state": RunState.AWAITING_APPROVAL,
                         },
                         start_to_close_timeout=timedelta(seconds=10),
                     )
@@ -341,7 +342,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         update_task_status,
                         {
                             "task_id": task_id,
-                            "status": "pending_user_input",
+                            "status": TaskStatus.PENDING_USER_INPUT,
                             "next_check_minutes": 60,
                         },
                         start_to_close_timeout=timedelta(seconds=10),
@@ -383,7 +384,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                                     task_id,
                                     session_key,
                                     f"Task {task_id[:8]} closed: no approval within 7 days, so nothing was done.",
-                                    status="cancelled",
+                                    status=TaskStatus.CANCELLED,
                                 )
                             reminded = True
                             await workflow.execute_activity(
@@ -423,13 +424,13 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         update_process_state,
                         {
                             "process_run_id": self.process_run_id,
-                            "state": "running",
+                            "state": RunState.RUNNING,
                         },
                         start_to_close_timeout=timedelta(seconds=10),
                     )
                     await workflow.execute_activity(
                         update_task_status,
-                        {"task_id": task_id, "status": "running", "next_check_minutes": 10},
+                        {"task_id": task_id, "status": TaskStatus.RUNNING, "next_check_minutes": 10},
                         start_to_close_timeout=timedelta(seconds=10),
                     )
                     step_context += f"\nApproval gate '{step.name}': approved"
@@ -440,7 +441,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         update_process_state,
                         {
                             "process_run_id": self.process_run_id,
-                            "state": "waiting_external",
+                            "state": RunState.WAITING_EXTERNAL,
                             "next_check_minutes": step.wait_minutes,
                         },
                         start_to_close_timeout=timedelta(seconds=10),
@@ -449,7 +450,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         update_task_status,
                         {
                             "task_id": task_id,
-                            "status": "pending_user_input",
+                            "status": TaskStatus.PENDING_USER_INPUT,
                             "next_check_minutes": step.wait_minutes,
                         },
                         start_to_close_timeout=timedelta(seconds=10),
@@ -468,14 +469,14 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                     await workflow.sleep(timedelta(minutes=step.wait_minutes))
                     await workflow.execute_activity(
                         update_task_status,
-                        {"task_id": task_id, "status": "running", "next_check_minutes": 10},
+                        {"task_id": task_id, "status": TaskStatus.RUNNING, "next_check_minutes": 10},
                         start_to_close_timeout=timedelta(seconds=10),
                     )
                     await workflow.execute_activity(
                         update_process_state,
                         {
                             "process_run_id": self.process_run_id,
-                            "state": "running",
+                            "state": RunState.RUNNING,
                         },
                         start_to_close_timeout=timedelta(seconds=10),
                     )
@@ -560,7 +561,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                     reason = result.get("reason", "")
                     text = result.get("text", "")
 
-                    if status == "failed":
+                    if status == StepStatus.FAILED:
                         if step_context.strip():
                             await workflow.execute_activity(
                                 execute_compensation,
@@ -583,7 +584,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                                 start_to_close_timeout=timedelta(seconds=30),
                             )
                             return {
-                                "status": "compensated",
+                                "status": TaskStatus.COMPENSATED,
                                 "task_id": task_id,
                                 "step": step.name,
                             }
@@ -592,8 +593,8 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                             {
                                 "task_id": task_id,
                                 "process_run_id": self.process_run_id,
-                                "task_status": "failed",
-                                "process_state": "failed_terminal",
+                                "task_status": TaskStatus.FAILED,
+                                "process_state": RunState.FAILED_TERMINAL,
                             },
                             start_to_close_timeout=timedelta(seconds=10),
                         )
@@ -606,14 +607,14 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                             },
                             start_to_close_timeout=timedelta(seconds=30),
                         )
-                        return {"status": "failed", "task_id": task_id, "step": step.name}
+                        return {"status": TaskStatus.FAILED, "task_id": task_id, "step": step.name}
 
-                    if status == "blocked":
+                    if status == StepStatus.BLOCKED:
                         await workflow.execute_activity(
                             update_task_status,
                             {
                                 "task_id": task_id,
-                                "status": "pending_user_input",
+                                "status": TaskStatus.PENDING_USER_INPUT,
                                 "next_check_minutes": 60,
                             },
                             start_to_close_timeout=timedelta(seconds=10),
@@ -622,7 +623,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                             update_process_state,
                             {
                                 "process_run_id": self.process_run_id,
-                                "state": "blocked",
+                                "state": RunState.BLOCKED,
                             },
                             start_to_close_timeout=timedelta(seconds=10),
                         )
@@ -647,7 +648,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         step_feedback = f"User guidance: {reply}"
                         continue
 
-                    if status == "completed":
+                    if status == StepStatus.COMPLETED:
                         clean = strip_json_eval(text)
                         accumulated_output += f"\n[{step.name}] {clean[:800]}"
                         await workflow.execute_activity(
@@ -688,7 +689,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                             start_to_close_timeout=timedelta(seconds=30),
                         )
                         return {
-                            "status": "compensated",
+                            "status": TaskStatus.COMPENSATED,
                             "task_id": task_id,
                             "step": step.name,
                         }
@@ -697,8 +698,8 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         {
                             "task_id": task_id,
                             "process_run_id": self.process_run_id,
-                            "task_status": "failed",
-                            "process_state": "failed_terminal",
+                            "task_status": TaskStatus.FAILED,
+                            "process_state": RunState.FAILED_TERMINAL,
                         },
                         start_to_close_timeout=timedelta(seconds=10),
                     )
@@ -711,7 +712,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         },
                         start_to_close_timeout=timedelta(seconds=30),
                     )
-                    return {"status": "failed", "task_id": task_id, "step": step.name}
+                    return {"status": TaskStatus.FAILED, "task_id": task_id, "step": step.name}
 
             clean_result = accumulated_output.strip() or "Workflow steps completed."
             added = self._take_user_messages()
@@ -767,7 +768,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                 user_intent=user_intent,
                 payload=payload,
             )
-            if quality.get("status") in ("failed", "stopped_by_user"):
+            if quality.get("status") in (TaskStatus.FAILED, TaskStatus.STOPPED_BY_USER):
                 return quality
             gate = decide_completion_gate(
                 evidence_passed=evidence_ok,
@@ -843,7 +844,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         user_intent=user_intent,
                         payload=payload,
                     )
-                    if quality.get("status") in ("failed", "stopped_by_user"):
+                    if quality.get("status") in (TaskStatus.FAILED, TaskStatus.STOPPED_BY_USER):
                         return quality
                     gate = decide_completion_gate(
                         evidence_passed=catalog_evidence["passed"]
@@ -868,8 +869,8 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         {
                             "task_id": task_id,
                             "process_run_id": self.process_run_id,
-                            "task_status": "failed",
-                            "process_state": "failed_terminal",
+                            "task_status": TaskStatus.FAILED,
+                            "process_state": RunState.FAILED_TERMINAL,
                         },
                         start_to_close_timeout=timedelta(seconds=10),
                     )
@@ -885,7 +886,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         },
                         start_to_close_timeout=timedelta(seconds=30),
                     )
-                    return {"status": "failed", "task_id": task_id}
+                    return {"status": TaskStatus.FAILED, "task_id": task_id}
 
             await workflow.execute_activity(
                 write_process_memory,
@@ -912,14 +913,14 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                 )
             await workflow.execute_activity(
                 update_task_status,
-                {"task_id": task_id, "status": "completed"},
+                {"task_id": task_id, "status": TaskStatus.COMPLETED},
                 start_to_close_timeout=timedelta(seconds=10),
             )
             await workflow.execute_activity(
                 update_process_state,
                 {
                     "process_run_id": self.process_run_id,
-                    "state": "completed",
+                    "state": RunState.COMPLETED,
                     "ended": True,
                 },
                 start_to_close_timeout=timedelta(seconds=10),
@@ -942,7 +943,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                 return await self._finish_durable_catalog(
                     payload,
                     user_intent,
-                    {"status": "completed", "task_id": task_id, "delivered": False},
+                    {"status": TaskStatus.COMPLETED, "task_id": task_id, "delivered": False},
                     task_kind,
                 )
 
@@ -958,7 +959,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                 }
             )
             if not delivered:
-                return {"status": "failed", "task_id": task_id, "reason": SLACK_DELIVERY_FAILED}
+                return {"status": TaskStatus.FAILED, "task_id": task_id, "reason": SLACK_DELIVERY_FAILED}
             if promote_after_delivery:
                 await workflow.execute_activity(
                     promote_completion_memory, promotion, start_to_close_timeout=timedelta(seconds=30)
@@ -966,7 +967,7 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
             return await self._finish_durable_catalog(
                 payload,
                 user_intent,
-                {"status": "completed", "task_id": task_id, "final_result": summary},
+                {"status": TaskStatus.COMPLETED, "task_id": task_id, "final_result": summary},
                 task_kind,
             )
 
@@ -990,17 +991,17 @@ class CatalogTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                     },
                     start_to_close_timeout=timedelta(seconds=30),
                 )
-                return {"status": "compensated", "task_id": task_id}
+                return {"status": TaskStatus.COMPENSATED, "task_id": task_id}
             await workflow.execute_activity(
                 update_task_status,
-                {"task_id": task_id, "status": "failed"},
+                {"task_id": task_id, "status": TaskStatus.FAILED},
                 start_to_close_timeout=timedelta(seconds=10),
             )
             await workflow.execute_activity(
                 update_process_state,
                 {
                     "process_run_id": self.process_run_id,
-                    "state": "failed_terminal",
+                    "state": RunState.FAILED_TERMINAL,
                     "ended": True,
                 },
                 start_to_close_timeout=timedelta(seconds=10),
