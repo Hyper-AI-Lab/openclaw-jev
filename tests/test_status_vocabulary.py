@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
+from temporalio.converter import DataConverter
 from temporalio.worker.workflow_sandbox import SandboxRestrictions
 from temporalio.worker.workflow_sandbox._importer import Importer
 from temporalio.worker.workflow_sandbox._restrictions import RestrictionContext
@@ -58,6 +59,15 @@ def test_members_behave_as_their_strings(member):
     assert hash(member) == hash(member.value)
     assert json.dumps(member) == json.dumps(member.value)
     assert f"{member}" == member.value
+
+
+async def test_a_workflow_payload_encodes_its_members_as_their_strings():
+    """Temporal's converter sends the same bytes when workflow code names a status by its member (WP04-09)."""
+    members = [m for enum in ENUMS for m in enum]
+    as_members = {"task_id": "t1", "status": TaskStatus.CANCELLED, "state": RunState.CANCELED, "all": members}
+    as_strings = {"task_id": "t1", "status": "cancelled", "state": "canceled", "all": [m.value for m in members]}
+    encoded = await DataConverter.default.encode([as_members, TaskStatus.FAILED])
+    assert encoded == await DataConverter.default.encode([as_strings, "failed"])
 
 
 def test_the_vocabulary_imports_inside_the_workflow_sandbox():
