@@ -5,13 +5,16 @@ import dataclasses
 import inspect
 
 import pytest
+from temporalio import workflow
 
 import worker
 from app.status import LIFECYCLES, NO_TASK_STATUS, TERMINAL, WAITING, RunState, StepStatus, TaskStatus
 from tests.test_status_vocabulary import workflow_status_values
 
 ENUMS = {enum.__name__: enum for enum in (TaskStatus, RunState, StepStatus)}
-REGISTERED = {cls.__name__: cls for cls in worker.WORKFLOWS}
+# By Temporal workflow type name, the name LIFECYCLES and NO_TASK_STATUS use; a @workflow.defn(name=...) makes it
+# differ from the class name.
+REGISTERED = {workflow._Definition.must_from_class(cls).name: cls for cls in worker.WORKFLOWS}
 
 
 def _member(node):
