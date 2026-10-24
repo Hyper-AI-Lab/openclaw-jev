@@ -2,8 +2,9 @@
 import ast
 import json
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -117,6 +118,20 @@ async def test_a_task_spelling_is_stored_as_the_run_spelling(runs):
     async with runs() as db:
         run = (await db.execute(select(ProcessRun).where(ProcessRun.id == "r1"))).scalar_one()
     assert run.current_state == "canceled" and run.ended_at is not None
+
+
+async def test_a_cancelled_close_clears_the_next_check(runs):
+    async with runs() as db:
+        db.add(Task(id="t2", goal="g", status="running", next_check_at=datetime.utcnow() + timedelta(minutes=60)))
+        await db.commit()
+
+    with patch("app.task_registry.hooks.index_terminal_task_async", new_callable=AsyncMock) as index:
+        assert await db_activities.update_task_status({"task_id": "t2", "status": "cancelled"})
+
+    async with runs() as db:
+        task = await db.get(Task, "t2")
+    assert task.status == "cancelled" and task.next_check_at is None
+    index.assert_awaited_once_with("t2")
 
 
 # A SQL text that sets a status column to a literal where that column holds another literal: a rename (rule 16).

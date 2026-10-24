@@ -9,7 +9,7 @@ from sqlalchemy import select, update
 from app.db.database import AsyncSessionLocal
 from app.metrics import inc as metrics_inc
 from app.production.alerting import send_alert
-from app.status import RUN_STATE_FOR_TASK_STATUS, RunState
+from app.status import RUN_STATE_FOR_TASK_STATUS, RUN_TERMINAL, TERMINAL, RunState, StepStatus, TaskStatus
 from app.telemetry import traced_activity
 
 logger = logging.getLogger("rmp.db_activities")
@@ -21,11 +21,6 @@ from app.db.models import (
     Step,
     Task,
     TaskMessage,
-)
-
-
-_TERMINAL_PROCESS_STATES = frozenset(
-    {"completed", "failed_terminal", "stopped_by_user", "compensated", "canceled"}
 )
 
 
@@ -45,7 +40,7 @@ async def touch_task_liveness(payload: Dict[str, Any]) -> bool:
         task = result.scalar_one_or_none()
         if not task:
             return False
-        if task.status in ("completed", "failed", "compensated", "stopped_by_user", "cancelled"):
+        if task.status in TERMINAL:
             return False
         task.updated_at = datetime.utcnow()
         await db.commit()
@@ -66,18 +61,18 @@ async def update_task_status(payload: Dict[str, Any]) -> bool:
         task.status = status
         if next_check_minutes is not None:
             task.next_check_at = datetime.utcnow() + timedelta(minutes=next_check_minutes)
-        elif status in ("completed", "failed", "stopped_by_user", "compensated"):
+        elif status in TERMINAL:
             task.next_check_at = None
         await db.commit()
 
-        if status in ("completed", "failed", "stopped_by_user", "compensated", "cancelled"):
+        if status in TERMINAL:
             from app.task_registry.hooks import index_terminal_task_async
 
             await index_terminal_task_async(task_id)
 
-        if status == "completed":
+        if status == TaskStatus.COMPLETED:
             metrics_inc("task_completed")
-        elif status == "failed":
+        elif status == TaskStatus.FAILED:
             metrics_inc("task_failed")
             from app.notification_policy import is_internal_task
 
@@ -169,7 +164,7 @@ async def ensure_process_run(payload: Dict[str, Any]) -> str:
         durable_leg = bool(payload.get("durable_leg"))
         if (
             existing
-            and existing.current_state not in _TERMINAL_PROCESS_STATES
+            and existing.current_state not in RUN_TERMINAL
             and not force_new
         ):
             return existing.id
@@ -178,9 +173,9 @@ async def ensure_process_run(payload: Dict[str, Any]) -> str:
             parent_run_id = existing.id
             if (
                 durable_leg
-                and existing.current_state not in _TERMINAL_PROCESS_STATES
+                and existing.current_state not in RUN_TERMINAL
             ):
-                existing.current_state = "superseded"
+                existing.current_state = RunState.SUPERSEDED
                 existing.ended_at = datetime.utcnow()
                 existing.lease_owner = None
 
@@ -190,7 +185,7 @@ async def ensure_process_run(payload: Dict[str, Any]) -> str:
                 id=run_id,
                 task_id=task_id,
                 process_type=process_type,
-                current_state="running",
+                current_state=RunState.RUNNING,
                 success_criteria=payload.get("success_criteria"),
                 parent_process_run_id=parent_run_id,
                 next_check_at=datetime.utcnow() + timedelta(minutes=5),
@@ -316,7 +311,7 @@ async def record_compensation(payload: Dict[str, Any]) -> bool:
             tr = await db.execute(select(Task).where(Task.id == task_id))
             task = tr.scalar_one_or_none()
             if task:
-                task.status = "compensated"
+                task.status = TaskStatus.COMPENSATED
                 task.next_check_at = None
         if process_run_id:
             pr = await db.execute(
@@ -324,7 +319,7 @@ async def record_compensation(payload: Dict[str, Any]) -> bool:
             )
             run = pr.scalar_one_or_none()
             if run:
-                run.current_state = "compensated"
+                run.current_state = RunState.COMPENSATED
                 run.ended_at = datetime.utcnow()
                 run.lease_owner = None
         db.add(
@@ -364,23 +359,23 @@ async def execute_compensation(payload: Dict[str, Any]) -> Dict[str, Any]:
             if run:
                 if not owner or not run.lease_owner or run.lease_owner == owner:
                     run.lease_owner = None
-                run.current_state = "compensated"
+                run.current_state = RunState.COMPENSATED
                 run.ended_at = datetime.utcnow()
             step_result = await db.execute(
                 select(Step).where(
                     Step.process_run_id == process_run_id,
-                    Step.status.in_(("running", "pending")),
+                    Step.status.in_((StepStatus.RUNNING, StepStatus.PENDING)),
                 )
             )
             for step in step_result.scalars().all():
-                step.status = "compensated"
+                step.status = StepStatus.COMPENSATED
                 step.ended_at = datetime.utcnow()
                 steps_marked += 1
         if task_id:
             tr = await db.execute(select(Task).where(Task.id == task_id))
             task = tr.scalar_one_or_none()
             if task:
-                task.status = "compensated"
+                task.status = TaskStatus.COMPENSATED
                 task.next_check_at = None
         db.add(
             Event(
@@ -438,8 +433,8 @@ async def record_step(payload: Dict[str, Any]) -> str:
                     existing.output_ref = payload.get("output_ref")
                 if payload.get("ended"):
                     existing.ended_at = datetime.utcnow()
-                    if existing.status == "running":
-                        existing.status = payload.get("status", "completed")
+                    if existing.status == StepStatus.RUNNING:
+                        existing.status = payload.get("status", StepStatus.COMPLETED)
                 await db.commit()
                 return existing.id
 
