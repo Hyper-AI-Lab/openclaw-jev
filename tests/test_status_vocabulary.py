@@ -1,4 +1,5 @@
-"""The status vocabulary (app/status.py), its named sets, and the stored spellings they keep (rule 16)."""
+"""The status vocabulary (app/status.py), its named sets, and the guard that keeps every task, run and step status
+literal outside workflow code in it."""
 import ast
 import json
 import re
@@ -35,6 +36,7 @@ from app.status import (
 
 REPO = Path(__file__).resolve().parents[1]
 ENUMS = (TaskStatus, RunState, StepStatus)
+VOCABULARY = frozenset(member.value for enum in ENUMS for member in enum)
 
 
 def test_the_vocabulary_is_pinned():
@@ -168,3 +170,152 @@ def test_no_stored_status_is_renamed():
                for node in ast.walk(tree)
                if isinstance(node, ast.Constant) and isinstance(node.value, str) and RENAME.search(node.value)]
     assert not renames, "SQL that renames a stored status:\n" + "\n".join(renames)
+
+
+# The guard (specs/WP-04.md D-4). A vocabulary value is any TaskStatus, RunState or StepStatus value. The scanners'
+# track statuses are not task statuses and retire with the scanners (K-31); app/workflows/ joins the guard with WP04-11.
+GUARDED = ("app", "ops", "worker.py")
+EXEMPT = ("app/status.py", "app/scanners/", "app/workflows/")
+ROWS = {"Task": "status", "ProcessRun": "current_state", "Step": "status"}
+STATUS_ATTRIBUTES = frozenset({"status", "current_state"})
+COMPARISONS = (ast.Eq, ast.NotEq, ast.In, ast.NotIn)
+COLLECTIONS = (ast.Set, ast.Tuple, ast.List)
+STATUS_WORD = re.compile(r"status|current_state", re.IGNORECASE)
+QUOTED_VALUE = re.compile("'(?:" + "|".join(sorted(VOCABULARY)) + ")'")
+
+
+def _string(node):
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def _vocabulary_set(node):
+    """G1: a set, tuple or list literal of two or more strings, every one a vocabulary value."""
+    return (isinstance(node, COLLECTIONS) and len(node.elts) >= 2
+            and all(_string(e) and e.value in VOCABULARY for e in node.elts))
+
+
+def _holds_a_string(node):
+    return _string(node) or (isinstance(node, COLLECTIONS) and any(_string(e) for e in node.elts))
+
+
+def _all_vocabulary(node):
+    """A string constant, or a literal collection of them, whose strings are all vocabulary values."""
+    values = [node] if _string(node) else list(node.elts) if isinstance(node, COLLECTIONS) and node.elts else None
+    return values is not None and all(_string(v) and v.value in VOCABULARY for v in values)
+
+
+def _column(node):
+    """Task.status, ProcessRun.current_state or Step.status."""
+    return isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and ROWS.get(node.value.id) == node.attr
+
+
+def _status_attribute(node):
+    return isinstance(node, ast.Attribute) and node.attr in STATUS_ATTRIBUTES
+
+
+def _assigned_values(node):
+    """The constants an assigned expression can evaluate to: itself, or both branches of a conditional."""
+    if isinstance(node, ast.IfExp):
+        return _assigned_values(node.body) + _assigned_values(node.orelse)
+    return [node.value] if _string(node) else []
+
+
+def _imports_a_row(tree):
+    return any(isinstance(node, ast.ImportFrom) and node.module == "app.db.models"
+               and any(alias.name in ROWS for alias in node.names) for node in ast.walk(tree))
+
+
+def _model_defaults(tree):
+    """G5 in app/db/models.py: a string-constant default= of Task.status, ProcessRun.current_state or Step.status."""
+    for cls in tree.body:
+        if not isinstance(cls, ast.ClassDef) or cls.name not in ROWS:
+            continue
+        for stmt in cls.body:
+            if (isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call)
+                    and any(isinstance(t, ast.Name) and t.id == ROWS[cls.name] for t in stmt.targets)
+                    and any(k.arg == "default" and _string(k.value) for k in stmt.value.keywords)):
+                yield stmt.lineno
+
+
+def violations(tree, path):
+    """Sorted (line, rule) pairs of G1-G6 in one module."""
+    found = set()
+    imports_a_row = _imports_a_row(tree)
+    for node in ast.walk(tree):
+        if _vocabulary_set(node):
+            found.add((node.lineno, "G1"))
+        if isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+            for op, left, right in zip(node.ops, operands, operands[1:]):
+                if not isinstance(op, COMPARISONS):
+                    continue
+                for side, other in ((left, right), (right, left)):
+                    if _column(side) and _holds_a_string(other):
+                        found.add((node.lineno, "G2"))
+                    if imports_a_row and _status_attribute(side) and _all_vocabulary(other):
+                        found.add((node.lineno, "G3"))
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("in_", "notin_")
+                and _column(node.func.value) and any(_holds_a_string(arg) for arg in node.args)):
+            found.add((node.lineno, "G2"))
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                pairs = [(target, node.value)]
+                if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple):
+                    pairs = list(zip(target.elts, node.value.elts))
+                for name, value in pairs:
+                    if (value is not None and _status_attribute(name)
+                            and any(v in VOCABULARY for v in _assigned_values(value))):
+                        found.add((node.lineno, "G4"))
+        if isinstance(node, ast.Call):
+            func = node.func
+            row = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+            if row in ROWS and any(k.arg in STATUS_ATTRIBUTES and _string(k.value) for k in node.keywords):
+                found.add((node.lineno, "G5"))
+        if _string(node) and STATUS_WORD.search(node.value) and QUOTED_VALUE.search(node.value):
+            found.add((node.lineno, "G6"))
+    if path == "app/db/models.py":
+        found.update((line, "G5") for line in _model_defaults(tree))
+    return sorted(found)
+
+
+def _rules(source, path="app/example.py"):
+    return {rule for _, rule in violations(ast.parse(source), path)}
+
+
+@pytest.mark.parametrize("rule, source, path", [
+    ("G1", 'DONE = frozenset({"completed", "failed"})', "app/example.py"),
+    ("G1", 'if run.current_state in ("canceled", "superseded"):\n    pass', "app/example.py"),
+    ("G2", 'select(Task).where(Task.status == "running")', "app/example.py"),
+    ("G2", 'select(Step).where(Step.status.in_(["running", "pending"]))', "app/example.py"),
+    ("G2", 'select(ProcessRun).where(ProcessRun.current_state.notin_(("canceled",)))', "app/example.py"),
+    ("G3", 'from app.db.models import Task\nif task.status == "completed":\n    pass', "app/example.py"),
+    ("G3", 'from app.db.models import Step\nok = step.status != "pending"', "app/example.py"),
+    ("G4", 'task.status = "failed"', "app/example.py"),
+    ("G4", 'run.current_state = "canceled" if stopped else "completed"', "app/example.py"),
+    ("G5", 'db.add(Task(id=tid, goal=goal, status="created"))', "app/example.py"),
+    ("G5", 'class ProcessRun(Base):\n    current_state = Column(String, default="created")', "app/db/models.py"),
+    ("G6", 'text("SELECT id FROM tasks WHERE status = \'running\'")', "app/example.py"),
+    ("G6", 'sql = "UPDATE process_runs SET current_state = \'canceled\' WHERE id = :id"', "ops/example.py"),
+])
+def test_each_rule_flags_its_snippet(rule, source, path):
+    assert rule in _rules(source, path)
+
+
+@pytest.mark.parametrize("rule, source, path", [
+    ("G1", 'SOFT_HEALTH_STATUSES = frozenset({"timeout", "failed"})', "app/production/canary_sentinel.py"),
+    ("G2", "select(Task).where(Task.status.in_(TERMINAL), Task.status != TaskStatus.CREATED)", "app/example.py"),
+    ("G3", 'from app.db.models import Task\nif result.status in ("failed", "timeout"):\n    pass', "app/example.py"),
+    ("G4", 'result = {"status": "failed", "summary": "main moved while the deploy waited"}', "app/coding/deploy.py"),
+    ("G5", 'db.add(DeepContextReport(id=rid, status="failed"))', "app/activities/deep_memory_activities.py"),
+    ("G6", 'text("SELECT count(*) FROM tasks WHERE status IN :statuses")', "app/production/canary_sentinel.py"),
+])
+def test_each_rule_passes_its_negative(rule, source, path):
+    assert not _rules(source, path)
+
+
+def test_no_status_literal_outside_the_vocabulary():
+    found = [f"{rel}:{line} {rule}"
+             for rel, tree in _parsed(*(REPO / root for root in GUARDED)) if not rel.startswith(EXEMPT)
+             for line, rule in violations(tree, rel)]
+    assert not found, "task, run or step status literals outside app/status.py:\n" + "\n".join(found)
