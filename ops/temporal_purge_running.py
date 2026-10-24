@@ -63,7 +63,7 @@ async def purge_running(
                 async with AsyncSessionLocal() as db:
                     row = await db.execute(select(Task).where(Task.id == task_id))
                     task = row.scalar_one_or_none()
-                    if task is None or task.status in TERMINAL_TASK:
+                    if task is None or task.status in TERMINAL:
                         terminate = True
 
         if not terminate:
