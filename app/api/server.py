@@ -1773,10 +1773,11 @@ async def dashboard_data(db: AsyncSession = Depends(get_db)):
 async def dashboard(request: Request, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Task).order_by(Task.created_at.desc()).limit(50))
     tasks = result.scalars().all()
+    # Request first: Starlette 1.x removed TemplateResponse(name, context), which reads the name as the request.
     return templates.TemplateResponse(
+        request,
         "dashboard.html",
         {
-            "request": request,
             "tasks": tasks,
             "stats": _dashboard_stats(tasks),
             "model": _read_current_model(),
