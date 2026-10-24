@@ -16,6 +16,7 @@ from app.config import RMP_DATA_DIR as _RMP_DATA_DIR, RMP_ROOT as _RMP_ROOT
 from app.production.alerting import send_alert
 from app.production.ops_notify import notify_ops_slack
 from app.llm.quota_broker import reap_stale_llm_slots_sync, seconds_until_any_key_ready
+from app.status import ACTIVE, IN_PROGRESS, TaskStatus
 
 logger = logging.getLogger("rmp.canary_sentinel")
 
@@ -151,7 +152,7 @@ def evaluate_memory_canary() -> Optional[CanaryIssue]:
         return CanaryIssue("memory_canary", "invalid", "Memory canary missing finished_at", data)
     age = datetime.utcnow() - finished
     status = data.get("status", "")
-    if status in ("running", "created"):
+    if status in IN_PROGRESS:
         status = "timeout"
     if status == "deferred":
         if age > timedelta(hours=MEMORY_MAX_AGE_HOURS):
@@ -355,7 +356,7 @@ def cancel_task_sync(task_id: str, reason: str = "canary_timeout") -> bool:
     if not task_id:
         return False
     try:
-        from sqlalchemy import create_engine, text
+        from sqlalchemy import bindparam, create_engine, text
 
         from app.db.database import DATABASE_URL
 
@@ -364,10 +365,9 @@ def cancel_task_sync(task_id: str, reason: str = "canary_timeout") -> bool:
         with engine.begin() as conn:
             conn.execute(
                 text(
-                    "UPDATE tasks SET status = 'cancelled' "
-                    "WHERE id = :id AND status IN ('running', 'created', 'pending_user_input')"
-                ),
-                {"id": task_id},
+                    "UPDATE tasks SET status = :cancelled WHERE id = :id AND status IN :active"
+                ).bindparams(bindparam("active", expanding=True)),
+                {"id": task_id, "cancelled": TaskStatus.CANCELLED, "active": sorted(ACTIVE)},
             )
         try:
 
@@ -393,7 +393,7 @@ def cancel_task_sync(task_id: str, reason: str = "canary_timeout") -> bool:
 def list_stuck_canary_task_ids_sync() -> List[str]:
     """Non-terminal canary/system probe tasks that can pin LLM slots."""
     try:
-        from sqlalchemy import create_engine, text
+        from sqlalchemy import bindparam, create_engine, text
 
         from app.db.database import DATABASE_URL
 
@@ -401,10 +401,10 @@ def list_stuck_canary_task_ids_sync() -> List[str]:
         engine = create_engine(sync_url)
         with engine.connect() as conn:
             rows = conn.execute(
-                text(
-                    "SELECT id, task_type, goal FROM tasks "
-                    "WHERE status IN ('running', 'created', 'pending_user_input')"
-                )
+                text("SELECT id, task_type, goal FROM tasks WHERE status IN :active").bindparams(
+                    bindparam("active", expanding=True)
+                ),
+                {"active": sorted(ACTIVE)},
             ).fetchall()
         ids: List[str] = []
         for task_id, task_type, goal in rows:

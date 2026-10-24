@@ -18,13 +18,11 @@ from temporalio.client import Client, WorkflowExecutionStatus
 
 from app.db.database import AsyncSessionLocal, engine
 from app.db.models import Task
+from app.status import TERMINAL
 
 logger = logging.getLogger("rmp.janitor")
 
 JANITOR_MAX_AGE_HOURS = 24
-TERMINAL_TASK_STATUSES = frozenset(
-    {"failed", "completed", "stopped_by_user", "cancelled", "compensated"}
-)
 
 
 async def janitor_once(max_age_hours: int = JANITOR_MAX_AGE_HOURS) -> dict:
@@ -54,7 +52,7 @@ async def janitor_once(max_age_hours: int = JANITOR_MAX_AGE_HOURS) -> dict:
                 async with AsyncSessionLocal() as db:
                     result = await db.execute(select(Task).where(Task.id == task_id))
                     task = result.scalar_one_or_none()
-                    if task is None or task.status in TERMINAL_TASK_STATUSES:
+                    if task is None or task.status in TERMINAL:
                         should_terminate = True
 
             if not should_terminate:

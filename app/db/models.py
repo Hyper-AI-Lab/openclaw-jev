@@ -3,6 +3,8 @@ from datetime import datetime
 from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, JSON, Text, Index, text
 from sqlalchemy.orm import declarative_base, relationship
 
+from app.status import RunState, StepStatus, TaskStatus
+
 Base = declarative_base()
 
 
@@ -21,7 +23,7 @@ class Task(Base):
     openclaw_session_key = Column(String, index=True)
     task_type = Column(String, default="user")
     goal = Column(Text)
-    status = Column(String, default="created", index=True)
+    status = Column(String, default=TaskStatus.CREATED, index=True)
     priority = Column(Integer, default=0)
     next_check_at = Column(DateTime)
     parent_task_id = Column(String, ForeignKey("tasks.id"), index=True)
@@ -43,7 +45,7 @@ class ProcessRun(Base):
     task_id = Column(String, ForeignKey("tasks.id"), index=True)
     process_type = Column(String, default="generic_task")
     plan_version = Column(String, default="1")
-    current_state = Column(String, default="created")
+    current_state = Column(String, default=RunState.CREATED)
     success_criteria = Column(JSON)
     failure_criteria = Column(JSON)
     plan_json = Column(JSON)
@@ -64,7 +66,7 @@ class Step(Base):
     process_run_id = Column(String, ForeignKey("process_runs.id"), index=True)
     step_name = Column(String)
     step_kind = Column(String)
-    status = Column(String, default="pending")
+    status = Column(String, default=StepStatus.PENDING)
     attempt_no = Column(Integer, default=1)
     idempotency_key = Column(String, index=True)
     input_ref = Column(JSON)
