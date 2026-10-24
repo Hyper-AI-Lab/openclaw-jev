@@ -36,6 +36,7 @@ from app.cron.reconciler import cron_reconciler_loop, reconcile_cron_once
 from app.reconciler import reconciler_loop
 from app.scanners.catalog import list_scanners
 from app.scanners.sync import get_scanner_status, scanner_monitor_loop, sync_scanners_once
+from app.status import ACTIVE, IDLE_BLOCKING, TERMINAL, WORKFLOW_OWNED, RunState, TaskStatus
 from app.telemetry import (
     init_telemetry,
     instrument_fastapi,
@@ -252,17 +253,9 @@ async def _start_task_workflow(
     )
 
 
-ACTIVE_TASK_STATUSES = frozenset(
-    {"created", "running", "pending", "pending_user_input", "blocked", "needs_replan"}
-)
-TERMINAL_TASK_STATUSES = frozenset(
-    {"failed", "completed", "stopped_by_user", "cancelled", "compensated"}
-)
-
-
 def task_visible_for_idempotent_recovery(status: str | None) -> bool:
     """Timeout recovery owns this DM only when this key's task is still in flight."""
-    return status in ACTIVE_TASK_STATUSES
+    return status in ACTIVE
 
 
 INTAKE_RESERVATION_WINDOW_SEC = 150
@@ -275,7 +268,7 @@ def reservation_retry_should_run_intake(
     ctx = task.supplementary_context or {}
     if not ctx.get("intake_reserved"):
         return False
-    if task.status not in ACTIVE_TASK_STATUSES:
+    if task.status not in ACTIVE:
         return False
     now = now or datetime.utcnow()
     stamp = task.updated_at or task.created_at
@@ -290,9 +283,9 @@ async def _cancel_intake_reservation(task: Task, db: AsyncSession) -> None:
     ctx = dict(task.supplementary_context or {})
     if not ctx.get("intake_reserved"):
         return
-    if task.status not in ACTIVE_TASK_STATUSES:
+    if task.status not in ACTIVE:
         return
-    task.status = "cancelled"
+    task.status = TaskStatus.CANCELLED
     ctx["intake_reserved"] = False
     ctx["closed_reason"] = INTAKE_PLACEHOLDER
     task.supplementary_context = ctx
@@ -444,7 +437,7 @@ async def create_task(
     prior = existing.scalar_one_or_none()
     reuse_stale_reservation = False
     if prior:
-        if prior.status in ACTIVE_TASK_STATUSES and not reservation_retry_should_run_intake(
+        if prior.status in ACTIVE and not reservation_retry_should_run_intake(
             prior
         ):
             return {
@@ -452,7 +445,7 @@ async def create_task(
                 "status": prior.status,
                 "deduplicated": True,
             }
-        if prior.status in TERMINAL_TASK_STATUSES:
+        if prior.status in TERMINAL:
             idem_key = _fresh_idempotency_key(idem_key)
             prior = None
         elif reservation_retry_should_run_intake(prior):
@@ -516,7 +509,7 @@ async def create_task(
         task.task_kind = task_kind
         task.recurrence_key = recurrence_key
         task.openclaw_session_key = request.session_key
-        task.status = "created"
+        task.status = TaskStatus.CREATED
         ctx = dict(task.supplementary_context or {})
         ctx["intake_reserved"] = True
         task.supplementary_context = ctx
@@ -531,7 +524,7 @@ async def create_task(
             openclaw_session_key=request.session_key,
             task_type=task_type,
             goal=intent,
-            status="created",
+            status=TaskStatus.CREATED,
             task_kind=task_kind,
             recurrence_key=recurrence_key,
             supplementary_context={"intake_reserved": True},
@@ -654,7 +647,7 @@ async def create_task(
                         )
                         return {**outcome, "attached_task_ids": delivered}
                     logger.warning("No live workflow for %s; starting this message instead", tid)
-                    task.status = "created"
+                    task.status = TaskStatus.CREATED
                     guided_memory = outcome.get("_guided_memory_block") or ""
                 else:
                     await db.commit()
@@ -765,7 +758,7 @@ async def create_task(
                 recall_depth=intake_result.get("recall_depth"),
             )
     except Exception as e:
-        task.status = "failed"
+        task.status = TaskStatus.FAILED
         metrics_inc("task_failed")
         await db.commit()
         from app.production.alerting import send_alert
@@ -944,7 +937,7 @@ async def cancel_task(task_id: str, reason: str = "api_cancel", db: AsyncSession
     except Exception as e:
         logger.warning("Terminate workflow %s: %s", task_id, e)
     # stopped_by_user is only for Kirill's own "stop"; API cancels are cleanups and timeouts.
-    task.status = "cancelled"
+    task.status = TaskStatus.CANCELLED
     task.supplementary_context = {**(task.supplementary_context or {}), "closed_reason": reason}
     task.next_check_at = None
     pr_result = await db.execute(
@@ -955,7 +948,7 @@ async def cancel_task(task_id: str, reason: str = "api_cancel", db: AsyncSession
     )
     run = pr_result.scalar_one_or_none()
     if run:
-        run.current_state = "canceled"
+        run.current_state = RunState.CANCELED
         run.ended_at = datetime.utcnow()
         run.lease_owner = None
     db.add(
@@ -981,7 +974,7 @@ async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
     source = result.scalar_one_or_none()
     if not source:
         raise HTTPException(status_code=404, detail="Task not found")
-    if source.status in ("running", "pending_user_input", "created"):
+    if source.status not in TERMINAL:
         raise HTTPException(status_code=409, detail="Task is still active")
 
     catalog_types = set(CATALOG.keys())
@@ -995,7 +988,7 @@ async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
         openclaw_session_key=source.openclaw_session_key,
         task_type=source.task_type or "user",
         goal=source.goal,
-        status="created",
+        status=TaskStatus.CREATED,
     )
     db.add(task)
     db.add(
@@ -1020,7 +1013,7 @@ async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
             process_type=source.task_type if source.task_type in catalog_types else None,
         )
     except Exception as e:
-        task.status = "failed"
+        task.status = TaskStatus.FAILED
         metrics_inc("task_failed")
         await db.commit()
         from app.production.alerting import send_alert
@@ -1050,13 +1043,13 @@ async def suspend_all_running(db: AsyncSession = Depends(get_db)):
             logger.warning("Failed to terminate %s: %s", wf.id, e)
 
     result = await db.execute(
-        select(Task).where(Task.status.in_(["running", "pending_user_input", "created"]))
+        select(Task).where(Task.status.in_(WORKFLOW_OWNED))
     )
     from app.openclaw_control import schedule_abort
 
     stopped = 0
     for task in result.scalars().all():
-        task.status = "cancelled"
+        task.status = TaskStatus.CANCELLED
         task.supplementary_context = {**(task.supplementary_context or {}), "closed_reason": "dev_suspend"}
         schedule_abort(task.id, reason="dev_suspend")
         stopped += 1
@@ -1132,7 +1125,7 @@ async def get_active_task(session_key: str, db: AsyncSession = Depends(get_db)):
         select(Task)
         .where(
             Task.openclaw_session_key.in_(lookup),
-            Task.status.in_(["running", "pending_user_input", "created"]),
+            Task.status.in_(IDLE_BLOCKING),
         )
         .order_by(Task.created_at.desc())
         .limit(1)
@@ -1154,7 +1147,7 @@ async def get_active_user_task(session_key: str, db: AsyncSession = Depends(get_
         select(Task)
         .where(
             Task.openclaw_session_key.in_(lookup),
-            Task.status.in_(ACTIVE_TASK_STATUSES),
+            Task.status.in_(WORKFLOW_OWNED),
             Task.task_type.notin_(["cron", "heartbeat", "canary"]),
         )
         .order_by(Task.created_at.desc())
@@ -1599,7 +1592,7 @@ async def _claude_event(db: AsyncSession, task_id: str, event_type: str, payload
 
 async def _live_task(db: AsyncSession, task_id: Optional[str]) -> Task:
     task = await db.get(Task, task_id) if task_id else None
-    if task is None or task.status in TERMINAL_TASK_STATUSES:
+    if task is None or task.status in TERMINAL:
         raise HTTPException(status_code=409, detail="Claude sessions belong to a task that is still running")
     return task
 
@@ -1751,9 +1744,9 @@ async def dashboard_data(db: AsyncSession = Depends(get_db)):
         "tasks": task_list,
         "stats": {
             "total": len(tasks),
-            "running": sum(1 for t in tasks if t.status == "running"),
-            "completed": sum(1 for t in tasks if t.status == "completed"),
-            "failed": sum(1 for t in tasks if t.status == "failed"),
+            "running": sum(1 for t in tasks if t.status == TaskStatus.RUNNING),
+            "completed": sum(1 for t in tasks if t.status == TaskStatus.COMPLETED),
+            "failed": sum(1 for t in tasks if t.status == TaskStatus.FAILED),
         },
         "model": _read_current_model(),
         "model_catalog": MODEL_CATALOG,

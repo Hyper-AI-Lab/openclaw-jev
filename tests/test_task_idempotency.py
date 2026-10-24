@@ -2,11 +2,10 @@ import hashlib
 import time
 
 from app.api.server import (
-    ACTIVE_TASK_STATUSES,
-    TERMINAL_TASK_STATUSES,
     _fresh_idempotency_key,
     _make_idempotency_key,
 )
+from app.status import ACTIVE, TERMINAL
 
 
 class TaskRequest:
@@ -18,7 +17,7 @@ class TaskRequest:
 
 
 def test_active_and_terminal_status_sets_disjoint():
-    assert not (ACTIVE_TASK_STATUSES & TERMINAL_TASK_STATUSES)
+    assert not (ACTIVE & TERMINAL)
 
 
 def test_fresh_idempotency_key_differs():
