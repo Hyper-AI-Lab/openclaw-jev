@@ -1,12 +1,21 @@
 """The status vocabulary (app/status.py), its named sets, and the stored spellings they keep (rule 16)."""
+import ast
 import json
+import re
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
 from temporalio.worker.workflow_sandbox import SandboxRestrictions
 from temporalio.worker.workflow_sandbox._importer import Importer
 from temporalio.worker.workflow_sandbox._restrictions import RestrictionContext
 
 import app.status
+from app.activities import db_activities
+from app.db.models import Base, ProcessRun, Task
 from app.status import (
     ACTIVE,
     AGENT_STEP_OUTCOMES,
@@ -23,6 +32,7 @@ from app.status import (
     TaskStatus,
 )
 
+REPO = Path(__file__).resolve().parents[1]
 ENUMS = (TaskStatus, RunState, StepStatus)
 
 
@@ -83,3 +93,63 @@ def test_the_sets_partition_the_task_statuses():
     assert IDLE_BLOCKING < ACTIVE and TaskStatus.DEPLOYING not in IDLE_BLOCKING
     assert set(RUN_STATE_FOR_TASK_STATUS) == TERMINAL
     assert set(RUN_STATE_FOR_TASK_STATUS.values()) <= RUN_TERMINAL
+
+
+@pytest.fixture
+async def runs(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'runs.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=[Task.__table__, ProcessRun.__table__])
+    factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    with patch.object(db_activities, "AsyncSessionLocal", factory):
+        yield factory
+    await engine.dispose()
+
+
+async def test_a_task_spelling_is_stored_as_the_run_spelling(runs):
+    async with runs() as db:
+        db.add_all([Task(id="t1", goal="g", status="running"),
+                    ProcessRun(id="r1", task_id="t1", current_state="awaiting_approval")])
+        await db.commit()
+
+    assert await db_activities.update_process_state({"process_run_id": "r1", "state": "cancelled", "ended": True})
+
+    async with runs() as db:
+        run = (await db.execute(select(ProcessRun).where(ProcessRun.id == "r1"))).scalar_one()
+    assert run.current_state == "canceled" and run.ended_at is not None
+
+
+# A SQL text that sets a status column to a literal where that column holds another literal: a rename (rule 16).
+RENAME = re.compile(
+    r"\bset\s+(?:\w+\.)?(status|current_state)\s*=\s*'[^']*'.*\bwhere\b.*\b\1\s*(?:=|<>|!=|\bin\b)\s*\(?\s*'",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _python_files(*roots):
+    for root in roots:
+        if root.is_file():
+            yield root
+        elif root.is_dir():
+            yield from sorted(root.rglob("*.py"))
+
+
+def _parsed(*roots):
+    """(repo-relative path, tree) of every Python file under ``roots``; files that do not parse are skipped
+    (ops/migrate_task_registry_schema.py is bash)."""
+    for path in _python_files(*roots):
+        try:
+            tree = ast.parse(path.read_text(), filename=str(path))
+        except SyntaxError:
+            continue
+        yield path.relative_to(REPO).as_posix(), tree
+
+
+def test_no_stored_status_is_renamed():
+    assert RENAME.search("UPDATE process_runs SET current_state = 'cancelled' WHERE current_state = 'canceled'")
+    assert RENAME.search("update tasks set status='failed'\n where id = :id and status in ('running', 'created')")
+    assert not RENAME.search("UPDATE tasks SET status = :to WHERE id = :id AND status IN :active")
+    assert not RENAME.search("UPDATE tasks SET status = 'failed' WHERE id = :id")
+    renames = [f"{rel}:{node.lineno}" for rel, tree in _parsed(REPO / "app", REPO / "ops", REPO / "migrations")
+               for node in ast.walk(tree)
+               if isinstance(node, ast.Constant) and isinstance(node.value, str) and RENAME.search(node.value)]
+    assert not renames, "SQL that renames a stored status:\n" + "\n".join(renames)

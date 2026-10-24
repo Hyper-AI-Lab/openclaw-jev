@@ -9,6 +9,7 @@ from sqlalchemy import select, update
 from app.db.database import AsyncSessionLocal
 from app.metrics import inc as metrics_inc
 from app.production.alerting import send_alert
+from app.status import RUN_STATE_FOR_TASK_STATUS, RunState
 from app.telemetry import traced_activity
 
 logger = logging.getLogger("rmp.db_activities")
@@ -233,7 +234,12 @@ async def update_process_state(payload: Dict[str, Any]) -> bool:
         run = result.scalar_one_or_none()
         if not run:
             return False
-        run.current_state = payload.get("state", run.current_state)
+        state = payload.get("state", run.current_state)
+        # A task spelling is stored as the run's (rule 16): the catalog's _stop_task sends the task's "cancelled",
+        # and a run is "canceled".
+        if state not in RunState:
+            state = RUN_STATE_FOR_TASK_STATUS.get(state, state)
+        run.current_state = state
         if payload.get("ended"):
             run.ended_at = datetime.utcnow()
             run.lease_owner = None
