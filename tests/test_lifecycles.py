@@ -174,3 +174,17 @@ def test_the_slot_walk_reads_the_workflows_writes():
     for name in LIFECYCLES:
         enums = {enum for _cls, enum, _node in _slots(_trees(REGISTERED[name]))}
         assert {TaskStatus, RunState} <= enums, name
+
+
+def test_every_wait_the_code_enters_is_declared():
+    """A type's waits are every waiting status its code writes. Coding waits in blocked twice: queued for a coding
+    slot, and paused until Claude's usage limit resets."""
+    for name, lifecycle in LIFECYCLES.items():
+        task_statuses, _run_states = _named(REGISTERED[name])
+        assert task_statuses & WAITING <= lifecycle.waits, name
+    coding = _trees(REGISTERED["CodingTaskWorkflow"])["CodingTaskWorkflow"]
+    pairs = {(call.args[0].attr, call.args[1].attr) for call in ast.walk(coding)
+             if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "_status"
+             and len(call.args) >= 2 and all(status_member(arg) for arg in call.args[:2])}
+    assert {("BLOCKED", "QUEUED"), ("BLOCKED", "PAUSED")} <= pairs
+    assert TaskStatus.BLOCKED in LIFECYCLES["CodingTaskWorkflow"].waits

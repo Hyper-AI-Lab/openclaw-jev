@@ -80,7 +80,8 @@ TERMINAL = frozenset({
 })
 # A workflow is running the task, or is about to start it. Read by the reconciler's repairs and the sentinel.
 IN_PROGRESS = frozenset({TaskStatus.CREATED, TaskStatus.RUNNING})
-# The workflow waits for Kirill or for a coding slot. Read through ACTIVE and WORKFLOW_OWNED.
+# The workflow waits for Kirill, for a coding slot, or for Claude's usage limit to reset. Read through ACTIVE and
+# WORKFLOW_OWNED.
 WAITING = frozenset({TaskStatus.PENDING_USER_INPUT, TaskStatus.BLOCKED})
 # The coding workflow has handed the task to the self-deploy. Read through ACTIVE.
 HANDED_OFF = frozenset({TaskStatus.DEPLOYING})
@@ -161,8 +162,9 @@ class Lifecycle:
     """What one task workflow type does with its task's status.
 
     ``task_statuses`` and ``run_states`` are everything its code writes; ``waits`` the statuses in which it waits for
-    Kirill or for a coding slot; ``outcomes`` the terminal statuses it ends in; ``compensation`` the status a compensated
-    task ends in, or None for a type that does not compensate.
+    Kirill, for a coding slot, or for Claude's usage limit to reset (Coding is ``blocked`` while it is paused);
+    ``outcomes`` the terminal statuses it ends in; ``compensation`` the status a compensated task ends in, or None for
+    a type that does not compensate.
     """
 
     task_statuses: frozenset[TaskStatus]
