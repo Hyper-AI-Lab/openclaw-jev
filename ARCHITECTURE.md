@@ -331,7 +331,7 @@ Temporal workflow (GenericTaskWorkflow | CatalogTaskWorkflow)
 
 1. Plugin or API submits `intent`, `session_key`, optional `tags`, `task_type`, `idempotency_key`.
 2. API deduplicates by idempotency key; returns existing task if terminal and caller retries.
-3. Creates `Task` (status `pending` → `running`), `ProcessRun`, initial `Event`.
+3. Creates `Task` (status `created` → `running`), `ProcessRun`, initial `Event`.
 4. Starts Temporal workflow on queue `openclaw-tasks` with payload including `initial_memory_block` when prefetched.
 
 **Signals (`POST /tasks/{id}/signal`):**
@@ -408,17 +408,18 @@ Child IDs use pattern `{task_id}-plan-{step_name}-{attempt}` and `{task_id}-reca
 | **SideEffectReceipt** | Dedup keys for Slack posts |
 | **Artifact** | SHA-256 content-addressed outputs |
 
-**Status machine (simplified):**
+**Status machine:** a task has one of ten statuses, in four groups:
 
 ```
-pending → running → completed
-                 ├→ failed → (retry) → running
-                 ├→ pending_user_input → (user_input) → running
-                 ├→ stopped_by_user
-                 └→ compensated (lease released, steps annotated)
+IN_PROGRESS  created, running                 a workflow runs the task, or is about to
+WAITING      pending_user_input, blocked      waiting for Kirill, a coding slot or Claude's usage limit
+HANDED_OFF   deploying                        the coding workflow handed the task to the self-deploy
+TERMINAL     completed, failed, compensated, stopped_by_user, cancelled
 ```
 
-**Compensation (`execute_compensation`):** Releases lease, marks open steps `compensated`, writes process memory annotation, sets terminal task/process state — without overwriting with a generic `failed` when already compensated.
+Terminal is final: no write moves a finished task again (a retry is a new task). The full table of allowed moves is `TASK_TRANSITIONS` in `app/status.py`, beside `LIFECYCLES`, what each task workflow writes. `app/transitions.py` is the one writer of task statuses and run states: a compare-and-set that refuses and logs any move the table forbids.
+
+**Compensation (`execute_compensation`):** Releases lease, marks open steps `compensated`, writes process memory annotation, sets terminal task/process state — without overwriting with a generic `failed` when already compensated. A finished task is not compensated afterwards: it keeps the status it ended in, and no `task.compensated` event is written.
 
 ### 5.4 Orchestrator modules (`app/orchestrator/`)
 
