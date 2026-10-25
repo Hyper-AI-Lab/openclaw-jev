@@ -136,6 +136,29 @@ async def test_a_late_running_does_not_resurrect_a_finished_task(control_plane, 
         "cause=update_task_status"]
 
 
+@pytest.mark.parametrize("status, state", [("completed", "completed"), ("failed", "failed_terminal")])
+async def test_the_deploy_reply_run_closes_its_deploying_task(control_plane, status, state):
+    """The deploy's reply path: after a self-deploy, ops/coding_deploy.py starts a fresh CodingTaskWorkflow run on
+    the task the coding workflow handed off as deploying; that run's close goes through the guarded writer."""
+    await seed(control_plane, Task(id="t1", goal="Fix the greeting", task_type="coding_task", status="deploying"),
+               ProcessRun(id="r1", task_id="t1", process_type="coding_task", current_state="deploying",
+                          lease_owner="t1"))
+    reply_run = in_workflow("CodingTaskWorkflow")
+
+    with patch("app.task_registry.hooks.index_terminal_task_async", new_callable=AsyncMock) as index, \
+         patch.object(db_activities, "send_alert", new_callable=AsyncMock):
+        assert await reply_run.run(db_activities.ensure_process_run,
+                                   {"task_id": "t1", "process_type": "coding_task"}) == "r1"
+        assert await reply_run.run(db_activities.update_task_status, {"task_id": "t1", "status": status}) is True
+        assert await reply_run.run(db_activities.update_process_state,
+                                   {"process_run_id": "r1", "state": state, "ended": True}) is True
+
+    (task,) = await rows(control_plane, Task)
+    (run,) = await rows(control_plane, ProcessRun)
+    assert task.status == status and run.current_state == state and run.lease_owner is None
+    index.assert_awaited_once_with("t1")
+
+
 async def test_side_effects_run_once(control_plane):
     """A second "completed" is no transition: the registry index, the metric and the alert run for the first only."""
     from app import metrics
