@@ -8,7 +8,7 @@ import pytest
 from temporalio import workflow
 
 import worker
-from app.status import LIFECYCLES, NO_TASK_STATUS, TERMINAL, WAITING, RunState, TaskStatus
+from app.status import ACTIVE, LIFECYCLES, NO_TASK_STATUS, TASK_TRANSITIONS, TERMINAL, WAITING, RunState, TaskStatus
 from tests.test_status_vocabulary import status_member, workflow_status_values
 
 # By Temporal workflow type name, the name LIFECYCLES and NO_TASK_STATUS use; a @workflow.defn(name=...) makes it
@@ -98,3 +98,11 @@ def test_the_declarations_fit_the_vocabulary(name):
     assert lifecycle.waits <= WAITING
     assert lifecycle.waits | lifecycle.outcomes <= lifecycle.task_statuses
     assert lifecycle.compensation is None or lifecycle.compensation in lifecycle.outcomes
+
+
+@pytest.mark.parametrize("name", sorted(LIFECYCLES))
+def test_the_lifecycles_fit_the_table(name):
+    """WP04-10 (c)'s last part: every status a type declares is one the table lets an active task move to."""
+    lifecycle = LIFECYCLES[name]
+    for status in lifecycle.task_statuses | lifecycle.waits | lifecycle.outcomes:
+        assert TASK_TRANSITIONS[status] & ACTIVE, status

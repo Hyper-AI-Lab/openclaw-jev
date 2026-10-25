@@ -8,13 +8,17 @@ Members are ``str``s (``StrEnum``): each compares, hashes and JSON-encodes exact
 lookups on loaded rows and the payloads workflows send are unchanged. The module imports nothing from ``app`` and does
 no I/O, so workflow code can import it.
 
+TASK_TRANSITIONS is the task state machine, with task_move_allowed and run_move_allowed; app/transitions.py writes
+every task status and run state through them.
+
 LIFECYCLES is R-05's per-type declaration: for each task workflow type, the task statuses and run states its code
 writes, its waits, its outcomes and its compensation. R-05's other parts live elsewhere: success and failure criteria,
 the evidence schema and template versioning in WP-28, retryable failure classes in WP-05, idempotency rules in WP-23,
 and escalation in WP-39 and WP-33.
 """
+from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum, StrEnum
 from types import MappingProxyType
 
 
@@ -117,6 +121,39 @@ RUN_STATE_FOR_TASK_STATUS = MappingProxyType({
     TaskStatus.STOPPED_BY_USER: RunState.STOPPED_BY_USER,
     TaskStatus.COMPENSATED: RunState.COMPENSATED,
 })
+
+# The task state machine, as "to <- allowed from": every move RMP's code makes, and no way out of a terminal status.
+# Read through task_move_allowed by app/transitions.py, the one writer of task statuses.
+TASK_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = MappingProxyType({
+    TaskStatus.CREATED: frozenset({TaskStatus.CREATED, TaskStatus.PENDING_USER_INPUT}),
+    TaskStatus.RUNNING: frozenset({
+        TaskStatus.CREATED, TaskStatus.RUNNING, TaskStatus.PENDING_USER_INPUT, TaskStatus.BLOCKED}),
+    TaskStatus.PENDING_USER_INPUT: frozenset({
+        TaskStatus.CREATED, TaskStatus.RUNNING, TaskStatus.PENDING_USER_INPUT, TaskStatus.BLOCKED}),
+    TaskStatus.BLOCKED: frozenset({TaskStatus.CREATED, TaskStatus.RUNNING, TaskStatus.BLOCKED}),
+    TaskStatus.DEPLOYING: frozenset({TaskStatus.RUNNING, TaskStatus.DEPLOYING}),
+    **{status: ACTIVE for status in TERMINAL},
+})
+
+
+def _names_a_member(enum: type[StrEnum], value: object) -> bool:
+    """``value`` is one of ``enum``'s values, as its string or as the member itself. A member of another enum is not,
+    even with the same value: a task status written as ``StepStatus.RUNNING`` is a mistake its value would hide."""
+    return isinstance(value, str) and value in enum and (not isinstance(value, Enum) or isinstance(value, enum))
+
+
+def task_move_allowed(prev: str | None, to: str) -> bool:
+    """Whether a task may go from ``prev`` to ``to``: a move TASK_TRANSITIONS allows, which includes the refresh of
+    every status that is not terminal. An unknown ``to`` is refused."""
+    return _names_a_member(TaskStatus, to) and prev in TASK_TRANSITIONS[to]
+
+
+def run_move_allowed(prev: str | None, to: str) -> bool:
+    """Whether a run may go from ``prev`` to ``to``: a terminal run state is final, except that it may stay as it is;
+    a run that has not ended may move to any run state. An unknown ``to`` is refused."""
+    if not _names_a_member(RunState, to):
+        return False
+    return prev not in RUN_TERMINAL or prev == to
 
 
 @dataclass(frozen=True)
