@@ -44,7 +44,7 @@ from app.telemetry import (
     trace_span,
     get_temporal_client_kwargs,
 )
-from app.transitions import UNCHANGED, set_task_status
+from app.transitions import UNCHANGED, set_run_state, set_task_status
 from app.workflows.catalog import (
     CATALOG,
     catalog_assignment_from_intake,
@@ -931,13 +931,24 @@ async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db)):
     }
 
 
+CANCEL_ACTOR = "api:/tasks/{id}/cancel"
+
+
 @app.post("/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str, reason: str = "api_cancel", db: AsyncSession = Depends(get_db)):
-    """Terminate workflow and mark task stopped (dashboard / dev use)."""
+    """Terminate workflow and mark task cancelled (dashboard / dev use).
+
+    A finished task changes nothing: the attempt goes through the guarded writer, which refuses and logs it (a repeat
+    of a cancel is unchanged), and the answer gives its status with ``cancelled: false``.
+    """
     result = await db.execute(select(Task).where(Task.id == task_id))
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    if task.status in TERMINAL:
+        finished = await set_task_status(db, task_id, TaskStatus.CANCELLED, actor=CANCEL_ACTOR, cause=reason)
+        await db.commit()
+        return {"status": finished.previous, "task_id": task_id, "cancelled": False}
     from app.openclaw_control import schedule_abort
 
     schedule_abort(task_id, reason=reason)
@@ -952,20 +963,22 @@ async def cancel_task(task_id: str, reason: str = "api_cancel", db: AsyncSession
     except Exception as e:
         logger.warning("Terminate workflow %s: %s", task_id, e)
     # stopped_by_user is only for Kirill's own "stop"; API cancels are cleanups and timeouts.
-    task.status = TaskStatus.CANCELLED
-    task.supplementary_context = {**(task.supplementary_context or {}), "closed_reason": reason}
-    task.next_check_at = None
+    cancelled = await set_task_status(db, task_id, TaskStatus.CANCELLED, actor=CANCEL_ACTOR, cause=reason,
+                                      closed_reason=reason)
+    if not cancelled.changed:
+        # It finished while the workflow was being stopped.
+        await db.commit()
+        return {"status": cancelled.previous, "task_id": task_id, "cancelled": False}
     pr_result = await db.execute(
-        select(ProcessRun)
+        select(ProcessRun.id)
         .where(ProcessRun.task_id == task_id)
         .order_by(ProcessRun.started_at.desc())
         .limit(1)
     )
-    run = pr_result.scalar_one_or_none()
-    if run:
-        run.current_state = RunState.CANCELED
-        run.ended_at = datetime.utcnow()
-        run.lease_owner = None
+    run_id = pr_result.scalar_one_or_none()
+    if run_id:
+        await set_run_state(db, run_id, RunState.CANCELED, actor=CANCEL_ACTOR, cause=reason, ended=True,
+                            release_lease=True)
     db.add(
         Event(
             correlation_id=task.correlation_id or task_id,
