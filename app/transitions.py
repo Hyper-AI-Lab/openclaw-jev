@@ -105,15 +105,14 @@ async def set_run_state(
     release_lease: bool = False,
     next_check_at: Any = KEEP,
 ) -> Transition:
-    """Move process run ``run_id`` to ``to``. ``ended`` sets ended_at and releases the lease; ``release_lease`` clears
-    lease_owner; a terminal ``to`` clears the next check, and otherwise ``next_check_at`` replaces it unless it is
-    KEEP."""
+    """Move process run ``run_id`` to ``to``. ``ended`` sets ended_at; ``release_lease`` clears lease_owner; a terminal
+    ``to`` clears the next check, and otherwise ``next_check_at`` replaces it unless it is KEEP."""
 
     def values(_prev: Optional[str], _context: Any) -> dict:
         changes = {}
         if ended:
             changes["ended_at"] = _now()
-        if ended or release_lease:
+        if release_lease:
             changes["lease_owner"] = None
         if to in RUN_TERMINAL:
             changes["next_check_at"] = None

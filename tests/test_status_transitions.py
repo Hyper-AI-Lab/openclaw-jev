@@ -273,24 +273,30 @@ async def test_an_in_session_task_sees_the_new_status(factory):
     assert (await stored(factory, Task, "t1")).status == "cancelled"
 
 
-async def test_a_run_ends_with_its_lease_released(factory):
+async def test_a_run_ends_and_releases_its_lease(factory):
     await seed(factory, ProcessRun(id="r1", task_id="t1", current_state="running", lease_owner="w-1",
                                    next_check_at=later(5)),
-               ProcessRun(id="r2", task_id="t2", current_state="awaiting_approval", lease_owner="w-2"))
+               ProcessRun(id="r2", task_id="t2", current_state="awaiting_approval", lease_owner="w-2"),
+               ProcessRun(id="r3", task_id="t3", current_state="running", lease_owner="w-3"))
     check = later(60).replace(microsecond=0)
 
     async with factory() as db:
-        ended = await set_run_state(db, "r1", RunState.CANCELED, actor="test", cause="cancel", ended=True)
+        ended = await set_run_state(db, "r1", RunState.CANCELED, actor="test", cause="cancel", ended=True,
+                                    release_lease=True)
         waiting = await set_run_state(db, "r2", RunState.AWAITING_INPUT, actor="test", cause="ask",
                                       release_lease=True, next_check_at=check)
+        kept = await set_run_state(db, "r3", RunState.COMPENSATED, actor="test", cause="compensate", ended=True)
         await db.commit()
 
     assert ended == Transition("changed", "running") and waiting == Transition("changed", "awaiting_approval")
-    r1, r2 = await stored(factory, ProcessRun, "r1"), await stored(factory, ProcessRun, "r2")
+    assert kept == Transition("changed", "running")
+    r1, r2, r3 = [await stored(factory, ProcessRun, run_id) for run_id in ("r1", "r2", "r3")]
     assert r1.current_state == "canceled" and r1.ended_at is not None and r1.lease_owner is None
     assert r1.next_check_at is None
     assert r2.current_state == "awaiting_input" and r2.ended_at is None and r2.lease_owner is None
     assert r2.next_check_at == check
+    # Ending a run does not take a lease its caller does not own.
+    assert r3.current_state == "compensated" and r3.ended_at is not None and r3.lease_owner == "w-3"
 
 
 def racing(db, moves, *, other=None):
