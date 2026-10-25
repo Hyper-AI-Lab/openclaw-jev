@@ -363,6 +363,60 @@ def workflow_status_values(tree, is_status):
     return found
 
 
+# The enum each status slot of workflow code holds: by status activity and payload key, and by the name of a status
+# helper's parameter. The value cannot tell them apart: StepStatus.RUNNING equals TaskStatus.RUNNING.
+ACTIVITY_SLOTS = {
+    "update_task_status": {"status": TaskStatus},
+    "finalize_task_failure": {"task_status": TaskStatus, "process_state": RunState},
+    "execute_compensation": {},
+    "update_process_state": {"state": RunState},
+    "record_step": {"status": StepStatus},
+}
+HELPER_SLOTS = {"task_status": TaskStatus, "status": TaskStatus, "process_state": RunState}
+
+
+def helper_parameters(tree):
+    """The positional parameters after ``self`` of each status helper defined in ``tree``, by helper name."""
+    return {node.name: [arg.arg for arg in [*node.args.posonlyargs, *node.args.args][1:]]
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in STATUS_HELPERS}
+
+
+def status_slots(tree, helpers):
+    """(enum, member) for each app.status member written into a status slot of workflow code: a status activity's
+    payload, a status helper's argument or parameter default (``helpers`` gives their positional parameters), or the
+    status of a task's or a step's dict. ``enum`` is None for a slot ACTIVITY_SLOTS and HELPER_SLOTS do not name."""
+    found = []
+
+    def take(enum, node):
+        found.extend((enum, leaf) for leaf in _leaves(node) if status_member(leaf))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            payload = _activity_payload(node)
+            if payload is not None:
+                for key, value in zip(payload.keys, payload.values):
+                    if _key(key) in STATUS_KEYS:
+                        take(ACTIVITY_SLOTS[node.args[0].id].get(_key(key)), value)
+            if _called(node) in STATUS_HELPERS:
+                parameters = helpers.get(_called(node), [])
+                for position, arg in enumerate(node.args):
+                    take(HELPER_SLOTS.get(parameters[position]) if position < len(parameters) else None, arg)
+                for keyword in node.keywords:
+                    take(HELPER_SLOTS.get(keyword.arg), keyword.value)
+        if isinstance(node, ast.Dict):
+            entries = {_key(key): value for key, value in zip(node.keys, node.values)}
+            if "status" in entries and ("task_id" in entries or "step_id" in entries):
+                take(TaskStatus if "task_id" in entries else StepStatus, entries["status"])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in STATUS_HELPERS:
+            positional = [*node.args.posonlyargs, *node.args.args]
+            defaulted = zip(positional[len(positional) - len(node.args.defaults):], node.args.defaults)
+            for arg, default in [*defaulted, *zip(node.args.kwonlyargs, node.args.kw_defaults)]:
+                if default is not None:
+                    take(HELPER_SLOTS.get(arg.arg), default)
+    return found
+
+
 def violations(tree, path):
     """Sorted (line, rule) pairs of G1-G6 in one module, and of G7 when it is workflow code."""
     found = set()
