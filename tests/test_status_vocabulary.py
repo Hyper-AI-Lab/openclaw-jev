@@ -532,3 +532,165 @@ def test_no_status_literal_outside_the_vocabulary():
     assert not unreached, f"the guard parsed no module under {unreached}"
     found = [f"{rel}:{line} {rule}" for rel, tree in modules for line, rule in violations(tree, rel)]
     assert not found, "task, run or step status literals outside app/status.py:\n" + "\n".join(found)
+
+
+# G8 (WP04-16): app/transitions.py is the one writer of tasks.status and process_runs.current_state.
+STATUS_WRITER = "app/transitions.py"
+TRANSITION_ROWS = frozenset({"Task", "ProcessRun"})
+RAW_STATUS_UPDATE = re.compile(r"\bupdate\s+(tasks|process_runs)\b", re.IGNORECASE)
+# Reviewed writes of another row's status in a module that imports Task or ProcessRun, as (path, function).
+OTHER_ROW_STATUS_WRITERS = frozenset({
+    ("app/activities/db_activities.py", "record_step"),  # Step
+    ("app/activities/db_activities.py", "execute_compensation"),  # Step
+    ("app/deep_memory/enrich.py", "enrich_document"),  # DeepDocument
+})
+# This batch only: the sentinel's cancel is already a compare-and-set in SQL; batch 4 replaces it, and this entry goes.
+RAW_STATUS_UPDATERS = frozenset({("app/production/canary_sentinel.py", "cancel_task_sync")})
+
+
+def _nodes_by_function(tree):
+    """(node, name of the innermost function around it, or None) for every node of ``tree``."""
+    stack = [(tree, None)]
+    while stack:
+        node, function = stack.pop()
+        yield node, function
+        inner = node.name if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else function
+        stack.extend((child, inner) for child in ast.iter_child_nodes(node))
+
+
+def _sqlalchemy_names(tree, name):
+    """The local names of SQLAlchemy's ``name`` (``update``, ``delete``), aliases included."""
+    return {name} | {alias.asname for node in ast.walk(tree)
+                     if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("sqlalchemy")
+                     for alias in node.names if alias.name == name and alias.asname}
+
+
+def _statement_on(call, names, rows):
+    """``update(Task)`` (or ``delete``; ``names`` holds the statement's local names) or ``Task.__table__.update()``."""
+    func = call.func
+    if (isinstance(func, ast.Name) and func.id in names and call.args and isinstance(call.args[0], ast.Name)
+            and call.args[0].id in rows):
+        return True
+    table = func.value if isinstance(func, ast.Attribute) else None
+    return (isinstance(table, ast.Attribute) and func.attr in names and table.attr == "__table__"
+            and isinstance(table.value, ast.Name) and table.value.id in rows)
+
+
+def _assigned_attributes(node):
+    """The attribute targets of an assignment, tuple targets unpacked."""
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    flat = []
+    while targets:
+        target = targets.pop()
+        if isinstance(target, (ast.Tuple, ast.List)):
+            targets.extend(target.elts)
+        elif isinstance(target, ast.Attribute):
+            flat.append(target)
+    return flat
+
+
+def writer_violations(tree, path):
+    """Sorted (line, "G8") pairs: a status written outside app/transitions.py."""
+    if path == STATUS_WRITER:
+        return []
+    updates = _sqlalchemy_names(tree, "update")
+    imports_a_row = any(isinstance(node, ast.ImportFrom) and node.module == "app.db.models"
+                        and any(alias.name in TRANSITION_ROWS for alias in node.names) for node in ast.walk(tree))
+    found = set()
+    for node, function in _nodes_by_function(tree):
+        if isinstance(node, ast.Call) and _statement_on(node, updates, TRANSITION_ROWS):
+            found.add((node.lineno, "G8"))
+        if _string(node) and RAW_STATUS_UPDATE.search(node.value) and (path, function) not in RAW_STATUS_UPDATERS:
+            found.add((node.lineno, "G8"))
+        if (imports_a_row and isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                and any(_status_attribute(target) for target in _assigned_attributes(node))
+                and (path, function) not in OTHER_ROW_STATUS_WRITERS):
+            found.add((node.lineno, "G8"))
+    return sorted(found)
+
+
+@pytest.mark.parametrize("source, path", [
+    ("from sqlalchemy import update\nawait db.execute(update(Task).where(Task.id == tid).values(status=to))",
+     "app/example.py"),
+    ("from sqlalchemy import update as sa_update\nstmt = sa_update(ProcessRun).values(current_state=state)",
+     "ops/example.py"),
+    ("stmt = Task.__table__.update().values(status=to)", "app/example.py"),
+    ('await db.execute(text("UPDATE tasks SET status = :to WHERE id = :id"))', "app/example.py"),
+    ('sql = "update process_runs set current_state = :s"', "worker.py"),
+    ("from app.db.models import Task\ntask.status = TaskStatus.FAILED", "app/example.py"),
+    ("from app.db.models import ProcessRun\nrun.current_state, run.ended_at = state, now", "app/example.py"),
+    # A reviewed writer of a step's status in one function is no licence for another.
+    ("from app.db.models import Step, Task\nasync def other(step):\n    step.status = StepStatus.FAILED",
+     "app/activities/db_activities.py"),
+    ('def cancel_task_sync():\n    pass\nSQL = "UPDATE tasks SET status = :cancelled WHERE id = :id"',
+     "app/production/canary_sentinel.py"),
+])
+def test_the_writer_guard_flags_its_snippet(source, path):
+    assert writer_violations(ast.parse(source), path)
+
+
+@pytest.mark.parametrize("source, path", [
+    ("from sqlalchemy import update\nawait db.execute(update(Task).where(Task.id == tid).values(status=to))",
+     "app/transitions.py"),
+    ("from sqlalchemy import update\nawait db.execute(update(VectorOutbox).values(done_at=now))", "app/example.py"),
+    ("from app.db.models import Task\ntask.supplementary_context = ctx", "app/example.py"),
+    # A module without Task or ProcessRun writes other rows' statuses: a deep-recall report.
+    ("from app.db.models import DeepContextReport\nrow.status = payload['status']", "app/example.py"),
+    ("from app.db.models import Step, Task\nasync def record_step(payload):\n    existing.status = payload['ok']",
+     "app/activities/db_activities.py"),
+    ('def cancel_task_sync():\n    sql = "UPDATE tasks SET status = :cancelled WHERE id = :id AND status IN :active"',
+     "app/production/canary_sentinel.py"),
+    ('text("SELECT id FROM tasks WHERE status IN :statuses")', "app/example.py"),
+])
+def test_the_writer_guard_passes_its_negative(source, path):
+    assert not writer_violations(ast.parse(source), path)
+
+
+def test_no_status_write_outside_the_writer():
+    """G8 over the guarded roots: app/transitions.py writes every status. app/scanners/ is exempt (D-4): its track
+    statuses retire with the scanners."""
+    modules = [(rel, tree) for rel, tree in _parsed(*(REPO / root for root in GUARDED)) if not rel.startswith(EXEMPT)]
+    assert any(rel == STATUS_WRITER for rel, _tree in modules)
+    found = [f"{rel}:{line} {rule}" for rel, tree in modules for line, rule in writer_violations(tree, rel)]
+    assert not found, "status written outside app/transitions.py:\n" + "\n".join(found)
+    # Each reviewed exception still names a function that exists, so a stale entry is noticed and removed.
+    functions = {(rel, node.name) for rel, tree in modules for node in ast.walk(tree)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert OTHER_ROW_STATUS_WRITERS | RAW_STATUS_UPDATERS <= functions
+
+
+async def test_the_listener_catches_a_direct_write(runs, tmp_path, monkeypatch):
+    """The runtime half of G8 (tests/conftest.py): a production module that sets a stored task's status is stopped;
+    the same write through app/transitions.py, and a test seeding a row, are not."""
+    import importlib.util
+
+    from app.transitions import set_run_state, set_task_status
+    from tests import conftest
+
+    production = tmp_path / "production"
+    production.mkdir()
+    (production / "stray_writer.py").write_text(
+        "def finish(task, run):\n    task.status = 'failed'\n\n\ndef end(run):\n    run.current_state = 'canceled'\n")
+    module_spec = importlib.util.spec_from_file_location("stray_writer", production / "stray_writer.py")
+    stray = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(stray)
+    monkeypatch.setattr(conftest, "PRODUCTION_ROOTS", (*conftest.PRODUCTION_ROOTS, production))
+    async with runs() as db:
+        db.add_all([Task(id="t1", goal="g", status="running"), ProcessRun(id="r1", task_id="t1")])
+        await db.commit()
+
+        task, run = await db.get(Task, "t1"), await db.get(ProcessRun, "r1")
+        with pytest.raises(AssertionError, match="^status written outside app/transitions.py$"):
+            stray.finish(task, run)
+        with pytest.raises(AssertionError, match="^status written outside app/transitions.py$"):
+            stray.end(run)
+        assert [entry.split(" ", 1)[1] for entry in conftest._STRAY_STATUS_WRITES] == [
+            "Task.status = failed", "ProcessRun.current_state = canceled"]
+        conftest._STRAY_STATUS_WRITES.clear()
+        assert task.status == "running" and run.current_state == "created"
+
+        assert (await set_task_status(db, "t1", TaskStatus.FAILED, actor="test", cause="listener")).changed
+        assert (await set_run_state(db, "r1", RunState.FAILED_TERMINAL, actor="test", cause="listener")).changed
+        task.status, run.current_state = "running", "running"
+        await db.commit()
+    assert conftest._STRAY_STATUS_WRITES == []
