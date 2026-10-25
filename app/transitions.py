@@ -3,8 +3,9 @@
 ``set_task_status`` and ``set_run_state`` move one row in the caller's session and transaction, compare-and-set: each
 reads the current value, refuses a move app/status.py forbids, and otherwise updates the row only where it still holds
 the value it read. On Postgres the conditional UPDATE is atomic under READ COMMITTED, so a lost race matches no row;
-the call then reads again and retries, at most RETRIES times. Writing the current value again is a refresh: the next
-check is updated and nothing else. On a terminal row it changes nothing.
+the call then reads again and retries, at most RETRIES times, and after that refuses with the cause ``contended``.
+Writing the current value again is a refresh: the next check is updated and nothing else. On a terminal row it
+changes nothing.
 
 A refusal is logged at WARNING on ``rmp.transitions`` in one fixed line, ``task transition refused: <id> <from> ->
 <to> actor=<actor> cause=<cause>`` (``run transition refused: …`` for a run), which the programme counts in the

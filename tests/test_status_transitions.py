@@ -188,8 +188,10 @@ async def test_completed_to_running_is_refused_and_logged(factory, caplog):
 
 async def test_an_active_task_moves_and_a_finished_one_stays(factory, caplog):
     caplog.set_level(logging.WARNING, logger=LOGGER)
-    await seed(factory, Task(id="t1", goal="g", status="running", next_check_at=later(30)),
-               Task(id="t2", goal="g", status="cancelled", supplementary_context={"closed_reason": "first"}))
+    touched = datetime(2026, 1, 1)
+    await seed(factory, Task(id="t1", goal="g", status="running", next_check_at=later(30), updated_at=touched),
+               Task(id="t2", goal="g", status="cancelled", supplementary_context={"closed_reason": "first"},
+                    updated_at=touched))
 
     async with factory() as db:
         moved = await set_task_status(db, "t1", "failed", actor="test", cause="it broke", closed_reason="broke")
@@ -202,8 +204,10 @@ async def test_an_active_task_moves_and_a_finished_one_stays(factory, caplog):
     failed, cancelled = await stored(factory, Task, "t1"), await stored(factory, Task, "t2")
     assert failed.status == "failed" and failed.next_check_at is None
     assert failed.supplementary_context == {"closed_reason": "broke"}
+    # A move touches updated_at, which the reconciler's stale and stuck scans read, as the ORM's own write did.
+    assert failed.updated_at > touched
     # A repeat of a terminal status changes nothing, and is no refusal.
-    assert cancelled.supplementary_context == {"closed_reason": "first"}
+    assert cancelled.supplementary_context == {"closed_reason": "first"} and cancelled.updated_at == touched
     assert refusals(caplog) == []
 
 
