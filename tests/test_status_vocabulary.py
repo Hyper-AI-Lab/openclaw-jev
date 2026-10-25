@@ -546,6 +546,9 @@ OTHER_ROW_STATUS_WRITERS = frozenset({
 })
 # This batch only: the sentinel's cancel is already a compare-and-set in SQL; batch 4 replaces it, and this entry goes.
 RAW_STATUS_UPDATERS = frozenset({("app/production/canary_sentinel.py", "cancel_task_sync")})
+# G9 (WP04-18): the event log is immutable (D-24). WP-27's K-12 retention job adds itself here, the one deleter.
+EVENT_DELETERS = frozenset()
+RAW_EVENT_WRITE = re.compile(r"\b(delete\s+from|update|truncate(\s+table)?)\s+events\b", re.IGNORECASE)
 
 
 def _nodes_by_function(tree):
@@ -609,6 +612,49 @@ def writer_violations(tree, path):
     return sorted(found)
 
 
+def _selects_events(node):
+    return any(isinstance(call, ast.Call) and _called(call) == "select"
+               and any(isinstance(arg, ast.Name) and arg.id == "Event" for arg in call.args)
+               for call in ast.walk(node))
+
+
+def _deleted_event_rows(function):
+    """Lines of ``.delete(`` on a name bound, in ``function``, from ``select(Event)`` or from such a name."""
+    bound, grew = set(), True
+    while grew:
+        grew = False
+        for node in ast.walk(function):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                source, targets = node.value, node.targets if isinstance(node, ast.Assign) else [node.target]
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                source, targets = node.iter, [node.target]
+            else:
+                continue
+            if _selects_events(source) or any(isinstance(n, ast.Name) and n.id in bound for n in ast.walk(source)):
+                names = {n.id for target in targets for n in ast.walk(target) if isinstance(n, ast.Name)} - bound
+                grew |= bool(names)
+                bound |= names
+    return [node.lineno for node in ast.walk(function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "delete"
+            and any(isinstance(n, ast.Name) and n.id in bound for n in [node.func.value, *node.args])]
+
+
+def event_log_violations(tree, path):
+    """Sorted (line, "G9") pairs: an update or delete of the event log."""
+    statements = _sqlalchemy_names(tree, "update") | _sqlalchemy_names(tree, "delete")
+    found = set()
+    for node, function in _nodes_by_function(tree):
+        if (path, function) in EVENT_DELETERS:
+            continue
+        if isinstance(node, ast.Call) and _statement_on(node, statements, {"Event"}):
+            found.add((node.lineno, "G9"))
+        if _string(node) and RAW_EVENT_WRITE.search(node.value):
+            found.add((node.lineno, "G9"))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (path, node.name) not in EVENT_DELETERS:
+            found.update((line, "G9") for line in _deleted_event_rows(node))
+    return sorted(found)
+
+
 @pytest.mark.parametrize("source, path", [
     ("from sqlalchemy import update\nawait db.execute(update(Task).where(Task.id == tid).values(status=to))",
      "app/example.py"),
@@ -646,17 +692,46 @@ def test_the_writer_guard_passes_its_negative(source, path):
     assert not writer_violations(ast.parse(source), path)
 
 
-def test_no_status_write_outside_the_writer():
-    """G8 over the guarded roots: app/transitions.py writes every status. app/scanners/ is exempt (D-4): its track
-    statuses retire with the scanners."""
+@pytest.mark.parametrize("source", [
+    "from sqlalchemy import delete\nawait db.execute(delete(Event).where(Event.occurred_at < cutoff))",
+    "from sqlalchemy import update\nawait db.execute(update(Event).values(event_payload={}))",
+    "stmt = Event.__table__.delete()",
+    'await db.execute(text("DELETE FROM events WHERE occurred_at < :cutoff"))',
+    'sql = "TRUNCATE TABLE events"',
+    'sql = "update events set event_payload = null"',
+    "async def prune(db):\n    rows = await db.execute(select(Event).where(Event.occurred_at < cutoff))\n"
+    "    for row in rows.scalars():\n        await db.delete(row)",
+    "async def prune(db):\n    old = (await db.execute(select(Event))).scalars().all()\n"
+    "    for event in [e for e in old if e.entity_id]:\n        await db.delete(event)",
+])
+def test_the_event_log_guard_flags_its_snippet(source):
+    assert event_log_violations(ast.parse(source), "app/example.py")
+
+
+@pytest.mark.parametrize("source", [
+    "db.add(Event(entity_id=tid, event_type='task.cancelled'))",
+    "from sqlalchemy import delete\nawait db.execute(delete(VectorOutbox).where(VectorOutbox.done_at < cutoff))",
+    'sql = "SELECT * FROM events WHERE entity_id = :id"',
+    # A deleted row that was not read from the event log.
+    "async def prune(db):\n    events = await db.execute(select(Event))\n"
+    "    stale = await db.execute(select(DeepChunk))\n    for row in stale.scalars():\n        await db.delete(row)",
+])
+def test_the_event_log_guard_passes_its_negative(source):
+    assert not event_log_violations(ast.parse(source), "app/example.py")
+
+
+def test_no_status_write_outside_the_writer_and_no_event_rewrite():
+    """G8 and G9 over the guarded roots: app/transitions.py writes every status, and nothing updates or deletes an
+    event. app/scanners/ is exempt (D-4): its track statuses retire with the scanners."""
     modules = [(rel, tree) for rel, tree in _parsed(*(REPO / root for root in GUARDED)) if not rel.startswith(EXEMPT)]
     assert any(rel == STATUS_WRITER for rel, _tree in modules)
-    found = [f"{rel}:{line} {rule}" for rel, tree in modules for line, rule in writer_violations(tree, rel)]
-    assert not found, "status written outside app/transitions.py:\n" + "\n".join(found)
+    found = [f"{rel}:{line} {rule}" for rel, tree in modules
+             for line, rule in [*writer_violations(tree, rel), *event_log_violations(tree, rel)]]
+    assert not found, "status written outside app/transitions.py, or the event log rewritten:\n" + "\n".join(found)
     # Each reviewed exception still names a function that exists, so a stale entry is noticed and removed.
     functions = {(rel, node.name) for rel, tree in modules for node in ast.walk(tree)
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    assert OTHER_ROW_STATUS_WRITERS | RAW_STATUS_UPDATERS <= functions
+    assert OTHER_ROW_STATUS_WRITERS | RAW_STATUS_UPDATERS | EVENT_DELETERS <= functions
 
 
 async def test_the_listener_catches_a_direct_write(runs, tmp_path, monkeypatch):
