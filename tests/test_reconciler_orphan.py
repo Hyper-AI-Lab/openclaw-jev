@@ -43,12 +43,14 @@ def _client(desc=None, describe_error=None):
     return client
 
 
-async def _recover(client, db, task):
+async def _recover(client, db, task, closed=True):
+    """``closed`` is what finalize_task_failure answers: whether it ended the task."""
     stats = {"events": 0}
     with patch("app.orchestrator.session_recovery.read_completed_rmp_session_reply", return_value=REPLY), \
          patch("app.orchestrator.session_recovery.extract_user_facing_reply", side_effect=lambda r: r), \
          patch.object(reconciler, "_notify_repair", new_callable=AsyncMock) as notify, \
-         patch("app.activities.db_activities.finalize_task_failure", new_callable=AsyncMock) as fail:
+         patch("app.activities.db_activities.finalize_task_failure", new_callable=AsyncMock,
+               return_value=closed) as fail:
         outcome = await reconciler._recover_orphaned_session_reply(client, db, task, datetime.utcnow(), stats)
     return outcome, notify, fail, db.add.call_args_list
 
@@ -90,11 +92,23 @@ async def test_a_dead_catalog_run_is_closed_with_a_notice_not_replayed():
     client = _client(desc=SimpleNamespace(status=WorkflowExecutionStatus.TERMINATED, workflow_type="CatalogTaskWorkflow"))
     task = _task()
     outcome, notify, fail, added = await _recover(client, _db(), task)
-    assert outcome == "failed" and task.status == "failed"
+    assert outcome == "failed"
     client.start_workflow.assert_not_awaited()
-    fail.assert_awaited_once()
+    # finalize_task_failure alone ends the task, through the guarded writer, as the reconciler.
+    assert fail.await_args.args[0] == {"task_id": "t1", "task_status": "failed", "process_state": "failed_terminal",
+                                       "actor": "reconciler", "cause": "orphaned catalog run"}
     assert "did not send it" in notify.await_args.args[1]
     assert added[0].args[0].event_type == "reconciler.orphan_run_failed"
+
+
+@pytest.mark.asyncio
+async def test_a_dead_catalog_run_that_ended_meanwhile_gets_no_notice():
+    terminated = SimpleNamespace(status=WorkflowExecutionStatus.TERMINATED, workflow_type="CatalogTaskWorkflow")
+    client = _client(desc=terminated)
+    outcome, notify, fail, added = await _recover(client, _db(), _task(), closed=False)
+    assert outcome is None and not added
+    fail.assert_awaited_once()
+    notify.assert_not_awaited()
 
 
 @pytest.mark.asyncio

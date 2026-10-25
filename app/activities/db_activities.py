@@ -1,16 +1,18 @@
 import hashlib
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select, update
+from temporalio import activity
 
 from app.db.database import AsyncSessionLocal
 from app.metrics import inc as metrics_inc
 from app.production.alerting import send_alert
 from app.status import RUN_STATE_FOR_TASK_STATUS, RUN_TERMINAL, TERMINAL, RunState, StepStatus, TaskStatus
 from app.telemetry import traced_activity
+from app.transitions import KEEP, set_run_state, set_task_status
 
 logger = logging.getLogger("rmp.db_activities")
 from app.db.models import (
@@ -27,6 +29,21 @@ from app.db.models import (
 def _hash_payload(data: Any) -> str:
     raw = str(data).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _actor(payload: Dict[str, Any]) -> str:
+    """Who writes a status through these activities: the workflow that scheduled the activity, or, for a direct call
+    (the reconciler, spawn), the ``actor`` its payload names."""
+    if activity.in_activity():
+        return f"workflow:{activity.info().workflow_type}"
+    return payload["actor"]
+
+
+def _next_check(minutes: Optional[int]) -> Any:
+    """The next check ``minutes`` from now (naive UTC), or KEEP the stored one."""
+    if minutes is None:
+        return KEEP
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=minutes)
 
 
 @traced_activity("task.touch_liveness")
@@ -49,21 +66,21 @@ async def touch_task_liveness(payload: Dict[str, Any]) -> bool:
 
 @traced_activity("task.update_status")
 async def update_task_status(payload: Dict[str, Any]) -> bool:
+    """Move the task to ``status``; True only when this call changed it, and only then index, count and alert."""
     task_id = payload.get("task_id")
     status = payload.get("status")
-    next_check_minutes = payload.get("next_check_minutes")
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(Task).where(Task.id == task_id))
         task = result.scalar_one_or_none()
         if not task:
             return False
-        task.status = status
-        if next_check_minutes is not None:
-            task.next_check_at = datetime.utcnow() + timedelta(minutes=next_check_minutes)
-        elif status in TERMINAL:
-            task.next_check_at = None
+        transition = await set_task_status(
+            db, task_id, status, actor=_actor(payload), cause=payload.get("cause") or "update_task_status",
+            next_check_at=_next_check(payload.get("next_check_minutes")))
         await db.commit()
+        if not transition.changed:
+            return False
 
         if status in TERMINAL:
             from app.task_registry.hooks import index_terminal_task_async
@@ -175,9 +192,9 @@ async def ensure_process_run(payload: Dict[str, Any]) -> str:
                 durable_leg
                 and existing.current_state not in RUN_TERMINAL
             ):
-                existing.current_state = RunState.SUPERSEDED
-                existing.ended_at = datetime.utcnow()
-                existing.lease_owner = None
+                await set_run_state(
+                    db, existing.id, RunState.SUPERSEDED, actor=_actor(payload),
+                    cause=payload.get("cause") or "ensure_process_run", ended=True, release_lease=True)
 
         run_id = str(uuid.uuid4())
         db.add(
@@ -222,6 +239,8 @@ async def acquire_process_run_lease(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @traced_activity("process.update_state")
 async def update_process_state(payload: Dict[str, Any]) -> bool:
+    """Move the run to ``state`` with its lease, end and next check; True only when this call changed its state.
+    Without a state, only those fields change."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(ProcessRun).where(ProcessRun.id == payload.get("process_run_id"))
@@ -233,7 +252,14 @@ async def update_process_state(payload: Dict[str, Any]) -> bool:
             # A task spelling handed in is stored as the run's (rule 16): the catalog's _stop_task sends the task's
             # "cancelled", and a run is "canceled". Without a state, the stored spelling stays as it is.
             state = payload["state"]
-            run.current_state = state if state in RunState else RUN_STATE_FOR_TASK_STATUS.get(state, state)
+            ended = bool(payload.get("ended"))
+            transition = await set_run_state(
+                db, run.id, state if state in RunState else RUN_STATE_FOR_TASK_STATUS.get(state, state),
+                actor=_actor(payload), cause=payload.get("cause") or "update_process_state", ended=ended,
+                release_lease=ended or bool(payload.get("release_lease")),
+                next_check_at=_next_check(payload.get("next_check_minutes")))
+            await db.commit()
+            return transition.changed
         if payload.get("ended"):
             run.ended_at = datetime.utcnow()
             run.lease_owner = None
@@ -267,88 +293,82 @@ async def release_process_run_lease(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @traced_activity("process.finalize_failure")
 async def finalize_task_failure(payload: Dict[str, Any]) -> bool:
-    """Align task + process run on terminal failure and release lease."""
+    """Align task + process run on terminal failure and release lease.
+
+    True when this call ended the task (without a task, the run); the task is indexed only then.
+    """
     task_id = payload.get("task_id")
     process_run_id = payload.get("process_run_id")
-    state = payload.get("process_state", "failed_terminal")
+    actor, cause = _actor(payload), payload.get("cause") or "finalize_task_failure"
+    task_moved = run_moved = None
     async with AsyncSessionLocal() as db:
         if task_id:
-            tr = await db.execute(select(Task).where(Task.id == task_id))
-            task = tr.scalar_one_or_none()
-            if task:
-                task.status = payload.get("task_status", "failed")
-                task.next_check_at = None
-                if payload.get("closed_reason"):
-                    task.supplementary_context = {
-                        **(task.supplementary_context or {}),
-                        "closed_reason": payload["closed_reason"],
-                    }
+            task_moved = await set_task_status(
+                db, task_id, payload.get("task_status", TaskStatus.FAILED), actor=actor, cause=cause,
+                closed_reason=payload.get("closed_reason"))
         if process_run_id:
-            pr = await db.execute(
-                select(ProcessRun).where(ProcessRun.id == process_run_id)
-            )
-            run = pr.scalar_one_or_none()
-            if run:
-                run.current_state = state
-                run.ended_at = datetime.utcnow()
-                run.lease_owner = None
+            run_moved = await set_run_state(
+                db, process_run_id, payload.get("process_state", RunState.FAILED_TERMINAL), actor=actor, cause=cause,
+                ended=True, release_lease=True)
         await db.commit()
-    from app.task_registry.hooks import index_terminal_task_async
+    if task_moved is not None and task_moved.changed:
+        from app.task_registry.hooks import index_terminal_task_async
 
-    await index_terminal_task_async(task_id)
-    return True
+        await index_terminal_task_async(task_id)
+    moved = task_moved if task_moved is not None else run_moved
+    return moved is not None and moved.changed
 
 
 @traced_activity("process.record_compensation")
 async def record_compensation(payload: Dict[str, Any]) -> bool:
-    """Mark task/process as compensated after rollback or partial failure cleanup."""
+    """Mark task/process as compensated after rollback or partial failure cleanup; True when the task changed."""
     task_id = payload.get("task_id")
     process_run_id = payload.get("process_run_id")
     reason = payload.get("reason", "Compensation applied")
+    actor, cause = _actor(payload), payload.get("cause") or "record_compensation"
+    task_changed = False
     async with AsyncSessionLocal() as db:
         if task_id:
-            tr = await db.execute(select(Task).where(Task.id == task_id))
-            task = tr.scalar_one_or_none()
-            if task:
-                task.status = TaskStatus.COMPENSATED
-                task.next_check_at = None
+            moved = await set_task_status(db, task_id, TaskStatus.COMPENSATED, actor=actor, cause=cause)
+            task_changed = moved.changed
         if process_run_id:
-            pr = await db.execute(
-                select(ProcessRun).where(ProcessRun.id == process_run_id)
+            await set_run_state(db, process_run_id, RunState.COMPENSATED, actor=actor, cause=cause, ended=True,
+                                release_lease=True)
+        if task_changed:
+            db.add(
+                Event(
+                    correlation_id=task_id,
+                    entity_type="task",
+                    entity_id=task_id,
+                    event_type="task.compensated",
+                    event_payload={"reason": reason[:500], "process_run_id": process_run_id},
+                )
             )
-            run = pr.scalar_one_or_none()
-            if run:
-                run.current_state = RunState.COMPENSATED
-                run.ended_at = datetime.utcnow()
-                run.lease_owner = None
-        db.add(
-            Event(
-                correlation_id=task_id or process_run_id or str(uuid.uuid4()),
-                entity_type="task",
-                entity_id=task_id or "",
-                event_type="task.compensated",
-                event_payload={"reason": reason[:500], "process_run_id": process_run_id},
-            )
-        )
         await db.commit()
-    if task_id:
+    if task_changed:
         from app.task_registry.hooks import index_terminal_task_async
 
         await index_terminal_task_async(task_id)
-    return True
+    return task_changed
 
 
 @traced_activity("process.execute_compensation")
 async def execute_compensation(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Release lease, mark open steps compensated, annotate memory, set terminal state."""
+    """Release lease, mark open steps compensated, annotate memory, set terminal state.
+
+    The steps and the memory note follow the run, the ``task.compensated`` event the task: each only when this call
+    moved it. ``compensated`` in the result says whether it moved the task.
+    """
     from app.memory.router import MemoryRouter
 
     task_id = payload.get("task_id")
     process_run_id = payload.get("process_run_id")
     reason = (payload.get("reason") or "Compensation applied")[:500]
     owner = payload.get("owner", task_id)
+    actor, cause = _actor(payload), payload.get("cause") or "execute_compensation"
 
     steps_marked = 0
+    run_changed = task_changed = False
     async with AsyncSessionLocal() as db:
         if process_run_id:
             pr = await db.execute(
@@ -356,42 +376,42 @@ async def execute_compensation(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
             run = pr.scalar_one_or_none()
             if run:
-                if not owner or not run.lease_owner or run.lease_owner == owner:
-                    run.lease_owner = None
-                run.current_state = RunState.COMPENSATED
-                run.ended_at = datetime.utcnow()
-            step_result = await db.execute(
-                select(Step).where(
-                    Step.process_run_id == process_run_id,
-                    Step.status.in_((StepStatus.RUNNING, StepStatus.PENDING)),
+                # The lease is released only for its owner, or when it has none.
+                released = not owner or not run.lease_owner or run.lease_owner == owner
+                moved = await set_run_state(db, run.id, RunState.COMPENSATED, actor=actor, cause=cause, ended=True,
+                                            release_lease=released)
+                run_changed = moved.changed
+            if run_changed:
+                step_result = await db.execute(
+                    select(Step).where(
+                        Step.process_run_id == process_run_id,
+                        Step.status.in_((StepStatus.RUNNING, StepStatus.PENDING)),
+                    )
+                )
+                for step in step_result.scalars().all():
+                    step.status = StepStatus.COMPENSATED
+                    step.ended_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    steps_marked += 1
+        if task_id:
+            moved = await set_task_status(db, task_id, TaskStatus.COMPENSATED, actor=actor, cause=cause)
+            task_changed = moved.changed
+        if task_changed:
+            db.add(
+                Event(
+                    correlation_id=task_id,
+                    entity_type="task",
+                    entity_id=task_id,
+                    event_type="task.compensated",
+                    event_payload={
+                        "reason": reason,
+                        "process_run_id": process_run_id,
+                        "steps_marked": steps_marked,
+                    },
                 )
             )
-            for step in step_result.scalars().all():
-                step.status = StepStatus.COMPENSATED
-                step.ended_at = datetime.utcnow()
-                steps_marked += 1
-        if task_id:
-            tr = await db.execute(select(Task).where(Task.id == task_id))
-            task = tr.scalar_one_or_none()
-            if task:
-                task.status = TaskStatus.COMPENSATED
-                task.next_check_at = None
-        db.add(
-            Event(
-                correlation_id=task_id or process_run_id or str(uuid.uuid4()),
-                entity_type="task",
-                entity_id=task_id or "",
-                event_type="task.compensated",
-                event_payload={
-                    "reason": reason,
-                    "process_run_id": process_run_id,
-                    "steps_marked": steps_marked,
-                },
-            )
-        )
         await db.commit()
 
-    if process_run_id:
+    if run_changed:
         try:
             await MemoryRouter.write(
                 scope_type="process",
@@ -405,7 +425,7 @@ async def execute_compensation(payload: Dict[str, Any]) -> Dict[str, Any]:
             logger.warning("Compensation memory annotation skipped: %s", exc)
 
     return {
-        "compensated": True,
+        "compensated": task_changed,
         "steps_marked": steps_marked,
         "task_id": task_id,
         "process_run_id": process_run_id,

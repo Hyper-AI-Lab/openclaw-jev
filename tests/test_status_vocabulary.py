@@ -125,7 +125,8 @@ async def test_a_task_spelling_is_stored_as_the_run_spelling(runs):
                     ProcessRun(id="r1", task_id="t1", current_state="awaiting_approval")])
         await db.commit()
 
-    assert await db_activities.update_process_state({"process_run_id": "r1", "state": "cancelled", "ended": True})
+    assert await db_activities.update_process_state(
+        {"process_run_id": "r1", "state": "cancelled", "ended": True, "actor": "test"})
 
     async with runs() as db:
         run = (await db.execute(select(ProcessRun).where(ProcessRun.id == "r1"))).scalar_one()
@@ -139,7 +140,7 @@ async def test_a_call_without_a_state_keeps_the_stored_spelling(runs):
                     ProcessRun(id="r3", task_id="t3", current_state="cancelled", lease_owner="worker-1")])
         await db.commit()
 
-    assert await db_activities.update_process_state({"process_run_id": "r3", "release_lease": True})
+    assert await db_activities.update_process_state({"process_run_id": "r3", "release_lease": True, "actor": "test"})
 
     async with runs() as db:
         run = (await db.execute(select(ProcessRun).where(ProcessRun.id == "r3"))).scalar_one()
@@ -153,7 +154,7 @@ async def test_a_cancelled_close_clears_the_next_check(runs):
         await db.commit()
 
     with patch("app.task_registry.hooks.index_terminal_task_async", new_callable=AsyncMock) as index:
-        assert await db_activities.update_task_status({"task_id": "t2", "status": "cancelled"})
+        assert await db_activities.update_task_status({"task_id": "t2", "status": "cancelled", "actor": "test"})
 
     async with runs() as db:
         task = await db.get(Task, "t2")

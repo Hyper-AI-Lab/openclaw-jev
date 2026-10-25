@@ -14,6 +14,7 @@ from app.metrics import inc as metrics_inc
 from app.notification_policy import is_internal_task
 from app.production.alerting import send_alert
 from app.status import IN_PROGRESS, RUN_STATE_FOR_TASK_STATUS, RUN_TERMINAL, TERMINAL, RunState, TaskStatus
+from app.transitions import set_run_state, set_task_status
 
 logger = logging.getLogger("rmp.reconciler")
 
@@ -123,17 +124,18 @@ async def _close_orphaned_coding_tasks(client: Client, db, now: datetime, stats:
         if desc is not None and desc.status == WorkflowExecutionStatus.RUNNING:
             continue
         stopped = await asyncio.to_thread(stop_task_units, task.id)
-        await finalize_task_failure({"task_id": task.id, "task_status": TaskStatus.FAILED,
-                                     "process_state": RunState.FAILED_TERMINAL})
-        task.status = TaskStatus.FAILED
-        task.next_check_at = None
+        workflow_status = desc.status.name if desc else "NOT_FOUND"
+        if not await finalize_task_failure({"task_id": task.id, "task_status": TaskStatus.FAILED,
+                                            "process_state": RunState.FAILED_TERMINAL, "actor": "reconciler",
+                                            "cause": f"coding workflow {workflow_status}"}):
+            continue
         db.add(
             Event(
                 correlation_id=task.correlation_id or task.id,
                 entity_type="task",
                 entity_id=task.id,
                 event_type="reconciler.coding_orphan_closed",
-                event_payload={"workflow_status": desc.status.name if desc else "NOT_FOUND", "stopped_units": stopped},
+                event_payload={"workflow_status": workflow_status, "stopped_units": stopped},
             )
         )
         stats["events"] += 1
@@ -241,11 +243,11 @@ async def _recover_orphaned_session_reply(
         # Replaying a catalog run could repeat its side effects; close it honestly.
         from app.activities.db_activities import finalize_task_failure
 
-        await finalize_task_failure(
-            {"task_id": task.id, "task_status": TaskStatus.FAILED, "process_state": RunState.FAILED_TERMINAL}
-        )
-        task.status = TaskStatus.FAILED
-        task.next_check_at = None
+        if not await finalize_task_failure(
+            {"task_id": task.id, "task_status": TaskStatus.FAILED, "process_state": RunState.FAILED_TERMINAL,
+             "actor": "reconciler", "cause": "orphaned catalog run"}
+        ):
+            return None
         await _notify_repair(
             task,
             f"Task {task.id[:8]} was interrupted before its result could be checked, "
@@ -385,30 +387,36 @@ async def _repair_stuck_running_task(
         for run in runs
     )
 
+    cause = f"stuck >{STUCK_REPAIR_MINUTES}m"
     if has_progress and process_run_id:
-        await execute_compensation(
+        compensation = await execute_compensation(
             {
                 "task_id": task.id,
                 "process_run_id": process_run_id,
                 "reason": f"Workflow stuck >{STUCK_REPAIR_MINUTES}m — reconciler terminated",
+                "actor": "reconciler",
+                "cause": cause,
             }
         )
-        task.status = TaskStatus.COMPENSATED
+        repaired = compensation["compensated"]
     else:
-        await finalize_task_failure(
+        repaired = await finalize_task_failure(
             {
                 "task_id": task.id,
                 "process_run_id": process_run_id,
                 "task_status": TaskStatus.FAILED,
                 "process_state": RunState.FAILED_TERMINAL,
+                "actor": "reconciler",
+                "cause": cause,
             }
         )
-        task.status = TaskStatus.FAILED
 
-    task.next_check_at = None
-    stats["repaired"] += 1
     orphans = await _cleanup_orphan_plan_children(client, task.id)
     stats["orphans_terminated"] = stats.get("orphans_terminated", 0) + orphans
+    # The task finished meanwhile: its workflow is gone all the same, but there is nothing to repair or report.
+    if not repaired:
+        return False
+    stats["repaired"] += 1
 
     db.add(
         Event(
@@ -532,16 +540,11 @@ async def reconcile_once() -> dict:
             try:
                 desc = await handle.describe()
                 if desc.status == WorkflowExecutionStatus.COMPLETED:
-                    task.status = TaskStatus.COMPLETED
-                    task.next_check_at = None
-                    pr = await db.execute(
-                        select(ProcessRun).where(ProcessRun.task_id == task.id)
-                    )
-                    for run in pr.scalars().all():
-                        if run.current_state not in RUN_TERMINAL:
-                            run.current_state = RunState.COMPLETED
-                            run.ended_at = now
-                            run.lease_owner = None
+                    completed = await set_task_status(db, task.id, TaskStatus.COMPLETED, actor="reconciler",
+                                                      cause="workflow completed")
+                    if not completed.changed:
+                        continue
+                    await _end_open_runs(db, task.id, RunState.COMPLETED, "workflow completed", now)
                     stats["repaired"] += 1
                     await _cleanup_orphan_plan_children(client, task.id)
                     db.add(
@@ -571,22 +574,13 @@ async def reconcile_once() -> dict:
                         if desc.status == WorkflowExecutionStatus.TERMINATED
                         else TaskStatus.FAILED
                     )
-                    task.status = terminal
-                    if terminal == TaskStatus.CANCELLED:
-                        task.supplementary_context = {
-                            **(task.supplementary_context or {}),
-                            "closed_reason": "workflow_terminated",
-                        }
-                    task.next_check_at = None
-                    pr = await db.execute(
-                        select(ProcessRun).where(ProcessRun.task_id == task.id)
-                    )
-                    proc_state = RUN_STATE_FOR_TASK_STATUS[terminal]
-                    for run in pr.scalars().all():
-                        if run.current_state not in RUN_TERMINAL:
-                            run.current_state = proc_state
-                            run.ended_at = now
-                            run.lease_owner = None
+                    cause = f"workflow {desc.status.name}"
+                    ended = await set_task_status(
+                        db, task.id, terminal, actor="reconciler", cause=cause,
+                        closed_reason="workflow_terminated" if terminal == TaskStatus.CANCELLED else None)
+                    if not ended.changed:
+                        continue
+                    await _end_open_runs(db, task.id, RUN_STATE_FOR_TASK_STATUS[terminal], cause, now)
                     stats["repaired"] += 1
                     await _cleanup_orphan_plan_children(client, task.id)
                     db.add(
@@ -697,21 +691,34 @@ async def close_runs_of_ended_tasks(db, now: datetime) -> int:
     )
     closed = 0
     for run, task_status in rows.all():
+        state = run.current_state
+        moved = await set_run_state(db, run.id, RUN_STATE_FOR_TASK_STATUS[task_status], actor="reconciler",
+                                    cause="task ended", release_lease=True)
+        if not moved.changed:
+            continue
+        run.ended_at = now
         db.add(
             Event(
                 correlation_id=run.task_id,
                 entity_type="process_run",
                 entity_id=run.id,
                 event_type="reconciler.process_run_closed",
-                event_payload={"state": run.current_state, "task_status": task_status},
+                event_payload={"state": state, "task_status": task_status},
             )
         )
-        run.current_state = RUN_STATE_FOR_TASK_STATUS[task_status]
-        run.ended_at = now
-        run.lease_owner = None
-        run.next_check_at = None
         closed += 1
     return closed
+
+
+async def _end_open_runs(db, task_id: str, state: str, cause: str, now: datetime) -> None:
+    """The stale repair ends each run of the task that has not ended, in the pass's session and at the pass's time."""
+    runs = await db.execute(
+        select(ProcessRun).where(ProcessRun.task_id == task_id, ProcessRun.current_state.notin_(RUN_TERMINAL))
+    )
+    for run in runs.scalars().all():
+        moved = await set_run_state(db, run.id, state, actor="reconciler", cause=cause, release_lease=True)
+        if moved.changed:
+            run.ended_at = now
 
 
 def watch_github_main():

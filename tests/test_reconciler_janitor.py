@@ -265,52 +265,59 @@ async def test_janitor_terminates_old_orphan():
     assert stats["terminated"] == 1
 
 
-def _rows(items):
-    result = MagicMock()
-    result.scalars.return_value.all.return_value = list(items)
-    return result
+@pytest.fixture
+async def stale_db(tmp_path):
+    """A SQLite file for the reconciler's pass."""
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.db.models import Base, Event, ProcessRun, Task
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'stale.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=[Task.__table__, ProcessRun.__table__, Event.__table__])
+    yield sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    await engine.dispose()
+
+
+def _stale_task(task_id, status, age_min):
+    from datetime import timezone
+
+    from app.db.models import Task
+
+    return Task(id=task_id, goal="Summarize my inbox", task_type="user", status=status, correlation_id=task_id,
+                openclaw_session_key="agent:main:slack:channel:d0test",
+                updated_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=age_min))
 
 
 @pytest.mark.asyncio
-async def test_reconciler_indexes_the_tasks_it_completes_after_commit():
+async def test_reconciler_indexes_the_tasks_it_completes_after_commit(stale_db):
     from temporalio.client import WorkflowExecutionStatus
 
     from app import reconciler
+    from app.db.models import Task
 
-    now = datetime.utcnow()
-
-    class FakeTask:
-        def __init__(self, task_id, status, age_min):
-            self.id = task_id
-            self.status = status
-            self.updated_at = now - timedelta(minutes=age_min)
-            self.correlation_id = task_id
-            self.goal = "Summarize my inbox"
-            self.task_type = "user"
-            self.next_check_at = None
-            self.openclaw_session_key = "agent:main:slack:channel:d0test"
-
-    orphan = FakeTask("orphan-reply", "running", 3)
-    stale_done = FakeTask("stale-done", "created", 25)
+    async with stale_db() as db:
+        db.add_all([_stale_task("orphan-reply", "running", 3), _stale_task("stale-done", "created", 25)])
+        await db.commit()
 
     async def recover(client, db, task, now_, stats):
-        task.status = "failed"
-        return "failed"
+        return "failed" if task.id == "orphan-reply" else None
 
     order = MagicMock()
-    db = AsyncMock()
-    db.add = MagicMock()
-    db.execute = AsyncMock(
-        side_effect=[
-            _rows([]),  # coding tasks whose workflow may be gone
-            _rows([orphan]),  # orphaned-reply candidates
-            _rows([]),  # stuck running workflows
-            _rows([stale_done]),  # stale tasks
-            _rows([]),  # process runs of the stale task
-            _rows([]),  # process runs due for a check
-        ]
-    )
-    db.commit = AsyncMock(side_effect=lambda: order.commit())
+
+    def session():
+        """The pass's session, its commits recorded in order with the registry index."""
+        s = stale_db()
+        commit = s.commit
+
+        async def recorded():
+            await commit()
+            order.commit()
+
+        s.commit = recorded
+        return s
+
     desc = MagicMock(status=WorkflowExecutionStatus.COMPLETED)
     client = MagicMock()
     client.get_workflow_handle.return_value.describe = AsyncMock(return_value=desc)
@@ -319,19 +326,77 @@ async def test_reconciler_indexes_the_tasks_it_completes_after_commit():
     with patch("app.config.is_development_mode", return_value=False), \
          patch.object(reconciler, "reap_stale_llm_slots_sync", return_value=[]), \
          patch.object(reconciler, "_get_temporal", new_callable=AsyncMock, return_value=client), \
-         patch.object(reconciler, "AsyncSessionLocal") as session, \
+         patch.object(reconciler, "AsyncSessionLocal", session), \
          patch.object(reconciler, "_recover_orphaned_session_reply", side_effect=recover), \
          patch.object(reconciler, "_cleanup_orphan_plan_children", new_callable=AsyncMock, return_value=0), \
          patch.object(reconciler, "close_runs_of_ended_tasks", new_callable=AsyncMock, return_value=0), \
          patch.object(reconciler, "_notify_repair", new_callable=AsyncMock), \
          patch("app.task_registry.hooks.index_terminal_task_async", index):
-        session.return_value.__aenter__.return_value = db
         stats = await reconciler.reconcile_once()
 
-    assert stale_done.status == "completed"
+    async with stale_db() as db:
+        assert (await db.get(Task, "stale-done")).status == "completed"
     assert stats["registry_indexed"] == 2
     assert [c[0] for c in order.mock_calls] == ["commit", "index", "index"]
     assert [c.args[0] for c in index.await_args_list] == ["orphan-reply", "stale-done"]
+
+
+@pytest.mark.parametrize("workflow_status", ["COMPLETED", "TERMINATED", "FAILED"])
+async def test_stale_repair_does_not_overwrite_a_terminal_task(stale_db, caplog, workflow_status):
+    """The task ended (here by /cancel) while the pass looked at its workflow: the repair's write is refused, and the
+    pass records, notifies and indexes nothing for it, and leaves its runs to the run close."""
+    import logging
+
+    from sqlalchemy import select
+    from temporalio.client import WorkflowExecutionStatus
+
+    from app import reconciler
+    from app.db.models import Event, ProcessRun, Task
+
+    caplog.set_level(logging.WARNING, logger="rmp.transitions")
+    async with stale_db() as db:
+        db.add_all([_stale_task("stale", "created", 25),
+                    ProcessRun(id="run-open", task_id="stale", current_state="running")])
+        await db.commit()
+
+    async def cancelled_meanwhile():
+        async with stale_db() as db:
+            (await db.get(Task, "stale")).status = "cancelled"
+            await db.commit()
+        return MagicMock(status=WorkflowExecutionStatus[workflow_status])
+
+    client = MagicMock()
+    client.get_workflow_handle.return_value.describe = AsyncMock(side_effect=cancelled_meanwhile)
+    client.get_workflow_handle.return_value.signal = AsyncMock()
+
+    with patch("app.config.is_development_mode", return_value=False), \
+         patch.object(reconciler, "reap_stale_llm_slots_sync", return_value=[]), \
+         patch.object(reconciler, "_get_temporal", new_callable=AsyncMock, return_value=client), \
+         patch.object(reconciler, "AsyncSessionLocal", stale_db), \
+         patch.object(reconciler, "_close_orphaned_coding_tasks", new_callable=AsyncMock, return_value=[]), \
+         patch.object(reconciler, "_end_claude_sessions_of_finished_tasks", AsyncMock(return_value=0)), \
+         patch.object(reconciler, "_recover_orphaned_session_reply", new_callable=AsyncMock, return_value=None), \
+         patch.object(reconciler, "_cleanup_orphan_plan_children", new_callable=AsyncMock, return_value=0) as cleanup, \
+         patch.object(reconciler, "close_runs_of_ended_tasks", new_callable=AsyncMock, return_value=0), \
+         patch.object(reconciler, "_notify_repair", new_callable=AsyncMock) as notify, \
+         patch("app.task_registry.hooks.index_terminal_task_async", new_callable=AsyncMock) as index:
+        stats = await reconciler.reconcile_once()
+
+    async with stale_db() as db:
+        assert (await db.get(Task, "stale")).status == "cancelled"
+        assert (await db.get(ProcessRun, "run-open")).current_state == "running"
+        assert (await db.execute(select(Event))).scalars().all() == []
+    assert stats["repaired"] == 0 and stats["registry_indexed"] == 0
+    notify.assert_not_awaited()
+    cleanup.assert_not_awaited()
+    index.assert_not_awaited()
+    to = "completed" if workflow_status == "COMPLETED" else "cancelled" if workflow_status == "TERMINATED" else "failed"
+    cause = "workflow completed" if workflow_status == "COMPLETED" else f"workflow {workflow_status}"
+    refused = [r.getMessage() for r in caplog.records if r.name == "rmp.transitions"]
+    if to == "cancelled":
+        assert refused == []
+    else:
+        assert refused == [f"task transition refused: stale cancelled -> {to} actor=reconciler cause={cause}"]
 
 
 async def test_a_cancelled_run_of_a_completed_workflow_stays_cancelled(tmp_path):
