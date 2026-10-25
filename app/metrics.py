@@ -21,6 +21,8 @@ COUNTERS = (
     "intake_spawn",
     "intake_workflow_ok",
     "intake_degraded",
+    "task_transition_refused",
+    "run_transition_refused",
 )
 
 _DEFAULT_METRICS_PATH = None  # resolved via RMP_DATA_DIR
