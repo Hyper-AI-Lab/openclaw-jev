@@ -7,7 +7,13 @@ translates a task status to its run state.
 Members are ``str``s (``StrEnum``): each compares, hashes and JSON-encodes exactly like its value, so SQL binds, set
 lookups on loaded rows and the payloads workflows send are unchanged. The module imports nothing from ``app`` and does
 no I/O, so workflow code can import it.
+
+LIFECYCLES is R-05's per-type declaration: for each task workflow type, the task statuses and run states its code
+writes, its waits, its outcomes and its compensation. R-05's other parts live elsewhere: success and failure criteria,
+the evidence schema and template versioning in WP-28, retryable failure classes in WP-05, idempotency rules in WP-23,
+and escalation in WP-39 and WP-33.
 """
+from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 
@@ -110,4 +116,99 @@ RUN_STATE_FOR_TASK_STATUS = MappingProxyType({
     TaskStatus.CANCELLED: RunState.CANCELED,
     TaskStatus.STOPPED_BY_USER: RunState.STOPPED_BY_USER,
     TaskStatus.COMPENSATED: RunState.COMPENSATED,
+})
+
+
+@dataclass(frozen=True)
+class Lifecycle:
+    """What one task workflow type does with its task's status.
+
+    ``task_statuses`` and ``run_states`` are everything its code writes; ``waits`` the statuses in which it waits for
+    Kirill or for a coding slot; ``outcomes`` the terminal statuses it ends in; ``compensation`` the status a compensated
+    task ends in, or None for a type that does not compensate.
+    """
+
+    task_statuses: frozenset[TaskStatus]
+    run_states: frozenset[RunState]
+    waits: frozenset[TaskStatus]
+    outcomes: frozenset[TaskStatus]
+    compensation: TaskStatus | None
+
+
+_GENERIC = Lifecycle(
+    task_statuses=frozenset({
+        TaskStatus.RUNNING,
+        TaskStatus.PENDING_USER_INPUT,
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.COMPENSATED,
+        TaskStatus.STOPPED_BY_USER,
+    }),
+    run_states=frozenset({
+        RunState.RUNNING,
+        RunState.COMPLETED,
+        RunState.FAILED_TERMINAL,
+        RunState.COMPENSATED,
+        RunState.STOPPED_BY_USER,
+    }),
+    waits=frozenset({TaskStatus.PENDING_USER_INPUT}),
+    outcomes=frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.COMPENSATED, TaskStatus.STOPPED_BY_USER}),
+    compensation=TaskStatus.COMPENSATED,
+)
+
+# Each task workflow type's lifecycle, by its workflow type name. tests/test_lifecycles.py pins that each type's code
+# names only what it declares. WP-14 reads the waits to take long human waits out of IDLE_BLOCKING.
+LIFECYCLES = MappingProxyType({
+    "GenericTaskWorkflow": _GENERIC,
+    "CatalogTaskWorkflow": Lifecycle(
+        task_statuses=_GENERIC.task_statuses | {TaskStatus.CANCELLED},
+        run_states=frozenset({
+            RunState.RUNNING,
+            RunState.AWAITING_APPROVAL,
+            RunState.WAITING_EXTERNAL,
+            RunState.BLOCKED,
+            RunState.COMPLETED,
+            RunState.FAILED_TERMINAL,
+            RunState.COMPENSATED,
+            RunState.STOPPED_BY_USER,
+            RunState.CANCELED,
+        }),
+        waits=frozenset({TaskStatus.PENDING_USER_INPUT}),
+        outcomes=_GENERIC.outcomes | {TaskStatus.CANCELLED},
+        compensation=TaskStatus.COMPENSATED,
+    ),
+    "CodingTaskWorkflow": Lifecycle(
+        task_statuses=frozenset({
+            TaskStatus.RUNNING,
+            TaskStatus.BLOCKED,
+            TaskStatus.PENDING_USER_INPUT,
+            TaskStatus.DEPLOYING,
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.STOPPED_BY_USER,
+            TaskStatus.CANCELLED,
+        }),
+        run_states=frozenset({
+            RunState.RUNNING,
+            RunState.QUEUED,
+            RunState.PAUSED,
+            RunState.AWAITING_INPUT,
+            RunState.AWAITING_APPROVAL,
+            RunState.DEPLOYING,
+            RunState.COMPLETED,
+            RunState.FAILED_TERMINAL,
+            RunState.STOPPED_BY_USER,
+            RunState.CANCELED,
+        }),
+        waits=frozenset({TaskStatus.BLOCKED, TaskStatus.PENDING_USER_INPUT}),
+        outcomes=frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.STOPPED_BY_USER, TaskStatus.CANCELLED}),
+        compensation=None,
+    ),
+})
+# The registered workflow types that write no task status: the two step children, intake and deep recall.
+NO_TASK_STATUS = frozenset({
+    "CatalogStepChildWorkflow",
+    "GenericExecuteChildWorkflow",
+    "IntakeWorkflow",
+    "DeepRecallWorkflow",
 })

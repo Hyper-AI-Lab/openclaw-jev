@@ -48,6 +48,7 @@ with workflow.unsafe.imports_passed_through():
         strip_system_acks,
     )
     from app.orchestrator.step_predicates import extract_agent_facts
+    from app.status import RunState, StepStatus, TaskStatus
     from app.workflows.judgment import EvaluatorRetry
     from app.workflows.recall_phase import DeepRecallPhase
     from app.workflows.timeouts import AURA_TURN
@@ -130,14 +131,14 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
         ]
         await workflow.execute_activity(
             update_task_status,
-            {"task_id": task_id, "status": "stopped_by_user"},
+            {"task_id": task_id, "status": TaskStatus.STOPPED_BY_USER},
             start_to_close_timeout=timedelta(seconds=10),
         )
         await workflow.execute_activity(
             update_process_state,
             {
                 "process_run_id": self.process_run_id,
-                "state": "stopped_by_user",
+                "state": RunState.STOPPED_BY_USER,
                 "ended": True,
             },
             start_to_close_timeout=timedelta(seconds=10),
@@ -155,7 +156,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
             start_to_close_timeout=timedelta(seconds=30),
         )
         await self._resubmit_leftovers(task_id, session_key)
-        return {"status": "stopped_by_user", "task_id": task_id}
+        return {"status": TaskStatus.STOPPED_BY_USER, "task_id": task_id}
 
     @workflow.run
     async def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -195,7 +196,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
 
         await workflow.execute_activity(
             update_task_status,
-            {"task_id": task_id, "status": "running", "next_check_minutes": 10},
+            {"task_id": task_id, "status": TaskStatus.RUNNING, "next_check_minutes": 10},
             start_to_close_timeout=timedelta(seconds=10),
         )
         recall_cfg = payload.get("deep_recall") or {}
@@ -263,11 +264,11 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                 },
                 start_to_close_timeout=timedelta(seconds=30),
             )
-            return {"status": "compensated", "task_id": task_id, "reason": err_text}
+            return {"status": TaskStatus.COMPENSATED, "task_id": task_id, "reason": err_text}
 
         if isinstance(result, dict):
             await self._drop_recall(f"task ended {result.get('status')}")
-        if isinstance(result, dict) and result.get("status") == "stopped_by_user":
+        if isinstance(result, dict) and result.get("status") == TaskStatus.STOPPED_BY_USER:
             return result
 
         while task_kind == "durable" and not self._cancel_requested:
@@ -300,9 +301,9 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                 )
             except Exception as e:
                 err_text = format_workflow_error(e)
-                return {"status": "compensated", "task_id": task_id, "reason": err_text}
+                return {"status": TaskStatus.COMPENSATED, "task_id": task_id, "reason": err_text}
 
-        if isinstance(result, dict) and result.get("status") in ("compensated", "failed"):
+        if isinstance(result, dict) and result.get("status") in (TaskStatus.COMPENSATED, TaskStatus.FAILED):
             # Slack refusing the reply for good is recorded and alerted; a notice would be refused too.
             if result.get("reason") == SLACK_DELIVERY_FAILED:
                 return result
@@ -446,7 +447,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                 result = await handle
                 status = result.get("status", "pending")
                 text = result.get("text", "")
-                if status == "completed":
+                if status == StepStatus.COMPLETED:
                     step_context += f"\n[{step_name}]: {text[:500]}"
                     final_text = text
                     if not is_conversational:
@@ -462,7 +463,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                         )
                         self._memory_block = memory_block
                     break
-                if status in ("failed", "blocked"):
+                if status in (StepStatus.FAILED, StepStatus.BLOCKED):
                     if attempt >= 3 and step_context.strip():
                         await workflow.execute_activity(
                             execute_compensation,
@@ -474,16 +475,16 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                             start_to_close_timeout=timedelta(seconds=15),
                         )
                         return {
-                            "status": "compensated",
+                            "status": TaskStatus.COMPENSATED,
                             "task_id": task_id,
                             "reason": result.get("reason"),
                         }
-                    if status == "blocked":
+                    if status == StepStatus.BLOCKED:
                         await workflow.execute_activity(
                             update_task_status,
                             {
                                 "task_id": task_id,
-                                "status": "pending_user_input",
+                                "status": TaskStatus.PENDING_USER_INPUT,
                                 "next_check_minutes": 60,
                             },
                             start_to_close_timeout=timedelta(seconds=10),
@@ -704,14 +705,14 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
                 update_process_state,
                 {
                     "process_run_id": self.process_run_id,
-                    "state": "completed",
+                    "state": RunState.COMPLETED,
                     "ended": True,
                 },
                 start_to_close_timeout=timedelta(seconds=10),
             )
             await workflow.execute_activity(
                 update_task_status,
-                {"task_id": task_id, "status": "completed"},
+                {"task_id": task_id, "status": TaskStatus.COMPLETED},
                 start_to_close_timeout=timedelta(seconds=10),
             )
         # Memory is promoted only from a reply that reached Kirill; histories from before kept the old call.
@@ -728,8 +729,8 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
             )
         await self._resubmit_leftovers(task_id, session_key)
         if not delivered:
-            return {"status": "failed", "task_id": task_id, "final_result": clean_result, "reason": SLACK_DELIVERY_FAILED}
-        return {"status": "completed", "task_id": task_id, "final_result": clean_result,
+            return {"status": TaskStatus.FAILED, "task_id": task_id, "final_result": clean_result, "reason": SLACK_DELIVERY_FAILED}
+        return {"status": TaskStatus.COMPLETED, "task_id": task_id, "final_result": clean_result,
                 **({"followup": followup} if followup else {})}
 
     async def _escalate(
@@ -757,8 +758,8 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
             {
                 "task_id": task_id,
                 "process_run_id": self.process_run_id,
-                "task_status": "failed",
-                "process_state": "failed_terminal",
+                "task_status": TaskStatus.FAILED,
+                "process_state": RunState.FAILED_TERMINAL,
             },
             start_to_close_timeout=timedelta(seconds=10),
         )
@@ -789,7 +790,7 @@ class GenericTaskWorkflow(AttachedMessages, EvaluatorRetry, DeepRecallPhase):
         )
         await self._resubmit_leftovers(task_id, session_key)
         return {
-            "status": "failed",
+            "status": TaskStatus.FAILED,
             "task_id": task_id,
             "reason": "escalated",
             "user_notified": notified,

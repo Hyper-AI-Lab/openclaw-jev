@@ -19,6 +19,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from app.orchestrator.prompt_policy import build_catalog_step_prompt
     from app.orchestrator.step_predicates import decide_status_from_predicates
+    from app.status import StepStatus
     from app.workflows.timeouts import AURA_TURN
 
 
@@ -58,7 +59,7 @@ class CatalogStepChildWorkflow:
         )
         if not lease.get("acquired"):
             return {
-                "status": "pending",
+                "status": StepStatus.PENDING,
                 "reason": f"Dispatch skipped: lease {lease.get('reason')}",
                 "text": "",
                 "step_id": step_id,
@@ -123,8 +124,8 @@ class CatalogStepChildWorkflow:
                 attempt,
                 max_attempts,
             )
-            step_status = "completed" if decision["action"] == "complete" else (
-                "failed" if decision["action"] == "fail" else decision["status"]
+            step_status = StepStatus.COMPLETED if decision["action"] == "complete" else (
+                StepStatus.FAILED if decision["action"] == "fail" else decision["status"]
             )
             await workflow.execute_activity(
                 record_step,

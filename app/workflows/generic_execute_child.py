@@ -20,6 +20,7 @@ with workflow.unsafe.imports_passed_through():
     from app.notification_policy import sanitize_user_facing_text
     from app.orchestrator.prompt_policy import build_generic_execute_prompt
     from app.orchestrator.step_predicates import decide_status_from_predicates, extract_agent_facts
+    from app.status import StepStatus
     from app.workflows.timeouts import AURA_TURN
 
 
@@ -61,7 +62,7 @@ class GenericExecuteChildWorkflow:
         )
         if not lease.get("acquired"):
             return {
-                "status": "pending",
+                "status": StepStatus.PENDING,
                 "reason": f"Lease {lease.get('reason')}",
                 "text": "",
                 "step_id": step_id,
@@ -145,8 +146,8 @@ class GenericExecuteChildWorkflow:
             display_text = sanitize_user_facing_text(
                 extract_agent_facts(text_content).get("body") or text_content
             )
-            step_status = "completed" if decision["action"] == "complete" else (
-                "failed" if decision["action"] == "fail" else decision["status"]
+            step_status = StepStatus.COMPLETED if decision["action"] == "complete" else (
+                StepStatus.FAILED if decision["action"] == "fail" else decision["status"]
             )
             await workflow.execute_activity(
                 record_step,

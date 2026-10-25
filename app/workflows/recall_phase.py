@@ -27,6 +27,7 @@ with workflow.unsafe.imports_passed_through():
     from app.orchestrator.decision_engine import decide_completion_gate
     from app.orchestrator.process_brief import compose_executor_memory
     from app.orchestrator.step_predicates import extract_agent_facts
+    from app.status import TaskStatus
     from app.workflows.deep_recall import DeepRecallWorkflow, recall_workflow_id
     from app.workflows.timeouts import AURA_TURN
 
@@ -129,7 +130,7 @@ class DeepRecallPhase:
             return {}
         await workflow.execute_activity(
             update_task_status,
-            {"task_id": task_id, "status": "running", "next_check_minutes": 10},
+            {"task_id": task_id, "status": TaskStatus.RUNNING, "next_check_minutes": 10},
             start_to_close_timeout=timedelta(seconds=10),
         )
         try:

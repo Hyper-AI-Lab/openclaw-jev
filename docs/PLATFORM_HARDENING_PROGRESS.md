@@ -2712,3 +2712,62 @@ The tree is clean. **Resumed from cache:** the fixer re-runs, then the round-2 r
 - **Not re-run:** the full four-layout verify. The change is one call in the `/` route, and the earlier four-layout run covers the rest of the head.
 
 **Ledger:** `WP04-b1-starlette-drift` (medium, WP-09). WP-09's hashed lock must pin every dependency to what production runs.
+
+## 2026-10-24 16:03 UTC · WP-04 batch 1 merged and deployed; batch 2 started
+
+**Gated merge (second run):**
+- CI `test` SUCCESS on head `ba1421a` (Starlette 1.10.0 on the runner), equal to the local HEAD;
+- `main` still `122d49a`; one open PR.
+
+PR #45 was squash-merged as `a9e81d9`.
+
+**Deploy:** `deployed`; restarted rmp-api and rmp-worker; health, readiness and the canary passed. The idle gate in this deploy already ran the new strict `IDLE_BLOCKING` count; it would have stopped the deploy on a raise.
+
+**Host step WP04-05** (after the next hourly canary at 16:07): a background check is running.
+
+**Batch 2 started:** branch `aura/wp-04-2-workflow-vocabulary` from `a9e81d9`, items WP04-09…11, run `wf_977a4c3a-ac1`. The PR will carry `no-replay-impact`.
+
+## 2026-10-24 16:10 UTC · WP-04 batch 1 host step done
+
+After the 16:07Z hourly canary:
+- `journalctl -u rmp-canary -u rmp-canary-sentinel --since "2026-10-24 15:52:51 UTC" | grep -c 'count_active_user_tasks_sync failed'` gives **0**;
+- the canary logged **CANARY OK** at 16:07:29Z (Result=success), not a SKIP, so no count comparison was needed;
+- the strict count itself ran inside this batch's deploy gate without raising.
+
+**WP-04 batch 1 is complete.** Batch 2 is in its workflow.
+
+## 2026-10-24 20:42 UTC · WP-04 batch 2: implemented, round 1 approved; fix round resumed after the usage limit
+
+**Implementer:** 8 commits.
+- 92 status lines in 7 workflow files now use `app.status` members of identical value, plus 7 import lines.
+- An AST identity script confirmed every file equals `a9e81d9` once the members are turned back into strings.
+- Replay: 43 passed, covering all 40 fixtures.
+- A new test pins that Temporal's converter sends identical bytes for a member and its string.
+- `LIFECYCLES` and `NO_TASK_STATUS` are declared; `tests/test_lifecycles.py` covers proofs (a)–(c), with mutation probes caught.
+- G7 (a)–(e) is in the guard.
+- **Deviations:** G7 (b) and (c) also flag conditionals, which `coding_task.py:492` needs; there are tests beyond the spec's list.
+- **Harness:** 1679 passed, 1 skipped in every layout.
+
+**Round 1:** both reviewers approved, with non-blocking points:
+- the comment said "writes" where the test counts reads too;
+- proof (a) keyed classes by `__name__` instead of the Temporal type name;
+- proof (b) sorts members by enum, not by the slot they fill.
+
+**Fix round 1:** stopped at the usage limit after `9a84ad5` and `3ddc4f4` (the first two points). Resumed from cache.
+
+## 2026-10-25 01:04 UTC · WP-04 batch 2 approved
+
+**Run `wf_977a4c3a-ac1`** (resumed after the usage limit): `approved: true`, 11 commits.
+- **Fix round 1:** `9a84ad5` and `3ddc4f4`.
+- **Round 2:** both approved. The closure reviewer's G7d mixed-comparison point was fixed in `7473b99`.
+- **Round 3:** both approved, with two minor non-blocking points carried into batch 3:
+  - proof (b) misses a task or run status written through `StepStatus` (same value);
+  - the `Lifecycle` docstring's `waits` wording leaves out Coding's `blocked` during a usage-limit pause.
+
+**Four-layout verify:** running.
+
+## 2026-10-25 02:13 UTC · WP-04 batch 2 verified
+
+**Four-layout verify** (HEAD `7473b99`): default, live, coding-job and direct each gave 1681 passed, 1 skipped, leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. Summary in `research/wp04-b2-verify-summary.txt`.
+
+**Next:** the PR with the label `no-replay-impact` (WP04-09 is the reason) and the gated merge. The deploy restarts rmp-api and rmp-worker, replay-safe. No host steps.

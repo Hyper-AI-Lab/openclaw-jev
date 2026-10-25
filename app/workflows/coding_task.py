@@ -43,6 +43,7 @@ with workflow.unsafe.imports_passed_through():
     from app.notification_policy import sanitize_user_facing_text
     from app.orchestrator.process_brief import user_words
     from app.orchestrator.step_predicates import extract_agent_facts
+    from app.status import RunState, TaskStatus
     from app.task_registry.stop_command import is_whole_message_stop
     from app.workflows.approval import CLOSE_AFTER, REMINDER_AFTER, gate_decision
     from app.workflows.judgment import EvaluatorRetry
@@ -121,7 +122,7 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
         settings = await workflow.execute_activity(coding_settings, {}, start_to_close_timeout=QUICK)
         holding = False
         try:
-            await self._status("running", "running")
+            await self._status(TaskStatus.RUNNING, RunState.RUNNING)
             await self._take_slot()
             holding = True
             brief = await self._brief(payload, settings)
@@ -143,9 +144,9 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
         except Stopped:
             return await self._finish_stopped()
         except Unanswered:
-            await self._close("cancelled", "canceled")
+            await self._close(TaskStatus.CANCELLED, RunState.CANCELED)
             await self._notice(f"Task {task_id[:8]} closed: no answer from you within 7 days, so nothing shipped.")
-            return {"status": "cancelled", "task_id": task_id}
+            return {"status": TaskStatus.CANCELLED, "task_id": task_id}
         finally:
             if holding and not self._handed_off:
                 await workflow.execute_activity(release_coding_slot, {"task_id": task_id}, start_to_close_timeout=QUICK)
@@ -215,17 +216,17 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
             slot = await workflow.execute_activity(acquire_coding_slot, {"task_id": self._ctx["task_id"]}, start_to_close_timeout=QUICK)
             if slot["granted"]:
                 if queued:
-                    await self._status("running", "running")
+                    await self._status(TaskStatus.RUNNING, RunState.RUNNING)
                 return
             if not queued:
                 queued = True
-                await self._status("blocked", "queued")
+                await self._status(TaskStatus.BLOCKED, RunState.QUEUED)
                 await self._notice(f"Another coding job is running (task {slot['holder'][:8]}). Yours starts as soon as "
                                    "it finishes; reply stop to cancel it.")
             await self._sleep(SLOT_POLL)
 
     async def _ask(self, message: str, process_state: str) -> None:
-        await self._status("pending_user_input", process_state, minutes=60)
+        await self._status(TaskStatus.PENDING_USER_INPUT, process_state, minutes=60)
         await self._notice(message)
         self._asked_at, self._reminded = workflow.now(), False
 
@@ -260,9 +261,9 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
             if asked == BRIEF_QUESTIONS:
                 return None
             questions = "\n".join(brief["questions"])
-            await self._ask(f"Before I start on this, I need to know:\n{questions}", "awaiting_input")
+            await self._ask(f"Before I start on this, I need to know:\n{questions}", RunState.AWAITING_INPUT)
             answers += await self._reply(f"Still waiting on your answer before I start:\n{questions}")
-            await self._status("running", "running")
+            await self._status(TaskStatus.RUNNING, RunState.RUNNING)
         return None
 
     async def _claude(self, prompt: str, system: str, session: Optional[str]) -> Dict[str, Any]:
@@ -284,11 +285,11 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
             resume = (datetime.fromtimestamp(claude["resume_at"], timezone.utc) if claude.get("resume_at")
                       else workflow.now() + USAGE_LIMIT_WAIT)
             wait = max(resume - workflow.now(), timedelta(minutes=1))
-            await self._status("blocked", "paused", minutes=int(wait.total_seconds() // 60) + 1)
+            await self._status(TaskStatus.BLOCKED, RunState.PAUSED, minutes=int(wait.total_seconds() // 60) + 1)
             await self._notice(f"Claude Code reached its usage limit on round {self._round}. I'll continue at "
                                f"{resume:%H:%M} UTC on {resume:%b %d}; reply stop to cancel.")
             await self._sleep(wait)
-            await self._status("running", "running")
+            await self._status(TaskStatus.RUNNING, RunState.RUNNING)
             session = claude.get("session_id") or session
             prompt = prompts.CONTINUE_PROMPT if session else prompt
 
@@ -413,7 +414,7 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
         """None once Kirill approved in Slack after the card; otherwise his change request."""
         # Approvals sent before this card are for nothing yet; the card asks for a fresh one.
         self.user_inputs = [m for m in self.user_inputs if gate_decision(str(m)) != "approve"]
-        await self._ask(card, "awaiting_approval")
+        await self._ask(card, RunState.AWAITING_APPROVAL)
         opened = self._asked_at
         how = "deploy it" if target == "self" else "open the pull request"
         reminder = (f"Reminder: the change is waiting for you. Reply approve to {how}, tell me what to change, or stop."
@@ -425,7 +426,7 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                 raise Stopped()
             changes = [words for words, decision in zip(replies, decisions) if decision == "other"]
             if changes:
-                await self._status("running", "running")
+                await self._status(TaskStatus.RUNNING, RunState.RUNNING)
                 return "\n".join(changes)
             if not ready:
                 await self._notice("I can't ship this yet: it hasn't passed review and RMP's tests. "
@@ -435,7 +436,7 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                 confirm_approval_provenance, {"task_id": self._ctx["task_id"], "gate_opened_at": opened.isoformat()},
                 start_to_close_timeout=QUICK)
             if provenance.get("ok"):
-                await self._status("running", "deploying")
+                await self._status(TaskStatus.RUNNING, RunState.DEPLOYING)
                 return None
             await self._notice("I can only ship this on your own approve, sent in Slack after the card above. "
                                "Reply approve here, tell me what to change, or stop.")
@@ -457,8 +458,8 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
             return shipped
         if shipped["status"] == "handed_off":
             self._handed_off = True
-            await self._status("deploying", "deploying")
-            return {"status": "deploying", "task_id": self._ctx["task_id"], "shipped": shipped}
+            await self._status(TaskStatus.DEPLOYING, RunState.DEPLOYING)
+            return {"status": TaskStatus.DEPLOYING, "task_id": self._ctx["task_id"], "shipped": shipped}
         return await self._final(brief, review, evidence, shipped)
 
     async def _final(self, brief: Dict[str, Any], review: Dict[str, Any], evidence: Dict[str, Any],
@@ -487,22 +488,22 @@ class CodingTaskWorkflow(EvaluatorRetry, AttachedMessages):
                 start_to_close_timeout=QUICK)
         delivered = await self._deliver_final({**self._ctx, "message": message or shipped.get("summary") or str(shipped)})
         if delivered:
-            await self._close("completed" if ok else "failed", "completed" if ok else "failed_terminal")
+            await self._close(TaskStatus.COMPLETED if ok else TaskStatus.FAILED, RunState.COMPLETED if ok else RunState.FAILED_TERMINAL)
         await self._resubmit_leftovers(self._ctx["task_id"], self._ctx["session_key"])
-        return {"status": "completed" if ok and delivered else "failed", "task_id": self._ctx["task_id"], "shipped": shipped}
+        return {"status": TaskStatus.COMPLETED if ok and delivered else TaskStatus.FAILED, "task_id": self._ctx["task_id"], "shipped": shipped}
 
     async def _fail(self, message: str) -> Dict[str, Any]:
         await workflow.execute_activity(finalize_task_failure, {"task_id": self._ctx["task_id"], "process_run_id": self.process_run_id,
-                                                                "task_status": "failed", "process_state": "failed_terminal"},
+                                                                "task_status": TaskStatus.FAILED, "process_state": RunState.FAILED_TERMINAL},
                                         start_to_close_timeout=QUICK)
         await self._notice(message)
         await self._resubmit_leftovers(self._ctx["task_id"], self._ctx["session_key"])
-        return {"status": "failed", "task_id": self._ctx["task_id"], "reason": message}
+        return {"status": TaskStatus.FAILED, "task_id": self._ctx["task_id"], "reason": message}
 
     async def _finish_stopped(self) -> Dict[str, Any]:
         await workflow.execute_activity(stop_coding_units, {"task_id": self._ctx["task_id"]}, start_to_close_timeout=timedelta(minutes=2))
-        await self._close("stopped_by_user", "stopped_by_user")
+        await self._close(TaskStatus.STOPPED_BY_USER, RunState.STOPPED_BY_USER)
         kept = f" The work so far is kept on branch {self._job['branch']}." if self._job else ""
         await self._notice(f"Stopped. Nothing shipped.{kept}")
         await self._resubmit_leftovers(self._ctx["task_id"], self._ctx["session_key"])
-        return {"status": "stopped_by_user", "task_id": self._ctx["task_id"]}
+        return {"status": TaskStatus.STOPPED_BY_USER, "task_id": self._ctx["task_id"]}
