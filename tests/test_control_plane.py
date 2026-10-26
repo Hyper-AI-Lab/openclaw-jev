@@ -1,12 +1,12 @@
 """Control-plane tests: status and compensation on a real database, reconciler filter, fail-soft memory.
 
-The status activities run on a SQLite session, as a workflow schedules them; a /cancel of a finished task is refused
-through the same writer (tests/test_task_cancel_api.py).
+The status activities run on a SQLite session, as a workflow schedules them, and so does /cancel of a finished task,
+which the same writer refuses (over HTTP: tests/test_task_cancel_api.py).
 """
 import dataclasses
 import logging
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -115,6 +115,36 @@ async def test_compensating_a_stopped_task_changes_nothing(control_plane, caplog
         "task transition refused: t1 stopped_by_user -> compensated actor=workflow:GenericTaskWorkflow "
         "cause=execute_compensation",
     ]
+
+
+async def test_cancel_on_a_finished_task_is_refused(control_plane, caplog, monkeypatch):
+    """/cancel of a compensated task (the canary pattern) stops nothing and writes nothing: the attempt is refused and
+    logged, and the answer gives the status the task ended in."""
+    from app import metrics
+    from app.api import server
+
+    caplog.set_level(logging.WARNING, logger="rmp.transitions")
+    await seed(control_plane,
+               Task(id="t1", goal="Compare visa rules", status="compensated"),
+               ProcessRun(id="r1", task_id="t1", current_state="compensated"),
+               Step(id="s-done", process_run_id="r1", status="compensated"))
+    connect, abort = AsyncMock(), MagicMock()
+    monkeypatch.setattr(server, "connect_temporal", connect)
+    monkeypatch.setattr("app.openclaw_control.schedule_abort", abort)
+
+    async with control_plane() as db:
+        answer = await server.cancel_task("t1", reason="canary_timeout", db=db)
+
+    assert answer == {"status": "compensated", "task_id": "t1", "cancelled": False}
+    connect.assert_not_awaited()
+    abort.assert_not_called()
+    assert [t.status for t in await rows(control_plane, Task)] == ["compensated"]
+    assert [r.current_state for r in await rows(control_plane, ProcessRun)] == ["compensated"]
+    assert [s.status for s in await rows(control_plane, Step)] == ["compensated"]
+    assert await rows(control_plane, Event) == []
+    assert [r.getMessage() for r in caplog.records if r.name == "rmp.transitions"] == [
+        "task transition refused: t1 compensated -> cancelled actor=api:/tasks/{id}/cancel cause=canary_timeout"]
+    assert metrics.get_counters()["task_transition_refused"] == 1
 
 
 @pytest.mark.parametrize("finished", ["failed", "cancelled", "completed"])
