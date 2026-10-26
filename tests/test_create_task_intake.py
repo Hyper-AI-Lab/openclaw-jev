@@ -122,7 +122,7 @@ async def test_a_stale_reservation_is_reused_only_while_it_is_still_created(tmp_
     not reused: 409, and the row stays as it was, a move the writer made in the request rolled back with it."""
     import json
     import logging
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
     import httpx
     from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -138,7 +138,7 @@ async def test_a_stale_reservation_is_reused_only_while_it_is_still_created(tmp_
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    stalled = datetime.utcnow() - timedelta(seconds=server.INTAKE_RESERVATION_WINDOW_SEC + 60)
+    stalled = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=server.INTAKE_RESERVATION_WINDOW_SEC + 60)
     async with factory() as db:
         db.add(Task(id="reserved", idempotency_key="idem-reuse", goal="check the logs", task_type="user",
                     status=status, supplementary_context={"intake_reserved": True}, updated_at=stalled))

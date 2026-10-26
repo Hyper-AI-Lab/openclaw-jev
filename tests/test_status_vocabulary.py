@@ -561,9 +561,11 @@ TRANSITION_ROWS = frozenset({"Task", "ProcessRun"})
 RAW_STATUS_UPDATE = re.compile(r"\bupdate\s+(tasks|process_runs)\b", re.IGNORECASE)
 # Reviewed writes of another row's status in a module that imports Task or ProcessRun, as (path, function).
 OTHER_ROW_STATUS_WRITERS = frozenset({
-    ("app/activities/db_activities.py", "record_step"),  # Step
-    ("app/activities/db_activities.py", "execute_compensation"),  # Step
-    ("app/deep_memory/enrich.py", "enrich_document"),  # DeepDocument
+    # (file, function, the variable whose .status the function writes): only that row's own status is exempt, so a
+    # Task or ProcessRun status written in the same function is still G8.
+    ("app/activities/db_activities.py", "record_step", "existing"),  # Step
+    ("app/activities/db_activities.py", "execute_compensation", "step"),  # Step
+    ("app/deep_memory/enrich.py", "enrich_document", "live_doc"),  # DeepDocument
 })
 # This batch only: the sentinel's cancel is already a compare-and-set in SQL; batch 4 replaces it, and this entry goes.
 RAW_STATUS_UPDATERS = frozenset({("app/production/canary_sentinel.py", "cancel_task_sync")})
@@ -619,6 +621,12 @@ def _assigned_attributes(node):
     return flat
 
 
+def _exempt_row_status(target, path, function):
+    """Whether ``target`` is the ``.status`` of the one non-transition row an allowlisted function writes."""
+    return (target.attr == "status" and isinstance(target.value, ast.Name)
+            and (path, function, target.value.id) in OTHER_ROW_STATUS_WRITERS)
+
+
 def writer_violations(tree, path):
     """Sorted (line, "G8") pairs: a status written outside app/transitions.py."""
     if path == STATUS_WRITER:
@@ -633,8 +641,8 @@ def writer_violations(tree, path):
         if _string(node) and RAW_STATUS_UPDATE.search(node.value) and (path, function) not in RAW_STATUS_UPDATERS:
             found.add((node.lineno, "G8"))
         if (imports_a_row and isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
-                and any(_status_attribute(target) for target in _assigned_attributes(node))
-                and (path, function) not in OTHER_ROW_STATUS_WRITERS):
+                and any(_status_attribute(target) and not _exempt_row_status(target, path, function)
+                        for target in _assigned_attributes(node))):
             found.add((node.lineno, "G8"))
     return sorted(found)
 
@@ -698,6 +706,11 @@ def event_log_violations(tree, path):
     # A reviewed writer of a step's status in one function is no licence for another.
     ("from app.db.models import Step, Task\nasync def other(step):\n    step.status = StepStatus.FAILED",
      "app/activities/db_activities.py"),
+    # An allowlisted function is exempt only for its own row's status: a task or run status in it is still G8.
+    ("from app.db.models import Step, Task\nasync def record_step(payload):\n    task.status = TaskStatus.FAILED",
+     "app/activities/db_activities.py"),
+    ("from app.db.models import ProcessRun, Step\nasync def execute_compensation(payload):\n"
+     "    run.current_state = RunState.CANCELED", "app/activities/db_activities.py"),
     ('def cancel_task_sync():\n    pass\nSQL = "UPDATE tasks SET status = :cancelled WHERE id = :id"',
      "app/production/canary_sentinel.py"),
 ])
@@ -765,7 +778,7 @@ def test_no_status_write_outside_the_writer_and_no_event_rewrite():
     # Each reviewed exception still names a function that exists, so a stale entry is noticed and removed.
     functions = {(rel, node.name) for rel, tree in modules for node in ast.walk(tree)
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    assert OTHER_ROW_STATUS_WRITERS | RAW_STATUS_UPDATERS | EVENT_DELETERS <= functions
+    assert {(path, function) for path, function, _ in OTHER_ROW_STATUS_WRITERS} | RAW_STATUS_UPDATERS | EVENT_DELETERS <= functions
 
 
 async def test_the_listener_catches_a_direct_write(runs, tmp_path, monkeypatch):

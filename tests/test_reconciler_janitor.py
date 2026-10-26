@@ -1,6 +1,6 @@
 """Reconciler and workflow janitor tests (W5)."""
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -438,7 +438,7 @@ async def test_a_stuck_task_that_finished_meanwhile_is_left_as_it_ended(stale_db
          patch.object(reconciler, "metrics_inc") as metric:
         async with stale_db() as db:
             task = await db.get(Task, "stuck")
-            repaired = await reconciler._repair_stuck_running_task(client, db, task, datetime.utcnow(), stats)
+            repaired = await reconciler._repair_stuck_running_task(client, db, task, datetime.now(timezone.utc).replace(tzinfo=None), stats)
             await db.commit()
 
     async with stale_db() as db:

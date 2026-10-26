@@ -1,6 +1,6 @@
 """Coding tasks in the reconciler: an orphan gets its units stopped and a notice, and is never re-judged."""
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -61,14 +61,14 @@ async def _close(client, factory, status="running", minutes=5):
     and the task's status, its run's state and the events after the pass's commit."""
     async with factory() as db:
         db.add_all([Task(id="t1", goal="Fix the greeting", task_type="user", status=status,
-                         updated_at=datetime.utcnow() - timedelta(minutes=minutes)),
+                         updated_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=minutes)),
                     ProcessRun(id="r1", task_id="t1", process_type="coding_task", current_state="running")])
         await db.commit()
     stats = {"events": 0}
     with patch("app.activities.coding_activities.stop_task_units", return_value=["aura-claude-t1-2"]) as stop, \
          patch.object(reconciler, "_notify_repair", new_callable=AsyncMock) as notify:
         async with factory() as db:
-            closed = await reconciler._close_orphaned_coding_tasks(client, db, datetime.utcnow(), stats)
+            closed = await reconciler._close_orphaned_coding_tasks(client, db, datetime.now(timezone.utc).replace(tzinfo=None), stats)
             await db.commit()
     async with factory() as db:
         task = await db.get(Task, "t1")
