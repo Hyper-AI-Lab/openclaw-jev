@@ -3,10 +3,11 @@ import logging
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.db.models import Base, Task
+from app.db.models import Base, Event, Task
 from app.task_registry.intake_decision_engine import apply_intake_policy
 from app.task_registry.intake_handlers import handle_intake_outcome
 from app.task_registry.intake_prompt import parse_intake_response
@@ -287,6 +288,8 @@ async def test_handle_attach_resume_clarify_starts_existing(factory):
         out = await handled(factory, ANSWER, "the awareness check, not an upgrade")
     assert out["intake_action"] == "resume_clarify"
     assert out["signal_required"] is False
+    # The brief describes the clarify as it was when the answer came.
+    assert "status=pending_user_input" in out["_guided_memory_block"]
     resumed = await stored(factory, "clarify-1")
     assert resumed.status == "created" and resumed.supplementary_context["intake_clarify"] is False
     assert "CLARIFY ANSWER" in out["_guided_memory_block"]
@@ -294,16 +297,21 @@ async def test_handle_attach_resume_clarify_starts_existing(factory):
 
 @pytest.mark.asyncio
 async def test_an_answer_to_a_finished_clarify_becomes_a_new_task(factory, caplog):
-    """The clarify was closed before the answer came: it is never started again, and the message is a new task."""
+    """The clarify was closed before the answer came: it is never started again, nothing is attached to it, and the
+    message is a new task."""
     caplog.set_level(logging.WARNING, logger="rmp.transitions")
     await seed(factory, Task(id="clarify-1", goal="original ask", task_type="user", status="cancelled",
                              supplementary_context=dict(CLARIFY)))
     with patch(RECORD, new=AsyncMock(return_value="dec-1")), patch(
         ADD_MSG, new=AsyncMock(return_value="m1")
-    ):
+    ) as add:
         out = await handled(factory, ANSWER, "the awareness check, not an upgrade")
     assert out is None
     assert (await stored(factory, "clarify-1")).status == "cancelled"
+    # No message and no intake.attach on the finished task, which would count as an attached message left unanswered.
+    add.assert_not_awaited()
+    async with factory() as db:
+        assert (await db.execute(select(Event).where(Event.event_type == "intake.attach"))).scalars().all() == []
     assert [r.getMessage() for r in caplog.records if r.name == "rmp.transitions"] == [
         "task transition refused: clarify-1 cancelled -> created actor=intake cause=clarify answered"]
 
