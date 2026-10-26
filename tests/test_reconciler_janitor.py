@@ -271,11 +271,12 @@ async def stale_db(tmp_path):
     from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
     from sqlalchemy.orm import sessionmaker
 
-    from app.db.models import Base, Event, ProcessRun, Task
+    from app.db.models import Base, Event, ProcessRun, Step, Task
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'stale.db'}")
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all, tables=[Task.__table__, ProcessRun.__table__, Event.__table__])
+        await conn.run_sync(Base.metadata.create_all,
+                            tables=[Task.__table__, ProcessRun.__table__, Step.__table__, Event.__table__])
     yield sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     await engine.dispose()
 
@@ -397,6 +398,58 @@ async def test_stale_repair_does_not_overwrite_a_terminal_task(stale_db, caplog,
         assert refused == []
     else:
         assert refused == [f"task transition refused: stale cancelled -> {to} actor=reconciler cause={cause}"]
+
+
+@pytest.mark.parametrize("run_state, to", [("awaiting_approval", "compensated"), ("running", "failed")])
+async def test_a_stuck_task_that_finished_meanwhile_is_left_as_it_ended(stale_db, caplog, run_state, to):
+    """The workflow's own close lands while the stuck repair terminates it: the repair's compensation (a run that made
+    progress) or failure is refused, and the repair counts, records and reports nothing."""
+    import logging
+
+    from sqlalchemy import select
+    from temporalio.client import WorkflowExecutionStatus
+
+    from app import reconciler
+    from app.activities import db_activities
+    from app.db.models import Event, ProcessRun, Task
+
+    caplog.set_level(logging.WARNING, logger="rmp.transitions")
+    async with stale_db() as db:
+        db.add_all([_stale_task("stuck", "running", STUCK_REPAIR_MINUTES + 15),
+                    ProcessRun(id="run-1", task_id="stuck", process_type="generic_task", current_state=run_state)])
+        await db.commit()
+
+    async def completed_meanwhile():
+        async with stale_db() as db:
+            (await db.get(Task, "stuck")).status = "completed"
+            await db.commit()
+        return MagicMock(status=WorkflowExecutionStatus.RUNNING)
+
+    client = MagicMock()
+    client.get_workflow_handle.return_value.describe = AsyncMock(side_effect=completed_meanwhile)
+    client.get_workflow_handle.return_value.terminate = AsyncMock()
+    stats = {"repaired": 0, "events": 0}
+
+    with patch.object(db_activities, "AsyncSessionLocal", stale_db), \
+         patch("app.memory.router.MemoryRouter.write", new_callable=AsyncMock), \
+         patch("app.task_registry.hooks.index_terminal_task_async", new_callable=AsyncMock), \
+         patch.object(reconciler, "_cleanup_orphan_plan_children", new_callable=AsyncMock, return_value=0), \
+         patch.object(reconciler, "_notify_repair", new_callable=AsyncMock) as notify, \
+         patch.object(reconciler, "metrics_inc") as metric:
+        async with stale_db() as db:
+            task = await db.get(Task, "stuck")
+            repaired = await reconciler._repair_stuck_running_task(client, db, task, datetime.utcnow(), stats)
+            await db.commit()
+
+    async with stale_db() as db:
+        assert (await db.get(Task, "stuck")).status == "completed"
+        assert (await db.execute(select(Event))).scalars().all() == []
+    assert repaired is False and stats == {"repaired": 0, "events": 0, "terminated": 1, "orphans_terminated": 0}
+    client.get_workflow_handle.return_value.terminate.assert_awaited_once()
+    notify.assert_not_awaited()
+    metric.assert_not_called()
+    assert [r.getMessage() for r in caplog.records if r.name == "rmp.transitions"] == [
+        f"task transition refused: stuck completed -> {to} actor=reconciler cause=stuck >{STUCK_REPAIR_MINUTES}m"]
 
 
 async def test_a_cancelled_run_of_a_completed_workflow_stays_cancelled(tmp_path):
