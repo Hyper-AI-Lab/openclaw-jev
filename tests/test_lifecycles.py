@@ -40,9 +40,9 @@ def _slots(trees):
 
 
 def _misplaced(trees):
-    """Each member written into a status slot of another enum, or of no known enum. A member of the wrong enum has a
-    right value (StepStatus.RUNNING equals TaskStatus.RUNNING), so only the slot shows that a task status or a run
-    state went through the wrong vocabulary."""
+    """Each member written into a status slot of another enum, or of no known enum, directly or through a name its
+    function assigns it to. A member of the wrong enum has a right value (StepStatus.RUNNING equals
+    TaskStatus.RUNNING), so only the slot shows that a task status or a run state went through the wrong vocabulary."""
     return [f"{cls}:{node.lineno} {node.value.id}.{node.attr} in a {enum.__name__ if enum else 'unknown'} slot"
             for cls, enum, node in _slots(trees) if enum is None or node.value.id != enum.__name__]
 
@@ -146,6 +146,12 @@ def _snippet(source):
     # A member given to a helper's parameter that holds no status.
     "class W:\n    async def _ask(self, message, process_state):\n        pass\n\n"
     "    async def run(self):\n        await self._ask(TaskStatus.BLOCKED, RunState.AWAITING_INPUT)",
+    # A member kept under a local name first.
+    "class W:\n    async def _status(self, task_status, process_state):\n        pass\n\n"
+    "    async def run(self):\n        task_status = StepStatus.RUNNING\n"
+    "        await self._status(task_status, RunState.RUNNING)",
+    'async def run(hard):\n    state = RunState.FAILED_TERMINAL if hard else StepStatus.FAILED\n'
+    '    await workflow.execute_activity(update_process_state, {"process_run_id": r, "state": state})',
 ])
 def test_a_member_of_the_wrong_enum_in_a_status_slot_is_found(source):
     assert _misplaced(_snippet(source))
@@ -163,6 +169,13 @@ def test_a_member_of_the_wrong_enum_in_a_status_slot_is_found(source):
     "    async def run(self):\n        await self._stop_task(task_id, status=TaskStatus.CANCELLED)",
     # Reads and locals are no slot: a step outcome compared or kept under a name ending in status.
     'if status in (StepStatus.FAILED, StepStatus.BLOCKED):\n    step_status = StepStatus.COMPLETED',
+    "class W:\n    async def _status(self, task_status, process_state):\n        pass\n\n"
+    "    async def run(self):\n        task_status = TaskStatus.BLOCKED\n"
+    "        await self._status(task_status, RunState.PAUSED)",
+    # A name counts by what its own function assigns: another function's step status is not this slot's.
+    "class W:\n    async def _status(self, task_status, process_state):\n        pass\n\n"
+    "    async def step(self):\n        status = StepStatus.FAILED\n\n"
+    "    async def run(self, status):\n        await self._status(status, RunState.RUNNING)",
 ])
 def test_a_member_of_its_own_enum_in_a_status_slot_passes(source):
     assert not _misplaced(_snippet(source))

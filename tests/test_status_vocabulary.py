@@ -383,14 +383,35 @@ def helper_parameters(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in STATUS_HELPERS}
 
 
+def _assignments_by_scope(tree):
+    """For each node inside a function of ``tree``, the values its innermost function assigns to each plain name."""
+    scopes = {}
+    # ast.walk visits an outer function before the functions inside it, which then take their own nodes.
+    for function in ast.walk(tree):
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            assigned = {}
+            for node in ast.walk(function):
+                if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                    for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                        if isinstance(target, ast.Name):
+                            assigned.setdefault(target.id, []).append(node.value)
+            scopes.update((node, assigned) for node in ast.walk(function))
+    return scopes
+
+
 def status_slots(tree, helpers):
     """(enum, member) for each app.status member written into a status slot of workflow code: a status activity's
     payload, a status helper's argument or parameter default (``helpers`` gives their positional parameters), or the
-    status of a task's or a step's dict. ``enum`` is None for a slot ACTIVITY_SLOTS and HELPER_SLOTS do not name."""
+    status of a task's or a step's dict. A plain name in a slot counts by the members its function assigns to it.
+    ``enum`` is None for a slot ACTIVITY_SLOTS and HELPER_SLOTS do not name."""
     found = []
+    scopes = _assignments_by_scope(tree)
 
     def take(enum, node):
-        found.extend((enum, leaf) for leaf in _leaves(node) if status_member(leaf))
+        for leaf in _leaves(node):
+            assigned = scopes.get(leaf, {}).get(leaf.id, []) if isinstance(leaf, ast.Name) else []
+            values = [leaf, *(value for source in assigned for value in _leaves(source))]
+            found.extend((enum, value) for value in values if status_member(value))
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
