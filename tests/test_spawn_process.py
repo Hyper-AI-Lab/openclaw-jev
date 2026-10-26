@@ -131,6 +131,44 @@ async def test_spawn_refuses_a_finished_task(factory):
 
 
 @pytest.mark.asyncio
+async def test_spawn_starts_nothing_when_the_move_to_running_is_refused(factory, caplog):
+    """A deploying task whose last run ended belongs to its deploy: the refused move makes no run and starts no
+    workflow (D-6: side effects only on a change)."""
+    import logging
+
+    from app.task_registry.spawn import spawn_process_for_task
+
+    caplog.set_level(logging.WARNING, logger="rmp.transitions")
+    async with factory() as db:
+        db.add_all([Task(id="t3", goal="ship the fix", task_type="user", status="deploying",
+                         openclaw_session_key="agent:main:main", correlation_id="t3"),
+                    ProcessRun(id="pr-shipped", task_id="t3", current_state="completed")])
+        await db.commit()
+
+    with patch(
+        "app.task_registry.spawn.workflow_is_running",
+        new=AsyncMock(return_value=False),
+    ), patch(
+        "app.task_registry.spawn.ensure_process_run",
+        new=AsyncMock(return_value="pr-next"),
+    ) as mock_ensure, patch(
+        "app.task_registry.spawn.start_task_workflow",
+        new=AsyncMock(),
+    ) as mock_start:
+        async with factory() as db:
+            out = await spawn_process_for_task("t3", db=db)
+            await db.commit()
+
+    assert out == {"task_id": "t3", "spawned": False, "reason": "active_process_exists"}
+    mock_ensure.assert_not_awaited()
+    mock_start.assert_not_awaited()
+    assert [r.getMessage() for r in caplog.records if r.name == "rmp.transitions"] == [
+        "task transition refused: t3 deploying -> running actor=spawn cause=spawn_process"]
+    async with factory() as db:
+        assert (await db.get(Task, "t3")).status == "deploying"
+
+
+@pytest.mark.asyncio
 async def test_the_spawn_route_and_intake_turn_a_finished_task_away(factory, monkeypatch):
     """The route answers 409, and intake makes the message a new task."""
     from app.api import server

@@ -84,6 +84,15 @@ async def spawn_process_for_task(
         if task.status in TERMINAL:
             return {"task_id": task_id, "spawned": False, "reason": "task_terminal"}
 
+        if task.status not in WORKFLOW_OWNED:
+            reopened = await set_task_status(session, task_id, TaskStatus.RUNNING, actor="spawn",
+                                             cause="spawn_process", next_check_at=None)
+            # A refused move starts nothing, not even a run: a deploying task belongs to its deploy, and a task that
+            # finished meanwhile is finished.
+            if not reopened.changed:
+                reason = "task_terminal" if reopened.previous in TERMINAL else "active_process_exists"
+                return {"task_id": task_id, "spawned": False, "reason": reason}
+
         process_run_id = await ensure_process_run(
             {
                 "task_id": task_id,
@@ -91,10 +100,6 @@ async def spawn_process_for_task(
                 "force_new": True,
             }
         )
-
-        if task.status not in WORKFLOW_OWNED:
-            await set_task_status(session, task_id, TaskStatus.RUNNING, actor="spawn", cause="spawn_process",
-                                  next_check_at=None)
 
         workflow_started = False
         spawn_leg_signaled = False
