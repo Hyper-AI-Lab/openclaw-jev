@@ -568,15 +568,21 @@ def _sqlalchemy_names(tree, name):
                      for alias in node.names if alias.name == name and alias.asname}
 
 
+def _row_or_table(node, rows):
+    """``Task`` or ``Task.__table__`` for a row named in ``rows``."""
+    if isinstance(node, ast.Attribute) and node.attr == "__table__":
+        node = node.value
+    return isinstance(node, ast.Name) and node.id in rows
+
+
 def _statement_on(call, names, rows):
-    """``update(Task)`` (or ``delete``; ``names`` holds the statement's local names) or ``Task.__table__.update()``."""
+    """``update(Task)`` (or ``delete``; ``names`` holds the statement's local names), also as ``sa.update(Task)`` or
+    on ``Task.__table__``, or ``Task.__table__.update()``."""
     func = call.func
-    if (isinstance(func, ast.Name) and func.id in names and call.args and isinstance(call.args[0], ast.Name)
-            and call.args[0].id in rows):
+    if _called(call) in names and call.args and _row_or_table(call.args[0], rows):
         return True
-    table = func.value if isinstance(func, ast.Attribute) else None
-    return (isinstance(table, ast.Attribute) and func.attr in names and table.attr == "__table__"
-            and isinstance(table.value, ast.Name) and table.value.id in rows)
+    return (isinstance(func, ast.Attribute) and func.attr in names and isinstance(func.value, ast.Attribute)
+            and func.value.attr == "__table__" and _row_or_table(func.value, rows))
 
 
 def _assigned_attributes(node):
@@ -661,6 +667,9 @@ def event_log_violations(tree, path):
     ("from sqlalchemy import update as sa_update\nstmt = sa_update(ProcessRun).values(current_state=state)",
      "ops/example.py"),
     ("stmt = Task.__table__.update().values(status=to)", "app/example.py"),
+    ("import sqlalchemy as sa\nawait db.execute(sa.update(Task).where(Task.id == tid).values(status='failed'))",
+     "app/example.py"),
+    ("from sqlalchemy import update\nstmt = update(Task.__table__).values(status=to)", "app/example.py"),
     ('await db.execute(text("UPDATE tasks SET status = :to WHERE id = :id"))', "app/example.py"),
     ('sql = "update process_runs set current_state = :s"', "worker.py"),
     ("from app.db.models import Task\ntask.status = TaskStatus.FAILED", "app/example.py"),
@@ -679,6 +688,8 @@ def test_the_writer_guard_flags_its_snippet(source, path):
     ("from sqlalchemy import update\nawait db.execute(update(Task).where(Task.id == tid).values(status=to))",
      "app/transitions.py"),
     ("from sqlalchemy import update\nawait db.execute(update(VectorOutbox).values(done_at=now))", "app/example.py"),
+    ("import sqlalchemy as sa\nawait db.execute(sa.update(VectorOutbox.__table__).values(done_at=now))",
+     "app/example.py"),
     ("from app.db.models import Task\ntask.supplementary_context = ctx", "app/example.py"),
     # A module without Task or ProcessRun writes other rows' statuses: a deep-recall report.
     ("from app.db.models import DeepContextReport\nrow.status = payload['status']", "app/example.py"),
@@ -696,6 +707,8 @@ def test_the_writer_guard_passes_its_negative(source, path):
     "from sqlalchemy import delete\nawait db.execute(delete(Event).where(Event.occurred_at < cutoff))",
     "from sqlalchemy import update\nawait db.execute(update(Event).values(event_payload={}))",
     "stmt = Event.__table__.delete()",
+    "import sqlalchemy as sa\nawait db.execute(sa.delete(Event))",
+    "from sqlalchemy import delete\nawait db.execute(delete(Event.__table__))",
     'await db.execute(text("DELETE FROM events WHERE occurred_at < :cutoff"))',
     'sql = "TRUNCATE TABLE events"',
     'sql = "update events set event_payload = null"',
