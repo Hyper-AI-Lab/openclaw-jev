@@ -2771,3 +2771,201 @@ After the 16:07Z hourly canary:
 **Four-layout verify** (HEAD `7473b99`): default, live, coding-job and direct each gave 1681 passed, 1 skipped, leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. Summary in `research/wp04-b2-verify-summary.txt`.
 
 **Next:** the PR with the label `no-replay-impact` (WP04-09 is the reason) and the gated merge. The deploy restarts rmp-api and rmp-worker, replay-safe. No host steps.
+
+## 2026-10-25 02:20 UTC · PR #46: the label race explained; merged on GitHub's CLEAN state
+
+**The stop:** the gated job stopped because the PR's check rollup held two `test` runs on head `088f22a`:
+- **failure:** run `40153613718`, 5 s, failed at the workflow-change guard step. It ran for the "opened" event, before the `no-replay-impact` label was visible.
+- **success:** run `40153614309`, started 1 s later, the full suite in 5 min 23 s, with the guard passing on the label.
+
+**Response:**
+- GitHub refused a re-run of the failed job ("cannot be rerun").
+- GitHub's own judgement was `mergeStateStatus` **CLEAN**: branch protection is satisfied, because it reads the latest run.
+
+**Gate rule for labelled PRs from now on:** `CLEAN`, and the latest `test` check-run by `started_at` = success. The other three checks stay: head equals the local HEAD, `main` unmoved, one open PR.
+
+**Merge:** squash-merged as `356f77d`. The deploy is being watched, together with the worker journal for nondeterminism.
+
+## 2026-10-25 02:26 UTC · WP-04 batch 2 deployed; batch 3 started
+
+**Deploy:** `deployed` `356f77d`; restarted rmp-api and rmp-worker; health, readiness and the canary passed. The worker journal since the restart has **0** nondeterminism lines, as the replay fixtures predicted. No host steps.
+
+**Batch 3 started:** guarded transitions, items WP04-12…19, plus the two points carried from batch 2's review.
+
+## 2026-10-26 05:20 UTC · WP-04 batch 3 resumed after the usage limit
+
+**Run `wf_d4c41af5-6bc`:** the implementer stopped after 2 h 10 min. It left 13 commits and a clean tree, but no report.
+
+**The commits:**
+- the transition table;
+- the wrong-enum slot check and the `blocked` wait wording (both carried from batch 2);
+- `app/transitions.py`;
+- every writer routed through it;
+- `/cancel` on a finished task;
+- G8 and the listener;
+- tests on a real database;
+- G9 (the event log stays immutable);
+- ARCHITECTURE;
+- the deploy reply run;
+- the contended wording.
+
+**Backup:** `/root/.cache/wp04-b3-wip-0520/`.
+
+**Relaunch:** run `wf_22a86eee-0a8`. Its resume note asks the implementer to review the 13 commits against the spec item by item, finish the rest (proofs, the replay and label decision, the four layouts) and report.
+
+## 2026-10-26 10:22 UTC · WP-04 batch 3: implemented, round 1 approved, fix round 1 done; resumed after the usage limit
+
+**Implementer** (resumed): reviewed and kept the 13 commits, and added two.
+- `a4adbb2` fixes a real bug: the clarify resume committed an attach on a finished task before its guarded write was refused.
+- `0d0e129` adds a WP04-17 test.
+- `app/workflows` is unchanged. Every workflow call to these activities is a bare awaited statement, except `ensure_process_run`, whose return value did not change. Replay: 43 passed, so the PR needs no label.
+
+**Round 1:** both reviewers approved, with non-blocking points:
+- **spawn ignored a refused move**, then created a run and started a workflow anyway;
+- the row 8 and row 19 paths were untested;
+- G8 and G9 missed `sa.update(Task)` and `Row.__table__` statements;
+- a status member kept under a local name passed the slot check.
+
+**Fix round 1:** `5a8fd8d`, `c294d36`, `8c582a6` (spawn writes the move first and starts nothing on a refusal), `eb92d32`, `5ba7d09`.
+
+**Round-2 correctness re-review:** stopped at the usage limit. Resumed from cache.
+
+## 2026-10-26 10:27 UTC · Kirill asked about overall progress; the WP-09 spec started in parallel
+
+**Answer to Kirill:**
+- Done: Phases 0, A and B; WP-01, WP-02 and WP-12 complete; WP-04 batches 1 and 2 deployed, batch 3 in round-2 review.
+- Ahead: 38 work packages, some partly done, then Phase 6.
+- Ledger: 522 open items, 9 of them high.
+
+**In parallel with WP-04 batch 3's re-review:** the WP-09 spec (`wp-spec`, run `wf_3b57de0a-19c`).
+- It reads a new read-only worktree `/root/work/spec-ro`, detached at `origin/main` `356f77d`, so it never touches batch 3's clone.
+- It runs from the scratch directory.
+- It plans WP-09 against WP-04 batches 3 and 4. Implementation starts after batch 4 is deployed (rule 43).
+- It takes in the WP-04 deferrals and `WP04-b1-starlette-drift`.
+
+## 2026-10-26 15:22 UTC · Both lines stopped at the usage limit; resuming one at a time
+
+**WP-04 batch 3** (run `wf_22a86eee-0a8`):
+- the round-2 correctness re-review **approved**, with one non-blocking point (an extra entry in the `OTHER_ROW_STATUS_WRITERS` allowlist);
+- the closure re-review stopped at the limit;
+- **resumed first.**
+
+**WP-09 spec** (run `wf_3b57de0a-19c`): the writer stopped after 55 min, leaving a complete-looking draft (`specs/WP-09.md`, 786 lines, 33 items in 8 batches, sections 0–8).
+- **Copy:** `/root/.cache/WP-09.draft-*.md`.
+- **Next:** resumed with a "verify and finish" note once batch 3's review ends.
+
+**Why one at a time:** the tokens per usage window are fixed, so parallel lines only reach the limit sooner, and more agents are cut off mid-task.
+
+## 2026-10-26 20:24 UTC · WP-04 batch 3 approved; two closure points fixed by me; verify and the WP-09 spec resumed
+
+**Run `wf_22a86eee-0a8`:** `approved: true`, 20 commits.
+- **Round 2:** both approved; the fixer's notes were report statements only.
+- **Round 3:** both approved, with two non-blocking points.
+
+**My fix `e1c5335`:**
+1. G8's `OTHER_ROW_STATUS_WRITERS` exempted whole functions. It is now (file, function, variable): only `existing`, `step` and `live_doc`'s own `.status` is exempt, so a task or run status inside those functions is still caught. Two positive snippets were added; the old whole-function exemption fails both (probe).
+2. Four new test lines used `datetime.utcnow()`; they now use `datetime.now(timezone.utc).replace(tzinfo=None)`, per spec §0.
+
+The affected tests pass: 148.
+
+**Label decision** (for the PR body): `app/workflows` is unchanged by this batch, and replay gives 43 passed, so the PR needs no label.
+
+**Running now:**
+- my four-layout verify (local compute, no tokens);
+- the WP-09 spec, resumed to verify and finish its draft (run `wf_b901d0fe-41d`).
+
+## 2026-10-26 21:27 UTC · WP-09 spec complete (writer, critic, revision)
+
+**Run `wf_b901d0fe-41d`:** the writer verified and finished its draft. The revision gives `specs/WP-09.md` 912 lines, with 33 items in 8 batches.
+
+**Critic:** "revise", with 8 gaps, all closed by the revision:
+1. **`make lock` would re-resolve every transitive pin**, the very Starlette drift the lock exists to stop. It now constrains to the current lock and fails, naming the pin, if a pin would move.
+2. **Reverting batch 5** would have rebuilt an unhashed fresh resolve. The old venv now moves to a lock-hash path, which a revert finds again.
+3. **Resuming a switch window** could have recorded the wrong rollback target and pruned production's only copy. `previous` is now recorded once, in `applying`, and `switch` gets an explicit `kind_root`.
+4. **A unit killed in the window** while rmp-api cannot start. Now forward means venv before tree, revert means tree before venv, and §0 gives a manual relaunch.
+5. **Dist-patch windows** versus rule 37 and the sentinel and canary restarts.
+6. **K-25's fence**: `ReadOnlyPaths` must cover `/root/.openclaw/venvs`.
+7. **Shared-file rows** and the WP-04 batch 3 overlap.
+8. Minor precision points.
+
+**Its open questions, decided by the programme, not Kirill:**
+1. **The `app/coding/verify.py` order:** 15 / 09 in either order. **Accepted:** the functions don't overlap and WP-15 is not yet specified.
+2. **Dist-patch residual:** the watchdog can restart the gateway mid-patch, but only after Temporal fails. **Accepted** as a documented residual until WP-08.
+3. **§7 bookkeeping:** being applied by an agent, with diffs to check.
+4. **The window assumes old code imports on the new venv.** **Accepted:** dependency PRs only add, `make lock` moves no pin silently, and review plus §0's relaunch cover the rest.
+
+**Implementation** starts after WP-04 batch 4 is deployed (rule 43).
+
+## 2026-10-26 21:34 UTC · WP-09 bookkeeping applied; a gap in my own bookkeeping found and being closed
+
+**WP-09 §7 "Before batch 1":** applied by an agent, all eleven bullets, with diffs checked. Backups are in `/root/.cache/bookkeeping-wp09/`.
+- `work-packages.md`: 12 §3 rows, the WP-09 notes, and the cross-WP notes for WP-03, -06, -16, -17, -21, -22 and -26.
+- `ordering.md`: the rule 37 sentence.
+- `specs/WP-04.md`: the WP04-33 amendment.
+- `ledger.json`: `wp_states["WP-09"]`.
+- One word beyond the literal text: ci.yml's "after all three" became "after all four", which is correct.
+
+**Gap found (my error):** WP-04's and WP-12's own §7 edits to the programme files were never applied. I had closed their ledger items but not done the rest:
+- `work-packages.md`: WP-04's 30-row §3 reorder, and both WPs' notes;
+- `ordering.md`: rule 3's sentence and rule 43's additions;
+- WP-04's per-batch ledger closures for its deployed batches 1 and 2;
+- `TRI-014`'s move to WP-30;
+- WP-01's stale TRI-001 ci.yml line.
+
+The §3 table therefore mixes old and new orders. **Fix:** the same agent applies both §7s (batches 1 and 2 only for WP-04's per-batch items), with backups, diffs and a "needs a decision" list.
+
+**Rule from now on:** when a WP's spec is written, apply its §7 "Before batch 1" bookkeeping. When each batch is deployed, apply that batch's §7 closures and notes, and log them.
+
+## 2026-10-26 21:41 UTC · WP-04 and WP-12 §7 bookkeeping applied; five open points decided
+
+**Applied by the agent**, with diffs checked; backups in `/root/.cache/bookkeeping-wp04-wp12/`.
+
+**WP-12 §7:**
+- the Qdrant scripts' row; WP-36's K-24 criterion; the B3b-01 D-1 sentence; WP-10's memory-limit note;
+- ledger closures and notes were already complete.
+
+**WP-04 §7:**
+- 20 rows reordered and 8 rows added. A script compared all 31 rows with the spec; they match, apart from the intended `server.py` (no 09) and `reconciler.py` (03 / 09).
+- four WP-04 notes and rule 43's sentence;
+- ledger: TRI-014's home moves to WP-30 (K-23); TRI-023's note;
+- after batch 2: `debt-scalability-03` closed; R-05's progress noted.
+
+**WP-01 TRI-001:** ci.yml order 01 → 09 → 26 → 20.
+
+**The five points needing a decision, decided by the programme:**
+1. `vector_store.py` row: **12** → 25. The `app/memory/vector.py` row moves 12 ahead. Reason: batch 8 was deployed on 2026-10-23.
+2. Rule 3: only the first clause, marked "met" (WP-12 complete 2026-10-24); the batch-8 clause was overtaken by the early deploy.
+3. `wp_states["WP-04"]`: an up-to-date value.
+4. The 4a/4b/4c batch mapping becomes a fifth note.
+5. Follow WP-04 §7's wording: drop "(fast-track)" from the `server.py` row; mark B3b-01's old `dropdb` fix as superseded; update WP-36's TRI-125 quote.
+
+The agent is applying these now.
+
+## 2026-10-26 21:42 UTC · Bookkeeping decisions applied
+
+The agent applied the five decisions exactly; diffs were checked and backups are in `/root/.cache/bookkeeping-decisions/`.
+- `app/memory/vector.py`: **12** moved ahead; new row `vector_store.py`: **12** → 25;
+- rule 3's met clause;
+- `wp_states["WP-04"]` updated;
+- the fifth WP-04 note (the 4a/4b/4c mapping);
+- "(fast-track)" dropped from the `server.py` row;
+- B3b-01's old fix marked superseded;
+- the TRI-125 quote updated.
+
+The programme files now agree with specs WP-01, WP-04, WP-09 and WP-12.
+
+## 2026-10-27 03:00 UTC · WP-04 batch 3 verified; a timing flake isolated
+
+**Four-layout verify** (HEAD `e1c5335`):
+- default, coding-job and direct each gave 1797 passed, 1 skipped, exit 0; node 58/58; leftovers 0. These runs took 26–30 min, under load from the WP-09 spec and the bookkeeping agents.
+- **live** first gave 1 failed: `tests/test_openclaw_control.py::test_the_warm_helper_aborts_without_the_cli`.
+  - The test sleeps a fixed 0.5 s, then expects the node helper to be ready; under load the abort fell back to the CLI.
+  - Alone it passed 3/3, and batch 3 touches neither the test nor `openclaw_control`.
+  - Ledgered as `WP04-b3-flaky-warm-helper-test` (WP-06).
+- **live, full re-run** (load 3.0): 1797 passed, 1 skipped, leftovers 0, clean, none, **exit 0**.
+
+Summaries: `research/wp04-b3-verify-summary.txt` and `wp04-b3-verify-live-rerun.txt`.
+
+**Label decision:** none. `app/workflows` is unchanged and replay passes.
+
+**Next:** PR, gated merge, deploy (rmp-api, rmp-worker), then the host steps: the refusal count over 24 h, and an unknown-status count of 0.
