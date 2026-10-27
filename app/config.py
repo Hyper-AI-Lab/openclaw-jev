@@ -59,6 +59,11 @@ def _aura_code_root() -> str:
     return os.environ.get("AURA_CODE_ROOT", "/srv/aura-code")
 
 
+def _temporal_address() -> str:
+    # ops/temporal_healthcheck.py reads the same variable with the same default; it cannot import app.
+    return os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+
+
 OPENCLAW_HOME = _openclaw_home()
 RMP_ROOT = _rmp_root()
 OPENCLAW_CONFIG_PATH = _openclaw_config_path()
@@ -68,6 +73,7 @@ AUTH_PROFILES_PATH = _auth_profiles_path()
 RMP_DATA_DIR = _rmp_data_dir()
 OPENCLAW_ENV_PATH = _openclaw_env_path()
 AURA_CODE_ROOT = _aura_code_root()
+TEMPORAL_ADDRESS = _temporal_address()
 
 # PEP 562: resolve path attrs even when a long-lived process imported an older
 # config module that lacked a newly-added name (from app.config import X).

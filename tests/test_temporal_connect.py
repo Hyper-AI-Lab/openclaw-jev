@@ -1,8 +1,13 @@
+import ast
 import asyncio
+from pathlib import Path
 
 import pytest
 
+from app import config
 from app.temporal_control import connect_temporal_with_retry
+
+REPO = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.asyncio
@@ -160,3 +165,13 @@ async def test_reconciler_reconnects_after_dead_client(monkeypatch):
     client = await reconciler._get_temporal()
     assert client is reconciler._temporal_client
     assert client is not None
+
+
+def test_the_address_has_one_default(monkeypatch):
+    """The watchdog's probe cannot import app, so it repeats app.config's default; the two stay equal."""
+    probe = ast.parse((REPO / "ops" / "temporal_healthcheck.py").read_text())
+    [default] = [node.args[1].value for node in ast.walk(probe)
+                 if isinstance(node, ast.Call) and len(node.args) == 2
+                 and isinstance(node.args[0], ast.Constant) and node.args[0].value == "TEMPORAL_ADDRESS"]
+    monkeypatch.delenv("TEMPORAL_ADDRESS", raising=False)
+    assert config._temporal_address() == default

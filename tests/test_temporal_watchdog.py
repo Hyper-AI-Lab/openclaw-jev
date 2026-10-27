@@ -48,6 +48,9 @@ class _Client:
 class Client:
     @staticmethod
     async def connect(address):
+        if os.environ.get("FAKE_TEMPORAL_ADDRESS_LOG"):
+            with open(os.environ["FAKE_TEMPORAL_ADDRESS_LOG"], "w") as log:
+                log.write(address)
         if os.environ.get("FAKE_TEMPORAL_DOWN"):
             raise ConnectionError("connection refused")
         # Stand-in for the SDK's native threads aborting interpreter finalization.
@@ -80,3 +83,10 @@ def test_probe_reports_an_unreachable_temporal(tmp_path):
     result = _run_probe(tmp_path, FAKE_TEMPORAL_DOWN="1")
     assert result.returncode == 1
     assert "Temporal health FAIL: connect failed" in result.stderr
+
+
+def test_the_probe_connects_to_the_configured_address(tmp_path):
+    log = tmp_path / "address"
+    result = _run_probe(tmp_path, TEMPORAL_ADDRESS="127.0.0.1:7999", FAKE_TEMPORAL_ADDRESS_LOG=str(log))
+    assert result.returncode == 0, result.stderr
+    assert log.read_text() == "127.0.0.1:7999"

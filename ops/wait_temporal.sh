@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wait until Temporal gRPC on localhost:7233 accepts a client.
+# Wait until Temporal gRPC on the configured Temporal address accepts a client.
 set -euo pipefail
 RMP_ROOT="/root/.openclaw/rmp"
 VENV="${RMP_ROOT}/venv/bin/python"
