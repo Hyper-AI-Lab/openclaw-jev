@@ -1,6 +1,7 @@
 """Shipping approved changes against hermetic repos: the live repo, its GitHub remote, the review repository, mirrors.
 
-git runs for real; the host's systemctl, pip, checks and waiting are a recording fake.
+git runs for real; the host's systemctl, pip, checks and the gate's probes are a recording fake, and so is the
+launcher's systemd-run.
 """
 import fcntl
 import importlib.util
