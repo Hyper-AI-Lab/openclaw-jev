@@ -6,7 +6,8 @@ directory: a reviewed job's approved commit, queued by the coding workflow's dep
 GitHub's main that CI passed, queued by RMP's watcher (``aura-deploy-main``). It takes the code-reload lock
 within ``LOCK_WAIT_SEC``, holds it for the whole deploy, runs ``app.coding.deploy.self_deploy`` and records the
 result; when it cannot take the lock or Aura is busy, it records nothing and the run stays queued. A run queued
-for two hours is launched with ``--postpone`` and records ``postponed`` without the lock. After a result, a
+for two hours is launched with ``--postpone`` and records ``postponed`` without the lock. Each launch first prints
+which launch of the run it is; the run's launches share one log, ``deploy.log``. After a result, a
 reviewed job gets a fresh run of its workflow, which sends Aura's judged reply on the new code; a deploy of
 GitHub's main sends Kirill a note with its pull requests' links when it did not go live (rolled back, blocked,
 failed, postponed) or when it changed files under ``ops/systemd/``, which it never installs.
@@ -95,8 +96,11 @@ def main(spec_path: str, postpone: bool = False) -> int:
     the run's state and exits 0; a result is recorded, then the state is removed, then ``finish`` runs."""
     spec = json.loads(Path(spec_path).read_text())
     state = deploy.state_file(spec["task_id"])
+    run = deploy._read_json(state) or {}
+    log(f"launch {run.get('launches', 0)} of the deploy of {spec['head'][:12]} (phase {run.get('phase')}"
+        f"{', postpone' if postpone else ''})")
     if postpone:
-        result = postponed(deploy._read_json(state) or {})
+        result = postponed(run)
     else:
         with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
             if not take_lock(lock):

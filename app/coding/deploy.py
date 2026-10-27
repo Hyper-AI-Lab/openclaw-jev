@@ -356,13 +356,14 @@ def gate(host: "Host") -> Optional[str]:
 def launch(task: str, *, postpone: bool = False, live: Path) -> str:
     """Start the run's detached root unit, which outlives worker restarts, including its own; the unit started.
 
-    The launch is counted in the run's state first; a failed start puts the state back, so the run stays queued.
+    The launch is counted in the run's state first; a failed start puts the state back, so the run stays queued. A
+    run keeps one log: its first launch starts it empty, and every later launch of the run appends to it.
     """
     path, state = spec_file(task), state_file(task)
     run = json.loads(state.read_text())
     unit = f"aura-deploy-{task}"
-    log = path.with_name("deploy.log")
-    props = [f"RuntimeMaxSec={DEPLOY_UNIT_MAX_SEC}", f"StandardOutput=file:{log}", "StandardError=inherit",
+    log = f"{'append' if run.get('launches') else 'truncate'}:{path.with_name('deploy.log')}"
+    props = [f"RuntimeMaxSec={DEPLOY_UNIT_MAX_SEC}", f"StandardOutput={log}", "StandardError=inherit",
              f"Environment=PYTHONPATH={live}", "EnvironmentFile=-/etc/rmp/rmp.env", "EnvironmentFile=-/etc/openclaw/openclaw.env"]
     argv = ["systemd-run", f"--unit={unit}", f"--working-directory={live}", "--collect", "--quiet",
             *[f"--property={prop}" for prop in props], "--",

@@ -5,6 +5,7 @@ git runs for real; the host's systemctl, pip, checks and waiting are a recording
 import fcntl
 import importlib.util
 import json
+import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -804,7 +805,7 @@ def test_a_reviewed_run_launches_before_githubs_main(repos, systemd_run):
         "--unit=aura-deploy-t2", "--unit=aura-deploy-t1", "--unit=aura-deploy-main"]
 
 
-def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, monkeypatch):
+def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, monkeypatch, capsys):
     unit, seen = deploy_unit(monkeypatch)
     lock = repos.tmp / "code-reload.lock"
     monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", lock)
@@ -817,9 +818,12 @@ def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, 
     queued_for("t1", 60)
     assert deploy.next_deploy(busy) == "aura-deploy-t1"
     assert systemd_run.argvs[-1][-2:] == [str(deploy.spec_file("t1")), "--postpone"]
+    capsys.readouterr()
     with open(lock, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         assert unit.main(str(deploy.spec_file("t1")), postpone=True) == 1
+    assert capsys.readouterr().out.splitlines()[0].endswith(
+        " launch 1 of the deploy of cccccccccccc (phase queued, postpone)")
     result = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())
     assert result["status"] == "postponed" and result["head"] == "c" * 40
     assert result["summary"] == "Aura stayed busy for 2 hours, so nothing was deployed; main is unchanged."
@@ -892,3 +896,25 @@ def test_a_held_launch_lock_launches_nothing(repos, systemd_run):
         assert deploy.next_deploy(FakeHost(repos.live)) is None
     assert systemd_run.argvs == []
     assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t1" and len(systemd_run.argvs) == 1
+
+
+def test_a_run_keeps_one_log_of_its_launches(repos, systemd_run, monkeypatch, capsys):
+    log = deploy.spec_file("t1").with_name("deploy.log")
+    deploy.queue(reviewed(repos))
+    host = FakeHost(repos.live)
+    assert deploy.next_deploy(host) == "aura-deploy-t1"
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", repos.tmp / "code-reload.lock")
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live, busy=[1]))
+    capsys.readouterr()
+    assert unit.main(str(deploy.spec_file("t1"))) == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ launch 1 of the deploy of cccccccccccc \(phase queued\)", first)
+
+    assert deploy.next_deploy(host) == "aura-deploy-t1"
+    deploy.state_file("t1").unlink()
+    deploy.queue(reviewed(repos, head="d" * 40))
+    assert deploy.next_deploy(host) == "aura-deploy-t1"
+    outputs = [[arg for arg in argv if arg.startswith("--property=StandardOutput=")] for argv in systemd_run.argvs]
+    assert outputs == [[f"--property=StandardOutput=truncate:{log}"], [f"--property=StandardOutput=append:{log}"],
+                       [f"--property=StandardOutput=truncate:{log}"]]
