@@ -235,3 +235,50 @@ def test_the_address_has_one_default(monkeypatch):
                  and isinstance(node.args[0], ast.Constant) and node.args[0].value == "TEMPORAL_ADDRESS"]
     monkeypatch.delenv("TEMPORAL_ADDRESS", raising=False)
     assert config._temporal_address() == default
+
+
+def _guarded_files():
+    """Every source file of app/, ops/ and worker.py; compiled caches are no source."""
+    files = [path for root in ("app", "ops") for path in (REPO / root).rglob("*")
+             if path.is_file() and "__pycache__" not in path.parts]
+    return sorted([*files, REPO / "worker.py"])
+
+
+# The only 7233s left: the configured default and the probe's copy of it, and two port lists that are not addresses.
+PORT_7233 = (
+    ("app/config.py", '"TEMPORAL_ADDRESS", "localhost:7233"'),
+    ("app/config.py", '"7233-7243"'),  # the coder firewall's blocked_tcp_ports
+    ("ops/temporal_healthcheck.py", '"TEMPORAL_ADDRESS", "localhost:7233"'),
+    ("ops/claude_code_smoke.py", "6333, 7233, 8000"),  # the smoke test's port list
+)
+
+
+def test_no_temporal_address_literal():
+    hits = []
+    for path in _guarded_files():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        rel = str(path.relative_to(REPO))
+        hits += [(rel, line.strip()) for line in text.splitlines() if "7233" in line]
+    unexplained = [hit for hit in hits if not any(hit[0] == rel and part in hit[1] for rel, part in PORT_7233)]
+    assert unexplained == [], "a Temporal address outside app.config:\n" + "\n".join(map(str, unexplained))
+    assert len(hits) == len(PORT_7233)
+
+
+def test_client_connect_appears_twice():
+    """Every Temporal client comes from connect_temporal; the watchdog's probe, which cannot import app, is the one
+    other Client.connect."""
+    found = []
+    for path in _guarded_files():
+        if path.suffix != ".py":
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # ops/migrate_task_registry_schema.py is bash
+        found += [str(path.relative_to(REPO)) for node in ast.walk(tree)
+                  if isinstance(node, ast.Attribute) and node.attr == "connect"
+                  and isinstance(node.value, ast.Name) and node.value.id == "Client"]
+    assert found == ["app/temporal_control.py", "ops/temporal_healthcheck.py"]
