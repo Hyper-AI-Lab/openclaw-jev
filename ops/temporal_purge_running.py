@@ -16,6 +16,7 @@ from temporalio.client import Client, WorkflowExecutionStatus
 from app.db.database import AsyncSessionLocal
 from app.db.models import Task
 from app.status import TERMINAL, TaskStatus
+from app.transitions import set_task_status
 
 logger = logging.getLogger("rmp.temporal_purge")
 
@@ -100,8 +101,10 @@ async def purge_running(
                 row = await db.execute(select(Task).where(Task.id == tid))
                 task = row.scalar_one_or_none()
                 if task and task.status not in TERMINAL:
-                    task.status = TaskStatus.FAILED
-                    stats["tasks_failed"] += 1
+                    failed = await set_task_status(db, tid, TaskStatus.FAILED, actor="ops:temporal_purge_running",
+                                                   cause="temporal purge")
+                    if failed.changed:
+                        stats["tasks_failed"] += 1
             await db.commit()
 
     return stats

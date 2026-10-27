@@ -44,6 +44,7 @@ from app.telemetry import (
     trace_span,
     get_temporal_client_kwargs,
 )
+from app.transitions import UNCHANGED, set_run_state, set_task_status
 from app.workflows.catalog import (
     CATALOG,
     catalog_assignment_from_intake,
@@ -285,11 +286,16 @@ async def _cancel_intake_reservation(task: Task, db: AsyncSession) -> None:
         return
     if task.status not in ACTIVE:
         return
-    task.status = TaskStatus.CANCELLED
     ctx["intake_reserved"] = False
-    ctx["closed_reason"] = INTAKE_PLACEHOLDER
     task.supplementary_context = ctx
+    await set_task_status(db, task.id, TaskStatus.CANCELLED, actor="api:intake", cause=INTAKE_PLACEHOLDER,
+                          closed_reason=INTAKE_PLACEHOLDER)
     await db.commit()
+
+
+def _one_line(exc: Exception, limit: int = 200) -> str:
+    """An error as one short line, for a transition's cause."""
+    return " ".join(str(exc).split())[:limit]
 
 
 def _slack_context(request: TaskRequest) -> Dict[str, Any]:
@@ -504,12 +510,15 @@ async def create_task(
 
     if reuse_stale_reservation and prior is not None:
         task = prior
+        # A stale reservation is still created; anything else means it moved on meanwhile and is not reused.
+        reused = await set_task_status(db, task.id, TaskStatus.CREATED, actor="api:/tasks", cause="reservation reused")
+        if reused.outcome != UNCHANGED:
+            raise HTTPException(status_code=409, detail="The intake reservation is no longer open")
         task.goal = intent
         task.task_type = task_type
         task.task_kind = task_kind
         task.recurrence_key = recurrence_key
         task.openclaw_session_key = request.session_key
-        task.status = TaskStatus.CREATED
         ctx = dict(task.supplementary_context or {})
         ctx["intake_reserved"] = True
         task.supplementary_context = ctx
@@ -617,7 +626,6 @@ async def create_task(
                 }
             if outcome.get("intake_action") == "attach_active":
                 tid = outcome.get("task_id")
-                await _cancel_intake_reservation(task, db)
                 if tid and outcome.get("signal_required"):
                     from app.task_registry.intake_handlers import acknowledge_attach
 
@@ -638,6 +646,7 @@ async def create_task(
                                 exc,
                             )
                     if delivered:
+                        await _cancel_intake_reservation(task, db)
                         await db.commit()
                         await acknowledge_attach(
                             session_key=request.session_key,
@@ -646,10 +655,11 @@ async def create_task(
                             tags=request.tags or [],
                         )
                         return {**outcome, "attached_task_ids": delivered}
+                    # The reservation stays created and becomes this message's task.
                     logger.warning("No live workflow for %s; starting this message instead", tid)
-                    task.status = TaskStatus.CREATED
                     guided_memory = outcome.get("_guided_memory_block") or ""
                 else:
+                    await _cancel_intake_reservation(task, db)
                     await db.commit()
                     return outcome
             if outcome.get("intake_action") == "spawn_process":
@@ -758,17 +768,19 @@ async def create_task(
                 recall_depth=intake_result.get("recall_depth"),
             )
     except Exception as e:
-        task.status = TaskStatus.FAILED
-        metrics_inc("task_failed")
+        failed = await set_task_status(db, task_id, TaskStatus.FAILED, actor="api:/tasks",
+                                       cause=f"workflow start failed: {_one_line(e)}")
         await db.commit()
-        from app.production.alerting import send_alert
+        if failed.changed:
+            metrics_inc("task_failed")
+            from app.production.alerting import send_alert
 
-        await send_alert(
-            "task.failed",
-            f"Workflow start failed for task {task_id[:8]}",
-            severity="error",
-            context={"task_id": task_id, "error": str(e)[:300]},
-        )
+            await send_alert(
+                "task.failed",
+                f"Workflow start failed for task {task_id[:8]}",
+                severity="error",
+                context={"task_id": task_id, "error": str(e)[:300]},
+            )
         raise HTTPException(status_code=500, detail=f"Workflow start failed: {str(e)}")
 
     return {
@@ -791,6 +803,8 @@ async def spawn_process(task_id: str, db: AsyncSession = Depends(get_db)):
         process_type=task.task_type or "generic_task",
         db=db,
     )
+    if proc.get("reason") == "task_terminal":
+        raise HTTPException(status_code=409, detail="Task is finished")
     await db.commit()
     return proc
 
@@ -917,13 +931,24 @@ async def get_task_status(task_id: str, db: AsyncSession = Depends(get_db)):
     }
 
 
+CANCEL_ACTOR = "api:/tasks/{id}/cancel"
+
+
 @app.post("/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str, reason: str = "api_cancel", db: AsyncSession = Depends(get_db)):
-    """Terminate workflow and mark task stopped (dashboard / dev use)."""
+    """Terminate workflow and mark task cancelled (dashboard / dev use).
+
+    A finished task changes nothing: the attempt goes through the guarded writer, which refuses and logs it (a repeat
+    of a cancel is unchanged), and the answer gives its status with ``cancelled: false``.
+    """
     result = await db.execute(select(Task).where(Task.id == task_id))
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    if task.status in TERMINAL:
+        finished = await set_task_status(db, task_id, TaskStatus.CANCELLED, actor=CANCEL_ACTOR, cause=reason)
+        await db.commit()
+        return {"status": finished.previous, "task_id": task_id, "cancelled": False}
     from app.openclaw_control import schedule_abort
 
     schedule_abort(task_id, reason=reason)
@@ -938,20 +963,22 @@ async def cancel_task(task_id: str, reason: str = "api_cancel", db: AsyncSession
     except Exception as e:
         logger.warning("Terminate workflow %s: %s", task_id, e)
     # stopped_by_user is only for Kirill's own "stop"; API cancels are cleanups and timeouts.
-    task.status = TaskStatus.CANCELLED
-    task.supplementary_context = {**(task.supplementary_context or {}), "closed_reason": reason}
-    task.next_check_at = None
+    cancelled = await set_task_status(db, task_id, TaskStatus.CANCELLED, actor=CANCEL_ACTOR, cause=reason,
+                                      closed_reason=reason)
+    if not cancelled.changed:
+        # It finished while the workflow was being stopped.
+        await db.commit()
+        return {"status": cancelled.previous, "task_id": task_id, "cancelled": False}
     pr_result = await db.execute(
-        select(ProcessRun)
+        select(ProcessRun.id)
         .where(ProcessRun.task_id == task_id)
         .order_by(ProcessRun.started_at.desc())
         .limit(1)
     )
-    run = pr_result.scalar_one_or_none()
-    if run:
-        run.current_state = RunState.CANCELED
-        run.ended_at = datetime.utcnow()
-        run.lease_owner = None
+    run_id = pr_result.scalar_one_or_none()
+    if run_id:
+        await set_run_state(db, run_id, RunState.CANCELED, actor=CANCEL_ACTOR, cause=reason, ended=True,
+                            release_lease=True)
     db.add(
         Event(
             correlation_id=task.correlation_id or task_id,
@@ -1014,17 +1041,19 @@ async def retry_task(task_id: str, db: AsyncSession = Depends(get_db)):
             process_type=source.task_type if source.task_type in catalog_types else None,
         )
     except Exception as e:
-        task.status = TaskStatus.FAILED
-        metrics_inc("task_failed")
+        failed = await set_task_status(db, new_id, TaskStatus.FAILED, actor="api:/retry",
+                                       cause=f"workflow start failed: {_one_line(e)}")
         await db.commit()
-        from app.production.alerting import send_alert
+        if failed.changed:
+            metrics_inc("task_failed")
+            from app.production.alerting import send_alert
 
-        await send_alert(
-            "task.failed",
-            f"Retry workflow start failed for task {new_id[:8]}",
-            severity="error",
-            context={"task_id": new_id, "retried_from": task_id, "error": str(e)[:300]},
-        )
+            await send_alert(
+                "task.failed",
+                f"Retry workflow start failed for task {new_id[:8]}",
+                severity="error",
+                context={"task_id": new_id, "retried_from": task_id, "error": str(e)[:300]},
+            )
         raise HTTPException(status_code=500, detail=f"Workflow start failed: {str(e)}")
 
     return {"task_id": new_id, "status": "created", "retried_from": task_id}
@@ -1050,10 +1079,11 @@ async def suspend_all_running(db: AsyncSession = Depends(get_db)):
 
     stopped = 0
     for task in result.scalars().all():
-        task.status = TaskStatus.CANCELLED
-        task.supplementary_context = {**(task.supplementary_context or {}), "closed_reason": "dev_suspend"}
-        schedule_abort(task.id, reason="dev_suspend")
-        stopped += 1
+        cancelled = await set_task_status(db, task.id, TaskStatus.CANCELLED, actor="api:/dev/suspend-all",
+                                          cause="dev_suspend", closed_reason="dev_suspend")
+        if cancelled.changed:
+            schedule_abort(task.id, reason="dev_suspend")
+            stopped += 1
     await db.commit()
 
     update_stored_settings(

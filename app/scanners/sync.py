@@ -11,6 +11,8 @@ from app.db.models import Event, OsProcessTrack, ProcessRun, Task
 from app.scanners.catalog import CATALOG, get_scanner, list_scanners
 from app.scanners.lifecycle import maybe_restart_scanner
 from app.scanners.monitor import log_file_mtime, process_start_time, running_by_scanner_id
+from app.status import RunState, TaskStatus
+from app.transitions import set_run_state, set_task_status
 
 logger = logging.getLogger("rmp.scanners.sync")
 
@@ -160,19 +162,18 @@ async def _stop_scanner_run(db, track: OsProcessTrack, reason: str = "process_ex
     if track.task_id:
         result = await db.execute(select(Task).where(Task.id == track.task_id))
         task = result.scalar_one_or_none()
-        if task and task.status == "running":
-            task.status = "completed" if reason == "process_exit" else "stopped_by_user"
-            task.next_check_at = None
+        if task and task.status == TaskStatus.RUNNING:
+            ended = TaskStatus.COMPLETED if reason == "process_exit" else TaskStatus.STOPPED_BY_USER
+            await set_task_status(db, task.id, ended, actor="scanner_sync", cause=reason)
 
     if track.process_run_id:
         result = await db.execute(
             select(ProcessRun).where(ProcessRun.id == track.process_run_id)
         )
         run = result.scalar_one_or_none()
-        if run and run.current_state == "running":
-            run.current_state = "completed"
-            run.ended_at = datetime.utcnow()
-            run.lease_owner = None
+        if run and run.current_state == RunState.RUNNING:
+            await set_run_state(db, run.id, RunState.COMPLETED, actor="scanner_sync", cause=reason, ended=True,
+                                release_lease=True)
 
     db.add(
         Event(

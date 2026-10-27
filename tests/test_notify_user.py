@@ -170,17 +170,31 @@ def test_second_post_does_not_start_another_intake_while_reserved():
     assert reservation_retry_should_run_intake(worked) is False
 
 
-async def test_a_reservation_intake_resolved_elsewhere_closes_as_a_placeholder():
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock
+async def test_a_reservation_intake_resolved_elsewhere_closes_as_a_placeholder(tmp_path):
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
 
     from app.api.server import _cancel_intake_reservation
+    from app.db.models import Base, Task
     from app.orchestrator.decision_engine import INTAKE_PLACEHOLDER
 
-    task = SimpleNamespace(status="created", supplementary_context={"intake_reserved": True})
-    await _cancel_intake_reservation(task, SimpleNamespace(commit=AsyncMock()))
-    assert task.status == "cancelled"
-    assert task.supplementary_context == {"intake_reserved": False, "closed_reason": INTAKE_PLACEHOLDER}
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'rmp.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=[Task.__table__])
+    factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with factory() as db:
+            db.add(Task(id="t1", goal="g", status="created", supplementary_context={"intake_reserved": True}))
+            await db.commit()
+        async with factory() as db:
+            task = await db.get(Task, "t1")
+            await _cancel_intake_reservation(task, db)
+        async with factory() as db:
+            stored = await db.get(Task, "t1")
+    finally:
+        await engine.dispose()
+    assert task.status == stored.status == "cancelled"
+    assert stored.supplementary_context == {"intake_reserved": False, "closed_reason": INTAKE_PLACEHOLDER}
 
 
 def test_plugin_post_timeout_covers_intake_budget():

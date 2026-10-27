@@ -10,12 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.activities.db_activities import ensure_process_run
 from app.db.database import AsyncSessionLocal
 from app.db.models import ProcessRun, Task
-from app.status import RUN_TERMINAL, WORKFLOW_OWNED, TaskStatus
+from app.status import RUN_TERMINAL, TERMINAL, WORKFLOW_OWNED, TaskStatus
 from app.temporal_control import (
     signal_spawn_leg,
     start_task_workflow,
     workflow_is_running,
 )
+from app.transitions import set_task_status
 
 logger = logging.getLogger("rmp.task_registry.spawn")
 
@@ -56,6 +57,8 @@ async def spawn_process_for_task(
                         "process_type": ptype,
                         "force_new": True,
                         "durable_leg": True,
+                        "actor": "spawn",
+                        "cause": "spawn_process",
                     }
                 )
                 signaled = await signal_spawn_leg(
@@ -77,6 +80,19 @@ async def spawn_process_for_task(
                 "reason": "active_process_exists",
             }
 
+        # A finished task is never reopened: no run, and the caller makes the message a new task.
+        if task.status in TERMINAL:
+            return {"task_id": task_id, "spawned": False, "reason": "task_terminal"}
+
+        if task.status not in WORKFLOW_OWNED:
+            reopened = await set_task_status(session, task_id, TaskStatus.RUNNING, actor="spawn",
+                                             cause="spawn_process", next_check_at=None)
+            # A refused move starts nothing, not even a run: a deploying task belongs to its deploy, and a task that
+            # finished meanwhile is finished.
+            if not reopened.changed:
+                reason = "task_terminal" if reopened.previous in TERMINAL else "active_process_exists"
+                return {"task_id": task_id, "spawned": False, "reason": reason}
+
         process_run_id = await ensure_process_run(
             {
                 "task_id": task_id,
@@ -84,10 +100,6 @@ async def spawn_process_for_task(
                 "force_new": True,
             }
         )
-
-        if task.status not in WORKFLOW_OWNED:
-            task.status = TaskStatus.RUNNING
-            task.next_check_at = None
 
         workflow_started = False
         spawn_leg_signaled = False

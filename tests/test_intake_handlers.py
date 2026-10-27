@@ -1,7 +1,13 @@
 """Intake handler outcome tests."""
+import logging
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
 
+from app.db.models import Base, Event, Task
 from app.task_registry.intake_decision_engine import apply_intake_policy
 from app.task_registry.intake_handlers import handle_intake_outcome
 from app.task_registry.intake_prompt import parse_intake_response
@@ -20,6 +26,36 @@ def _empty_exec():
 NOTIFY = "app.task_registry.intake_handlers._intake_notify_slack"
 RECORD = "app.task_registry.intake_handlers.record_intake_decision"
 ADD_MSG = "app.task_registry.intake_handlers.add_task_message"
+
+
+@pytest.fixture
+async def factory(tmp_path):
+    """Intake's session on a SQLite file, for the handlers that move a task."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'intake.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    await engine.dispose()
+
+
+async def seed(factory, *rows):
+    async with factory() as db:
+        db.add_all(rows)
+        await db.commit()
+
+
+async def stored(factory, task_id):
+    async with factory() as db:
+        return await db.get(Task, task_id)
+
+
+async def handled(factory, decision, intent, session_key="agent:main:main", tags=("user-request",)):
+    """handle_intake_outcome in one session, committed as POST /tasks commits it."""
+    async with factory() as db:
+        out = await handle_intake_outcome(decision, request=None, db=db, intent=intent, session_key=session_key,
+                                          tags=list(tags))
+        await db.commit()
+    return out
 
 
 @pytest.mark.asyncio
@@ -119,15 +155,8 @@ async def test_handle_records_execution_mode_in_event():
 
 
 @pytest.mark.asyncio
-async def test_handle_supersede_terminates_and_falls_through():
-    db = AsyncMock()
-    db.add = MagicMock()
-    old_task = MagicMock()
-    old_task.status = "running"
-    old_task.next_check_at = None
-    task_result = MagicMock()
-    task_result.scalar_one_or_none.return_value = old_task
-    db.execute = AsyncMock(return_value=task_result)
+async def test_handle_supersede_terminates_and_falls_through(factory):
+    await seed(factory, Task(id="old-task-1", goal="retry job", status="running"))
     decision = {
         "effective_decision": "supersede",
         "decision": "supersede",
@@ -141,17 +170,10 @@ async def test_handle_supersede_terminates_and_falls_through():
         "app.temporal_control.terminate_task_workflow",
         new=AsyncMock(return_value=True),
     ) as mock_term:
-        out = await handle_intake_outcome(
-            decision,
-            request=None,
-            db=db,
-            intent="[cron:test] retry job",
-            session_key="agent:main:cron",
-            tags=["cron"],
-        )
+        out = await handled(factory, decision, "[cron:test] retry job", "agent:main:cron", ["cron"])
     assert out is None
     mock_term.assert_awaited_once_with("old-task-1", "superseded by intake")
-    assert old_task.status == "failed"
+    assert (await stored(factory, "old-task-1")).status == "failed"
 
 
 @pytest.mark.asyncio
@@ -189,22 +211,9 @@ async def test_handle_clarify_no_temporal_start():
 
 
 @pytest.mark.asyncio
-async def test_handle_rebuild_stale_terminates_and_returns_memory():
-    db = AsyncMock()
-    db.add = MagicMock()
-    old_task = MagicMock()
-    old_task.status = "blocked"
-    old_task.next_check_at = None
-    old_task.goal = "stuck upgrade"
-    old_task.task_type = "coding_task"
-    old_task.supplementary_context = {}
-    task_result = MagicMock()
-    task_result.scalar_one_or_none.return_value = old_task
-    scalars = MagicMock()
-    scalars.first.return_value = None
-    scalars.all.return_value = []
-    task_result.scalars.return_value = scalars
-    db.execute = AsyncMock(return_value=task_result)
+async def test_handle_rebuild_stale_terminates_and_returns_memory(factory):
+    await seed(factory, Task(id="stuck-1", goal="stuck upgrade", task_type="coding_task", status="blocked",
+                             supplementary_context={}))
     decision = {
         "effective_decision": "rebuild_stale",
         "decision": "rebuild_stale",
@@ -218,19 +227,12 @@ async def test_handle_rebuild_stale_terminates_and_returns_memory():
         "app.temporal_control.terminate_task_workflow",
         new=AsyncMock(return_value=True),
     ) as mock_term:
-        out = await handle_intake_outcome(
-            decision,
-            request=None,
-            db=db,
-            intent="try the upgrade again",
-            session_key="agent:main:main",
-            tags=["user-request"],
-        )
+        out = await handled(factory, decision, "try the upgrade again")
     mock_term.assert_awaited_once_with("stuck-1", "rebuild_stale by intake")
     assert out is not None
     assert out.get("intake_action") is None
     assert "rebuild_stale" in out["_guided_memory_block"]
-    assert old_task.status == "failed"
+    assert (await stored(factory, "stuck-1")).status == "failed"
 
 
 @pytest.mark.asyncio
@@ -264,50 +266,54 @@ async def test_handle_attach_includes_catchup_signal():
     assert "PROCESS BRIEF" in out["signal_text"]
 
 
+CLARIFY = {"intake_clarify": True, "original_intent": "original ask", "clarify_question": "which one?"}
+ANSWER = {
+    "effective_decision": "attach_active",
+    "decision": "attach_active",
+    "target_task_id": "clarify-1",
+    "intake_mode": "enforce",
+    "request_hash": "abc",
+    "confidence": 90,
+    "rationale": "answer",
+}
+
+
 @pytest.mark.asyncio
-async def test_handle_attach_resume_clarify_starts_existing():
-    db = AsyncMock()
-    db.add = MagicMock()
-    pending = MagicMock()
-    pending.status = "pending_user_input"
-    pending.task_type = "user"
-    pending.goal = "original ask"
-    pending.supplementary_context = {
-        "intake_clarify": True,
-        "original_intent": "original ask",
-        "clarify_question": "which one?",
-    }
-    task_result = MagicMock()
-    task_result.scalar_one_or_none.return_value = pending
-    scalars = MagicMock()
-    scalars.first.return_value = None
-    scalars.all.return_value = []
-    task_result.scalars.return_value = scalars
-    db.execute = AsyncMock(return_value=task_result)
-    decision = {
-        "effective_decision": "attach_active",
-        "decision": "attach_active",
-        "target_task_id": "clarify-1",
-        "intake_mode": "enforce",
-        "request_hash": "abc",
-        "confidence": 90,
-        "rationale": "answer",
-    }
+async def test_handle_attach_resume_clarify_starts_existing(factory):
+    await seed(factory, Task(id="clarify-1", goal="original ask", task_type="user", status="pending_user_input",
+                             supplementary_context=dict(CLARIFY)))
     with patch(RECORD, new=AsyncMock(return_value="dec-1")), patch(
         ADD_MSG, new=AsyncMock(return_value="m1")
     ):
-        out = await handle_intake_outcome(
-            decision,
-            request=None,
-            db=db,
-            intent="the awareness check, not an upgrade",
-            session_key="agent:main:main",
-            tags=["user-request"],
-        )
+        out = await handled(factory, ANSWER, "the awareness check, not an upgrade")
     assert out["intake_action"] == "resume_clarify"
     assert out["signal_required"] is False
-    assert pending.status == "created"
+    # The brief describes the clarify as it was when the answer came.
+    assert "status=pending_user_input" in out["_guided_memory_block"]
+    resumed = await stored(factory, "clarify-1")
+    assert resumed.status == "created" and resumed.supplementary_context["intake_clarify"] is False
     assert "CLARIFY ANSWER" in out["_guided_memory_block"]
+
+
+@pytest.mark.asyncio
+async def test_an_answer_to_a_finished_clarify_becomes_a_new_task(factory, caplog):
+    """The clarify was closed before the answer came: it is never started again, nothing is attached to it, and the
+    message is a new task."""
+    caplog.set_level(logging.WARNING, logger="rmp.transitions")
+    await seed(factory, Task(id="clarify-1", goal="original ask", task_type="user", status="cancelled",
+                             supplementary_context=dict(CLARIFY)))
+    with patch(RECORD, new=AsyncMock(return_value="dec-1")), patch(
+        ADD_MSG, new=AsyncMock(return_value="m1")
+    ) as add:
+        out = await handled(factory, ANSWER, "the awareness check, not an upgrade")
+    assert out is None
+    assert (await stored(factory, "clarify-1")).status == "cancelled"
+    # No message and no intake.attach on the finished task, which would count as an attached message left unanswered.
+    add.assert_not_awaited()
+    async with factory() as db:
+        assert (await db.execute(select(Event).where(Event.event_type == "intake.attach"))).scalars().all() == []
+    assert [r.getMessage() for r in caplog.records if r.name == "rmp.transitions"] == [
+        "task transition refused: clarify-1 cancelled -> created actor=intake cause=clarify answered"]
 
 
 def test_low_confidence_without_active_is_clarify():

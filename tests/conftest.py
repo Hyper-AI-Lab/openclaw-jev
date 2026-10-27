@@ -10,10 +10,14 @@ to keep, and ROOT is removed when pytest unconfigures, or at exit when pytest st
 import atexit
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
+import sqlalchemy
+from sqlalchemy import event
+from sqlalchemy import inspect as sa_inspect
 
 from tests import production_guard
 
@@ -51,6 +55,39 @@ production_guard.install(GUARD)
 # Violations recorded outside any test: at collection, or in a module or session fixture.
 _OUTSIDE_TESTS = []
 
+# The runtime half of the writer guard (specs/WP-04.md WP04-16): production code writes a stored task's status or a
+# run's state only through app/transitions.py, which the AST guard cannot see through a variable. The listener finds
+# the nearest calling frame outside SQLAlchemy; a write from a production file other than the writer raises, and fails
+# the test even when the code under test swallows the error. Test code that seeds a row's status is no writer.
+PRODUCTION_ROOTS = (REPO_ROOT / "app", REPO_ROOT / "ops", REPO_ROOT / "worker.py")
+STATUS_WRITER = REPO_ROOT / "app" / "transitions.py"
+_SQLALCHEMY = Path(sqlalchemy.__file__).resolve().parent
+_STRAY_STATUS_WRITES = []
+
+
+def _refuse_a_status_write_outside_the_writer(target, value, oldvalue, initiator):
+    if not sa_inspect(target).persistent:
+        return
+    frame = sys._getframe(1)
+    while frame is not None and Path(frame.f_code.co_filename).resolve().is_relative_to(_SQLALCHEMY):
+        frame = frame.f_back
+    if frame is None:
+        return
+    path = Path(frame.f_code.co_filename).resolve()
+    if path != STATUS_WRITER and any(path.is_relative_to(root.resolve()) for root in PRODUCTION_ROOTS):
+        _STRAY_STATUS_WRITES.append(f"{path}:{frame.f_lineno} {type(target).__name__}.{initiator.key} = {value}")
+        raise AssertionError("status written outside app/transitions.py")
+
+
+def _listen_for_status_writes():
+    from app.db.models import ProcessRun, Task
+
+    for column in (Task.status, ProcessRun.current_state):
+        event.listen(column, "set", _refuse_a_status_write_outside_the_writer)
+
+
+_listen_for_status_writes()
+
 
 @pytest.fixture(autouse=True)
 def _production_guard():
@@ -62,6 +99,15 @@ def _production_guard():
     if violations:
         pytest.fail("hermetic tests: this test reached production\n" + production_guard.report(violations),
                     pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _status_writes_go_through_the_writer():
+    """A status write the listener refused fails the test, whatever the code under test did with the error."""
+    _STRAY_STATUS_WRITES.clear()
+    yield
+    if _STRAY_STATUS_WRITES:
+        pytest.fail("status written outside app/transitions.py:\n" + "\n".join(_STRAY_STATUS_WRITES), pytrace=False)
 
 
 @pytest.hookimpl(tryfirst=True)

@@ -125,7 +125,8 @@ async def test_a_task_spelling_is_stored_as_the_run_spelling(runs):
                     ProcessRun(id="r1", task_id="t1", current_state="awaiting_approval")])
         await db.commit()
 
-    assert await db_activities.update_process_state({"process_run_id": "r1", "state": "cancelled", "ended": True})
+    assert await db_activities.update_process_state(
+        {"process_run_id": "r1", "state": "cancelled", "ended": True, "actor": "test"})
 
     async with runs() as db:
         run = (await db.execute(select(ProcessRun).where(ProcessRun.id == "r1"))).scalar_one()
@@ -139,7 +140,7 @@ async def test_a_call_without_a_state_keeps_the_stored_spelling(runs):
                     ProcessRun(id="r3", task_id="t3", current_state="cancelled", lease_owner="worker-1")])
         await db.commit()
 
-    assert await db_activities.update_process_state({"process_run_id": "r3", "release_lease": True})
+    assert await db_activities.update_process_state({"process_run_id": "r3", "release_lease": True, "actor": "test"})
 
     async with runs() as db:
         run = (await db.execute(select(ProcessRun).where(ProcessRun.id == "r3"))).scalar_one()
@@ -153,7 +154,7 @@ async def test_a_cancelled_close_clears_the_next_check(runs):
         await db.commit()
 
     with patch("app.task_registry.hooks.index_terminal_task_async", new_callable=AsyncMock) as index:
-        assert await db_activities.update_task_status({"task_id": "t2", "status": "cancelled"})
+        assert await db_activities.update_task_status({"task_id": "t2", "status": "cancelled", "actor": "test"})
 
     async with runs() as db:
         task = await db.get(Task, "t2")
@@ -363,6 +364,81 @@ def workflow_status_values(tree, is_status):
     return found
 
 
+# The enum each status slot of workflow code holds: by status activity and payload key, and by the name of a status
+# helper's parameter. The value cannot tell them apart: StepStatus.RUNNING equals TaskStatus.RUNNING.
+ACTIVITY_SLOTS = {
+    "update_task_status": {"status": TaskStatus},
+    "finalize_task_failure": {"task_status": TaskStatus, "process_state": RunState},
+    "execute_compensation": {},
+    "update_process_state": {"state": RunState},
+    "record_step": {"status": StepStatus},
+}
+HELPER_SLOTS = {"task_status": TaskStatus, "status": TaskStatus, "process_state": RunState}
+
+
+def helper_parameters(tree):
+    """The positional parameters after ``self`` of each status helper defined in ``tree``, by helper name."""
+    return {node.name: [arg.arg for arg in [*node.args.posonlyargs, *node.args.args][1:]]
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in STATUS_HELPERS}
+
+
+def _assignments_by_scope(tree):
+    """For each node inside a function of ``tree``, the values its innermost function assigns to each plain name."""
+    scopes = {}
+    # ast.walk visits an outer function before the functions inside it, which then take their own nodes.
+    for function in ast.walk(tree):
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            assigned = {}
+            for node in ast.walk(function):
+                if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                    for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                        if isinstance(target, ast.Name):
+                            assigned.setdefault(target.id, []).append(node.value)
+            scopes.update((node, assigned) for node in ast.walk(function))
+    return scopes
+
+
+def status_slots(tree, helpers):
+    """(enum, member) for each app.status member written into a status slot of workflow code: a status activity's
+    payload, a status helper's argument or parameter default (``helpers`` gives their positional parameters), or the
+    status of a task's or a step's dict. A plain name in a slot counts by the members its function assigns to it.
+    ``enum`` is None for a slot ACTIVITY_SLOTS and HELPER_SLOTS do not name."""
+    found = []
+    scopes = _assignments_by_scope(tree)
+
+    def take(enum, node):
+        for leaf in _leaves(node):
+            assigned = scopes.get(leaf, {}).get(leaf.id, []) if isinstance(leaf, ast.Name) else []
+            values = [leaf, *(value for source in assigned for value in _leaves(source))]
+            found.extend((enum, value) for value in values if status_member(value))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            payload = _activity_payload(node)
+            if payload is not None:
+                for key, value in zip(payload.keys, payload.values):
+                    if _key(key) in STATUS_KEYS:
+                        take(ACTIVITY_SLOTS[node.args[0].id].get(_key(key)), value)
+            if _called(node) in STATUS_HELPERS:
+                parameters = helpers.get(_called(node), [])
+                for position, arg in enumerate(node.args):
+                    take(HELPER_SLOTS.get(parameters[position]) if position < len(parameters) else None, arg)
+                for keyword in node.keywords:
+                    take(HELPER_SLOTS.get(keyword.arg), keyword.value)
+        if isinstance(node, ast.Dict):
+            entries = {_key(key): value for key, value in zip(node.keys, node.values)}
+            if "status" in entries and ("task_id" in entries or "step_id" in entries):
+                take(TaskStatus if "task_id" in entries else StepStatus, entries["status"])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in STATUS_HELPERS:
+            positional = [*node.args.posonlyargs, *node.args.args]
+            defaulted = zip(positional[len(positional) - len(node.args.defaults):], node.args.defaults)
+            for arg, default in [*defaulted, *zip(node.args.kwonlyargs, node.args.kw_defaults)]:
+                if default is not None:
+                    take(HELPER_SLOTS.get(arg.arg), default)
+    return found
+
+
 def violations(tree, path):
     """Sorted (line, rule) pairs of G1-G6 in one module, and of G7 when it is workflow code."""
     found = set()
@@ -477,3 +553,266 @@ def test_no_status_literal_outside_the_vocabulary():
     assert not unreached, f"the guard parsed no module under {unreached}"
     found = [f"{rel}:{line} {rule}" for rel, tree in modules for line, rule in violations(tree, rel)]
     assert not found, "task, run or step status literals outside app/status.py:\n" + "\n".join(found)
+
+
+# G8 (WP04-16): app/transitions.py is the one writer of tasks.status and process_runs.current_state.
+STATUS_WRITER = "app/transitions.py"
+TRANSITION_ROWS = frozenset({"Task", "ProcessRun"})
+RAW_STATUS_UPDATE = re.compile(r"\bupdate\s+(tasks|process_runs)\b", re.IGNORECASE)
+# Reviewed writes of another row's status in a module that imports Task or ProcessRun, as (path, function).
+OTHER_ROW_STATUS_WRITERS = frozenset({
+    # (file, function, the variable whose .status the function writes): only that row's own status is exempt, so a
+    # Task or ProcessRun status written in the same function is still G8.
+    ("app/activities/db_activities.py", "record_step", "existing"),  # Step
+    ("app/activities/db_activities.py", "execute_compensation", "step"),  # Step
+    ("app/deep_memory/enrich.py", "enrich_document", "live_doc"),  # DeepDocument
+})
+# This batch only: the sentinel's cancel is already a compare-and-set in SQL; batch 4 replaces it, and this entry goes.
+RAW_STATUS_UPDATERS = frozenset({("app/production/canary_sentinel.py", "cancel_task_sync")})
+# G9 (WP04-18): the event log is immutable (D-24). WP-27's K-12 retention job adds itself here, the one deleter.
+EVENT_DELETERS = frozenset()
+RAW_EVENT_WRITE = re.compile(r"\b(delete\s+from|update|truncate(\s+table)?)\s+events\b", re.IGNORECASE)
+
+
+def _nodes_by_function(tree):
+    """(node, name of the innermost function around it, or None) for every node of ``tree``."""
+    stack = [(tree, None)]
+    while stack:
+        node, function = stack.pop()
+        yield node, function
+        inner = node.name if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else function
+        stack.extend((child, inner) for child in ast.iter_child_nodes(node))
+
+
+def _sqlalchemy_names(tree, name):
+    """The local names of SQLAlchemy's ``name`` (``update``, ``delete``), aliases included."""
+    return {name} | {alias.asname for node in ast.walk(tree)
+                     if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("sqlalchemy")
+                     for alias in node.names if alias.name == name and alias.asname}
+
+
+def _row_or_table(node, rows):
+    """``Task`` or ``Task.__table__`` for a row named in ``rows``."""
+    if isinstance(node, ast.Attribute) and node.attr == "__table__":
+        node = node.value
+    return isinstance(node, ast.Name) and node.id in rows
+
+
+def _statement_on(call, names, rows):
+    """``update(Task)`` (or ``delete``; ``names`` holds the statement's local names), also as ``sa.update(Task)`` or
+    on ``Task.__table__``, or ``Task.__table__.update()``."""
+    func = call.func
+    if _called(call) in names and call.args and _row_or_table(call.args[0], rows):
+        return True
+    return (isinstance(func, ast.Attribute) and func.attr in names and isinstance(func.value, ast.Attribute)
+            and func.value.attr == "__table__" and _row_or_table(func.value, rows))
+
+
+def _assigned_attributes(node):
+    """The attribute targets of an assignment, tuple targets unpacked."""
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    flat = []
+    while targets:
+        target = targets.pop()
+        if isinstance(target, (ast.Tuple, ast.List)):
+            targets.extend(target.elts)
+        elif isinstance(target, ast.Attribute):
+            flat.append(target)
+    return flat
+
+
+def _exempt_row_status(target, path, function):
+    """Whether ``target`` is the ``.status`` of the one non-transition row an allowlisted function writes."""
+    return (target.attr == "status" and isinstance(target.value, ast.Name)
+            and (path, function, target.value.id) in OTHER_ROW_STATUS_WRITERS)
+
+
+def writer_violations(tree, path):
+    """Sorted (line, "G8") pairs: a status written outside app/transitions.py."""
+    if path == STATUS_WRITER:
+        return []
+    updates = _sqlalchemy_names(tree, "update")
+    imports_a_row = any(isinstance(node, ast.ImportFrom) and node.module == "app.db.models"
+                        and any(alias.name in TRANSITION_ROWS for alias in node.names) for node in ast.walk(tree))
+    found = set()
+    for node, function in _nodes_by_function(tree):
+        if isinstance(node, ast.Call) and _statement_on(node, updates, TRANSITION_ROWS):
+            found.add((node.lineno, "G8"))
+        if _string(node) and RAW_STATUS_UPDATE.search(node.value) and (path, function) not in RAW_STATUS_UPDATERS:
+            found.add((node.lineno, "G8"))
+        if (imports_a_row and isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                and any(_status_attribute(target) and not _exempt_row_status(target, path, function)
+                        for target in _assigned_attributes(node))):
+            found.add((node.lineno, "G8"))
+    return sorted(found)
+
+
+def _selects_events(node):
+    return any(isinstance(call, ast.Call) and _called(call) == "select"
+               and any(isinstance(arg, ast.Name) and arg.id == "Event" for arg in call.args)
+               for call in ast.walk(node))
+
+
+def _deleted_event_rows(function):
+    """Lines of ``.delete(`` on a name bound, in ``function``, from ``select(Event)`` or from such a name."""
+    bound, grew = set(), True
+    while grew:
+        grew = False
+        for node in ast.walk(function):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                source, targets = node.value, node.targets if isinstance(node, ast.Assign) else [node.target]
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                source, targets = node.iter, [node.target]
+            else:
+                continue
+            if _selects_events(source) or any(isinstance(n, ast.Name) and n.id in bound for n in ast.walk(source)):
+                names = {n.id for target in targets for n in ast.walk(target) if isinstance(n, ast.Name)} - bound
+                grew |= bool(names)
+                bound |= names
+    return [node.lineno for node in ast.walk(function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "delete"
+            and any(isinstance(n, ast.Name) and n.id in bound for n in [node.func.value, *node.args])]
+
+
+def event_log_violations(tree, path):
+    """Sorted (line, "G9") pairs: an update or delete of the event log."""
+    statements = _sqlalchemy_names(tree, "update") | _sqlalchemy_names(tree, "delete")
+    found = set()
+    for node, function in _nodes_by_function(tree):
+        if (path, function) in EVENT_DELETERS:
+            continue
+        if isinstance(node, ast.Call) and _statement_on(node, statements, {"Event"}):
+            found.add((node.lineno, "G9"))
+        if _string(node) and RAW_EVENT_WRITE.search(node.value):
+            found.add((node.lineno, "G9"))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (path, node.name) not in EVENT_DELETERS:
+            found.update((line, "G9") for line in _deleted_event_rows(node))
+    return sorted(found)
+
+
+@pytest.mark.parametrize("source, path", [
+    ("from sqlalchemy import update\nawait db.execute(update(Task).where(Task.id == tid).values(status=to))",
+     "app/example.py"),
+    ("from sqlalchemy import update as sa_update\nstmt = sa_update(ProcessRun).values(current_state=state)",
+     "ops/example.py"),
+    ("stmt = Task.__table__.update().values(status=to)", "app/example.py"),
+    ("import sqlalchemy as sa\nawait db.execute(sa.update(Task).where(Task.id == tid).values(status='failed'))",
+     "app/example.py"),
+    ("from sqlalchemy import update\nstmt = update(Task.__table__).values(status=to)", "app/example.py"),
+    ('await db.execute(text("UPDATE tasks SET status = :to WHERE id = :id"))', "app/example.py"),
+    ('sql = "update process_runs set current_state = :s"', "worker.py"),
+    ("from app.db.models import Task\ntask.status = TaskStatus.FAILED", "app/example.py"),
+    ("from app.db.models import ProcessRun\nrun.current_state, run.ended_at = state, now", "app/example.py"),
+    # A reviewed writer of a step's status in one function is no licence for another.
+    ("from app.db.models import Step, Task\nasync def other(step):\n    step.status = StepStatus.FAILED",
+     "app/activities/db_activities.py"),
+    # An allowlisted function is exempt only for its own row's status: a task or run status in it is still G8.
+    ("from app.db.models import Step, Task\nasync def record_step(payload):\n    task.status = TaskStatus.FAILED",
+     "app/activities/db_activities.py"),
+    ("from app.db.models import ProcessRun, Step\nasync def execute_compensation(payload):\n"
+     "    run.current_state = RunState.CANCELED", "app/activities/db_activities.py"),
+    ('def cancel_task_sync():\n    pass\nSQL = "UPDATE tasks SET status = :cancelled WHERE id = :id"',
+     "app/production/canary_sentinel.py"),
+])
+def test_the_writer_guard_flags_its_snippet(source, path):
+    assert writer_violations(ast.parse(source), path)
+
+
+@pytest.mark.parametrize("source, path", [
+    ("from sqlalchemy import update\nawait db.execute(update(Task).where(Task.id == tid).values(status=to))",
+     "app/transitions.py"),
+    ("from sqlalchemy import update\nawait db.execute(update(VectorOutbox).values(done_at=now))", "app/example.py"),
+    ("import sqlalchemy as sa\nawait db.execute(sa.update(VectorOutbox.__table__).values(done_at=now))",
+     "app/example.py"),
+    ("from app.db.models import Task\ntask.supplementary_context = ctx", "app/example.py"),
+    # A module without Task or ProcessRun writes other rows' statuses: a deep-recall report.
+    ("from app.db.models import DeepContextReport\nrow.status = payload['status']", "app/example.py"),
+    ("from app.db.models import Step, Task\nasync def record_step(payload):\n    existing.status = payload['ok']",
+     "app/activities/db_activities.py"),
+    ('def cancel_task_sync():\n    sql = "UPDATE tasks SET status = :cancelled WHERE id = :id AND status IN :active"',
+     "app/production/canary_sentinel.py"),
+    ('text("SELECT id FROM tasks WHERE status IN :statuses")', "app/example.py"),
+])
+def test_the_writer_guard_passes_its_negative(source, path):
+    assert not writer_violations(ast.parse(source), path)
+
+
+@pytest.mark.parametrize("source", [
+    "from sqlalchemy import delete\nawait db.execute(delete(Event).where(Event.occurred_at < cutoff))",
+    "from sqlalchemy import update\nawait db.execute(update(Event).values(event_payload={}))",
+    "stmt = Event.__table__.delete()",
+    "import sqlalchemy as sa\nawait db.execute(sa.delete(Event))",
+    "from sqlalchemy import delete\nawait db.execute(delete(Event.__table__))",
+    'await db.execute(text("DELETE FROM events WHERE occurred_at < :cutoff"))',
+    'sql = "TRUNCATE TABLE events"',
+    'sql = "update events set event_payload = null"',
+    "async def prune(db):\n    rows = await db.execute(select(Event).where(Event.occurred_at < cutoff))\n"
+    "    for row in rows.scalars():\n        await db.delete(row)",
+    "async def prune(db):\n    old = (await db.execute(select(Event))).scalars().all()\n"
+    "    for event in [e for e in old if e.entity_id]:\n        await db.delete(event)",
+])
+def test_the_event_log_guard_flags_its_snippet(source):
+    assert event_log_violations(ast.parse(source), "app/example.py")
+
+
+@pytest.mark.parametrize("source", [
+    "db.add(Event(entity_id=tid, event_type='task.cancelled'))",
+    "from sqlalchemy import delete\nawait db.execute(delete(VectorOutbox).where(VectorOutbox.done_at < cutoff))",
+    'sql = "SELECT * FROM events WHERE entity_id = :id"',
+    # A deleted row that was not read from the event log.
+    "async def prune(db):\n    events = await db.execute(select(Event))\n"
+    "    stale = await db.execute(select(DeepChunk))\n    for row in stale.scalars():\n        await db.delete(row)",
+])
+def test_the_event_log_guard_passes_its_negative(source):
+    assert not event_log_violations(ast.parse(source), "app/example.py")
+
+
+def test_no_status_write_outside_the_writer_and_no_event_rewrite():
+    """G8 and G9 over the guarded roots: app/transitions.py writes every status, and nothing updates or deletes an
+    event. app/scanners/ is exempt (D-4): its track statuses retire with the scanners."""
+    modules = [(rel, tree) for rel, tree in _parsed(*(REPO / root for root in GUARDED)) if not rel.startswith(EXEMPT)]
+    assert any(rel == STATUS_WRITER for rel, _tree in modules)
+    found = [f"{rel}:{line} {rule}" for rel, tree in modules
+             for line, rule in [*writer_violations(tree, rel), *event_log_violations(tree, rel)]]
+    assert not found, "status written outside app/transitions.py, or the event log rewritten:\n" + "\n".join(found)
+    # Each reviewed exception still names a function that exists, so a stale entry is noticed and removed.
+    functions = {(rel, node.name) for rel, tree in modules for node in ast.walk(tree)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert {(path, function) for path, function, _ in OTHER_ROW_STATUS_WRITERS} | RAW_STATUS_UPDATERS | EVENT_DELETERS <= functions
+
+
+async def test_the_listener_catches_a_direct_write(runs, tmp_path, monkeypatch):
+    """The runtime half of G8 (tests/conftest.py): a production module that sets a stored task's status is stopped;
+    the same write through app/transitions.py, and a test seeding a row, are not."""
+    import importlib.util
+
+    from app.transitions import set_run_state, set_task_status
+    from tests import conftest
+
+    production = tmp_path / "production"
+    production.mkdir()
+    (production / "stray_writer.py").write_text(
+        "def finish(task, run):\n    task.status = 'failed'\n\n\ndef end(run):\n    run.current_state = 'canceled'\n")
+    module_spec = importlib.util.spec_from_file_location("stray_writer", production / "stray_writer.py")
+    stray = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(stray)
+    monkeypatch.setattr(conftest, "PRODUCTION_ROOTS", (*conftest.PRODUCTION_ROOTS, production))
+    async with runs() as db:
+        db.add_all([Task(id="t1", goal="g", status="running"), ProcessRun(id="r1", task_id="t1")])
+        await db.commit()
+
+        task, run = await db.get(Task, "t1"), await db.get(ProcessRun, "r1")
+        with pytest.raises(AssertionError, match="^status written outside app/transitions.py$"):
+            stray.finish(task, run)
+        with pytest.raises(AssertionError, match="^status written outside app/transitions.py$"):
+            stray.end(run)
+        assert [entry.split(" ", 1)[1] for entry in conftest._STRAY_STATUS_WRITES] == [
+            "Task.status = failed", "ProcessRun.current_state = canceled"]
+        conftest._STRAY_STATUS_WRITES.clear()
+        assert task.status == "running" and run.current_state == "created"
+
+        assert (await set_task_status(db, "t1", TaskStatus.FAILED, actor="test", cause="listener")).changed
+        assert (await set_run_state(db, "r1", RunState.FAILED_TERMINAL, actor="test", cause="listener")).changed
+        task.status, run.current_state = "running", "running"
+        await db.commit()
+    assert conftest._STRAY_STATUS_WRITES == []

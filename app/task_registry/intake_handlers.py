@@ -15,6 +15,7 @@ from app.orchestrator.process_brief import with_catchup
 from app.status import TERMINAL, TaskStatus
 from app.task_registry.intake_audit import record_intake_decision
 from app.task_registry.messages import add_task_message
+from app.transitions import CHANGED, UNCHANGED, set_task_status
 
 logger = logging.getLogger("rmp.intake_handlers")
 
@@ -259,6 +260,13 @@ async def handle_intake_outcome(
             signals = []
             for target in targets:
                 catchup = await build_catchup_block(target, db)
+                if existing and intake_clarify:
+                    # The answered clarify (its one target) starts again from created. One that has finished
+                    # meanwhile is not started and gets nothing attached: the message becomes a new task.
+                    resumed = await set_task_status(db, tid, TaskStatus.CREATED, actor="intake",
+                                                    cause="clarify answered")
+                    if resumed.outcome not in (CHANGED, UNCHANGED):
+                        return None
                 await add_task_message(
                     target, intent, role="user", source="slack", db=db,
                     slack_ts=getattr(request, "slack_message_id", None),
@@ -293,7 +301,6 @@ async def handle_intake_outcome(
                 )
             catchup = signals[0]["catchup"]
             if existing and intake_clarify:
-                existing.status = TaskStatus.CREATED
                 ctx["intake_clarify"] = False
                 ctx["answered_at"] = datetime.utcnow().isoformat()
                 existing.supplementary_context = ctx
@@ -452,8 +459,7 @@ async def handle_intake_outcome(
             result = await db.execute(select(Task).where(Task.id == tid))
             old = result.scalar_one_or_none()
             if old and old.status not in TERMINAL:
-                old.status = TaskStatus.FAILED
-                old.next_check_at = None
+                await set_task_status(db, tid, TaskStatus.FAILED, actor="intake", cause="rebuild_stale")
             db.add(
                 Event(
                     correlation_id=tid,
@@ -491,8 +497,7 @@ async def handle_intake_outcome(
             result = await db.execute(select(Task).where(Task.id == tid))
             old = result.scalar_one_or_none()
             if old and old.status not in TERMINAL:
-                old.status = TaskStatus.FAILED
-                old.next_check_at = None
+                await set_task_status(db, tid, TaskStatus.FAILED, actor="intake", cause="superseded")
         return None  # fall through to create
 
     if effective == "spawn_process":
@@ -508,6 +513,8 @@ async def handle_intake_outcome(
                 leg_intent=intent,
                 db=db,
             )
+            if proc.get("reason") == "task_terminal":
+                return None  # a finished task is not reopened: the message becomes a new task
             metrics_inc("intake_spawn")
             return {
                 "task_id": tid,
