@@ -84,12 +84,13 @@ class FakeHost(deploy.Host):
     """GitHub is the origin repo: a pull request that merges is pushed onto its main as it is.
 
     The gate's probes answer from ``units`` (the deploy units running), ``held`` (the code-reload lock) and ``busy``
-    (the idle counts in turn, then 0; an exception in it is raised)."""
+    (the idle counts in turn, then 0; an exception in it is raised). CI's check on a commit answers from ``ci``, by
+    commit, else "success"."""
 
-    def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False):
+    def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None):
         super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
         self.calls, self.busy, self.results, self.lands = [], list(busy), list(checks), list(lands)
-        self.units, self.held = list(units), held
+        self.units, self.held, self.ci = list(units), held, dict(ci or {})
 
     def active_user_tasks(self):
         count = self.busy.pop(0) if self.busy else 0
@@ -119,6 +120,10 @@ class FakeHost(deploy.Host):
             return {"status": "blocked", "pr": pr, "check": outcome}
         git(self.live, "push", "-q", "origin", f"{commit}:refs/heads/main")
         return {"status": "merged", "pr": pr, "merge": commit}
+
+    def wait_check(self, sha):
+        self.calls.append(("wait_check", sha))
+        return self.ci.get(sha, "success")
 
     def readiness_baseline(self):
         return ["telemetry"]
@@ -932,3 +937,51 @@ def test_a_queued_githubs_main_already_shipped_by_a_reviewed_deploy_is_unchanged
     assert result["summary"] == f"GitHub's main ({head[:12]}) is already live, so nothing changed."
     assert git(repos.live, "rev-parse", "main") == shipped and not [c for c in host.calls if c[0] == "systemctl"]
     assert run_github_unit(tmp_path, monkeypatch, "unchanged", summary=result["summary"]) == (1, [])
+
+
+def test_a_reviewed_deploy_waits_for_ci_on_the_merge_commit(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = FakeHost(repos.live, ci={head: "failure"})
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "blocked" and result["pr"]["url"].startswith("https://github.com/")
+    assert result["summary"] == (f"CI's test check on the merged commit {head[:12]} is failure, so nothing was deployed "
+                                 "here; main is unchanged. GitHub's main has the change; it goes live with GitHub's "
+                                 "main once CI passes on a later commit.")
+    assert ("wait_check", head) in host.calls and not [c for c in host.calls if c[0] == "systemctl"]
+    assert git(repos.live, "rev-parse", "main") == repos.old and git(repos.origin, "rev-parse", "main") == head
+    run = json.loads(deploy.state_file("t1").read_text())
+    assert run["phase"] == "landed" and run["merge"] == head and run["pr"] == result["pr"]
+
+    class GitHubMovesOn(FakeHost):
+        """Another pull request merges onto GitHub's main right after this one."""
+
+        def land(self, commit, branch, title, body, method):
+            landed = super().land(commit, branch, title, body, method)
+            other = repos.tmp / "other"
+            git(repos.tmp, "clone", "-q", "-b", "main", str(repos.origin), str(other))
+            write(other, {"docs/d.md": "another pull request\n"})
+            git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "another pull request")
+            git(other, "push", "-q", "origin", "main")
+            return landed
+
+    deploy.state_file("t1").unlink()
+    host = GitHubMovesOn(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    later = git(repos.origin, "rev-parse", "main")
+    assert result["status"] == "deployed" and result["head"] == head != later
+    assert git(repos.live, "rev-parse", "main") == head and ("wait_check", head) in host.calls
+    assert git(repos.live, "rev-parse", "refs/remotes/origin/main") == later
+
+
+def test_a_relaunched_run_that_landed_deploys_its_merge_commit_without_landing_again(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
+    deploy.queue(reviewed(repos, head=head))
+    pr = {"number": 7, "url": "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/7"}
+    run = json.loads(deploy.state_file("t1").read_text())
+    deploy.write_json(deploy.state_file("t1"), {**run, "launches": 1, "phase": "landed", "pr": pr, "merge": head})
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and result["pr"] == pr and git(repos.live, "rev-parse", "main") == head
+    assert not [c for c in host.calls if c[0] == "land"] and ("wait_check", head) in host.calls

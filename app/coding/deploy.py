@@ -567,6 +567,10 @@ class Host:
     def land(self, commit: str, branch: str, title: str, body: str, method: str) -> Dict[str, Any]:
         return github.land(self.live, commit, branch, title, body, repo=self.repo, method=method)
 
+    def wait_check(self, sha: str) -> str:
+        """CI's test check on ``sha`` once it finished, or its state when the wait ran out."""
+        return github.wait_check(sha, self.repo)
+
     def readiness_baseline(self) -> List[str]:
         from app.coding import deploy_checks
 
@@ -598,7 +602,8 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     task is active or the idle count fails: the run then stays queued, and the launcher's next pass tries again.
 
     ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
-    approved ``head`` lands through a pull request first.
+    approved ``head`` lands through a pull request first, the run's state records the merge commit (``landed``), and
+    exactly that commit is deployed once CI's test check passed on it.
     """
     live = host.live
     try:
@@ -626,12 +631,25 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         blocked = _drift(live, old)
         if blocked:
             return blocked
-        landed = host.land(spec["head"], spec["branch"], spec["title"], spec["body"], "squash")
-        if landed["status"] != "merged":
-            return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on {landed['pr']['url']} is "
-                    f"{landed['check']}, so nothing was deployed; main is unchanged."}
-        head = host.fetch_main()
+        state = state_file(spec["task_id"])
+        run = _read_json(state)
+        if run is not None and run.get("phase") == "landed":
+            landed = {"status": "merged", "pr": run["pr"], "merge": run["merge"]}
+        else:
+            landed = host.land(spec["head"], spec["branch"], spec["title"], spec["body"], "squash")
+            if landed["status"] != "merged":
+                return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on {landed['pr']['url']} "
+                        f"is {landed['check']}, so nothing was deployed; main is unchanged."}
+            if run is not None:
+                write_json(state, {**run, "phase": "landed", "pr": landed["pr"], "merge": landed["merge"]})
+        head = landed["merge"]
         log(f"landed {landed['pr']['url']} as {head[:12]}")
+        host.fetch_main()
+        check = host.wait_check(head)
+        if check != "success":
+            return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on the merged commit "
+                    f"{head[:12]} is {check}, so nothing was deployed here; main is unchanged. GitHub's main has the "
+                    "change; it goes live with GitHub's main once CI passes on a later commit."}
     changed = changes(live, old, head)
     blocked = _drift(live, old)
     if blocked:
