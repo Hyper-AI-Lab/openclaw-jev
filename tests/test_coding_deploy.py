@@ -844,6 +844,10 @@ def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, 
     queued_for("t1", deploy.IDLE_WAIT_SEC - 60)
     assert deploy.next_deploy(busy) is None and systemd_run.argvs == []
     queued_for("t1", 60)
+    # The postponed launch skips the gate, but never starts while another deploy unit runs.
+    busy.units = ["aura-deploy-t9.service"]
+    assert deploy.next_deploy(busy) is None and systemd_run.argvs == []
+    busy.units = []
     assert deploy.next_deploy(busy) == "aura-deploy-t1"
     assert systemd_run.argvs[-1][-2:] == [str(deploy.spec_file("t1")), "--postpone"]
     capsys.readouterr()
