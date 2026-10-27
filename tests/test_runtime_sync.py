@@ -3,6 +3,9 @@ import json
 import os
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
 
 from app.production import runtime_sync
 
@@ -45,7 +48,8 @@ def test_a_plugin_edit_leaves_the_api_and_worker_in_sync(tmp_path, monkeypatch):
     assert runtime_sync.runtime_sync_status(root=tmp_path)["status"] == "ok"
 
 
-def test_attempt_remediation_restarts_on_stale_health(monkeypatch):
+@pytest.mark.asyncio
+async def test_attempt_remediation_restarts_on_stale_health(monkeypatch):
     from app.production import canary_sentinel
     from app.production.canary_sentinel import CanaryIssue
 
@@ -61,10 +65,10 @@ def test_attempt_remediation_restarts_on_stale_health(monkeypatch):
     monkeypatch.setattr(canary_sentinel, "_remediation_cooldown_active", lambda key="restart_runtime": False)
     monkeypatch.setattr(canary_sentinel, "_record_remediation", lambda key="restart_runtime": None)
     monkeypatch.setattr(canary_sentinel, "count_active_user_tasks_sync", lambda: 0)
-    monkeypatch.setattr(canary_sentinel, "cancel_stuck_canary_tasks_sync", lambda reason="x": [])
-    monkeypatch.setattr(canary_sentinel, "cancel_task_sync", lambda tid, reason="x": True)
+    monkeypatch.setattr(canary_sentinel, "cancel_stuck_canary_tasks", AsyncMock(return_value=[]))
+    monkeypatch.setattr(canary_sentinel, "cancel_task", AsyncMock(return_value=True))
 
-    actions = canary_sentinel.attempt_remediation(
+    actions = await canary_sentinel.attempt_remediation(
         [CanaryIssue("health_canary", "stale", "old")]
     )
     assert "rmp-api" in calls
@@ -72,7 +76,8 @@ def test_attempt_remediation_restarts_on_stale_health(monkeypatch):
     assert any("stale-runtime/canary" in a for a in actions)
 
 
-def test_attempt_remediation_defers_soft_health_when_users_active(monkeypatch):
+@pytest.mark.asyncio
+async def test_attempt_remediation_defers_soft_health_when_users_active(monkeypatch):
     from app.production import canary_sentinel
     from app.production.canary_sentinel import CanaryIssue
 
@@ -86,17 +91,18 @@ def test_attempt_remediation_defers_soft_health_when_users_active(monkeypatch):
     )
     monkeypatch.setattr(canary_sentinel, "_remediation_cooldown_active", lambda key="restart_runtime": False)
     monkeypatch.setattr(canary_sentinel, "count_active_user_tasks_sync", lambda: 2)
-    monkeypatch.setattr(canary_sentinel, "cancel_task_sync", lambda tid, reason="x": True)
-    monkeypatch.setattr(canary_sentinel, "cancel_stuck_canary_tasks_sync", lambda reason="x": [])
+    monkeypatch.setattr(canary_sentinel, "cancel_task", AsyncMock(return_value=True))
+    monkeypatch.setattr(canary_sentinel, "cancel_stuck_canary_tasks", AsyncMock(return_value=[]))
 
-    actions = canary_sentinel.attempt_remediation(
+    actions = await canary_sentinel.attempt_remediation(
         [CanaryIssue("health_canary", "timeout", "poll timeout", {"task_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"})]
     )
     assert calls == []
     assert any("cancelled canary task" in a for a in actions)
 
 
-def test_attempt_remediation_soft_timeout_idle_does_not_restart(monkeypatch):
+@pytest.mark.asyncio
+async def test_attempt_remediation_soft_timeout_idle_does_not_restart(monkeypatch):
     from app.production import canary_sentinel
     from app.production.canary_sentinel import CanaryIssue
 
@@ -109,10 +115,10 @@ def test_attempt_remediation_soft_timeout_idle_does_not_restart(monkeypatch):
         lambda unit: calls.append(unit) or True,
     )
     monkeypatch.setattr(canary_sentinel, "count_active_user_tasks_sync", lambda: 0)
-    monkeypatch.setattr(canary_sentinel, "cancel_task_sync", lambda tid, reason="x": True)
-    monkeypatch.setattr(canary_sentinel, "cancel_stuck_canary_tasks_sync", lambda reason="x": [])
+    monkeypatch.setattr(canary_sentinel, "cancel_task", AsyncMock(return_value=True))
+    monkeypatch.setattr(canary_sentinel, "cancel_stuck_canary_tasks", AsyncMock(return_value=[]))
 
-    canary_sentinel.attempt_remediation(
+    await canary_sentinel.attempt_remediation(
         [CanaryIssue("health_canary", "timeout", "poll timeout", {"task_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"})]
     )
     assert calls == []

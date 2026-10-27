@@ -1,6 +1,6 @@
 """Tests for canary sentinel and ops notification helpers."""
-from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -364,3 +364,80 @@ def test_the_idle_gate_counts_exactly_idle_blocking(tmp_path, monkeypatch):
     with pytest.raises(OperationalError):
         canary_sentinel.count_active_user_tasks_sync(strict=True)
     assert canary_sentinel.count_active_user_tasks_sync() == 0
+
+
+async def test_remediation_cancels_a_stuck_canary_inside_the_running_loop(tmp_path, monkeypatch):
+    """R-128 (4b): the sentinel runs in an event loop. Its remediation awaits the cancel of the canary that the soft
+    health issue names; that cancel terminates the canary's workflow, and no coroutine is left un-awaited (the sync
+    cancel's asyncio.run raised inside the running loop and dropped its terminate)."""
+    import gc
+    import json
+    import warnings
+
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app import temporal_control
+    from app.db.models import Base, Event, ProcessRun, Task
+    from app.production import canary_sentinel
+
+    tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'rmp.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=[Task.__table__, ProcessRun.__table__, Event.__table__])
+    factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as db:
+        db.add(Task(id=tid, goal="RMP CANARY: Reply with exactly CANARY_OK", task_type="canary", status="running"))
+        await db.commit()
+    client = MagicMock()
+    handle = client.get_workflow_handle.return_value
+    handle.signal, handle.terminate = AsyncMock(), AsyncMock()
+    abort = AsyncMock(return_value=[])
+    cancel = AsyncMock(wraps=temporal_control.cancel_task)
+    for module in (temporal_control, canary_sentinel):
+        monkeypatch.setattr(module, "AsyncSessionLocal", factory)
+    monkeypatch.setattr(temporal_control, "connect_temporal", AsyncMock(return_value=client))
+    monkeypatch.setattr("app.openclaw_control.abort_task_runs", abort)
+    monkeypatch.setattr("app.task_registry.hooks.index_terminal_task_async", AsyncMock())
+    monkeypatch.setattr(canary_sentinel, "cancel_task", cancel)
+
+    health_path, mem_path = tmp_path / "health.json", tmp_path / "mem.json"
+    monkeypatch.setattr(canary_sentinel, "HEALTH_CANARY_PATH", health_path)
+    monkeypatch.setattr(canary_sentinel, "MEMORY_CANARY_PATH", mem_path)
+    monkeypatch.setattr(canary_sentinel, "ALERT_STATE_PATH", tmp_path / "alerts.json")
+    monkeypatch.setattr(canary_sentinel, "evaluate_runtime_code_sync", lambda: None)
+    monkeypatch.setattr(canary_sentinel, "evaluate_llm_usage", lambda: None)
+    monkeypatch.setattr(canary_sentinel, "reap_stale_llm_slots_sync", lambda: [])
+    monkeypatch.setattr(canary_sentinel, "_systemctl_is_active", lambda unit: True)
+    monkeypatch.setattr(canary_sentinel, "count_active_user_tasks_sync", lambda: 0)
+    monkeypatch.setattr(canary_sentinel, "_wait_for_llm_capacity", lambda: None)
+    monkeypatch.setattr("app.production.invariants.run_invariant_checks", AsyncMock(return_value=[]))
+    canary_sentinel.write_health_canary_result(status="timeout", task_id=tid, error="poll timeout")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    mem_path.write_text(json.dumps({"status": "completed", "finished_at": now.isoformat() + "Z",
+                                    "memory_ok": 1, "prompt_ok": 1, "search_bad": 0}))
+
+    def prove():
+        canary_sentinel.write_health_canary_result(status="completed", task_id="recovered")
+        return True
+
+    monkeypatch.setattr(canary_sentinel, "rerun_health_canary_sync", prove)
+    # Garbage of earlier tests is collected first, so only this run's coroutines can warn below.
+    gc.collect()
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = await canary_sentinel.run_sentinel(trigger="health_canary")
+            gc.collect()
+        async with factory() as db:
+            task = await db.get(Task, tid)
+    finally:
+        await engine.dispose()
+
+    cancel.assert_awaited_once_with(tid, reason="health_canary_timeout", actor="canary_sentinel", wait_abort=True)
+    abort.assert_awaited_once_with(tid, reason="health_canary_timeout")
+    client.get_workflow_handle.assert_called_once_with(f"workflow-{tid}")
+    handle.terminate.assert_awaited_once_with("health_canary_timeout")
+    assert task.status == "cancelled"
+    assert f"cancelled canary task {tid[:8]}" in result["remediation"] and result["resolved_by_remediation"]
+    assert [str(w.message) for w in caught if "never awaited" in str(w.message)] == []

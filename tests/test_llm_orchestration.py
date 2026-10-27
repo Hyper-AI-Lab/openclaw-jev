@@ -153,9 +153,9 @@ def test_mutate_reserve_says_why_it_failed(broker_env, monkeypatch):
 
     monkeypatch.setattr(qb, "_load_env_keys", lambda: [("nvidia:default", "k1")])
     cfg = qb.QuotaConfig(min_interval_sec=60, max_concurrent=3)
-    assert qb._mutate_reserve("agent:main:a", ["nvidia:default"], cfg)
+    assert qb._mutate_reserve("agent:main:a", ["nvidia:default"], cfg)[0]
     why = []
-    assert qb._mutate_reserve("agent:main:b", ["nvidia:default"], cfg, why=why) is None
+    assert qb._mutate_reserve("agent:main:b", ["nvidia:default"], cfg, why=why)[0] is None
     assert why and why[-1].startswith("nvidia:default paced (")
 
     until = time.time() * 1000 + 60_000
@@ -165,7 +165,7 @@ def test_mutate_reserve_says_why_it_failed(broker_env, monkeypatch):
         )
     )
     why.clear()
-    assert qb._mutate_reserve("agent:main:c", ["nvidia:default"], cfg, why=why) is None
+    assert qb._mutate_reserve("agent:main:c", ["nvidia:default"], cfg, why=why)[0] is None
     assert why == ["every key is cooling down"]
 
 
