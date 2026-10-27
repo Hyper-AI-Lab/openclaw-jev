@@ -234,7 +234,6 @@ def test_user_intake_preempts_canary_slot(monkeypatch, tmp_path):
     monkeypatch.setattr(qb, "OPENCLAW_ENV_PATH", env_file)
     monkeypatch.setattr(qb, "_today_usage_by_profile", lambda: {})
     monkeypatch.setattr(qb, "_task_looks_like_canary_sync", lambda _tid: False)
-    monkeypatch.setattr("app.temporal_control.cancel_task", AsyncMock(return_value=True))
 
     now_ms = time.time() * 1000
     state_file.write_text(
@@ -264,12 +263,14 @@ def test_user_intake_preempts_canary_slot(monkeypatch, tmp_path):
         )
     )
     cfg = qb.QuotaConfig(max_concurrent=1, min_interval_sec=0.0)
-    result, _preempted = qb._mutate_reserve(
+    result, preempted = qb._mutate_reserve(
         "agent:main:rmp_intake_user_abcd1234",
         ["nvidia:default"],
         cfg,
     )
     assert result is not None
+    # The canary's session names no task, so the caller has no task to cancel.
+    assert preempted == []
     profile_id, slot_id = result
     assert profile_id == "nvidia:default"
     assert slot_id != "slot-canary"
