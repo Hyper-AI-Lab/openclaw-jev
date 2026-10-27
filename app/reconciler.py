@@ -14,6 +14,7 @@ from app.metrics import inc as metrics_inc
 from app.notification_policy import is_internal_task
 from app.production.alerting import send_alert
 from app.status import IN_PROGRESS, RUN_STATE_FOR_TASK_STATUS, RUN_TERMINAL, TERMINAL, RunState, TaskStatus
+from app.temporal_control import connect_temporal
 from app.transitions import set_run_state, set_task_status
 
 logger = logging.getLogger("rmp.reconciler")
@@ -25,8 +26,6 @@ STUCK_REPAIR_MINUTES = 45
 # Recover completed OpenClaw replies quickly after worker crashes mid-notify.
 ORPHAN_REPLY_MIN_AGE_SEC = 90
 ORPHAN_REPLY_MAX_AGE_MINUTES = 30
-
-_temporal_client: Client | None = None
 
 
 def _task_is_internal(task: Task) -> bool:
@@ -286,20 +285,6 @@ async def _recover_orphaned_session_reply(
     return outcome
 
 
-async def _get_temporal() -> Client:
-    global _temporal_client
-    if _temporal_client is not None:
-        try:
-            await _temporal_client.service_client.check_health()
-            return _temporal_client
-        except Exception:
-            _temporal_client = None
-    from app.temporal_control import connect_temporal_with_retry
-
-    _temporal_client = await connect_temporal_with_retry(attempts=4, delay_sec=0.5)
-    return _temporal_client
-
-
 async def _terminate_workflow(client: Client, wf_id: str, reason: str) -> bool:
     try:
         handle = client.get_workflow_handle(wf_id)
@@ -444,7 +429,7 @@ async def _repair_stuck_running_task(
 async def count_stuck_running_workflows() -> int:
     """Count parent workflows and deep recalls still RUNNING while task row is non-active."""
     try:
-        client = await _get_temporal()
+        client = await connect_temporal(attempts=4, delay_sec=0.5)
         count = 0
         async for wf in client.list_workflows('ExecutionStatus="Running"'):
             if wf.id.startswith("workflow-"):
@@ -499,7 +484,7 @@ async def reconcile_once() -> dict:
     # Tasks this pass moves to a terminal status itself (stuck repair indexes in db_activities).
     terminal_task_ids: list = []
 
-    client = await _get_temporal()
+    client = await connect_temporal(attempts=4, delay_sec=0.5)
 
     async with AsyncSessionLocal() as db:
         stats["coding_orphans_closed"] = len(await _close_orphaned_coding_tasks(client, db, now, stats))

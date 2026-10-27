@@ -1,9 +1,11 @@
 import asyncio
 import json
+import logging
 import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -232,9 +234,6 @@ def test_user_intake_preempts_canary_slot(monkeypatch, tmp_path):
     monkeypatch.setattr(qb, "OPENCLAW_ENV_PATH", env_file)
     monkeypatch.setattr(qb, "_today_usage_by_profile", lambda: {})
     monkeypatch.setattr(qb, "_task_looks_like_canary_sync", lambda _tid: False)
-    monkeypatch.setattr(
-        "app.production.canary_sentinel.cancel_task_sync", lambda *_a, **_k: True
-    )
 
     now_ms = time.time() * 1000
     state_file.write_text(
@@ -264,12 +263,14 @@ def test_user_intake_preempts_canary_slot(monkeypatch, tmp_path):
         )
     )
     cfg = qb.QuotaConfig(max_concurrent=1, min_interval_sec=0.0)
-    result = qb._mutate_reserve(
+    result, preempted = qb._mutate_reserve(
         "agent:main:rmp_intake_user_abcd1234",
         ["nvidia:default"],
         cfg,
     )
     assert result is not None
+    # The canary's session names no task, so the caller has no task to cancel.
+    assert preempted == []
     profile_id, slot_id = result
     assert profile_id == "nvidia:default"
     assert slot_id != "slot-canary"
@@ -319,7 +320,7 @@ def test_user_does_not_preempt_other_user_slot(monkeypatch, tmp_path):
         )
     )
     cfg = qb.QuotaConfig(max_concurrent=1, min_interval_sec=0.0)
-    result = qb._mutate_reserve(
+    result, _preempted = qb._mutate_reserve(
         "agent:main:rmp_intake_other_ffff9999",
         ["nvidia:default"],
         cfg,
@@ -340,8 +341,8 @@ def test_canary_cannot_take_both_user_slots(monkeypatch, tmp_path):
     monkeypatch.setattr(qb, "_task_looks_like_canary_sync", lambda _tid: False)
     state_file.write_text(json.dumps({"keys": {}, "global": {"active_slots": {}, "session_slots": {}}}))
     cfg = qb.QuotaConfig(max_concurrent=3, min_interval_sec=0.0)
-    a = qb._mutate_reserve("agent:main:rmp_task_canary_one", ["nvidia:default"], cfg, kind="canary")
-    b = qb._mutate_reserve("agent:main:rmp_task_canary_two", ["nvidia:default"], cfg, kind="canary")
+    a, _ = qb._mutate_reserve("agent:main:rmp_task_canary_one", ["nvidia:default"], cfg, kind="canary")
+    b, _ = qb._mutate_reserve("agent:main:rmp_task_canary_two", ["nvidia:default"], cfg, kind="canary")
     assert a is not None
     assert b is None
     state = json.loads(state_file.read_text())
@@ -402,7 +403,12 @@ async def test_canary_reserve_does_not_wait_1800s(monkeypatch, tmp_path):
     assert slept == [], "a canary is refused without waiting"
 
 
-def test_user_reserve_cancels_canary_task(monkeypatch, tmp_path):
+CANARY_TID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def _one_key_held_by_a_canary(monkeypatch, tmp_path):
+    """One key and one slot, held by the run of canary task CANARY_TID; the broker touches no OpenClaw file. Returns
+    the settings of that one-slot pool."""
     state_file = tmp_path / "llm_quota.json"
     env_file = tmp_path / "openclaw.env"
     env_file.write_text("NVIDIA_API_KEY=k1\n")
@@ -410,16 +416,8 @@ def test_user_reserve_cancels_canary_task(monkeypatch, tmp_path):
     monkeypatch.setattr(qb, "LOCK_PATH", tmp_path / ".llm_quota.lock")
     monkeypatch.setattr(qb, "OPENCLAW_ENV_PATH", env_file)
     monkeypatch.setattr(qb, "_today_usage_by_profile", lambda: {})
-    cancelled = []
-
-    def fake_cancel(tid, reason="x"):
-        cancelled.append((tid, reason))
-        return True
-
-    monkeypatch.setattr(
-        "app.production.canary_sentinel.cancel_task_sync", fake_cancel
-    )
-    canary_tid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    monkeypatch.setattr(qb, "assign_openclaw_session_profile", lambda session_key, profile_id: None)
+    monkeypatch.setattr(qb, "_patch_auth_last_good", lambda profile_id: None)
     now_ms = time.time() * 1000
     state_file.write_text(
         json.dumps(
@@ -430,23 +428,102 @@ def test_user_reserve_cancels_canary_task(monkeypatch, tmp_path):
                         "slot-c": {
                             "profile_id": "nvidia:default",
                             "started_ms": now_ms,
-                            "session_key": f"agent:main:rmp_task_{canary_tid}",
+                            "session_key": f"agent:main:rmp_task_{CANARY_TID}",
                             "kind": "canary",
                         }
                     },
                     "session_slots": {
-                        f"agent:main:rmp_task_{canary_tid}": "slot-c"
+                        f"agent:main:rmp_task_{CANARY_TID}": "slot-c"
                     },
                 },
             }
         )
     )
-    cfg = qb.QuotaConfig(max_concurrent=1, min_interval_sec=0.0)
-    result = qb._mutate_reserve(
-        "agent:main:rmp_intake_user_abcd1234",
-        ["nvidia:default"],
-        cfg,
-        kind="user",
-    )
+    return {"llm_quota": {"max_concurrent": 1, "min_interval_sec": 0}}
+
+
+async def test_user_reserve_cancels_canary_task(monkeypatch, tmp_path):
+    from app import temporal_control
+
+    settings = _one_key_held_by_a_canary(monkeypatch, tmp_path)
+    cancel = AsyncMock(return_value=True)
+    monkeypatch.setattr(temporal_control, "cancel_task", cancel)
+    monkeypatch.setattr(temporal_control, "_background", set())
+
+    result = await qb.reserve_profile(session_key="agent:main:rmp_intake_user_abcd1234", settings=settings,
+                                      kind="user")
+
     assert result is not None
-    assert cancelled == [(canary_tid, "user_preempt_canary")]
+    await asyncio.gather(*temporal_control._background)
+    cancel.assert_awaited_once_with(CANARY_TID, reason="user_preempt_canary", actor="quota_broker")
+
+
+async def test_a_failed_preemption_cancel_is_one_warning(monkeypatch, tmp_path, caplog):
+    """The background cancel's failure never reaches the reservation: it is logged once, at WARNING, with the canary
+    task's id."""
+    from app import temporal_control
+
+    caplog.set_level(logging.WARNING)
+    settings = _one_key_held_by_a_canary(monkeypatch, tmp_path)
+    monkeypatch.setattr(temporal_control, "cancel_task", AsyncMock(side_effect=ConnectionError("Temporal went away")))
+    monkeypatch.setattr(temporal_control, "_background", set())
+
+    result = await qb.reserve_profile(session_key="agent:main:rmp_intake_user_abcd1234", settings=settings,
+                                      kind="user")
+
+    assert result is not None
+    [cancel] = temporal_control._background
+    await asyncio.gather(cancel, return_exceptions=True)
+    assert temporal_control._background == set()
+    assert [(r.levelname, r.getMessage()) for r in caplog.records if r.levelno >= logging.WARNING] == [
+        ("WARNING", f"Cancelling preempted canary task {CANARY_TID[:8]} failed: Temporal went away")]
+
+
+async def test_preemption_terminates_the_canary_workflow(monkeypatch, tmp_path):
+    """R-103: a user reservation that preempts a canary's slot cancels the canary task and terminates its workflow,
+    and the reservation is back before that cancel finishes."""
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app import temporal_control
+    from app.db.models import Base, Event, ProcessRun, Task
+
+    settings = _one_key_held_by_a_canary(monkeypatch, tmp_path)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'rmp.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=[Task.__table__, ProcessRun.__table__, Event.__table__])
+    factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as db:
+        db.add_all([Task(id=CANARY_TID, goal="RMP CANARY: Reply with exactly CANARY_OK", task_type="canary",
+                         status="running"),
+                    ProcessRun(id="r-canary", task_id=CANARY_TID, current_state="running")])
+        await db.commit()
+    # Temporal answers the terminate only once the test releases it.
+    release, terminated, aborted = asyncio.Event(), [], []
+
+    async def terminate(reason):
+        await release.wait()
+        terminated.append(reason)
+
+    client = MagicMock()
+    client.get_workflow_handle.return_value = SimpleNamespace(signal=AsyncMock(), terminate=terminate)
+    monkeypatch.setattr(temporal_control, "AsyncSessionLocal", factory)
+    monkeypatch.setattr(temporal_control, "connect_temporal", AsyncMock(return_value=client))
+    monkeypatch.setattr(temporal_control, "_background", set())
+    monkeypatch.setattr("app.openclaw_control.schedule_abort", lambda task_id, *, reason: aborted.append(task_id))
+    monkeypatch.setattr("app.task_registry.hooks.index_terminal_task_async", AsyncMock())
+    try:
+        profile_id, _slot = await qb.reserve_profile(session_key="agent:main:rmp_intake_user_abcd1234",
+                                                     settings=settings, kind="user")
+
+        [cancel] = temporal_control._background
+        assert profile_id == "nvidia:default" and not cancel.done() and terminated == []
+        release.set()
+        await cancel
+        async with factory() as db:
+            task, run = await db.get(Task, CANARY_TID), await db.get(ProcessRun, "r-canary")
+        assert task.status == "cancelled" and run.current_state == "canceled"
+        client.get_workflow_handle.assert_called_once_with(f"workflow-{CANARY_TID}")
+        assert terminated == ["user_preempt_canary"] and aborted == [CANARY_TID]
+    finally:
+        await engine.dispose()

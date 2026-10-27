@@ -11,11 +11,12 @@ from datetime import datetime, timezone
 sys.path.insert(0, "/root/.openclaw/rmp")
 
 from sqlalchemy import select
-from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.client import WorkflowExecutionStatus
 
 from app.db.database import AsyncSessionLocal
 from app.db.models import Task
 from app.status import TERMINAL, TaskStatus
+from app.temporal_control import connect_temporal
 from app.transitions import set_task_status
 
 logger = logging.getLogger("rmp.temporal_purge")
@@ -25,7 +26,7 @@ async def purge_running(
     *, max_age_minutes: int = 0, dry_run: bool = False, force_recovery: bool = False
 ) -> dict:
     stats = {"scanned": 0, "terminated": 0, "skipped": 0, "errors": 0, "tasks_failed": 0}
-    client = await Client.connect("localhost:7233")
+    client = await connect_temporal()
     now = datetime.now(timezone.utc)
     cutoff = None
     if max_age_minutes > 0:

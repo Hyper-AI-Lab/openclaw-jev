@@ -14,11 +14,12 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from sqlalchemy import select
-from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.client import WorkflowExecutionStatus
 
 from app.db.database import AsyncSessionLocal, engine
 from app.db.models import Task
 from app.status import TERMINAL
+from app.temporal_control import connect_temporal
 
 logger = logging.getLogger("rmp.janitor")
 
@@ -29,7 +30,7 @@ async def janitor_once(max_age_hours: int = JANITOR_MAX_AGE_HOURS) -> dict:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     stats = {"scanned": 0, "terminated": 0, "errors": 0}
 
-    client = await Client.connect("localhost:7233")
+    client = await connect_temporal()
     try:
         async for wf in client.list_workflows('ExecutionStatus="Running"'):
             stats["scanned"] += 1

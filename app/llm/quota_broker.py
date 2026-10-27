@@ -699,8 +699,11 @@ def _mutate_reserve(
     cfg: QuotaConfig,
     kind: str = "user",
     why: Optional[List[str]] = None,
-) -> Optional[tuple[str, str]]:
-    """Try one reservation. On failure, append the reason to ``why`` if given."""
+) -> tuple[Optional[tuple[str, str]], List[str]]:
+    """Try one reservation: ``(profile and slot, or None; the canary task ids whose slots it preempted)``.
+
+    On failure, append the reason to ``why`` if given. The caller cancels the preempted canaries.
+    """
     preempted: List[str] = []
 
     def _fail(reason: str) -> None:
@@ -767,15 +770,7 @@ def _mutate_reserve(
         g["last_profile_id"] = pid
         return pid, slot_id
 
-    result = _mutate_state(_apply)
-    for tid in preempted:
-        try:
-            from app.production.canary_sentinel import cancel_task_sync
-
-            cancel_task_sync(tid, "user_preempt_canary")
-        except Exception as exc:
-            logger.warning("canary cancel after preempt failed: %s", exc)
-    return result
+    return _mutate_state(_apply), preempted
 
 
 def release_profile_sync(
@@ -1031,7 +1026,7 @@ async def reserve_profile(
         why.clear()
         # One attempt per lock hold: release_profile needs the same lock.
         async with _lock:
-            result = _mutate_reserve(session_key, profiles, cfg, kind=slot_kind, why=why)
+            result, preempted = _mutate_reserve(session_key, profiles, cfg, kind=slot_kind, why=why)
             if result:
                 profile_id, slot_id = result
                 if session_key:
@@ -1040,6 +1035,13 @@ async def reserve_profile(
                     if should_pin_nvidia_profile(model, profile_id):
                         assign_openclaw_session_profile(session_key, profile_id)
                 _patch_auth_last_good(profile_id)
+        if preempted:
+            from app.temporal_control import cancel_task, run_in_background
+
+            # The preempted canary is cancelled in the background: the reservation never waits on Temporal.
+            for tid in preempted:
+                run_in_background(cancel_task(tid, reason="user_preempt_canary", actor="quota_broker"),
+                                  what=f"Cancelling preempted canary task {tid[:8]}")
         if result:
             waited = time.time() - started
             if waited > RESERVE_WAIT_LOG_SEC:

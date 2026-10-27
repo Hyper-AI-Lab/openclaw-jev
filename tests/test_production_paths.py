@@ -47,6 +47,8 @@ PRODUCTION = {
     "app.coding.deploy.PLUGINS_MIRROR": "/root/.openclaw/plugins",
     "app.coding.deploy.WEB_STACK_MIRROR": "/root/.openclaw/web-stack",
 }
+# Every other host setting a module reads from config, with its value in production.
+PRODUCTION_SETTINGS = {"app.config.TEMPORAL_ADDRESS": "localhost:7233"}
 # Run with every production default in effect, so the guard's audit hook refuses and records any touch of a production
 # path, database, process or service while the modules import: a later import-time settings read would otherwise read,
 # and could write, the live ones.
@@ -76,15 +78,16 @@ def constant(name):
 
 def test_the_production_defaults_are_unchanged(tmp_path):
     # DATABASE_URL stays: without it app.db.database falls back to /etc/rmp/rmp.env.
-    env = {name: value for name, value in os.environ.items() if name not in PATH_VARIABLES}
+    env = {name: value for name, value in os.environ.items() if name not in (*PATH_VARIABLES, "TEMPORAL_ADDRESS")}
     env["TMPDIR"] = str(tmp_path)
-    proc = subprocess.run([sys.executable, "-c", CHILD, str(REPO), str(tmp_path), json.dumps(list(PRODUCTION))],
+    expected = {**PRODUCTION, **PRODUCTION_SETTINGS}
+    proc = subprocess.run([sys.executable, "-c", CHILD, str(REPO), str(tmp_path), json.dumps(list(expected))],
                           cwd=REPO, env=env, capture_output=True, text=True, timeout=120)
     assert proc.stdout, proc.stderr
     result = json.loads(proc.stdout.splitlines()[-1])
     assert result["violations"] == []
     assert proc.returncode == 0, proc.stderr
-    assert result["values"] == PRODUCTION
+    assert result["values"] == expected
 
 
 def test_under_the_test_environment_nothing_resolves_to_production(monkeypatch):

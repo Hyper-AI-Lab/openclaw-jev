@@ -103,8 +103,7 @@ async def test_the_janitor_reads_the_task_of_a_deep_recall(monkeypatch):
         result.scalar_one_or_none.return_value = MagicMock(status="running" if task_id == "t-live" else "completed")
         return result
 
-    with patch.object(janitor_mod, "Client") as mock_client_cls:
-        mock_client_cls.connect = AsyncMock(return_value=client)
+    with patch.object(janitor_mod, "connect_temporal", AsyncMock(return_value=client)):
         with patch.object(janitor_mod, "AsyncSessionLocal") as mock_session:
             db = AsyncMock()
             db.execute = execute
@@ -135,8 +134,7 @@ async def test_the_janitor_keeps_a_coding_task_waiting_days_for_approval():
     result = MagicMock()
     result.scalar_one_or_none.return_value = MagicMock(status="pending_user_input")
 
-    with patch.object(janitor_mod, "Client") as mock_client_cls:
-        mock_client_cls.connect = AsyncMock(return_value=client)
+    with patch.object(janitor_mod, "connect_temporal", AsyncMock(return_value=client)):
         with patch.object(janitor_mod, "AsyncSessionLocal") as mock_session:
             db = AsyncMock()
             db.execute = AsyncMock(return_value=result)
@@ -163,7 +161,7 @@ async def test_count_stuck_created_task_workflows():
         status = "created"
         updated_at = datetime.utcnow() - timedelta(minutes=50)
 
-    with patch("app.reconciler._get_temporal", new_callable=AsyncMock, return_value=client):
+    with patch("app.reconciler.connect_temporal", new_callable=AsyncMock, return_value=client):
         with patch("app.reconciler.AsyncSessionLocal") as mock_session:
             db = AsyncMock()
             mock_session.return_value.__aenter__.return_value = db
@@ -191,7 +189,7 @@ async def test_count_stuck_running_workflows():
         status = "running"
         updated_at = datetime.utcnow() - timedelta(minutes=50)
 
-    with patch("app.reconciler._get_temporal", new_callable=AsyncMock, return_value=client):
+    with patch("app.reconciler.connect_temporal", new_callable=AsyncMock, return_value=client):
         with patch("app.reconciler.AsyncSessionLocal") as mock_session:
             db = AsyncMock()
             mock_session.return_value.__aenter__.return_value = db
@@ -220,7 +218,7 @@ async def test_a_deep_recall_counts_as_stuck_only_once_its_task_has_ended():
         )
         return result
 
-    with patch("app.reconciler._get_temporal", new_callable=AsyncMock, return_value=client):
+    with patch("app.reconciler.connect_temporal", new_callable=AsyncMock, return_value=client):
         with patch("app.reconciler.AsyncSessionLocal") as mock_session:
             db = AsyncMock()
             db.execute = execute
@@ -253,8 +251,7 @@ async def test_janitor_terminates_old_orphan():
     client.list_workflows = fake_list
     client.get_workflow_handle.return_value.terminate = AsyncMock()
 
-    with patch.object(janitor_mod, "Client") as mock_client_cls:
-        mock_client_cls.connect = AsyncMock(return_value=client)
+    with patch.object(janitor_mod, "connect_temporal", AsyncMock(return_value=client)):
         with patch.object(janitor_mod, "AsyncSessionLocal") as mock_session:
             db = AsyncMock()
             mock_session.return_value.__aenter__.return_value = db
@@ -326,7 +323,7 @@ async def test_reconciler_indexes_the_tasks_it_completes_after_commit(stale_db):
 
     with patch("app.config.is_development_mode", return_value=False), \
          patch.object(reconciler, "reap_stale_llm_slots_sync", return_value=[]), \
-         patch.object(reconciler, "_get_temporal", new_callable=AsyncMock, return_value=client), \
+         patch.object(reconciler, "connect_temporal", new_callable=AsyncMock, return_value=client), \
          patch.object(reconciler, "AsyncSessionLocal", session), \
          patch.object(reconciler, "_recover_orphaned_session_reply", side_effect=recover), \
          patch.object(reconciler, "_cleanup_orphan_plan_children", new_callable=AsyncMock, return_value=0), \
@@ -372,7 +369,7 @@ async def test_stale_repair_does_not_overwrite_a_terminal_task(stale_db, caplog,
 
     with patch("app.config.is_development_mode", return_value=False), \
          patch.object(reconciler, "reap_stale_llm_slots_sync", return_value=[]), \
-         patch.object(reconciler, "_get_temporal", new_callable=AsyncMock, return_value=client), \
+         patch.object(reconciler, "connect_temporal", new_callable=AsyncMock, return_value=client), \
          patch.object(reconciler, "AsyncSessionLocal", stale_db), \
          patch.object(reconciler, "_close_orphaned_coding_tasks", new_callable=AsyncMock, return_value=[]), \
          patch.object(reconciler, "_end_claude_sessions_of_finished_tasks", AsyncMock(return_value=0)), \
@@ -484,7 +481,7 @@ async def test_a_cancelled_run_of_a_completed_workflow_stays_cancelled(tmp_path)
     try:
         with patch("app.config.is_development_mode", return_value=False), \
              patch.object(reconciler, "reap_stale_llm_slots_sync", return_value=[]), \
-             patch.object(reconciler, "_get_temporal", new_callable=AsyncMock, return_value=client), \
+             patch.object(reconciler, "connect_temporal", new_callable=AsyncMock, return_value=client), \
              patch.object(reconciler, "AsyncSessionLocal", factory), \
              patch.object(reconciler, "_close_orphaned_coding_tasks", new_callable=AsyncMock, return_value=[]), \
              patch.object(reconciler, "_end_claude_sessions_of_finished_tasks", AsyncMock(return_value=0)), \

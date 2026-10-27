@@ -13,9 +13,11 @@ import time
 async def probe_temporal(timeout_sec: float = 8.0) -> tuple[bool, str]:
     from temporalio.client import Client
 
+    # The address app.config resolves, read here without app: ops/temporal_recover.sh runs this without the repo on
+    # the path.
     try:
         client = await asyncio.wait_for(
-            Client.connect("localhost:7233"), timeout=timeout_sec
+            Client.connect(os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")), timeout=timeout_sec
         )
     except Exception as exc:
         return False, f"connect failed: {exc}"

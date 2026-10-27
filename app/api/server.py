@@ -15,7 +15,6 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from temporalio.client import Client
 
 from app.config import (
     get_api_key,
@@ -36,15 +35,15 @@ from app.cron.reconciler import cron_reconciler_loop, reconcile_cron_once
 from app.reconciler import reconciler_loop
 from app.scanners.catalog import list_scanners
 from app.scanners.sync import get_scanner_status, scanner_monitor_loop, sync_scanners_once
-from app.status import ACTIVE, IDLE_BLOCKING, TERMINAL, WORKFLOW_OWNED, RunState, TaskStatus
+from app.status import ACTIVE, IDLE_BLOCKING, TERMINAL, WORKFLOW_OWNED, TaskStatus
 from app.telemetry import (
     init_telemetry,
     instrument_fastapi,
     telemetry_status,
     trace_span,
-    get_temporal_client_kwargs,
 )
-from app.transitions import UNCHANGED, set_run_state, set_task_status
+from app.temporal_control import connect_temporal
+from app.transitions import UNCHANGED, set_task_status
 from app.workflows.catalog import (
     CATALOG,
     catalog_assignment_from_intake,
@@ -218,10 +217,6 @@ class ArtifactRegisterRequest(BaseModel):
     mime_type: Optional[str] = None
 
 
-async def connect_temporal() -> Client:
-    return await Client.connect("localhost:7233", **get_temporal_client_kwargs())
-
-
 async def _start_task_workflow(
     task_id: str,
     intent: str,
@@ -364,10 +359,7 @@ async def health():
     vm = await MemoryRouter.vector_status()
     temporal = {"ok": False, "error": None}
     try:
-        client = await asyncio.wait_for(
-            Client.connect("localhost:7233", **get_temporal_client_kwargs()),
-            timeout=5.0,
-        )
+        client = await asyncio.wait_for(connect_temporal(), timeout=5.0)
         await client.service_client.check_health()
         temporal = {"ok": True, "error": None}
     except Exception as exc:
@@ -936,7 +928,7 @@ CANCEL_ACTOR = "api:/tasks/{id}/cancel"
 
 @app.post("/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str, reason: str = "api_cancel", db: AsyncSession = Depends(get_db)):
-    """Terminate workflow and mark task cancelled (dashboard / dev use).
+    """Cancel an active task through ``temporal_control.cancel_task`` (dashboard / dev use).
 
     A finished task changes nothing: the attempt goes through the guarded writer, which refuses and logs it (a repeat
     of a cancel is unchanged), and the answer gives its status with ``cancelled: false``.
@@ -949,50 +941,14 @@ async def cancel_task(task_id: str, reason: str = "api_cancel", db: AsyncSession
         finished = await set_task_status(db, task_id, TaskStatus.CANCELLED, actor=CANCEL_ACTOR, cause=reason)
         await db.commit()
         return {"status": finished.previous, "task_id": task_id, "cancelled": False}
-    from app.openclaw_control import schedule_abort
+    from app import temporal_control
 
-    schedule_abort(task_id, reason=reason)
-    try:
-        client = await connect_temporal()
-        handle = client.get_workflow_handle(f"workflow-{task_id}")
-        try:
-            await handle.signal("cancel", "Cancelled via API")
-        except Exception:
-            pass
-        await handle.terminate("Cancelled via API")
-    except Exception as e:
-        logger.warning("Terminate workflow %s: %s", task_id, e)
     # stopped_by_user is only for Kirill's own "stop"; API cancels are cleanups and timeouts.
-    cancelled = await set_task_status(db, task_id, TaskStatus.CANCELLED, actor=CANCEL_ACTOR, cause=reason,
-                                      closed_reason=reason)
-    if not cancelled.changed:
-        # It finished while the workflow was being stopped.
-        await db.commit()
-        return {"status": cancelled.previous, "task_id": task_id, "cancelled": False}
-    pr_result = await db.execute(
-        select(ProcessRun.id)
-        .where(ProcessRun.task_id == task_id)
-        .order_by(ProcessRun.started_at.desc())
-        .limit(1)
-    )
-    run_id = pr_result.scalar_one_or_none()
-    if run_id:
-        await set_run_state(db, run_id, RunState.CANCELED, actor=CANCEL_ACTOR, cause=reason, ended=True,
-                            release_lease=True)
-    db.add(
-        Event(
-            correlation_id=task.correlation_id or task_id,
-            entity_type="task",
-            entity_id=task_id,
-            event_type="task.cancelled",
-            event_payload={"source": "api", "reason": reason},
-        )
-    )
-    await db.commit()
-    from app.task_registry.hooks import index_terminal_task_async
-
-    await index_terminal_task_async(task_id)
-    return {"status": "cancelled", "task_id": task_id}
+    if await temporal_control.cancel_task(task_id, reason=reason, actor=CANCEL_ACTOR):
+        return {"status": "cancelled", "task_id": task_id}
+    # It finished between this read and the cancel's write, which the guarded writer refused.
+    await db.refresh(task)
+    return {"status": task.status, "task_id": task_id, "cancelled": False}
 
 
 @app.post("/tasks/{task_id}/retry")

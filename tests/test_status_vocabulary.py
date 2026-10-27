@@ -567,8 +567,6 @@ OTHER_ROW_STATUS_WRITERS = frozenset({
     ("app/activities/db_activities.py", "execute_compensation", "step"),  # Step
     ("app/deep_memory/enrich.py", "enrich_document", "live_doc"),  # DeepDocument
 })
-# This batch only: the sentinel's cancel is already a compare-and-set in SQL; batch 4 replaces it, and this entry goes.
-RAW_STATUS_UPDATERS = frozenset({("app/production/canary_sentinel.py", "cancel_task_sync")})
 # G9 (WP04-18): the event log is immutable (D-24). WP-27's K-12 retention job adds itself here, the one deleter.
 EVENT_DELETERS = frozenset()
 RAW_EVENT_WRITE = re.compile(r"\b(delete\s+from|update|truncate(\s+table)?)\s+events\b", re.IGNORECASE)
@@ -638,7 +636,7 @@ def writer_violations(tree, path):
     for node, function in _nodes_by_function(tree):
         if isinstance(node, ast.Call) and _statement_on(node, updates, TRANSITION_ROWS):
             found.add((node.lineno, "G8"))
-        if _string(node) and RAW_STATUS_UPDATE.search(node.value) and (path, function) not in RAW_STATUS_UPDATERS:
+        if _string(node) and RAW_STATUS_UPDATE.search(node.value):
             found.add((node.lineno, "G8"))
         if (imports_a_row and isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
                 and any(_status_attribute(target) and not _exempt_row_status(target, path, function)
@@ -713,6 +711,9 @@ def event_log_violations(tree, path):
      "    run.current_state = RunState.CANCELED", "app/activities/db_activities.py"),
     ('def cancel_task_sync():\n    pass\nSQL = "UPDATE tasks SET status = :cancelled WHERE id = :id"',
      "app/production/canary_sentinel.py"),
+    # The sentinel's raw UPDATE had batch 3's one exception; its cancel goes through the guarded writer since batch 4.
+    ('def cancel_task_sync():\n    sql = "UPDATE tasks SET status = :cancelled WHERE id = :id AND status IN :active"',
+     "app/production/canary_sentinel.py"),
 ])
 def test_the_writer_guard_flags_its_snippet(source, path):
     assert writer_violations(ast.parse(source), path)
@@ -729,8 +730,6 @@ def test_the_writer_guard_flags_its_snippet(source, path):
     ("from app.db.models import DeepContextReport\nrow.status = payload['status']", "app/example.py"),
     ("from app.db.models import Step, Task\nasync def record_step(payload):\n    existing.status = payload['ok']",
      "app/activities/db_activities.py"),
-    ('def cancel_task_sync():\n    sql = "UPDATE tasks SET status = :cancelled WHERE id = :id AND status IN :active"',
-     "app/production/canary_sentinel.py"),
     ('text("SELECT id FROM tasks WHERE status IN :statuses")', "app/example.py"),
 ])
 def test_the_writer_guard_passes_its_negative(source, path):
@@ -778,7 +777,7 @@ def test_no_status_write_outside_the_writer_and_no_event_rewrite():
     # Each reviewed exception still names a function that exists, so a stale entry is noticed and removed.
     functions = {(rel, node.name) for rel, tree in modules for node in ast.walk(tree)
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    assert {(path, function) for path, function, _ in OTHER_ROW_STATUS_WRITERS} | RAW_STATUS_UPDATERS | EVENT_DELETERS <= functions
+    assert {(path, function) for path, function, _ in OTHER_ROW_STATUS_WRITERS} | EVENT_DELETERS <= functions
 
 
 async def test_the_listener_catches_a_direct_write(runs, tmp_path, monkeypatch):

@@ -12,11 +12,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import select
+
 from app.config import RMP_DATA_DIR as _RMP_DATA_DIR, RMP_ROOT as _RMP_ROOT
+from app.db.database import AsyncSessionLocal
+from app.db.models import Task
 from app.production.alerting import send_alert
 from app.production.ops_notify import notify_ops_slack
 from app.llm.quota_broker import reap_stale_llm_slots_sync, seconds_until_any_key_ready
-from app.status import ACTIVE, IDLE_BLOCKING, IN_PROGRESS, TaskStatus
+from app.status import ACTIVE, IDLE_BLOCKING, IN_PROGRESS
+from app.temporal_control import cancel_task
 
 logger = logging.getLogger("rmp.canary_sentinel")
 
@@ -360,76 +365,42 @@ def count_active_user_tasks_sync(*, strict: bool = False) -> int:
             engine.dispose()
 
 
-def cancel_task_sync(task_id: str, reason: str = "canary_timeout") -> bool:
-    if not task_id:
-        return False
+SENTINEL_ACTOR = "canary_sentinel"
+
+
+async def _cancel_canary(task_id: str, reason: str) -> bool:
+    """Cancel a canary task and wait for its Aura runs to abort: the sentinel is a short-lived process. A failure is
+    logged, so the remediation goes on to its restarts and alert."""
     try:
-        from sqlalchemy import bindparam, create_engine, text
-
-        from app.db.database import DATABASE_URL
-
-        sync_url = DATABASE_URL.replace("+asyncpg", "+psycopg2")
-        engine = create_engine(sync_url)
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "UPDATE tasks SET status = :cancelled WHERE id = :id AND status IN :active"
-                ).bindparams(bindparam("active", expanding=True)),
-                {"id": task_id, "cancelled": TaskStatus.CANCELLED, "active": sorted(ACTIVE)},
-            )
-        try:
-
-            async def _term() -> None:
-                from temporalio.client import Client
-
-                client = await Client.connect("localhost:7233")
-                for wid in (f"workflow-{task_id}", f"{task_id}-plan-deliver-1"):
-                    try:
-                        await client.get_workflow_handle(wid).terminate(reason)
-                    except Exception:
-                        pass
-
-            asyncio.run(_term())
-        except Exception as exc:
-            logger.debug("Temporal terminate after canary cancel skipped: %s", exc)
-        return True
+        return await cancel_task(task_id, reason=reason, actor=SENTINEL_ACTOR, wait_abort=True)
     except Exception as exc:
-        logger.warning("cancel_task_sync %s failed: %s", task_id[:8], exc)
+        logger.warning("Cancelling canary task %s failed: %s", task_id[:8], exc)
         return False
 
 
-def list_stuck_canary_task_ids_sync() -> List[str]:
+async def list_stuck_canary_task_ids() -> List[str]:
     """Non-terminal canary/system probe tasks that can pin LLM slots."""
     try:
-        from sqlalchemy import bindparam, create_engine, text
-
-        from app.db.database import DATABASE_URL
-
-        sync_url = DATABASE_URL.replace("+asyncpg", "+psycopg2")
-        engine = create_engine(sync_url)
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text("SELECT id, task_type, goal FROM tasks WHERE status IN :active").bindparams(
-                    bindparam("active", expanding=True)
-                ),
-                {"active": sorted(ACTIVE)},
-            ).fetchall()
-        ids: List[str] = []
-        for task_id, task_type, goal in rows:
-            t = (task_type or "").lower()
-            g = (goal or "").upper()
-            if t == "canary" or "RMP CANARY" in g or "MEMORY CANARY" in g:
-                ids.append(str(task_id))
-        return ids
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(Task.id, Task.task_type, Task.goal).where(Task.status.in_(ACTIVE))
+            )).all()
     except Exception as exc:
-        logger.warning("list_stuck_canary_task_ids_sync failed: %s", exc)
+        logger.warning("list_stuck_canary_task_ids failed: %s", exc)
         return []
+    ids: List[str] = []
+    for task_id, task_type, goal in rows:
+        t = (task_type or "").lower()
+        g = (goal or "").upper()
+        if t == "canary" or "RMP CANARY" in g or "MEMORY CANARY" in g:
+            ids.append(str(task_id))
+    return ids
 
 
-def cancel_stuck_canary_tasks_sync(reason: str = "canary_timeout") -> List[str]:
+async def cancel_stuck_canary_tasks(reason: str = "canary_timeout") -> List[str]:
     cancelled: List[str] = []
-    for tid in list_stuck_canary_task_ids_sync():
-        if cancel_task_sync(tid, reason):
+    for tid in await list_stuck_canary_task_ids():
+        if await _cancel_canary(tid, reason):
             cancelled.append(tid)
     return cancelled
 
@@ -474,7 +445,7 @@ def _wait_for_llm_capacity() -> Optional[str]:
     return f"waited {sleep_for:.0f}s for LLM key cooldown"
 
 
-def attempt_remediation(issues: List[CanaryIssue]) -> List[str]:
+async def attempt_remediation(issues: List[CanaryIssue]) -> List[str]:
     """Deterministic fixes — reap LLM slots, cancel stuck canaries, restart down/stale units.
 
     Soft health_canary timeout/failed does NOT restart rmp-api/worker. That is LLM
@@ -500,11 +471,11 @@ def attempt_remediation(issues: List[CanaryIssue]) -> List[str]:
             SOFT_HEALTH_STATUSES | SOFT_MEMORY_STATUSES
         ):
             tid = str((issue.details or {}).get("task_id") or "")
-            if tid and cancel_task_sync(tid, f"{issue.name}_{issue.status}"):
+            if tid and await _cancel_canary(tid, f"{issue.name}_{issue.status}"):
                 extra_ids.append(tid)
                 actions.append(f"cancelled canary task {tid[:8]}")
 
-    stuck = cancel_stuck_canary_tasks_sync("canary_sentinel_recovery")
+    stuck = await cancel_stuck_canary_tasks("canary_sentinel_recovery")
     for tid in stuck:
         if tid not in extra_ids:
             actions.append(f"cancelled canary task {tid[:8]}")
@@ -673,7 +644,7 @@ async def _run_canaries(trigger: str) -> Dict[str, Any]:
     if not issues:
         return result
 
-    result["remediation"] = attempt_remediation(issues)
+    result["remediation"] = await attempt_remediation(issues)
 
     wait_note = _wait_for_llm_capacity()
     if wait_note:
@@ -754,7 +725,14 @@ async def _main_async(args: List[str]) -> int:
 def main() -> None:
     import sys
 
-    raise SystemExit(asyncio.run(_main_async(sys.argv[1:])))
+    code = asyncio.run(_main_async(sys.argv[1:]))
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # A remediation cancel leaves this process holding a Temporal client, whose native threads can abort interpreter
+    # finalization (PyGILState_Release, exit 134) after the verdict is known; leave without finalizing, as
+    # ops/temporal_healthcheck.py does.
+    os._exit(code)
 
 
 if __name__ == "__main__":
