@@ -955,24 +955,31 @@ def test_a_reviewed_deploy_waits_for_ci_on_the_merge_commit(repos):
     run = json.loads(deploy.state_file("t1").read_text())
     assert run["phase"] == "landed" and run["merge"] == head and run["pr"] == result["pr"]
 
-    class GitHubMovesOn(FakeHost):
-        """Another pull request merges onto GitHub's main right after this one."""
+    class GitHubSquashesAndMovesOn(FakeHost):
+        """GitHub squashes the pull request into a commit of its own, and another pull request merges right after."""
 
-        def land(self, commit, branch, title, body, method):
-            landed = super().land(commit, branch, title, body, method)
-            other = repos.tmp / "other"
-            git(repos.tmp, "clone", "-q", "-b", "main", str(repos.origin), str(other))
-            write(other, {"docs/d.md": "another pull request\n"})
-            git(other, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "another pull request")
-            git(other, "push", "-q", "origin", "main")
-            return landed
+        def land(self, commit_sha, branch, title, body, method):
+            self.calls.append(("land", branch, method))
+            github = repos.tmp / "github"
+            git(repos.tmp, "clone", "-q", "-b", "main", str(repos.origin), str(github))
+            git(github, "fetch", "-q", str(self.live), "refs/aura/t1")
+            git(github, "merge", "-q", "--squash", "FETCH_HEAD")
+            merge = commit(github, f"{title} (#7)")
+            write(github, {"docs/d.md": "another pull request\n"})
+            commit(github, "another pull request")
+            git(github, "push", "-q", "origin", "main")
+            return {"status": "merged", "pr": {"number": 7, "url": "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/7"},
+                    "merge": merge}
 
+    # GitHub's main back at the live main, so the pull request merges anew.
+    git(repos.live, "push", "-q", "--force", "origin", f"{repos.old}:refs/heads/main")
     deploy.state_file("t1").unlink()
-    host = GitHubMovesOn(repos.live)
+    host = GitHubSquashesAndMovesOn(repos.live)
     result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
-    later = git(repos.origin, "rev-parse", "main")
-    assert result["status"] == "deployed" and result["head"] == head != later
-    assert git(repos.live, "rev-parse", "main") == head and ("wait_check", head) in host.calls
+    merge, later = git(repos.origin, "rev-parse", "main~1"), git(repos.origin, "rev-parse", "main")
+    assert result["status"] == "deployed" and result["head"] == merge and merge not in (head, later)
+    assert git(repos.live, "rev-parse", "main") == merge and ("wait_check", merge) in host.calls
+    assert git(repos.live, "rev-parse", "main^{tree}") == git(repos.live, "rev-parse", f"{head}^{{tree}}")
     assert git(repos.live, "rev-parse", "refs/remotes/origin/main") == later
 
 
