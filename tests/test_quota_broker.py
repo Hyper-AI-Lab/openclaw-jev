@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -454,6 +455,27 @@ async def test_user_reserve_cancels_canary_task(monkeypatch, tmp_path):
     assert result is not None
     await asyncio.gather(*temporal_control._background)
     cancel.assert_awaited_once_with(CANARY_TID, reason="user_preempt_canary", actor="quota_broker")
+
+
+async def test_a_failed_preemption_cancel_is_one_warning(monkeypatch, tmp_path, caplog):
+    """The background cancel's failure never reaches the reservation: it is logged once, at WARNING, with the canary
+    task's id."""
+    from app import temporal_control
+
+    caplog.set_level(logging.WARNING)
+    settings = _one_key_held_by_a_canary(monkeypatch, tmp_path)
+    monkeypatch.setattr(temporal_control, "cancel_task", AsyncMock(side_effect=ConnectionError("Temporal went away")))
+    monkeypatch.setattr(temporal_control, "_background", set())
+
+    result = await qb.reserve_profile(session_key="agent:main:rmp_intake_user_abcd1234", settings=settings,
+                                      kind="user")
+
+    assert result is not None
+    [cancel] = temporal_control._background
+    await asyncio.gather(cancel, return_exceptions=True)
+    assert temporal_control._background == set()
+    assert [(r.levelname, r.getMessage()) for r in caplog.records if r.levelno >= logging.WARNING] == [
+        ("WARNING", f"Cancelling preempted canary task {CANARY_TID[:8]} failed: Temporal went away")]
 
 
 async def test_preemption_terminates_the_canary_workflow(monkeypatch, tmp_path):

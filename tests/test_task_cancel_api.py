@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
+from temporalio.service import RPCError, RPCStatusCode
 
 from app import metrics, temporal_control
 from app.api import server
@@ -198,6 +199,27 @@ async def test_cancel_task_terminates_and_reports_the_real_change(api):
     assert (await stored(factory, Task, "t-comp")).status == "compensated"
     connect.assert_not_awaited()
     assert calls == [("commit",)] and len(await cancelled_events(factory)) == 1
+
+
+@pytest.mark.parametrize("status, message, warnings", [
+    (RPCStatusCode.NOT_FOUND, "workflow execution not found", []),
+    (RPCStatusCode.UNAVAILABLE, "Temporal is unavailable", ["Terminate workflow t-live: Temporal is unavailable"]),
+], ids=["not found", "unavailable"])
+async def test_a_failed_terminate_is_a_warning_unless_the_workflow_is_gone(api, caplog, status, message, warnings):
+    """NOT_FOUND on the terminate means the workflow is already closed or gone, which is what the cancel wanted, so it
+    is no warning; any other RPC error is one WARNING. Either way the call that cancelled the task returns True."""
+    caplog.set_level(logging.WARNING)
+    _http, factory, calls, _connect, handle = api
+    await seed(factory, Task(id="t-live", goal="g", status="running"))
+    handle.terminate.side_effect = RPCError(message, status, b"")
+
+    assert await temporal_control.cancel_task("t-live", reason="dashboard", actor="api:/tasks/{id}/cancel") is True
+
+    assert (await stored(factory, Task, "t-live")).status == "cancelled"
+    handle.terminate.assert_awaited_once_with("dashboard")
+    assert calls == [("commit",), ("abort", "t-live", "dashboard"), ("signal", "cancel", "dashboard"),
+                     ("index", "t-live", "cancelled")]
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == warnings
 
 
 async def test_a_waiting_cancel_awaits_the_abort(api, monkeypatch):
