@@ -36,7 +36,7 @@ async def connect_temporal(*, attempts: int = 1, delay_sec: float = 1.0) -> Clie
     loop = asyncio.get_running_loop()
     for key, (owner, _, _) in list(_clients.items()):
         if owner.is_closed() or (key == id(loop) and owner is not loop):
-            del _clients[key]
+            _clients.pop(key, None)
     entry = _clients.get(id(loop))
     if entry is None:
         entry = _clients[id(loop)] = (loop, None, asyncio.Lock())

@@ -65,6 +65,27 @@ async def test_one_client_per_loop(connects):
     assert [cached for _, cached, _ in temporal_control._clients.values()] == [first]
 
 
+async def test_a_closed_loop_purged_by_another_thread_first_is_no_error(connects, monkeypatch):
+    """Every loop's thread purges closed loops from the one dict. When another thread drops the same entry between this
+    call's look and its purge, this call still gets its client."""
+    closed = asyncio.new_event_loop()
+    closed.close()
+
+    class PurgedMeanwhile(dict):
+        def items(self):
+            seen = list(super().items())
+            self.pop(id(closed), None)  # the other thread's purge
+            return seen
+
+    clients = PurgedMeanwhile({id(closed): (closed, FakeClient(), asyncio.Lock())})
+    monkeypatch.setattr(temporal_control, "_clients", clients)
+
+    client = await temporal_control.connect_temporal()
+
+    assert len(connects.calls) == 1
+    assert [(owner, cached) for owner, cached, _ in clients.values()] == [(asyncio.get_running_loop(), client)]
+
+
 async def test_a_failed_health_check_reconnects(connects, caplog):
     caplog.set_level(logging.WARNING, logger="rmp.temporal_control")
     first = await temporal_control.connect_temporal()
