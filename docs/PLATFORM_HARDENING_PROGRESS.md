@@ -2969,3 +2969,119 @@ Summaries: `research/wp04-b3-verify-summary.txt` and `wp04-b3-verify-live-rerun.
 **Label decision:** none. `app/workflows` is unchanged and replay passes.
 
 **Next:** PR, gated merge, deploy (rmp-api, rmp-worker), then the host steps: the refusal count over 24 h, and an unknown-status count of 0.
+
+## 2026-10-27 03:14 UTC · WP-04 batch 3 merged and deployed; host step part 1; ledger updated
+
+**Gated merge:** `CLEAN`; latest `test` run success on head `f4b6a54`, equal to the local HEAD; `main` still `356f77d`; one open PR. Squash-merged PR #47 as `25909f8`.
+
+**Deploy:** `deployed` (03:13Z); restarted rmp-api and rmp-worker; health, readiness and the canary passed; worker nondeterminism lines **0**.
+
+**Host step** (WP04-13/14):
+- **Stored statuses outside the vocabulary** (read-only SQL, vocabulary from the live `app.status`): tasks **0**, runs **0**. Current tasks: cancelled 48, compensated 959, completed 3014, failed 252, stopped_by_user 631, all terminal.
+- **Refusal lines since the deploy:** 0 so far. A one-shot background check counts and lists them at the end of the 24 h window (2026-10-28 03:20Z); each one must be explained.
+
+**Ledger** (WP-04 §7, "after batch 3", applied at deploy under the new rule):
+- **concurrency-idempotency-13 closed;**
+- R-01, R-20, R-125 (writer part) and R-22 (4a part): "WP-04 part delivered";
+- `wp_states["WP-04"]` updated.
+
+**Next:** WP-04 batch 4, one reconnecting Temporal client (4b).
+
+## 2026-10-27 03:15 UTC · WP-04 batch 4: pre-merge probe passed early; batch started
+
+**WP04-20's read-only probe:**
+1. **The env files** (`systemd-run` loading `/etc/rmp/rmp.env` and `/etc/openclaw/openclaw.env`, presence only): `False`.
+2. **The units' own `Environment=` lines:** `TEMPORAL_ADDRESS` count 0 for all 10 units (rmp-api, rmp-worker, canary-sentinel, janitor ×2, temporal-watchdog, canary, memory-canary, code-watch, code-reload).
+
+Nothing blocks the batch. The probe is re-run right before the merge.
+
+**Batch 4 started:** branch `aura/wp-04-4-temporal-client` from `25909f8`, items WP04-20…23 (4b, one reconnecting Temporal client).
+
+## 2026-10-27 03:35 UTC · WP-04 batch 4 on the manual pipeline (the Workflow hook timed out twice)
+
+The Workflow tool's PreToolUse hook timed out twice. `render.js` rendered the workflow's exact prompts into `/root/.cache/wp-batch-manual/wp04-b4/`. The implementer now runs as a background subagent; the Tier-1 reviewers follow the same way.
+
+## 2026-10-27 05:27 UTC · WP-04 batch 4 implemented; round-1 reviews running
+
+**Implementer** (manual pipeline): 5 commits, `a8fa8d3`…`3845dd1`.
+- **WP04-20:** `TEMPORAL_ADDRESS` comes from config, and the watchdog probe reads the same variable with the same default.
+- **WP04-21:** one cached, health-checked client per event loop at every site. `connect_temporal_with_retry` and `_get_temporal` are removed, and an AST pin keeps `Client.connect` to two modules.
+- **WP04-22:**
+  - one async `cancel_task`: status first through the guarded writer, then side effects, then the signal and the terminate;
+  - it is used by `/cancel`, the quota broker's background preemption, and the sentinel, now async;
+  - `cancel_task_sync` and G8's `RAW_STATUS_UPDATERS` entry are gone.
+- **WP04-23:** the sentinel's remediation is tested through the repo's fake `systemctl`.
+
+**Deviations:**
+- `TEMPORAL_ADDRESS` is not in `_PATH_ATTR_RESOLVERS` (paths only, guarded by WP-01's test);
+- `_cancel_canary` never raises;
+- the fake `systemctl` gains `restart`;
+- visible changes in `/cancel` (reason, source) and in the sentinel (it terminates only `workflow-<id>`).
+
+**Harness:** 1810 passed, 1 skipped in all four layouts. No `app/workflows` diff, replay unchanged, no label needed. 10 mutation probes, all caught.
+
+**Round 1:** the correctness and closure reviewers run in parallel.
+
+## 2026-10-27 06:00 UTC · WP-04 batch 4 round 1: both reviewers approve; fix round started
+
+**Closure:** approve.
+- All 12 named proofs fail on base code; every listed client site uses the shared client.
+- Deviations justified.
+- Non-blocking points: the Client.connect guard misses `temporalio.client.Client.connect` and aliased imports; the background-cancel WARNING is untested; a blank line.
+
+**Correctness:** approve.
+- The per-loop cache is correct across the API, the worker and the ops scripts.
+- `cancel_task` ordering: a failed signal or terminate leaves the task cancelled, and the workflow's later writes are refused.
+- Worker registration is identical; replay unchanged.
+- Non-blocking points:
+  - a dead mock patch;
+  - `del` vs `pop` in the purge;
+  - NOT_FOUND-as-done is untested;
+  - **the sentinel exits holding an undisposed Temporal client**, a possible finalization abort (134), as the probe and the janitor already work around;
+  - a hung connect blocks the loop's other callers (pre-existing pattern);
+  - no coverage tool.
+
+**Fix round** (a subagent): the guard spellings; the WARNING tests and NOT_FOUND-as-done; the dead patch; `pop`; a clean sentinel exit using the repo's established approach, with a test; the blank line.
+
+**Accepted as is:** the hung-connect pattern (pre-existing; `/health` keeps its 5 s `wait_for`), and mutation evidence in place of coverage.
+
+## 2026-10-27 14:14 UTC · WP-04 batch 4 fix round done; round-2 re-review and verify running
+
+**Fixer** (resumed after the usage limit), six commits:
+- `4dfa750`: the guard catches two more spellings;
+- `c5710d0`: the WARNING and NOT_FOUND tests;
+- `4a4dd67`: the dead stub is gone; the test now asserts `preempted == []`;
+- `991a5dc`: `pop` in the purge;
+- `3f37f63`: **the sentinel exits through `os._exit`** after flushing logging and its output, as the Temporal probe does, because temporalio 1.23's `Client` has no close method;
+- `e17f101`: blank lines.
+
+Each has a mutation probe that fails on its revert. The fixer's harness at `e17f101`: 1818 passed, 1 skipped in all four layouts.
+
+**Spec:** `specs/WP-04.md` §9, amendment 1, records the deviation and the new tests.
+
+**Running now:** a round-2 adversarial re-review of the six commits, and my four-layout verify.
+
+## 2026-10-27 14:23 UTC · WP-04 batch 4 round 2: approve
+
+**Adversarial re-review of `3845dd1..e17f101`:** approve. Every fix is closed and every new assertion is mutation-killed (A, A2, B, C, D, D2, E, E2, E3, F).
+
+**On `3f37f63` (the sentinel's `os._exit`):**
+- **Real subprocess probe:** the old `main`, holding a Temporal client, died with SIGABRT in 1 of 3 runs ("PyGILState_Release ... finalizing"). The new `main` gave exit codes 0/1 every time, with the full JSON verdict and the logs intact.
+- **atexit probe:** only `logging.shutdown` (now called explicitly), the thread-pool exit (its executor is already shut down by `asyncio.run`) and certifi's no-op are bypassed. No database commit or background task is lost.
+
+**Accepted as is:**
+- the exception path still finalizes normally. It predates the batch and needs a failure after a successful cancel; every caller treats any non-zero code alike.
+- `stderr.flush` is not asserted. It is harmless: stderr is line-buffered, and `logging.shutdown` flushes the handlers.
+
+## 2026-10-27 15:28 UTC · WP-04 batch 4 verified; pre-merge probe repeated
+
+**Four-layout verify** (HEAD `e17f101`): default, live, coding-job and direct each gave 1818 passed, 1 skipped, leftovers 0, placeholder grep clean, no ignored files, exit 0. Node 58/58. Summary in `research/wp04-b4-verify-summary.txt`.
+
+**Kirill asked how I continue after a long background run.** The background task's completion notice wakes me. The exceptions:
+- the usage limit (I act only after it resets);
+- the session stopping;
+- external events, which is why CI is awaited with a background `gh pr checks --watch`.
+
+**WP04-20 pre-merge probe**, repeated just before the merge: env files `False`; every unit's `TEMPORAL_ADDRESS` count 0. **PASS.**
+
+**Label decision:** none; there is no `app/workflows` diff.
