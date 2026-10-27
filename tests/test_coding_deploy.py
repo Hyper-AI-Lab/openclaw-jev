@@ -794,12 +794,13 @@ def test_an_idle_count_that_fails_keeps_the_deploy_queued(repos, github_ci, syst
     assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 1
 
 
-def test_a_reviewed_run_launches_before_githubs_main(repos, systemd_run):
+def test_a_reviewed_run_launches_before_githubs_main(repos, github_ci, systemd_run):
     deploy.queue(main_spec("a" * 40))
     deploy.queue(reviewed(repos, "t2"))
     deploy.queue(reviewed(repos, "t1"))
     host = FakeHost(repos.live)
-    assert deploy.next_deploy(host) == "aura-deploy-t2"
+    # The reconciler's pass launches queued runs even when GitHub's main has not moved.
+    assert deploy.watch_main(host) == "aura-deploy-t2"
     host.units = ["aura-deploy-t2.service"]
     assert deploy.next_deploy(host) is None
     host.units = []
