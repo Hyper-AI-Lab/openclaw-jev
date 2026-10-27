@@ -725,7 +725,14 @@ async def _main_async(args: List[str]) -> int:
 def main() -> None:
     import sys
 
-    raise SystemExit(asyncio.run(_main_async(sys.argv[1:])))
+    code = asyncio.run(_main_async(sys.argv[1:]))
+    logging.shutdown()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # A remediation cancel leaves this process holding a Temporal client, whose native threads can abort interpreter
+    # finalization (PyGILState_Release, exit 134) after the verdict is known; leave without finalizing, as
+    # ops/temporal_healthcheck.py does.
+    os._exit(code)
 
 
 if __name__ == "__main__":

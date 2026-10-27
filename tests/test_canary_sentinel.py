@@ -441,3 +441,48 @@ async def test_remediation_cancels_a_stuck_canary_inside_the_running_loop(tmp_pa
     assert task.status == "cancelled"
     assert f"cancelled canary task {tid[:8]}" in result["remediation"] and result["resolved_by_remediation"]
     assert [str(w.message) for w in caught if "never awaited" in str(w.message)] == []
+
+
+@pytest.mark.parametrize("result, code", [
+    ({"issues": [], "invariants": {"broken": []}}, 0),
+    ({"issues": [{"name": "health_canary", "status": "timeout"}], "invariants": {"broken": []}}, 1),
+], ids=["healthy", "issues"])
+def test_main_flushes_then_leaves_through_os_exit(monkeypatch, result, code):
+    """A remediation cancel leaves the sentinel holding a Temporal client, whose native threads can abort interpreter
+    finalization (exit 134). main prints the verdict, flushes logging and its output, and leaves through os._exit with
+    the exit code it always had, as ops/temporal_healthcheck.py does."""
+    import io
+    import json
+    import sys
+
+    from app.production import canary_sentinel
+
+    steps = []
+
+    class Exited(Exception):
+        """os._exit never returns."""
+
+    async def run_sentinel(*, trigger):
+        steps.append(("run", trigger))
+        return result
+
+    def leave(status):
+        steps.append(("exit", status))
+        raise Exited
+
+    class Output(io.StringIO):
+        def flush(self):
+            steps.append(("output flushed",))
+
+    out = Output()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "argv", ["canary_sentinel", "--trigger", "health_canary"])
+    monkeypatch.setattr(canary_sentinel, "run_sentinel", run_sentinel)
+    monkeypatch.setattr(canary_sentinel.logging, "shutdown", lambda: steps.append(("logging flushed",)))
+    monkeypatch.setattr(canary_sentinel.os, "_exit", leave)
+
+    with pytest.raises(Exited):
+        canary_sentinel.main()
+
+    assert steps == [("run", "health_canary"), ("logging flushed",), ("output flushed",), ("exit", code)]
+    assert json.loads(out.getvalue()) == result
