@@ -1,12 +1,15 @@
 """Shipping Aura's code: GitHub's main is protected, so every change lands there through a pull request first.
 
 Two changes ship this way. Aura's own pull requests: Claude merges one once she approves and CI passed, and
-``watch_main`` starts the deploy of GitHub's main once CI passed on that commit too. A reviewed coding
+``watch_main`` queues the deploy of GitHub's main once CI passed on that commit too. A reviewed coding
 job's approved commit: the worker fetches it into the live repo, checks it fast-forwards ``main`` and runs
 the full suite on that exact commit as aura-coder, then hands off; the unit lands it through a pull request.
 
-The detached root unit (``ops/coding_deploy.py``) holds the code-reload lock, waits until no user task is
-active, refuses mirrors edited by hand, fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in
+A deploy waits queued on disk (``RUNS_DIR/<task>``). One launcher, ``next_deploy``, run by the reconciler's
+``watch_main`` every minute and by the hand-off, starts the detached root unit (``ops/coding_deploy.py``) of the
+next queued run, only when no deploy unit runs, nothing holds the code-reload lock and no user task is active.
+The unit holds the code-reload lock, checks once more that Aura is idle (else the run stays queued), refuses
+mirrors edited by hand, fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in
 full, restarts what changed or what the reconcile wrote and checks health, readiness and a canary. It never
 installs a unit file; the result names the changed ones. On failure it reverts the live ``main`` and restarts
 at once; the revert reaches GitHub as a pull request of its own. It records the result, then a reviewed job's
@@ -14,13 +17,15 @@ workflow replies on the new code, or Kirill gets a note for Aura's own.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import logging
 import os
 import re
 import shutil
 import stat
 import subprocess
-import time
+import tempfile
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,11 +35,15 @@ from app.coding import github, verify, workspace
 from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
 from app.config import OPENCLAW_HOME
 
+logger = logging.getLogger(__name__)
+
 LIVE_REPO = Path(OPENCLAW_HOME) / "rmp"
 BUNDLES_DIR = CODE_ROOT / "bundles"
 CODE_RELOAD_LOCK = Path("/run/rmp-code-reload.lock")
+# The longest a run may stay queued; its next launch then records ``postponed``.
 IDLE_WAIT_SEC = 2 * 3600
-IDLE_POLL_SEC = 15
+# How long a deploy unit waits for the code-reload lock before it ends, leaving its run queued.
+LOCK_WAIT_SEC = 300
 DEPLOY_UNIT_MAX_SEC = 3 * 3600
 # (path or directory prefix, services restarted when it changes); docs, tests and ops restart nothing.
 SERVICE_PATHS = (
@@ -277,32 +286,140 @@ def spec_file(task_id: str) -> Path:
     return RUNS_DIR / task_id / "deploy.json"
 
 
-def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
-    """Start the detached deploy unit; it outlives worker restarts, including its own.
+def state_file(task_id: str) -> Path:
+    """The run's state. While it exists the run has work to do; the unit removes it once it records the result."""
+    return RUNS_DIR / task_id / "deploy-state.json"
 
-    The spec stays on disk only once the unit started, so a retried activity finding it does not deploy twice.
-    While a deploy of GitHub's main runs, a later commit waits for the next one.
+
+def write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Replace ``path`` atomically: a temporary file in its directory, flushed to disk, then renamed over it."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(json.dumps(data, indent=2) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def queue(spec: Dict[str, Any]) -> str:
+    """Queue a deploy run, its spec and its state ``queued``, for the launcher; the run's unit name.
+
+    A spec whose head is stored already is not written again, so a retried activity does not deploy twice; for
+    GitHub's main, which the watcher queues again after a ``postponed`` result, that holds while its run is queued. A
+    different head replaces a run still queued; a run past that is kept, and the call raises.
     """
-    path = spec_file(spec["task_id"])
-    unit = f"aura-deploy-{spec['task_id']}"
-    if spec.get("source") == "github":
-        if _unit_active(unit):
-            return unit
-    elif path.exists() and json.loads(path.read_text()).get("head") == spec["head"]:
-        return unit
+    task = spec["task_id"]
+    path, state = spec_file(task), state_file(task)
+    stored, run = _read_json(path), _read_json(state)
+    if stored and stored.get("head") == spec["head"] and (run is not None or spec.get("source") != "github"):
+        return f"aura-deploy-{task}"
+    if run is not None and run.get("phase") != "queued":
+        raise RuntimeError(f"a deploy of {task} is in progress")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.write_text(json.dumps(spec, indent=2) + "\n")
+    write_json(path, spec)
+    write_json(state, {"phase": "queued", "queued_at": datetime.now(timezone.utc).isoformat(), "attempt": 0,
+                       "launches": 0})
+    return f"aura-deploy-{task}"
+
+
+def queued_runs() -> List[Tuple[str, Dict[str, Any]]]:
+    """The runs with work to do, as (task, state), in launch order: reviewed runs by when they were queued, then
+    GitHub's main."""
+    runs = []
+    for path in RUNS_DIR.glob("*/deploy-state.json"):
+        run = _read_json(path)
+        if run is not None:
+            runs.append((path.parent.name, run))
+    return sorted(runs, key=lambda item: (item[0] == MAIN, item[1].get("queued_at", "")))
+
+
+def gate(host: "Host") -> Optional[str]:
+    """Why no deploy unit may start now, or None when the gate is open: no deploy unit runs, nothing holds the
+    code-reload lock and no user task is active, by the strict count."""
+    if host.deploy_units():
+        return "a deploy unit is running"
+    if host.reload_lock_held():
+        return "the code-reload lock is held"
+    try:
+        active = host.active_user_tasks()
+    except Exception as exc:
+        return f"the idle count failed: {exc}"
+    if active > 0:
+        return f"{active} active user task(s)"
+    return None
+
+
+def launch(task: str, *, postpone: bool = False, live: Path) -> str:
+    """Start the run's detached root unit, which outlives worker restarts, including its own; the unit started.
+
+    The launch is counted in the run's state first; a failed start puts the state back, so the run stays queued.
+    """
+    path, state = spec_file(task), state_file(task)
+    run = json.loads(state.read_text())
+    unit = f"aura-deploy-{task}"
     log = path.with_name("deploy.log")
     props = [f"RuntimeMaxSec={DEPLOY_UNIT_MAX_SEC}", f"StandardOutput=file:{log}", "StandardError=inherit",
              f"Environment=PYTHONPATH={live}", "EnvironmentFile=-/etc/rmp/rmp.env", "EnvironmentFile=-/etc/openclaw/openclaw.env"]
     argv = ["systemd-run", f"--unit={unit}", f"--working-directory={live}", "--collect", "--quiet",
             *[f"--property={prop}" for prop in props], "--",
-            str(live / "venv" / "bin" / "python"), str(live / "ops" / "coding_deploy.py"), str(path)]
+            str(live / "venv" / "bin" / "python"), str(live / "ops" / "coding_deploy.py"), str(path),
+            *(["--postpone"] if postpone else [])]
+    write_json(state, {**run, "launches": run.get("launches", 0) + 1})
     try:
         subprocess.run(argv, check=True, capture_output=True, timeout=60)
     except Exception:
-        path.unlink(missing_ok=True)
+        write_json(state, run)
         raise
+    return unit
+
+
+def next_deploy(host: "Host") -> Optional[str]:
+    """The launcher: start the unit of the first queued run when the gate is open; the unit started, or None.
+
+    It runs under ``RUNS_DIR/.launch.lock``, so the worker's hand-off and the API's reconciler never launch two units
+    at once: when the other holds it, the reconciler's next pass launches. A run queued for ``IDLE_WAIT_SEC`` is
+    launched without the gate, to record ``postponed``.
+    """
+    fd = os.open(RUNS_DIR / ".launch.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        if host.deploy_units():
+            return None
+        runs = queued_runs()
+        if not runs:
+            return None
+        task, run = runs[0]
+        waited = datetime.now(timezone.utc) - datetime.fromisoformat(run["queued_at"])
+        if run["phase"] in ("queued", "landed") and waited.total_seconds() >= IDLE_WAIT_SEC:
+            return launch(task, postpone=True, live=host.live)
+        reason = gate(host)
+        if reason is None:
+            return launch(task, live=host.live)
+        logger.debug("The deploy of %s waits: %s", task, reason)
+        return None
+    finally:
+        os.close(fd)
+
+
+def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
+    """Queue a reviewed job's deploy and launch the next run through the gate; the run's unit name.
+
+    Once the run is queued, a launch that fails is logged, not raised: the run stays queued and the reconciler's next
+    pass launches it. Raising would fail the activity while the queued run stays on disk.
+    """
+    unit = queue(spec)
+    try:
+        next_deploy(Host(live))
+    except Exception as exc:
+        logger.warning("Launching a deploy after queueing %s failed; the reconciler's next pass launches it: %s",
+                       spec["task_id"], exc)
     return unit
 
 
@@ -312,21 +429,30 @@ NOT_RETRIED = ("blocked", "failed", "rolled_back")
 
 
 def watch_main(host: Optional["Host"] = None) -> Optional[str]:
-    """Start the deploy of GitHub's main once it moved past the live main and CI's test check passed on that commit;
-    the unit then waits until Aura is idle. The unit started, or None."""
+    """The reconciler's pass, every minute: queue GitHub's main once it moved past the live main and CI's test check
+    passed on that commit, then launch the next queued run through the gate. The unit started, or None."""
     host = host or Host()
+    _queue_main(host)
+    return next_deploy(host)
+
+
+def _queue_main(host: "Host") -> None:
+    """Queue GitHub's main unless its deploy unit runs or its run is past ``queued``, which is never replaced."""
     if _unit_active(f"aura-deploy-{MAIN}"):
-        return None
+        return
+    run = _read_json(state_file(MAIN))
+    if run is not None and run.get("phase") != "queued":
+        return
     head = host.fetch_main()
     old = _git(host.live, "rev-parse", "refs/heads/main").strip()
     if head == old or not _is_ancestor(host.live, old, head):
-        return None
+        return
     last = _read_json(spec_file(MAIN).with_name("result.json"))
     if last and last.get("head") == head and last.get("status") in NOT_RETRIED:
-        return None
+        return
     if github.check(head, host.repo) != "success":
-        return None
-    return hand_off({"task_id": MAIN, "source": "github", "head": head, "ci": "success"}, live=host.live)
+        return
+    queue({"task_id": MAIN, "source": "github", "head": head, "ci": "success"})
 
 
 def pending_main(repo: str, *, live: Path = LIVE_REPO) -> Optional[Dict[str, Any]]:
@@ -407,6 +533,23 @@ class Host:
 
         return count_active_user_tasks_sync(strict=True)
 
+    def deploy_units(self) -> List[str]:
+        """The deploy units active or starting now."""
+        out = subprocess.run(["systemctl", "list-units", "--plain", "--no-legend", "--state=active,activating",
+                              "aura-deploy-*"], check=True, capture_output=True, text=True, timeout=60).stdout
+        return [line.split()[0] for line in out.splitlines() if line.strip()]
+
+    def reload_lock_held(self) -> bool:
+        """Whether another process holds the code-reload lock: a non-blocking probe, released at once."""
+        fd = os.open(CODE_RELOAD_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+        return False
+
     def systemctl(self, *args: str) -> None:
         subprocess.run(["systemctl", *args], check=True, capture_output=True, timeout=300)
 
@@ -433,9 +576,6 @@ class Host:
 
         return deploy_checks.run(self.live, restarted, baseline)
 
-    def sleep(self, seconds: float) -> None:
-        time.sleep(seconds)
-
 
 def _apply(host: Host, old: str, new: str, changed: List[Tuple[str, str]]) -> List[str]:
     """Reconcile every mirror to ``new``, install requirements and restart what changed between two commits or what the
@@ -452,19 +592,22 @@ def _apply(host: Host, old: str, new: str, changed: List[Tuple[str, str]]) -> Li
     return services
 
 
-def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] = print) -> Dict[str, Any]:
-    """The deploy unit's work, once it holds the code-reload lock. Returns the result to record.
+def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] = print) -> Optional[Dict[str, Any]]:
+    """The deploy unit's work, once it holds the code-reload lock. Returns the result to record, or None when a user
+    task is active or the idle count fails: the run then stays queued, and the launcher's next pass tries again.
 
     ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
     approved ``head`` lands through a pull request first.
     """
     live = host.live
-    waited = 0
-    while host.active_user_tasks() > 0:
-        if waited >= IDLE_WAIT_SEC:
-            return {"status": "postponed", "summary": "Aura stayed busy for 2 hours, so nothing was deployed; main is unchanged."}
-        host.sleep(IDLE_POLL_SEC)
-        waited += IDLE_POLL_SEC
+    try:
+        active = host.active_user_tasks()
+    except Exception as exc:
+        log(f"waiting: the idle count failed ({str(exc)[:300]})")
+        return None
+    if active > 0:
+        log(f"waiting: {active} active user task(s)")
+        return None
     old = _git(live, "rev-parse", "refs/heads/main").strip()
     landed = None
     if spec.get("source") == "github":

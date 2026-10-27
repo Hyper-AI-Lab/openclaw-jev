@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.coding import deploy, verify, workspace
+from app.production import canary_sentinel
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = {"app/a.py": "A = 1\n", "worker.py": "W = 1\n", "requirements.txt": "x==1\n", "plugins/p/index.js": "v1\n",
@@ -59,6 +60,7 @@ def repos(tmp_path, monkeypatch):
                 (target / path[len(prefix):]).chmod(0o644)
         mirrors.append((prefix, target))
     monkeypatch.setattr(deploy, "MIRRORS", tuple(mirrors))
+    monkeypatch.setattr(deploy, "RUNS_DIR", tmp_path / "runs")
 
     def change(files: dict, deletes=(), on=None) -> str:
         if scratch.exists():
@@ -78,14 +80,27 @@ def repos(tmp_path, monkeypatch):
 
 
 class FakeHost(deploy.Host):
-    """GitHub is the origin repo: a pull request that merges is pushed onto its main as it is."""
+    """GitHub is the origin repo: a pull request that merges is pushed onto its main as it is.
 
-    def __init__(self, live, *, busy=(), checks=(), lands=()):
+    The gate's probes answer from ``units`` (the deploy units running), ``held`` (the code-reload lock) and ``busy``
+    (the idle counts in turn, then 0; an exception in it is raised)."""
+
+    def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False):
         super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
         self.calls, self.busy, self.results, self.lands = [], list(busy), list(checks), list(lands)
+        self.units, self.held = list(units), held
 
     def active_user_tasks(self):
-        return self.busy.pop(0) if self.busy else 0
+        count = self.busy.pop(0) if self.busy else 0
+        if isinstance(count, Exception):
+            raise count
+        return count
+
+    def deploy_units(self):
+        return list(self.units)
+
+    def reload_lock_held(self):
+        return self.held
 
     def systemctl(self, *args):
         self.calls.append(("systemctl", *args))
@@ -110,9 +125,6 @@ class FakeHost(deploy.Host):
     def checks(self, restarted, baseline):
         self.calls.append(("checks", tuple(restarted), tuple(baseline)))
         return self.results.pop(0) if self.results else {"failure": None, "canary": "ok"}
-
-    def sleep(self, seconds):
-        self.calls.append(("sleep", seconds))
 
 
 def spec(repos, head):
@@ -288,19 +300,6 @@ def test_failed_checks_revert_main_at_once_restore_the_mirrors_restart_and_land_
     assert restarts == [("systemctl", "restart", "openclaw-gateway", "rmp-api", "rmp-worker")] * 2
 
 
-def test_the_deploy_waits_for_idle_and_postpones_when_aura_stays_busy(repos, monkeypatch):
-    head = repos.change({"app/a.py": "A = 2\n"})
-    host = FakeHost(repos.live, busy=[2, 1, 0])
-    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
-    assert [c for c in host.calls if c[0] == "sleep"] == [("sleep", deploy.IDLE_POLL_SEC)] * 2
-
-    monkeypatch.setattr(deploy, "IDLE_WAIT_SEC", 30)
-    git(repos.live, "reset", "-q", "--hard", repos.old)
-    busy = FakeHost(repos.live, busy=[1] * 10)
-    assert deploy.self_deploy(spec(repos, head), busy, log=lambda m: None)["status"] == "postponed"
-    assert git(repos.live, "rev-parse", "main") == repos.old
-
-
 def test_main_moving_while_the_deploy_waited_deploys_nothing(repos):
     head = repos.change({"app/a.py": "A = 2\n"})
     write(repos.live, {"docs/d.md": "another deploy\n"})
@@ -417,51 +416,93 @@ def test_a_pull_request_pushes_the_branch_and_opens_the_pr_with_the_token(repos,
     assert failed["status"] == "failed" and "already exists" in failed["summary"]
 
 
-def test_the_hand_off_starts_one_root_unit_and_forgets_a_failed_start(repos, monkeypatch):
-    monkeypatch.setattr(deploy, "RUNS_DIR", repos.tmp / "runs")
-    started = []
+@pytest.fixture
+def systemd_run(monkeypatch):
+    """systemd-run and systemctl's unit list as the launcher calls them: each start's argv is recorded, or raises while
+    ``fail`` is set, and ``units`` are the deploy units listed. Every other command runs for real."""
+    real, state = subprocess.run, SimpleNamespace(argvs=[], fail=False, units=[])
 
     def run(argv, **kwargs):
-        started.append(argv)
-        return SimpleNamespace(returncode=0)
+        if argv[:2] == ["systemctl", "list-units"]:
+            return SimpleNamespace(returncode=0, stderr="",
+                                   stdout="".join(f"{unit} loaded active running Deploy\n" for unit in state.units))
+        if argv[:1] != ["systemd-run"]:
+            return real(argv, **kwargs)
+        if state.fail:
+            raise subprocess.CalledProcessError(1, argv)
+        state.argvs.append(argv)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(deploy.subprocess, "run", run)
+    return state
+
+
+def test_the_hand_off_queues_once_and_launches_when_the_gate_is_open(repos, systemd_run, monkeypatch):
+    lock = repos.tmp / "code-reload.lock"
+    monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", lock)
+    counts = []
+    monkeypatch.setattr(canary_sentinel, "count_active_user_tasks_sync", lambda *, strict=False: counts.append(strict) or 0)
     the_spec = {"task_id": "t1", "old": repos.old, "head": "c" * 40}
-    assert deploy.hand_off(the_spec, live=repos.live) == "aura-deploy-t1"
-    assert deploy.hand_off(the_spec, live=repos.live) == "aura-deploy-t1" and len(started) == 1
-    argv = started[0]
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert deploy.hand_off(the_spec, live=repos.live) == "aura-deploy-t1"
+    assert systemd_run.argvs == [] and counts == []
+    assert deploy.hand_off(the_spec, live=repos.live) == "aura-deploy-t1" and counts == [True]
+    systemd_run.units = ["aura-deploy-t1.service"]
+    assert deploy.hand_off(the_spec, live=repos.live) == "aura-deploy-t1" and len(systemd_run.argvs) == 1
+    argv = systemd_run.argvs[0]
     assert argv[:2] == ["systemd-run", "--unit=aura-deploy-t1"] and not any(a.startswith("--uid") for a in argv)
+    assert "--property=RuntimeMaxSec=10800" in argv
     assert "--property=EnvironmentFile=-/etc/rmp/rmp.env" in argv and argv[-2:] == [
         str(repos.live / "ops" / "coding_deploy.py"), str(deploy.spec_file("t1"))]
     assert json.loads(deploy.spec_file("t1").read_text())["head"] == "c" * 40
-
-    def broken(argv, **kwargs):
-        raise subprocess.CalledProcessError(1, argv)
-
-    monkeypatch.setattr(deploy.subprocess, "run", broken)
-    with pytest.raises(subprocess.CalledProcessError):
-        deploy.hand_off({**the_spec, "head": "d" * 40}, live=repos.live)
-    assert not deploy.spec_file("t1").exists()
+    run = json.loads(deploy.state_file("t1").read_text())
+    assert {key: run[key] for key in ("phase", "attempt", "launches")} == {"phase": "queued", "attempt": 0, "launches": 1}
+    assert oct(deploy.spec_file("t1").parent.stat().st_mode & 0o777) == oct(0o700)
 
 
-def test_a_deploy_of_githubs_main_starts_once_while_one_is_waiting(repos, monkeypatch):
-    monkeypatch.setattr(deploy, "RUNS_DIR", repos.tmp / "runs")
-    calls, active = [], {"now": False}
+def test_a_failed_launch_from_the_hand_off_leaves_the_run_queued(repos, systemd_run, monkeypatch):
+    host = FakeHost(repos.live)
+    monkeypatch.setattr(deploy, "Host", lambda live: host)
+    systemd_run.fail = True
+    assert deploy.hand_off({"task_id": "t1", "old": repos.old, "head": "c" * 40}, live=repos.live) == "aura-deploy-t1"
+    run = json.loads(deploy.state_file("t1").read_text())
+    assert run["phase"] == "queued" and run["launches"] == 0 and systemd_run.argvs == []
+    systemd_run.fail = False
+    assert deploy.next_deploy(host) == "aura-deploy-t1" and len(systemd_run.argvs) == 1
+    assert json.loads(deploy.state_file("t1").read_text())["launches"] == 1
 
-    def run(argv, **kwargs):
-        calls.append(argv)
-        return SimpleNamespace(returncode=0 if argv[:2] != ["systemctl", "is-active"] or active["now"] else 3)
 
-    monkeypatch.setattr(deploy.subprocess, "run", run)
-    github_spec = {"task_id": "t2", "source": "github", "head": "h" * 40}
-    assert deploy.hand_off(github_spec, live=repos.live) == "aura-deploy-t2"
-    active["now"] = True
-    assert deploy.hand_off({**github_spec, "head": "i" * 40}, live=repos.live) == "aura-deploy-t2"
-    assert [argv[0] for argv in calls].count("systemd-run") == 1
-    active["now"] = False
-    deploy.hand_off({**github_spec, "head": "j" * 40}, live=repos.live)
-    assert [argv[0] for argv in calls].count("systemd-run") == 2
-    assert json.loads(deploy.spec_file("t2").read_text())["head"] == "j" * 40
+def test_a_queued_run_takes_a_new_head_and_a_run_past_queued_keeps_its_own(repos):
+    deploy.queue({"task_id": "t1", "old": repos.old, "head": "c" * 40})
+    queued = deploy.state_file("t1").read_text()
+    assert deploy.queue({"task_id": "t1", "old": repos.old, "head": "c" * 40}) == "aura-deploy-t1"
+    assert deploy.state_file("t1").read_text() == queued
+    deploy.queue({"task_id": "t1", "old": repos.old, "head": "d" * 40})
+    assert json.loads(deploy.spec_file("t1").read_text())["head"] == "d" * 40
+    run = json.loads(deploy.state_file("t1").read_text())
+    deploy.write_json(deploy.state_file("t1"), {**run, "phase": "landed"})
+    with pytest.raises(RuntimeError, match="^a deploy of t1 is in progress$"):
+        deploy.queue({"task_id": "t1", "old": repos.old, "head": "e" * 40})
+    assert deploy.queue({"task_id": "t1", "old": repos.old, "head": "d" * 40}) == "aura-deploy-t1"
+    assert json.loads(deploy.spec_file("t1").read_text())["head"] == "d" * 40
+
+    deploy.state_file("t1").unlink()
+    assert deploy.queue({"task_id": "t1", "old": repos.old, "head": "d" * 40}) == "aura-deploy-t1"
+    assert not deploy.state_file("t1").exists()
+
+
+def test_a_deploy_of_githubs_main_starts_once_while_one_is_waiting(repos, github_ci, systemd_run):
+    first = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live)
+    assert deploy.watch_main(host) == "aura-deploy-main"
+    github_ci.active, host.units = True, ["aura-deploy-main.service"]
+    later = repos.change({"app/a.py": "A = 3\n"}, on=first)
+    git(repos.live, "push", "-q", "origin", f"{later}:refs/heads/main")
+    assert deploy.watch_main(host) is None and len(systemd_run.argvs) == 1
+    github_ci.active, host.units = False, []
+    assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 2
+    assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == later
 
 
 def test_the_exact_commit_suite_runs_on_a_clean_checkout_of_the_head(repos, monkeypatch):
@@ -488,6 +529,7 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
     module_spec.loader.exec_module(unit)
     lock = tmp_path / "code-reload.lock"
     monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", lock)
+    monkeypatch.setattr(unit.deploy, "RUNS_DIR", tmp_path / "runs")
     held = []
 
     def self_deploy(the_spec, host, *, log):
@@ -500,8 +542,14 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
         return {"status": "deployed", "summary": "Deployed cccccccccccc to main."}
 
     monkeypatch.setattr(unit.deploy, "self_deploy", self_deploy)
-    added = []
-    db = SimpleNamespace(add=added.append, get=AsyncMock(return_value=SimpleNamespace(supplementary_context={"a": 1})),
+    added, recorded = [], []
+
+    def add(event):
+        # finish runs once the result is recorded and the run's state is gone.
+        recorded.append((path.with_name("result.json").exists(), deploy.state_file("t1").exists()))
+        added.append(event)
+
+    db = SimpleNamespace(add=add, get=AsyncMock(return_value=SimpleNamespace(supplementary_context={"a": 1})),
                          commit=AsyncMock())
     session = AsyncMock()
     session.__aenter__.return_value = db
@@ -509,12 +557,13 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
     monkeypatch.setattr(unit, "engine", SimpleNamespace(dispose=AsyncMock()))
     client = SimpleNamespace(start_workflow=AsyncMock())
     monkeypatch.setattr(unit, "connect_temporal", AsyncMock(return_value=client))
-    path = tmp_path / "deploy.json"
     context = {"task_id": "t1", "session_key": "s", "intent": "Fix it", "task_type": "user", "tags": []}
-    path.write_text(json.dumps({"task_id": "t1", "old": "b" * 40, "head": "c" * 40, "context": context,
-                                "report": {"brief": {}, "review": {}, "evidence": {}}}))
+    deploy.queue({"task_id": "t1", "old": "b" * 40, "head": "c" * 40, "context": context,
+                  "report": {"brief": {}, "review": {}, "evidence": {}}})
+    path = deploy.spec_file("t1")
 
     assert unit.main(str(path)) == 0 and held == [True]
+    assert recorded == [(True, False)] and not deploy.state_file("t1").exists()
     assert added[0].event_type == "coding.deploy" and added[0].event_payload["status"] == "deployed"
     name, payload = client.start_workflow.await_args.args
     assert name == "CodingTaskWorkflow" and client.start_workflow.await_args.kwargs["id"] == "workflow-t1"
@@ -522,43 +571,51 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
     assert db.get.return_value.supplementary_context == {"a": 1, "coding_deploy": payload["report"]["shipped"]}
 
 
-def run_github_unit(tmp_path, monkeypatch, status, **fields):
-    """Run the deploy unit for a deploy of GitHub's main that ends in ``status``, with any further result ``fields``;
-    what it recorded, said and started."""
+def deploy_unit(monkeypatch):
+    """``ops/coding_deploy.py`` with its database, Slack and Temporal faked: the module, and what it recorded
+    (``added``, ``db``), told Kirill (``notes``) and started (``client``)."""
     module_spec = importlib.util.spec_from_file_location("coding_deploy", ROOT / "ops" / "coding_deploy.py")
     unit = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(unit)
+    seen = SimpleNamespace(added=[], notes=[], client=SimpleNamespace(start_workflow=AsyncMock()))
+    seen.db = SimpleNamespace(add=seen.added.append, get=AsyncMock(return_value=None), commit=AsyncMock())
+    session = AsyncMock()
+    session.__aenter__.return_value = seen.db
+    monkeypatch.setattr(unit, "AsyncSessionLocal", lambda: session)
+    monkeypatch.setattr(unit, "engine", SimpleNamespace(dispose=AsyncMock()))
+    monkeypatch.setattr(unit, "get_coding_config", lambda: {"repositories": {"rmp": {"remote": "Hyper-AI-Lab/openclaw-jev"}}})
+
+    async def notify(message, *, incident_id):
+        seen.notes.append((message, incident_id))
+        return True
+
+    monkeypatch.setattr(unit, "notify_ops_slack", notify)
+    monkeypatch.setattr(unit, "connect_temporal", AsyncMock(return_value=seen.client))
+    return unit, seen
+
+
+def run_github_unit(tmp_path, monkeypatch, status, **fields):
+    """Run the deploy unit for a deploy of GitHub's main that ends in ``status``, with any further result ``fields``;
+    what it recorded, said and started."""
+    unit, seen = deploy_unit(monkeypatch)
     monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
+    monkeypatch.setattr(unit.deploy, "RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
         "status": status, "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Deployed cccccccccccc.",
         **fields})
     monkeypatch.setattr(unit.deploy, "Host", lambda: None)
-    added = []
-    db = SimpleNamespace(add=added.append, get=AsyncMock(return_value=None), commit=AsyncMock())
-    session = AsyncMock()
-    session.__aenter__.return_value = db
-    monkeypatch.setattr(unit, "AsyncSessionLocal", lambda: session)
-    monkeypatch.setattr(unit, "engine", SimpleNamespace(dispose=AsyncMock()))
-    monkeypatch.setattr(unit, "get_coding_config", lambda: {"repositories": {"rmp": {"remote": "Hyper-AI-Lab/openclaw-jev"}}})
-    notes = []
-
-    async def notify(message, *, incident_id):
-        notes.append((message, incident_id))
-        return True
-
-    monkeypatch.setattr(unit, "notify_ops_slack", notify)
-    client = SimpleNamespace(start_workflow=AsyncMock())
-    monkeypatch.setattr(unit, "connect_temporal", AsyncMock(return_value=client))
-    path = tmp_path / "deploy.json"
-    path.write_text(json.dumps({"task_id": "main", "source": "github", "head": "c" * 40, "ci": "success"}))
+    deploy.queue({"task_id": "main", "source": "github", "head": "c" * 40, "ci": "success"})
+    path = deploy.spec_file("main")
 
     code = unit.main(str(path))
+    added = seen.added
     assert added[0].event_type == "coding.deploy" and added[0].entity_type == "deploy" and added[0].entity_id == "main"
     assert added[0].event_payload["status"] == status and added[0].event_payload["ci"] == "success"
-    assert db.commit.await_count == 1
+    assert seen.db.commit.await_count == 1
     assert json.loads(path.with_name("result.json").read_text())["head"] == "c" * 40
-    client.start_workflow.assert_not_awaited()
-    return code, notes
+    assert not deploy.state_file("main").exists()
+    seen.client.start_workflow.assert_not_awaited()
+    return code, seen.notes
 
 
 @pytest.mark.parametrize("status, code, fields", [("deployed", 0, {}), ("deployed", 0, {"units": []}),
@@ -590,13 +647,27 @@ def test_a_deploy_of_githubs_main_that_is_not_live_still_tells_kirill(tmp_path, 
 
 
 @pytest.fixture
-def watching(repos, monkeypatch):
-    monkeypatch.setattr(deploy, "RUNS_DIR", repos.tmp / "runs")
-    state = SimpleNamespace(check="success", active=False, started=[])
+def github_ci(monkeypatch):
+    """CI's test check on GitHub's main (``check``) and whether the deploy unit of GitHub's main runs (``active``)."""
+    state = SimpleNamespace(check="success", active=False)
     monkeypatch.setattr(deploy.github, "check", lambda sha, repo: state.check)
     monkeypatch.setattr(deploy, "_unit_active", lambda unit: state.active)
-    monkeypatch.setattr(deploy, "hand_off", lambda spec, live: state.started.append(spec) or f"aura-deploy-{spec['task_id']}")
     return state
+
+
+@pytest.fixture
+def watching(github_ci, monkeypatch):
+    """The watcher with a launcher that records, in ``started``, the spec of GitHub's main whenever its run is queued."""
+    github_ci.started = []
+
+    def next_deploy(host):
+        if not deploy.state_file(deploy.MAIN).exists():
+            return None
+        github_ci.started.append(json.loads(deploy.spec_file(deploy.MAIN).read_text()))
+        return f"aura-deploy-{deploy.MAIN}"
+
+    monkeypatch.setattr(deploy, "next_deploy", next_deploy)
+    return github_ci
 
 
 def merged_on_github(repos, files):
@@ -670,3 +741,154 @@ def test_a_deploy_that_only_adds_a_plugin_file_restarts_only_the_gateway(repos):
     assert result["status"] == "deployed"
     assert (repos.mirror["plugins/"] / "p" / "exec_cap.js").read_text() == "module.exports = {};\n"
     assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "openclaw-gateway")]
+
+
+def reviewed(repos, task="t1", head="c" * 40):
+    """A reviewed job's deploy spec with what the unit's reply run needs."""
+    context = {"task_id": task, "session_key": "s", "intent": "Fix it", "task_type": "user", "tags": []}
+    return {"task_id": task, "old": repos.old, "head": head, "branch": f"aura/{task}-x", "title": "The approved change",
+            "body": "Body", "context": context, "report": {"brief": {}, "review": {}, "evidence": {}}}
+
+
+def queued_for(task, seconds):
+    """Move the queued run of ``task`` back by ``seconds``."""
+    run = json.loads(deploy.state_file(task).read_text())
+    run["queued_at"] = (datetime.fromisoformat(run["queued_at"]) - timedelta(seconds=seconds)).isoformat()
+    deploy.write_json(deploy.state_file(task), run)
+
+
+def test_githubs_main_is_queued_and_launched_only_through_the_gate(repos, github_ci, systemd_run):
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live, busy=[1, 1])
+    assert deploy.gate(host) == "1 active user task(s)"
+    assert deploy.watch_main(host) is None and systemd_run.argvs == []
+    assert json.loads(deploy.spec_file(deploy.MAIN).read_text()) == main_spec(head)
+    assert json.loads(deploy.state_file(deploy.MAIN).read_text())["phase"] == "queued"
+
+    host.held = True
+    assert deploy.gate(host) == "the code-reload lock is held"
+    assert deploy.watch_main(host) is None and systemd_run.argvs == []
+    host.held, host.units = False, ["aura-deploy-t9.service"]
+    assert deploy.gate(host) == "a deploy unit is running"
+    assert deploy.watch_main(host) is None and systemd_run.argvs == []
+    host.units = []
+    assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 1
+    assert systemd_run.argvs[0][1] == "--unit=aura-deploy-main"
+    assert systemd_run.argvs[0][-1] == str(deploy.spec_file(deploy.MAIN))
+    assert json.loads(deploy.state_file(deploy.MAIN).read_text())["launches"] == 1
+
+
+def test_an_idle_count_that_fails_keeps_the_deploy_queued(repos, github_ci, systemd_run):
+    merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live, busy=[RuntimeError("could not connect to server"), RuntimeError("timeout")])
+    assert deploy.gate(host) == "the idle count failed: could not connect to server"
+    assert deploy.watch_main(host) is None and systemd_run.argvs == []
+    assert json.loads(deploy.state_file(deploy.MAIN).read_text())["phase"] == "queued"
+    assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 1
+
+
+def test_a_reviewed_run_launches_before_githubs_main(repos, systemd_run):
+    deploy.queue(main_spec("a" * 40))
+    deploy.queue(reviewed(repos, "t2"))
+    deploy.queue(reviewed(repos, "t1"))
+    host = FakeHost(repos.live)
+    assert deploy.next_deploy(host) == "aura-deploy-t2"
+    host.units = ["aura-deploy-t2.service"]
+    assert deploy.next_deploy(host) is None
+    host.units = []
+    deploy.state_file("t2").unlink()
+    assert deploy.next_deploy(host) == "aura-deploy-t1"
+    deploy.state_file("t1").unlink()
+    assert deploy.next_deploy(host) == "aura-deploy-main"
+    assert [argv[1] for argv in systemd_run.argvs] == [
+        "--unit=aura-deploy-t2", "--unit=aura-deploy-t1", "--unit=aura-deploy-main"]
+
+
+def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    lock = repos.tmp / "code-reload.lock"
+    monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", lock)
+    monkeypatch.setattr(deploy, "self_deploy", lambda *args, **kwargs: pytest.fail("a postponed run deployed"))
+    busy = FakeHost(repos.live, busy=[1] * 10)
+
+    deploy.queue(reviewed(repos))
+    queued_for("t1", deploy.IDLE_WAIT_SEC - 60)
+    assert deploy.next_deploy(busy) is None and systemd_run.argvs == []
+    queued_for("t1", 60)
+    assert deploy.next_deploy(busy) == "aura-deploy-t1"
+    assert systemd_run.argvs[-1][-2:] == [str(deploy.spec_file("t1")), "--postpone"]
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert unit.main(str(deploy.spec_file("t1")), postpone=True) == 1
+    result = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())
+    assert result["status"] == "postponed" and result["head"] == "c" * 40
+    assert result["summary"] == "Aura stayed busy for 2 hours, so nothing was deployed; main is unchanged."
+    assert not deploy.state_file("t1").exists() and seen.notes == []
+    name, payload = seen.client.start_workflow.await_args.args
+    assert name == "CodingTaskWorkflow" and payload["report"]["shipped"]["status"] == "postponed"
+
+    deploy.queue(reviewed(repos, "t2"))
+    deploy.write_json(deploy.state_file("t2"), {**json.loads(deploy.state_file("t2").read_text()), "phase": "landed"})
+    queued_for("t2", deploy.IDLE_WAIT_SEC)
+    assert deploy.next_deploy(busy) == "aura-deploy-t2"
+    assert unit.main(str(deploy.spec_file("t2")), postpone=True) == 1
+    assert json.loads(deploy.spec_file("t2").with_name("result.json").read_text())["summary"] == (
+        "Aura stayed busy for 2 hours, so nothing was deployed; GitHub's main has the change, and it goes live with "
+        "GitHub's main once Aura is idle.")
+
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    assert deploy.watch_main(busy) is None
+    queued_for(deploy.MAIN, deploy.IDLE_WAIT_SEC)
+    assert deploy.watch_main(busy) == "aura-deploy-main" and systemd_run.argvs[-1][-1] == "--postpone"
+    assert unit.main(str(deploy.spec_file(deploy.MAIN)), postpone=True) == 1
+    [(note, incident)] = seen.notes
+    assert note.startswith("Aura's deploy: postponed.") and incident == f"deploy:main:{head[:12]}"
+    assert not deploy.state_file(deploy.MAIN).exists()
+    launches = len(systemd_run.argvs)
+    assert deploy.watch_main(busy) is None and len(systemd_run.argvs) == launches
+    run = json.loads(deploy.state_file(deploy.MAIN).read_text())
+    assert run["phase"] == "queued" and run["launches"] == 0
+    assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == head
+
+
+def test_a_unit_that_cannot_take_the_lock_leaves_its_run_queued(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    lock = repos.tmp / "code-reload.lock"
+    monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", lock)
+    monkeypatch.setattr(deploy, "LOCK_WAIT_SEC", 1)
+    monkeypatch.setattr(deploy, "self_deploy", lambda *args, **kwargs: pytest.fail("deployed without the lock"))
+    deploy.queue(reviewed(repos))
+    queued = deploy.state_file("t1").read_text()
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert unit.main(str(deploy.spec_file("t1"))) == 0
+    assert deploy.state_file("t1").read_text() == queued
+    assert not deploy.spec_file("t1").with_name("result.json").exists()
+    assert seen.added == [] and seen.notes == [] and seen.client.start_workflow.await_count == 0
+
+
+def test_a_unit_that_finds_aura_busy_leaves_its_run_queued(repos, monkeypatch):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    for count in (1, RuntimeError("could not connect to server")):
+        host = FakeHost(repos.live, busy=[count])
+        assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None) is None
+        assert host.calls == [] and git(repos.live, "rev-parse", "main") == repos.old
+
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", repos.tmp / "code-reload.lock")
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live, busy=[1]))
+    deploy.queue(reviewed(repos, head=head))
+    queued = deploy.state_file("t1").read_text()
+    assert unit.main(str(deploy.spec_file("t1"))) == 0
+    assert deploy.state_file("t1").read_text() == queued
+    assert not deploy.spec_file("t1").with_name("result.json").exists() and seen.added == []
+    assert git(repos.live, "rev-parse", "main") == repos.old
+
+
+def test_a_held_launch_lock_launches_nothing(repos, systemd_run):
+    deploy.queue(reviewed(repos))
+    with open(deploy.RUNS_DIR / ".launch.lock", "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert deploy.next_deploy(FakeHost(repos.live)) is None
+    assert systemd_run.argvs == []
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t1" and len(systemd_run.argvs) == 1
