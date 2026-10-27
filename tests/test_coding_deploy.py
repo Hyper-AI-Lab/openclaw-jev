@@ -994,3 +994,28 @@ def test_a_relaunched_run_that_landed_deploys_its_merge_commit_without_landing_a
     result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
     assert result["status"] == "deployed" and result["pr"] == pr and git(repos.live, "rev-parse", "main") == head
     assert not [c for c in host.calls if c[0] == "land"] and ("wait_check", head) in host.calls
+
+
+def test_what_the_previous_deploy_code_left_launches_nothing_and_the_next_head_queues_over_it(repos, github_ci,
+                                                                                              systemd_run):
+    """This code ships through the deploy code before it, whose unit writes deploy.json, deploy.log and result.json and
+    no run state. While that unit runs nothing is queued or launched, its run directories are never launched, and the
+    next head of GitHub's main is queued over its spec with the log started anew."""
+    shipped = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    git(repos.live, "merge", "-q", "--ff-only", shipped)
+    left = {deploy.MAIN: shipped, "t0": "b" * 40}
+    for task, head in left.items():
+        write(deploy.RUNS_DIR / task, {"deploy.json": json.dumps({"task_id": task, "head": head}) + "\n",
+                                       "deploy.log": "the previous code's unit\n"})
+    head = repos.change({"app/a.py": "A = 3\n"}, on=shipped)
+    git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
+    github_ci.active, host = True, FakeHost(repos.live, units=["aura-deploy-main.service"])
+    assert deploy.watch_main(host) is None and systemd_run.argvs == [] and deploy.queued_runs() == []
+
+    for task, done in left.items():
+        (deploy.RUNS_DIR / task / "result.json").write_text(json.dumps({"status": "deployed", "head": done}) + "\n")
+    github_ci.active, host.units = False, []
+    assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 1
+    assert [task for task, _ in deploy.queued_runs()] == [deploy.MAIN]
+    assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == head
+    assert f"--property=StandardOutput=truncate:{deploy.RUNS_DIR / deploy.MAIN / 'deploy.log'}" in systemd_run.argvs[0]
