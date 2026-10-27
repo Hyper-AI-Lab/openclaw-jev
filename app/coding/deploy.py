@@ -431,10 +431,16 @@ NOT_RETRIED = ("blocked", "failed", "rolled_back")
 
 def watch_main(host: Optional["Host"] = None) -> Optional[str]:
     """The reconciler's pass, every minute: queue GitHub's main once it moved past the live main and CI's test check
-    passed on that commit, then launch the next queued run through the gate. The unit started, or None."""
+    passed on that commit, then launch the next queued run through the gate. The unit started, or None.
+
+    The launcher runs even when GitHub's main cannot be read, so queued runs launch and postpone whatever GitHub
+    does; that error is raised after it, for the reconciler's log."""
     host = host or Host()
-    _queue_main(host)
-    return next_deploy(host)
+    try:
+        _queue_main(host)
+    finally:
+        started = next_deploy(host)
+    return started
 
 
 def _queue_main(host: "Host") -> None:

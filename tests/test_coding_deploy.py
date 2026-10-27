@@ -812,6 +812,27 @@ def test_a_reviewed_run_launches_before_githubs_main(repos, github_ci, systemd_r
         "--unit=aura-deploy-t2", "--unit=aura-deploy-t1", "--unit=aura-deploy-main"]
 
 
+def test_the_reconcilers_pass_launches_queued_runs_while_github_cannot_be_read(repos, github_ci, systemd_run):
+    host = FakeHost(repos.live)
+
+    def fetch_main():
+        raise RuntimeError("git fetch failed: Could not resolve host: github.com")
+
+    host.fetch_main = fetch_main
+    deploy.queue(reviewed(repos))
+    with pytest.raises(RuntimeError, match="Could not resolve host"):
+        deploy.watch_main(host)
+    assert [argv[1] for argv in systemd_run.argvs] == ["--unit=aura-deploy-t1"]
+
+    deploy.state_file("t1").unlink()
+    deploy.queue(reviewed(repos, "t2"))
+    queued_for("t2", deploy.IDLE_WAIT_SEC)
+    host.busy = [1]
+    with pytest.raises(RuntimeError, match="Could not resolve host"):
+        deploy.watch_main(host)
+    assert systemd_run.argvs[-1][1] == "--unit=aura-deploy-t2" and systemd_run.argvs[-1][-1] == "--postpone"
+
+
 def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, monkeypatch, capsys):
     unit, seen = deploy_unit(monkeypatch)
     lock = repos.tmp / "code-reload.lock"
