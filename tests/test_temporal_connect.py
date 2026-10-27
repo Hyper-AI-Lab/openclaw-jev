@@ -267,6 +267,26 @@ def test_no_temporal_address_literal():
     assert len(hits) == len(PORT_7233)
 
 
+def _client_connects(tree):
+    """The lines that name Client.connect: on ``Client``, on a name an import binds to temporalio.client's Client,
+    or at the end of an attribute chain such as ``temporalio.client.Client.connect``."""
+    names = {"Client"} | {alias.asname for node in ast.walk(tree)
+                          if isinstance(node, ast.ImportFrom) and node.module == "temporalio.client"
+                          for alias in node.names if alias.name == "Client" and alias.asname}
+    return [node.lineno for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and node.attr == "connect"
+            and ((isinstance(node.value, ast.Name) and node.value.id in names)
+                 or (isinstance(node.value, ast.Attribute) and node.value.attr == "Client"))]
+
+
+@pytest.mark.parametrize("source", [
+    "import temporalio.client\n\nasync def client():\n    return await temporalio.client.Client.connect(address)\n",
+    "from temporalio.client import Client as Temporal\n\nasync def client():\n    return await Temporal.connect(address)\n",
+], ids=["attribute chain", "import alias"])
+def test_the_guard_sees_client_connect_by_any_name(source):
+    assert _client_connects(ast.parse(source)) == [4]
+
+
 def test_client_connect_appears_twice():
     """Every Temporal client comes from connect_temporal; the watchdog's probe, which cannot import app, is the one
     other Client.connect."""
@@ -278,7 +298,5 @@ def test_client_connect_appears_twice():
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except SyntaxError:
             continue  # ops/migrate_task_registry_schema.py is bash
-        found += [str(path.relative_to(REPO)) for node in ast.walk(tree)
-                  if isinstance(node, ast.Attribute) and node.attr == "connect"
-                  and isinstance(node.value, ast.Name) and node.value.id == "Client"]
+        found += [str(path.relative_to(REPO))] * len(_client_connects(tree))
     assert found == ["app/temporal_control.py", "ops/temporal_healthcheck.py"]
