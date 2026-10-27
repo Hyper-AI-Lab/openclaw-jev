@@ -614,9 +614,9 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     if spec.get("source") == "github":
         host.fetch_main()
         head = spec["head"]
-        if head == old:
+        if _is_ancestor(live, head, old):
             return {"status": "unchanged", "old": old, "head": head, "restarted": [], "commits": [],
-                    "summary": f"GitHub's main ({head[:12]}) was already live, so nothing changed."}
+                    "summary": f"GitHub's main ({head[:12]}) is already live, so nothing changed."}
         if not _is_ancestor(live, old, head):
             return {"status": "blocked", "summary": f"The live main ({old[:12]}) has commits GitHub's main lacks, so nothing "
                     "was deployed; main is unchanged."}

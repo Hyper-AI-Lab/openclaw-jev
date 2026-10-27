@@ -918,3 +918,17 @@ def test_a_run_keeps_one_log_of_its_launches(repos, systemd_run, monkeypatch, ca
     outputs = [[arg for arg in argv if arg.startswith("--property=StandardOutput=")] for argv in systemd_run.argvs]
     assert outputs == [[f"--property=StandardOutput=truncate:{log}"], [f"--property=StandardOutput=append:{log}"],
                        [f"--property=StandardOutput=truncate:{log}"]]
+
+
+def test_a_queued_githubs_main_already_shipped_by_a_reviewed_deploy_is_unchanged(repos, tmp_path, monkeypatch):
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    git(repos.live, "merge", "-q", "--ff-only", head)
+    write(repos.live, {"app/a.py": "A = 3\n"})
+    shipped = commit(repos.live, "a reviewed change deployed after GitHub's main was queued")
+    git(repos.live, "push", "-q", "origin", "main")
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "unchanged" and result["old"] == shipped and result["restarted"] == []
+    assert result["summary"] == f"GitHub's main ({head[:12]}) is already live, so nothing changed."
+    assert git(repos.live, "rev-parse", "main") == shipped and not [c for c in host.calls if c[0] == "systemctl"]
+    assert run_github_unit(tmp_path, monkeypatch, "unchanged", summary=result["summary"]) == (1, [])
