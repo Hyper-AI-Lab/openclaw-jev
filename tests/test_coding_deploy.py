@@ -549,7 +549,16 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
         return {"status": "deployed", "summary": "Deployed cccccccccccc to main."}
 
     monkeypatch.setattr(unit.deploy, "self_deploy", self_deploy)
-    added, recorded = [], []
+    added, recorded, written = [], [], []
+
+    class RecordingPath(type(Path())):
+        """The unit's paths; each file written notes whether the run's state was still there."""
+
+        def write_text(self, *args, **kwargs):
+            written.append((self.name, deploy.state_file("t1").exists()))
+            return super().write_text(*args, **kwargs)
+
+    monkeypatch.setattr(unit, "Path", RecordingPath)
 
     def add(event):
         # finish runs once the result is recorded and the run's state is gone.
@@ -570,6 +579,8 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
     path = deploy.spec_file("t1")
 
     assert unit.main(str(path)) == 0 and held == [True]
+    # The result is written while the state is still there, so a unit that dies between the two loses no run.
+    assert written == [("result.json", True)]
     assert recorded == [(True, False)] and not deploy.state_file("t1").exists()
     assert added[0].event_type == "coding.deploy" and added[0].event_payload["status"] == "deployed"
     name, payload = client.start_workflow.await_args.args
