@@ -47,7 +47,7 @@ async def purge(tmp_path, monkeypatch):
     client = MagicMock()
     client.list_workflows = running
     client.get_workflow_handle.return_value.terminate = AsyncMock()
-    monkeypatch.setattr(module, "Client", MagicMock(connect=AsyncMock(return_value=client)))
+    monkeypatch.setattr(module, "connect_temporal", AsyncMock(return_value=client))
     monkeypatch.setattr(module, "AsyncSessionLocal", factory)
 
     async def statuses():

@@ -30,7 +30,6 @@ from app.config import (
 from app.production import backup_manifest
 
 RMP_API = "http://127.0.0.1:8000"
-TEMPORAL_ADDR = "localhost:7233"
 SYSTEMD_UNITS = [
     "temporal.service",
     "rmp-api.service",
@@ -120,9 +119,9 @@ async def check_rmp_health() -> CheckResult:
 
 async def check_temporal() -> CheckResult:
     try:
-        from temporalio.client import Client
+        from app.temporal_control import connect_temporal
 
-        client = await Client.connect(TEMPORAL_ADDR)
+        client = await connect_temporal()
         await client.service_client.check_health()
         return CheckResult("temporal", "pass", "Temporal reachable")
     except Exception as e:

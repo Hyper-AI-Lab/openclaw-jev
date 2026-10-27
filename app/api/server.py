@@ -15,7 +15,6 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from temporalio.client import Client
 
 from app.config import (
     get_api_key,
@@ -42,8 +41,8 @@ from app.telemetry import (
     instrument_fastapi,
     telemetry_status,
     trace_span,
-    get_temporal_client_kwargs,
 )
+from app.temporal_control import connect_temporal
 from app.transitions import UNCHANGED, set_run_state, set_task_status
 from app.workflows.catalog import (
     CATALOG,
@@ -218,10 +217,6 @@ class ArtifactRegisterRequest(BaseModel):
     mime_type: Optional[str] = None
 
 
-async def connect_temporal() -> Client:
-    return await Client.connect("localhost:7233", **get_temporal_client_kwargs())
-
-
 async def _start_task_workflow(
     task_id: str,
     intent: str,
@@ -364,10 +359,7 @@ async def health():
     vm = await MemoryRouter.vector_status()
     temporal = {"ok": False, "error": None}
     try:
-        client = await asyncio.wait_for(
-            Client.connect("localhost:7233", **get_temporal_client_kwargs()),
-            timeout=5.0,
-        )
+        client = await asyncio.wait_for(connect_temporal(), timeout=5.0)
         await client.service_client.check_health()
         temporal = {"ok": True, "error": None}
     except Exception as exc:

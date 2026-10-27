@@ -42,7 +42,7 @@ from app.activities.plan_activities import generate_process_plan, save_process_p
 from app.activities.coding_activities import CODING_ACTIVITIES
 from app.activities.deep_memory_activities import RECALL_ACTIVITIES
 from app.telemetry import init_telemetry
-from app.temporal_control import connect_temporal_with_retry
+from app.temporal_control import connect_temporal
 from app.workflows.catalog_step_child import CatalogStepChildWorkflow
 from app.workflows.catalog_task import CatalogTaskWorkflow
 from app.workflows.coding_task import CodingTaskWorkflow
@@ -106,7 +106,7 @@ async def main():
         mark_runtime_boot("rmp-worker")
     except Exception as exc:
         logging.warning("runtime boot stamp failed: %s", exc)
-    client = await connect_temporal_with_retry()
+    client = await connect_temporal(attempts=8)
     worker = Worker(client, task_queue="openclaw-tasks", workflows=WORKFLOWS, activities=ACTIVITIES)
     from app.deep_memory.curator import warm_up
 

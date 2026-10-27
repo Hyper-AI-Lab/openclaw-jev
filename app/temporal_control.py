@@ -3,39 +3,62 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from temporalio.client import Client, WorkflowExecutionStatus
 
+from app.config import TEMPORAL_ADDRESS
 from app.telemetry import get_temporal_client_kwargs
 
 logger = logging.getLogger("rmp.temporal_control")
 
-TEMPORAL_ADDR = "localhost:7233"
+# The process's Temporal client for each running event loop, by id(loop): (loop, client or None, connect lock).
+_clients: Dict[int, Tuple[asyncio.AbstractEventLoop, Optional[Client], asyncio.Lock]] = {}
 
 
-async def connect_temporal() -> Client:
-    return await Client.connect(TEMPORAL_ADDR, **get_temporal_client_kwargs())
+async def connect_temporal(*, attempts: int = 1, delay_sec: float = 1.0) -> Client:
+    """The process's one Temporal client for the running event loop.
 
-
-async def connect_temporal_with_retry(
-    *,
-    attempts: int = 8,
-    delay_sec: float = 1.0,
-) -> Client:
-    last: Exception | None = None
-    wait = delay_sec
-    for i in range(1, attempts + 1):
+    A cached client is returned once its health check passes. Otherwise it is dropped and a new one connects to
+    ``TEMPORAL_ADDRESS`` with the telemetry interceptor, tried up to ``attempts`` times with a delay that doubles from
+    ``delay_sec`` up to 8 s.
+    """
+    loop = asyncio.get_running_loop()
+    for key, (owner, _, _) in list(_clients.items()):
+        if owner.is_closed() or (key == id(loop) and owner is not loop):
+            del _clients[key]
+    entry = _clients.get(id(loop))
+    if entry is None:
+        entry = _clients[id(loop)] = (loop, None, asyncio.Lock())
+    _, client, lock = entry
+    if client is not None:
         try:
-            return await Client.connect(TEMPORAL_ADDR, **get_temporal_client_kwargs())
+            await client.service_client.check_health()
+            return client
         except Exception as exc:
-            last = exc
-            logger.warning("Temporal connect %s/%s failed: %s", i, attempts, exc)
-            if i < attempts:
-                await asyncio.sleep(wait)
-                wait = min(wait * 2, 8.0)
-    assert last is not None
-    raise last
+            logger.warning("Temporal client failed its health check; reconnecting: %s", exc)
+    async with lock:
+        current = _clients[id(loop)][1]
+        if current is not None and current is not client:
+            # Another caller reconnected while this one waited for the lock.
+            return current
+        _clients[id(loop)] = (loop, None, lock)
+        last: Exception | None = None
+        wait = delay_sec
+        for i in range(1, attempts + 1):
+            try:
+                client = await Client.connect(TEMPORAL_ADDRESS, **get_temporal_client_kwargs())
+            except Exception as exc:
+                last = exc
+                logger.warning("Temporal connect %s/%s failed: %s", i, attempts, exc)
+                if i < attempts:
+                    await asyncio.sleep(wait)
+                    wait = min(wait * 2, 8.0)
+                continue
+            _clients[id(loop)] = (loop, client, lock)
+            return client
+        assert last is not None
+        raise last
 
 
 async def terminate_task_workflow(task_id: str, reason: str = "superseded") -> bool:

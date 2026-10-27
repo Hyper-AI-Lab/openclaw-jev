@@ -1,49 +1,125 @@
+"""The process's one Temporal client (specs/WP-04.md WP04-20, WP04-21), and how task workflows are started and
+ended through it."""
 import ast
 import asyncio
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from app import config
-from app.temporal_control import connect_temporal_with_retry
+from app import config, temporal_control
 
 REPO = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.asyncio
-async def test_connect_temporal_with_retry_succeeds_after_failures(monkeypatch):
-    calls = {"n": 0}
+class FakeClient:
+    """A connected client whose health check passes until ``healthy`` is cleared."""
 
-    async def fake_connect(addr, **kwargs):
-        calls["n"] += 1
-        if calls["n"] < 3:
-            raise ConnectionError("not ready")
-        return "client"
+    def __init__(self):
+        self.healthy = True
+        self.service_client = SimpleNamespace(check_health=self._check_health)
 
-    async def _no_sleep(_d):
-        return None
-
-    monkeypatch.setattr("app.temporal_control.Client.connect", fake_connect)
-    monkeypatch.setattr("app.temporal_control.get_temporal_client_kwargs", lambda: {})
-    monkeypatch.setattr("app.temporal_control.asyncio.sleep", _no_sleep)
-    client = await connect_temporal_with_retry(attempts=5, delay_sec=0.01)
-    assert client == "client"
-    assert calls["n"] == 3
+    async def _check_health(self):
+        if not self.healthy:
+            raise ConnectionError("Temporal went away")
+        return True
 
 
-@pytest.mark.asyncio
-async def test_connect_temporal_with_retry_raises_after_exhaustion(monkeypatch):
-    async def fake_connect(addr, **kwargs):
-        raise ConnectionError("down")
+@pytest.fixture
+def connects(monkeypatch):
+    """Client.connect replaced, and no client cached yet. Each connect is recorded as (address, keyword arguments)
+    and returns a new FakeClient, unless an exception is queued in ``failures``; the sleeps between attempts are
+    recorded, not slept."""
+    record = SimpleNamespace(calls=[], failures=[], slept=[])
 
-    async def _no_sleep(_d):
-        return None
+    async def connect(address, **kwargs):
+        record.calls.append((address, kwargs))
+        # A real connect yields to the loop: concurrent callers meet here.
+        await asyncio.sleep(0)
+        if record.failures:
+            raise record.failures.pop(0)
+        return FakeClient()
 
-    monkeypatch.setattr("app.temporal_control.Client.connect", fake_connect)
-    monkeypatch.setattr("app.temporal_control.get_temporal_client_kwargs", lambda: {})
-    monkeypatch.setattr("app.temporal_control.asyncio.sleep", _no_sleep)
-    with pytest.raises(ConnectionError):
-        await connect_temporal_with_retry(attempts=3, delay_sec=0.01)
+    async def sleep(seconds):
+        record.slept.append(seconds)
+
+    monkeypatch.setattr(temporal_control, "_clients", {})
+    monkeypatch.setattr(temporal_control.Client, "connect", connect)
+    monkeypatch.setattr(temporal_control, "get_temporal_client_kwargs", lambda: {})
+    # Only temporal_control's back-off sleeps are recorded; the fake connect above still yields.
+    monkeypatch.setattr(temporal_control, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep}))
+    return record
+
+
+async def test_one_client_per_loop(connects):
+    first, second = await asyncio.gather(temporal_control.connect_temporal(), temporal_control.connect_temporal())
+    assert first is second
+    assert await temporal_control.connect_temporal() is first
+    assert connects.calls == [(config.TEMPORAL_ADDRESS, {})]
+
+    # Another event loop gets its own client; once that loop is closed, its entry is dropped.
+    other = await asyncio.to_thread(asyncio.run, temporal_control.connect_temporal())
+    assert other is not first and len(connects.calls) == 2
+    assert await temporal_control.connect_temporal() is first
+    assert [cached for _, cached, _ in temporal_control._clients.values()] == [first]
+
+
+async def test_a_failed_health_check_reconnects(connects, caplog):
+    caplog.set_level(logging.WARNING, logger="rmp.temporal_control")
+    first = await temporal_control.connect_temporal()
+    first.healthy = False
+
+    second = await temporal_control.connect_temporal()
+
+    assert second is not first and len(connects.calls) == 2
+    assert await temporal_control.connect_temporal() is second and len(connects.calls) == 2
+    assert [r.getMessage() for r in caplog.records] == [
+        "Temporal client failed its health check; reconnecting: Temporal went away"]
+
+
+async def test_attempts_back_off_then_raise(connects, caplog):
+    caplog.set_level(logging.WARNING, logger="rmp.temporal_control")
+    connects.failures.extend([ConnectionError("not ready")] * 2)
+
+    client = await temporal_control.connect_temporal(attempts=5, delay_sec=1.0)
+
+    assert len(connects.calls) == 3 and connects.slept == [1.0, 2.0]
+    client.healthy = False
+    connects.failures.extend([ConnectionError("down")] * 6)
+    connects.slept.clear()
+    caplog.clear()
+    with pytest.raises(ConnectionError, match="down"):
+        await temporal_control.connect_temporal(attempts=6, delay_sec=1.0)
+    # The delay doubles up to 8 s; each failed try is one WARNING.
+    assert connects.slept == [1.0, 2.0, 4.0, 8.0, 8.0]
+    assert [r.getMessage() for r in caplog.records] == [
+        "Temporal client failed its health check; reconnecting: Temporal went away",
+        *[f"Temporal connect {i}/6 failed: down" for i in range(1, 7)]]
+    # Nothing is cached after a failed reconnect: the next call connects again.
+    assert [cached for _, cached, _ in temporal_control._clients.values()] == [None]
+    assert await temporal_control.connect_temporal() is not client and len(connects.calls) == 10
+
+
+async def test_the_interceptor_is_passed(connects, monkeypatch):
+    """With telemetry ready (the API and the worker), every client gets the tracing interceptor; readiness's check
+    connected without it before."""
+    from temporalio.contrib.opentelemetry import TracingInterceptor
+
+    from app import telemetry
+    from app.production import readiness
+
+    monkeypatch.setattr(temporal_control, "get_temporal_client_kwargs", telemetry.get_temporal_client_kwargs)
+    monkeypatch.setattr(telemetry, "is_telemetry_enabled", lambda: True)
+    monkeypatch.setitem(telemetry._status, "ready", True)
+    monkeypatch.setitem(telemetry._status, "temporal_tracing", False)
+
+    result = await readiness.check_temporal()
+
+    assert result.status == "pass"
+    [(address, kwargs)] = connects.calls
+    assert address == config.TEMPORAL_ADDRESS
+    assert [type(interceptor) for interceptor in kwargs["interceptors"]] == [TracingInterceptor]
 
 
 @pytest.mark.asyncio
@@ -138,34 +214,18 @@ async def test_terminating_a_task_also_stops_its_coding_units(monkeypatch):
     assert stopped == ["t1"] and terminated == ["superseded by intake"]
 
 
-@pytest.mark.asyncio
-async def test_reconciler_reconnects_after_dead_client(monkeypatch):
+async def test_the_reconciler_uses_the_shared_client_with_its_retries(monkeypatch):
     from app import reconciler
 
-    class Dead:
-        class service_client:
-            @staticmethod
-            async def check_health():
-                raise ConnectionError("dead")
+    asked = []
 
-    class Live:
-        class service_client:
-            @staticmethod
-            async def check_health():
-                return True
+    async def connect(**kwargs):
+        asked.append(kwargs)
+        raise ConnectionError("down")
 
-    monkeypatch.setattr(reconciler, "_temporal_client", Dead())
-
-    async def fake_retry(**kwargs):
-        return Live()
-
-    monkeypatch.setattr(
-        "app.temporal_control.connect_temporal_with_retry", fake_retry
-    )
-    client = await reconciler._get_temporal()
-    assert client is reconciler._temporal_client
-    assert client is not None
-
+    monkeypatch.setattr(reconciler, "connect_temporal", connect)
+    assert await reconciler.count_stuck_running_workflows() == -1
+    assert asked == [{"attempts": 4, "delay_sec": 0.5}]
 
 def test_the_address_has_one_default(monkeypatch):
     """The watchdog's probe cannot import app, so it repeats app.config's default; the two stay equal."""

@@ -76,7 +76,7 @@ async def test_main_builds_the_worker_from_the_module_lists(monkeypatch):
     from app.llm import openai_direct
     from app.production import runtime_sync
 
-    client, built = object(), []
+    client, built, asked = object(), [], []
 
     class Recorder:
         def __init__(self, client, **kwargs):
@@ -85,13 +85,14 @@ async def test_main_builds_the_worker_from_the_module_lists(monkeypatch):
         async def run(self):
             return None
 
-    async def connect():
+    async def connect(**kwargs):
+        asked.append(kwargs)
         return client
 
     async def nothing():
         return None
 
-    monkeypatch.setattr(worker, "connect_temporal_with_retry", connect)
+    monkeypatch.setattr(worker, "connect_temporal", connect)
     monkeypatch.setattr(worker, "init_telemetry", lambda name: None)
     monkeypatch.setattr(worker, "Worker", Recorder)
     monkeypatch.setattr(runtime_sync, "mark_runtime_boot", lambda name: None)
@@ -102,7 +103,7 @@ async def test_main_builds_the_worker_from_the_module_lists(monkeypatch):
     await worker.main()
 
     [(got, kwargs)] = built
-    assert got is client
+    assert got is client and asked == [{"attempts": 8}]
     assert kwargs["task_queue"] == "openclaw-tasks"
     assert kwargs["workflows"] is worker.WORKFLOWS and kwargs["activities"] is worker.ACTIVITIES
 
