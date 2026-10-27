@@ -248,6 +248,7 @@ async def test_the_reconciler_uses_the_shared_client_with_its_retries(monkeypatc
     assert await reconciler.count_stuck_running_workflows() == -1
     assert asked == [{"attempts": 4, "delay_sec": 0.5}]
 
+
 def test_the_address_has_one_default(monkeypatch):
     """The watchdog's probe cannot import app, so it repeats app.config's default; the two stay equal."""
     probe = ast.parse((REPO / "ops" / "temporal_healthcheck.py").read_text())
