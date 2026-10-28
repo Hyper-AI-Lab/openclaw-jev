@@ -106,8 +106,9 @@ def main(spec_path: str, postpone: bool = False) -> int:
 def run_launch(spec_path: str, postpone: bool) -> int:
     """One launch of the run of ``spec_path``. Waiting (the lock stayed held, or Aura is busy) records nothing, keeps
     the run's state and exits 0; a result is recorded, then the state is removed, then ``finish`` runs. A postponed
-    run records its result under the code-reload lock, taken at once or not at all. An error or ``SIGTERM`` in a
-    phase from ``applying`` on keeps the state, for the next idle pass to resume, and exits 1."""
+    run records its result under the code-reload lock, taken at once or not at all. An error or ``SIGTERM`` before
+    ``applying`` is an attempt (``deploy.record_attempt``): the run is retried, and the third ends it ``failed``. In a
+    phase from ``applying`` on it keeps the state, for the next idle pass to resume. Both exit 1."""
     spec = json.loads(Path(spec_path).read_text())
     run = deploy._read_json(deploy.state_file(spec["task_id"])) or {}
     log(f"launch {run.get('launches', 0)} of the deploy of {spec['head'][:12]} (phase {run.get('phase')}"
@@ -130,10 +131,11 @@ def run_launch(spec_path: str, postpone: bool) -> int:
             log(f"interrupted in phase {phase}; the next idle pass resumes it" if isinstance(exc, deploy.Interrupted)
                 else f"stopped in phase {phase} with an error ({str(exc)[:300]}); the next idle pass resumes it")
             return 1
-        main_now = deploy._git(deploy.LIVE_REPO, "rev-parse", "refs/heads/main").strip()
-        result = {"status": "failed", "error": str(exc)[:500],
-                  "summary": f"The deploy stopped with an error ({str(exc)[:300]}); main is at {main_now[:12]}, "
-                             "please check it."}
+        error = str(exc) or type(exc).__name__
+        result = deploy.record_attempt(spec["task_id"], error)
+        if result is None:
+            log(f"stopped before the change ({error[:300]}); the launcher's next pass tries again")
+            return 1
     if result is None:
         log("the run stays queued; the launcher's next pass tries again")
         return 0

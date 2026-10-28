@@ -1415,3 +1415,91 @@ def test_the_stop_post_command_starts_the_listed_units(tmp_path):
     (run_dir / "stopped-units").unlink()
     assert subprocess.run(["/bin/sh", "-c", command], env=env, timeout=30).returncode == 0
     assert not calls.exists()
+
+
+class BlippingHost(FakeHost):
+    """The readiness baseline (a Postgres blip behind the API) and CI's check on the merged commit (GitHub) raise their
+    queued errors in turn, then answer."""
+
+    def __init__(self, live, *, baselines=(), waits=(), **kwargs):
+        super().__init__(live, **kwargs)
+        self.baselines, self.waits = list(baselines), list(waits)
+
+    def readiness_baseline(self):
+        if self.baselines:
+            raise self.baselines.pop(0)
+        return super().readiness_baseline()
+
+    def wait_check(self, sha):
+        if self.waits:
+            self.calls.append(("wait_check", sha))
+            raise self.waits.pop(0)
+        return super().wait_check(sha)
+
+
+def test_a_transient_error_before_the_change_is_retried(repos, monkeypatch, systemd_run):
+    unit, seen = deploy_unit(monkeypatch)
+    host = BlippingHost(repos.live, baselines=[RuntimeError("could not connect to server")])
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    path = deploy.spec_file(deploy.MAIN)
+
+    assert unit.main(str(path)) == 1
+    run = state(deploy.MAIN)
+    assert run["phase"] == "queued" and run["attempt"] == 1 and run["last_error"] == "could not connect to server"
+    assert not path.with_name("result.json").exists() and seen.added == [] and seen.notes == []
+    assert git(repos.live, "rev-parse", "main") == repos.old and not [c for c in host.calls if c[0] == "systemctl"]
+
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+    assert unit.main(str(path)) == 0
+    assert json.loads(path.with_name("result.json").read_text())["status"] == "deployed" and seen.notes == []
+    assert git(repos.live, "rev-parse", "main") == head and not deploy.state_file(deploy.MAIN).exists()
+
+
+def test_three_errors_end_the_run_failed(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    host = BlippingHost(repos.live, baselines=[RuntimeError(f"blip {n}") for n in range(1, 4)])
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    path = deploy.spec_file(deploy.MAIN)
+
+    assert [unit.main(str(path)) for _ in range(3)] == [1, 1, 1]
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == "failed" and result["summary"] == (
+        "The deploy failed 3 times before changing anything (last: blip 3); main is unchanged.")
+    [(note, incident)] = seen.notes
+    assert note.startswith("Aura's deploy: failed.") and incident == f"deploy:main:{head[:12]}"
+    assert not deploy.state_file(deploy.MAIN).exists() and git(repos.live, "rev-parse", "main") == repos.old
+
+
+def test_a_github_error_while_waiting_for_ci_on_the_merge_commit_is_retried(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    head = repos.change({"app/a.py": "A = 2\n"})
+    error = deploy.github.GitHubError("GET repos/x/commits/y/check-runs: 502 Bad Gateway")
+    host = BlippingHost(repos.live, waits=[error])
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    deploy.queue(reviewed(repos, head=head))
+    path = deploy.spec_file("t1")
+
+    assert unit.main(str(path)) == 1
+    assert state()["phase"] == "landed" and state()["attempt"] == 1 and seen.added == []
+    assert unit.main(str(path)) == 0
+    shipped = seen.client.start_workflow.await_args.args[1]["report"]["shipped"]
+    assert shipped["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert [c for c in host.calls if c[0] == "land"] == [("land", "aura/t1-x", "squash")]
+
+    # Three errors: the run ends, and the change waits on GitHub's main.
+    head = repos.change({"app/a.py": "A = 3\n"}, on=head)
+    repos.old = git(repos.live, "rev-parse", "main")
+    host = BlippingHost(repos.live, waits=[error] * 3)
+    path.with_name("result.json").unlink()
+    deploy.queue(reviewed(repos, head=head))
+    assert [unit.main(str(path)) for _ in range(3)] == [1, 1, 1]
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == "failed" and result["summary"] == (
+        f"The deploy failed 3 times before changing anything (last: {error}); main is unchanged. GitHub's main has the "
+        "change; it goes live with GitHub's main.")
+    assert [c for c in host.calls if c[0] == "land"] == [("land", "aura/t1-x", "squash")]
+    assert git(repos.live, "rev-parse", "main") == repos.old and not deploy.state_file("t1").exists()

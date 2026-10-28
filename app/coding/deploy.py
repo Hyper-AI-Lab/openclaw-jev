@@ -52,6 +52,8 @@ DEPLOY_UNIT_MAX_SEC = 3 * 3600
 APPLY_RESERVE_SEC = 90 * 60
 # The run's phases from ``applying`` on: the host may be mid-change, so such a run is resumed, never started over.
 CHANGING = ("applying", "merged", "restarted", "reverting")
+# Errors before the change a run survives: the last of them ends it ``failed``.
+MAX_ATTEMPTS = 3
 # (path or directory prefix, services restarted when it changes); docs, tests and ops restart nothing.
 SERVICE_PATHS = (
     ("app/", ("rmp-api", "rmp-worker")),
@@ -333,6 +335,25 @@ def write_json(path: Path, data: Dict[str, Any]) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def record_attempt(task_id: str, error: str) -> Optional[Dict[str, Any]]:
+    """Count an error before the change (an exception or ``SIGTERM`` before ``applying``, when nothing on the host has
+    changed): the attempt and its error go into the run's state, quietly, and the launcher relaunches the run through
+    the gate. The ``MAX_ATTEMPTS``-th ends the run: its ``failed`` result. None while the run is retried, or when it has
+    no state."""
+    path = state_file(task_id)
+    run = _read_json(path)
+    if run is None:
+        return None
+    attempt = run.get("attempt", 0) + 1
+    write_json(path, {**run, "attempt": attempt, "last_error": error[:300]})
+    if attempt < MAX_ATTEMPTS:
+        return None
+    summary = f"The deploy failed {attempt} times before changing anything (last: {error[:300]}); main is unchanged."
+    if run.get("phase") == "landed":
+        summary += " GitHub's main has the change; it goes live with GitHub's main."
+    return {"status": "failed", "summary": summary}
 
 
 def queue(spec: Dict[str, Any]) -> str:
