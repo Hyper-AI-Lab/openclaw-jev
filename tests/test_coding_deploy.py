@@ -1759,3 +1759,57 @@ def test_aborting_a_run_past_applying_keeps_it(repos, systemd_run):
                                       "the next idle pass resumes it.")
     assert systemd_run.stopped == ["aura-deploy-t1"] and deploy.state_file("t1").read_text() == before
     assert not deploy.spec_file("t1").with_name("result.json").exists()
+
+
+def batch_1_state(launches, **fields):
+    """A run's state as the deploy code before this one writes it: no ``started``, no ``escapes``."""
+    queued_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    return {"phase": "queued", "queued_at": queued_at, "attempt": 0, "launches": launches, **fields}
+
+
+def test_this_code_leaves_a_unit_of_the_previous_deploy_code_alone_while_it_runs(repos, github_ci, systemd_run):
+    """This code ships through the deploy code before it: its unit deploys GitHub's main while rmp-api, restarted on
+    this code, runs the reconciler's pass. That pass ends nothing and launches nothing while the unit runs, and nothing
+    once the unit recorded its result and removed the run's state."""
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    deploy.write_json(deploy.state_file(deploy.MAIN), batch_1_state(1))
+    before = deploy.state_file(deploy.MAIN).read_text()
+    github_ci.active, host = True, FakeHost(repos.live, units=["aura-deploy-main.service"])
+    assert deploy.end_dead_runs(host) == [] and deploy.watch_main(host) is None
+    assert deploy.state_file(deploy.MAIN).read_text() == before and systemd_run.argvs == []
+
+    git(repos.live, "merge", "-q", "--ff-only", head)
+    deploy.write_json(deploy.spec_file(deploy.MAIN).with_name("result.json"), {"status": "deployed", "head": head})
+    deploy.state_file(deploy.MAIN).unlink()
+    github_ci.active, host.units = False, []
+    assert deploy.end_dead_runs(host) == [] and deploy.watch_main(host) is None and systemd_run.argvs == []
+
+
+@pytest.mark.parametrize("source", ["reviewed", "github"])
+def test_a_run_the_previous_deploy_code_left_is_launched_and_deployed_by_this_code(repos, systemd_run, monkeypatch,
+                                                                                  source):
+    """A run the previous deploy code queued, or landed and left waiting, is launched by this launcher, which gives
+    its state ``started``, and deployed by this unit: a landed run at exactly its recorded merge, without landing
+    again."""
+    unit, seen = deploy_unit(monkeypatch)
+    host = FakeHost(repos.live)
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    if source == "github":
+        head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+        task, left = deploy.MAIN, batch_1_state(2)
+        deploy.queue(main_spec(head))
+    else:
+        head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+        pr = {"number": 7, "url": "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/7"}
+        task, left = "t1", batch_1_state(2, phase="landed", pr=pr, merge=head)
+        deploy.queue(reviewed(repos, head=head))
+    deploy.write_json(deploy.state_file(task), left)
+
+    assert deploy.next_deploy(FakeHost(repos.live)) == f"aura-deploy-{task}"
+    assert {key: state(task)[key] for key in ("phase", "launches", "started")} == {
+        "phase": left["phase"], "launches": 3, "started": 2}
+    assert unit.main(str(deploy.spec_file(task))) == 0
+    result = json.loads(deploy.spec_file(task).with_name("result.json").read_text())
+    assert result["status"] == "deployed" and result["head"] == head and git(repos.live, "rev-parse", "main") == head
+    assert not [c for c in host.calls if c[0] == "land"] and not deploy.state_file(task).exists()
