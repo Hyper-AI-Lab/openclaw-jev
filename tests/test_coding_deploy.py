@@ -87,12 +87,14 @@ class FakeHost(deploy.Host):
 
     The gate's probes answer from ``units`` (the deploy units running), ``held`` (the code-reload lock) and ``busy``
     (the idle counts in turn, then 0; an exception in it is raised); each count is recorded. CI's check on a commit
-    answers from ``ci``, by commit, else "success"."""
+    answers from ``ci``, by commit, else "success". ``kill_at`` (a systemctl verb and n) kills the unit at its n-th
+    systemctl call of that verb: ``deploy.Interrupted`` is raised there, once, before the call is made."""
 
-    def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None):
+    def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None, kill_at=None):
         super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
         self.calls, self.busy, self.results, self.lands = [], list(busy), list(checks), list(lands)
         self.units, self.held, self.ci = list(units), held, dict(ci or {})
+        self.kill_at = list(kill_at) if kill_at else None
 
     def active_user_tasks(self):
         count = self.busy.pop(0) if self.busy else 0
@@ -108,6 +110,11 @@ class FakeHost(deploy.Host):
         return self.held
 
     def systemctl(self, *args):
+        if self.kill_at and args[0] == self.kill_at[0]:
+            self.kill_at[1] -= 1
+            if self.kill_at[1] == 0:
+                self.kill_at = None
+                raise deploy.Interrupted(f"killed at systemctl {' '.join(args)}")
         self.calls.append(("systemctl", *args))
 
     def pip_install(self):
@@ -1222,3 +1229,112 @@ def test_a_change_that_restarts_nothing_moves_main_without_stopping_anything(rep
     assert result["status"] == "deployed" and result["restarted"] == [] and "Restarted nothing" in result["summary"]
     assert git(repos.live, "rev-parse", "main") == head
     assert [c for c in host.calls if c[0] in ("systemctl", "count")] == [("count", 0)]
+
+
+def state(task="t1"):
+    return json.loads(deploy.state_file(task).read_text())
+
+
+def test_a_unit_killed_after_the_fast_forward_resumes_from_its_merged_mark(repos, systemd_run):
+    head = repos.change({"app/a.py": "A = 2\n", "plugins/p/index.js": "v2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = FakeHost(repos.live, kill_at=("start", 1))
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    run = state()
+    assert run["phase"] == "merged" and run["old"] == repos.old and run["head"] == head
+    assert git(repos.live, "rev-parse", "main") == head and not deploy.spec_file("t1").with_name("result.json").exists()
+    units = ("openclaw-gateway", "rmp-api", "rmp-worker")
+    # The window starts what it stopped on its way out.
+    assert [c for c in host.calls if c[0] == "systemctl"][-1] == ("systemctl", "start", *units)
+
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t1" and "--postpone" not in systemd_run.argvs[-1]
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and result["old"] == repos.old and result["restarted"] == list(units)
+    assert [c for c in host.calls if c[0] in ("systemctl", "checks", "land", "wait_check", "count")] == [
+        *switched(*units), ("checks", units, ("telemetry",))]
+    assert (repos.mirror["plugins/"] / "p" / "index.js").read_text() == "v2\n"
+
+
+def test_a_unit_killed_while_reverting_publishes_the_revert_once(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    failed = {"failure": "CANARY FAIL: task failed", "canary": None}
+    # Killed in the revert window before its tree moved, and after.
+    for kill_at, main_at in ((("stop", 3), "head"), (("start", 2), "revert")):
+        git(repos.live, "reset", "-q", "--hard", repos.old)
+        git(repos.live, "push", "-q", "--force", "origin", f"{repos.old}:refs/heads/main")
+        for path in (deploy.spec_file("t1"), deploy.state_file("t1")):
+            path.unlink(missing_ok=True)
+        deploy.queue(reviewed(repos, head=head))
+        host = FakeHost(repos.live, checks=[failed], kill_at=kill_at)
+        with pytest.raises(deploy.Interrupted):
+            deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+        run = state()
+        assert run["phase"] == "reverting" and run["failure"] == failed["failure"] and run["revert"]
+        assert git(repos.live, "rev-parse", "main") == run[main_at]
+        assert not [c for c in host.calls if c[1:] == (f"aura/revert-{head[:12]}", "merge")]
+
+        host = FakeHost(repos.live)
+        result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+        assert result["status"] == "rolled_back" and result["revert"] == run["revert"]
+        assert git(repos.live, "rev-parse", "main") == run["revert"] == git(repos.origin, "rev-parse", "main")
+        assert git(repos.live, "rev-parse", f"{run['revert']}^{{tree}}") == git(repos.live, "rev-parse",
+                                                                                f"{repos.old}^{{tree}}")
+        assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]
+        assert [c for c in host.calls if c[0] in ("systemctl", "checks")] == [
+            *switched("rmp-api", "rmp-worker"), ("checks", ("rmp-api", "rmp-worker"), ("telemetry",))]
+
+
+def test_the_fast_forward_waits_for_a_full_reserve(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
+    deploy.queue(main_spec(head))
+    host = FakeHost(repos.live)
+    host.elapsed = lambda: deploy.DEPLOY_UNIT_MAX_SEC - deploy.APPLY_RESERVE_SEC + 1
+    assert deploy.self_deploy(main_spec(head), host, log=lambda m: None) is None
+    assert state(deploy.MAIN)["phase"] == "queued" and state(deploy.MAIN)["attempt"] == 0
+    assert git(repos.live, "rev-parse", "main") == repos.old
+    assert not [c for c in host.calls if c[0] in ("systemctl", "count")]
+
+    host.elapsed = lambda: deploy.DEPLOY_UNIT_MAX_SEC - deploy.APPLY_RESERVE_SEC
+    assert deploy.self_deploy(main_spec(head), host, log=lambda m: None)["status"] == "deployed"
+
+
+def test_a_resume_that_finds_a_foreign_main_fails_and_starts_the_units(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    deploy.write_json(deploy.state_file("t1"), {**state(), "phase": "merged", "old": repos.old, "head": head,
+                                                "affected": ["rmp-api", "rmp-worker"], "baseline": []})
+    write(repos.live, {"docs/d.md": "someone else's commit\n"})
+    foreign = commit(repos.live, "a commit no deploy made")
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result == {"status": "failed",
+                      "summary": f"The live main is {foreign[:12]}, which this deploy did not make; please check it."}
+    assert [c for c in host.calls if c[0] in ("systemctl", "land", "checks")] == [
+        ("systemctl", "start", "rmp-api", "rmp-worker")]
+    assert git(repos.live, "rev-parse", "main") == foreign
+
+
+@pytest.mark.parametrize("phase, at", [("applying", "old"), ("applying", "head"), ("merged", "head"),
+                                       ("restarted", "head")])
+def test_each_phase_of_a_killed_run_resumes_where_it_stopped(repos, phase, at):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
+    pr = {"number": 7, "url": "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/7"}
+    deploy.write_json(deploy.state_file("t1"), {**state(), "phase": phase, "pr": pr, "merge": head, "old": repos.old,
+                                                "head": head, "affected": ["rmp-api", "rmp-worker"], "baseline": []})
+    if at == "head":
+        git(repos.live, "merge", "-q", "--ff-only", head)
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and result["pr"] == pr and git(repos.live, "rev-parse", "main") == head
+    assert state()["phase"] == "restarted"
+    window = [] if phase == "restarted" else switched("rmp-api", "rmp-worker")
+    started = [("systemctl", "start", "rmp-api", "rmp-worker")] if at == "old" else []
+    # Only a run still at old counts again, before its window: a run whose tree moved finishes its window.
+    counts = [("count", 0)] * 2 if at == "old" else []
+    calls = [c for c in host.calls if c[0] in ("systemctl", "count", "land", "wait_check")]
+    assert calls == ([*started, counts[0], window[0], counts[1], *window[1:]] if at == "old" else window)

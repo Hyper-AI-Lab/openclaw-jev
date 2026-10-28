@@ -67,6 +67,14 @@ def runner_unit_active(unit: str) -> bool:
     return unit_active(unit)
 
 
+def deploy_owns(task_id: str) -> bool:
+    """Whether the deploy still owns a ``deploying`` task: its unit runs, or its run waits (queued, retried or killed
+    and not yet resumed)."""
+    from app.coding import deploy
+
+    return runner_unit_active(f"aura-deploy-{task_id}") or deploy.run_exists(task_id)
+
+
 async def _is_coding_task(db, task: Task) -> bool:
     if task.task_type == CODING_PROCESS:
         return True
@@ -109,10 +117,10 @@ async def _close_orphaned_coding_tasks(client: Client, db, now: datetime, stats:
     for task in rows.scalars().all():
         if task.updated_at and now - task.updated_at < timedelta(seconds=ORPHAN_REPLY_MIN_AGE_SEC):
             continue
-        # After the hand-off the deploy unit owns the task; it starts the reply run when it is done.
+        # After the hand-off the deploy owns the task, while its run waits too; the unit starts the reply run when
+        # it is done.
         deploying = task.status == TaskStatus.DEPLOYING
-        if deploying and (now - task.updated_at < DEPLOY_GRACE
-                          or await asyncio.to_thread(runner_unit_active, f"aura-deploy-{task.id}")):
+        if deploying and (now - task.updated_at < DEPLOY_GRACE or await asyncio.to_thread(deploy_owns, task.id)):
             continue
         try:
             desc = await client.get_workflow_handle(f"workflow-{task.id}").describe()
