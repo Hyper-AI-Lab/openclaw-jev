@@ -6,7 +6,10 @@ launcher's systemd-run.
 import fcntl
 import importlib.util
 import json
+import os
 import re
+import shutil
+import signal
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1338,3 +1341,77 @@ def test_each_phase_of_a_killed_run_resumes_where_it_stopped(repos, phase, at):
     counts = [("count", 0)] * 2 if at == "old" else []
     calls = [c for c in host.calls if c[0] in ("systemctl", "count", "land", "wait_check")]
     assert calls == ([*started, counts[0], window[0], counts[1], *window[1:]] if at == "old" else window)
+
+
+def test_sigterm_in_the_window_starts_the_units_and_keeps_the_run(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    host = FakeHost(repos.live)
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    real_reconcile = deploy.reconcile
+
+    def reconcile(*args):
+        # The first step after the fast-forward; systemd's stop sends SIGTERM.
+        signal.raise_signal(signal.SIGTERM)
+        return real_reconcile(*args)
+
+    monkeypatch.setattr(deploy, "reconcile", reconcile)
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    before = signal.getsignal(signal.SIGTERM)
+
+    assert unit.main(str(deploy.spec_file(deploy.MAIN))) == 1
+    assert signal.getsignal(signal.SIGTERM) == before
+    assert state(deploy.MAIN)["phase"] == "merged" and git(repos.live, "rev-parse", "main") == head
+    assert [c for c in host.calls if c[0] == "systemctl"] == switched("rmp-api", "rmp-worker")
+    assert not deploy.spec_file(deploy.MAIN).with_name("result.json").exists() and seen.added == [] and seen.notes == []
+    assert not deploy.stopped_file(deploy.MAIN).exists()
+
+
+def test_the_window_lists_its_stopped_units_until_they_start(repos, systemd_run):
+    class ListWatchingHost(FakeHost):
+        """Records, with each systemctl call, the list of stopped units as it was."""
+
+        def systemctl(self, *args):
+            listed = deploy.stopped_file("t1")
+            self.calls.append(("systemctl", *args, listed.read_text() if listed.exists() else None))
+
+    head = repos.change({"app/a.py": "A = 2\n", "plugins/p/index.js": "v2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = ListWatchingHost(repos.live)
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)["status"] == "deployed"
+    listed = "openclaw-gateway\nrmp-api\nrmp-worker\n"
+    assert [c for c in host.calls if c[0] == "systemctl"] == [
+        ("systemctl", "stop", "rmp-api", listed), ("systemctl", "stop", "openclaw-gateway", "rmp-worker", listed),
+        ("systemctl", "start", "openclaw-gateway", "rmp-api", "rmp-worker", listed)]
+    assert not deploy.stopped_file("t1").exists()
+
+    deploy.state_file("t1").unlink()
+    deploy.queue(reviewed(repos, "t2"))
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t2"
+    listed = deploy.RUNS_DIR / "t2" / "stopped-units"
+    assert (f"--property=ExecStopPost=/bin/sh -c 'test -s {listed} && xargs -r systemctl start --no-block < {listed}; "
+            "exit 0'") in systemd_run.argvs[-1]
+
+
+def test_the_stop_post_command_starts_the_listed_units(tmp_path):
+    fakes, calls = tmp_path / "bin", tmp_path / "systemctl.log"
+    fakes.mkdir()
+    fake = fakes / "systemctl"
+    fake.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n')
+    fake.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fakes}{os.pathsep}{os.environ['PATH']}"}
+    # xargs runs only in front of the fake systemctl.
+    assert shutil.which("systemctl", path=env["PATH"]) == str(fake)
+    assert shutil.which("xargs", path=env["PATH"]) and not shutil.which("xargs", path=env["PATH"]).startswith(str(fakes))
+    run_dir = tmp_path / "t1"
+    run_dir.mkdir()
+    command = deploy.stop_post_command(run_dir)
+
+    (run_dir / "stopped-units").write_text("rmp-api\nrmp-worker\n")
+    assert subprocess.run(["/bin/sh", "-c", command], env=env, timeout=30).returncode == 0
+    assert calls.read_text() == "start --no-block rmp-api rmp-worker\n"
+
+    calls.unlink()
+    (run_dir / "stopped-units").unlink()
+    assert subprocess.run(["/bin/sh", "-c", command], env=env, timeout=30).returncode == 0
+    assert not calls.exists()

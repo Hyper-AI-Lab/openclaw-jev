@@ -16,6 +16,7 @@ under ``ops/systemd/``, which it never installs.
 import asyncio
 import fcntl
 import json
+import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,10 +88,26 @@ def record(spec_path: str, spec: dict, result: dict) -> int:
     return 0 if result["status"] == "deployed" else 1
 
 
+def interrupt(signum, frame) -> None:
+    """``SIGTERM`` (``systemctl stop``, the unit's time cap, a shutdown) as ``deploy.Interrupted``: the switch window
+    starts the units it stopped, and ``main`` keeps the run."""
+    raise deploy.Interrupted("SIGTERM")
+
+
 def main(spec_path: str, postpone: bool = False) -> int:
-    """Deploy the queued run of ``spec_path``. Waiting (the lock stayed held, or Aura is busy) records nothing, keeps
+    """Deploy the queued run of ``spec_path``, with ``SIGTERM`` raising ``deploy.Interrupted`` meanwhile."""
+    previous = signal.signal(signal.SIGTERM, interrupt)
+    try:
+        return run_launch(spec_path, postpone)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def run_launch(spec_path: str, postpone: bool) -> int:
+    """One launch of the run of ``spec_path``. Waiting (the lock stayed held, or Aura is busy) records nothing, keeps
     the run's state and exits 0; a result is recorded, then the state is removed, then ``finish`` runs. A postponed
-    run records its result under the code-reload lock, taken at once or not at all."""
+    run records its result under the code-reload lock, taken at once or not at all. An error or ``SIGTERM`` in a
+    phase from ``applying`` on keeps the state, for the next idle pass to resume, and exits 1."""
     spec = json.loads(Path(spec_path).read_text())
     run = deploy._read_json(deploy.state_file(spec["task_id"])) or {}
     log(f"launch {run.get('launches', 0)} of the deploy of {spec['head'][:12]} (phase {run.get('phase')}"
@@ -107,7 +124,12 @@ def main(spec_path: str, postpone: bool = False) -> int:
     log(f"deploying {what}")
     try:
         result = deploy.self_deploy(spec, deploy.Host(), log=log)
-    except Exception as exc:
+    except (Exception, deploy.Interrupted) as exc:
+        phase = (deploy._read_json(deploy.state_file(spec["task_id"])) or {}).get("phase")
+        if phase in deploy.CHANGING:
+            log(f"interrupted in phase {phase}; the next idle pass resumes it" if isinstance(exc, deploy.Interrupted)
+                else f"stopped in phase {phase} with an error ({str(exc)[:300]}); the next idle pass resumes it")
+            return 1
         main_now = deploy._git(deploy.LIVE_REPO, "rev-parse", "refs/heads/main").strip()
         result = {"status": "failed", "error": str(exc)[:500],
                   "summary": f"The deploy stopped with an error ({str(exc)[:300]}); main is at {main_now[:12]}, "

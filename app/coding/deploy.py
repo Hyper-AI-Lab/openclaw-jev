@@ -303,6 +303,19 @@ def state_file(task_id: str) -> Path:
     return RUNS_DIR / task_id / "deploy-state.json"
 
 
+def stopped_file(task_id: str) -> Path:
+    """The units a switch window holds stopped, one name per line; it exists only while they are stopped."""
+    return RUNS_DIR / task_id / "stopped-units"
+
+
+def stop_post_command(run_dir: Path) -> str:
+    """The deploy unit's ``ExecStopPost=``, run after every end of the unit, a kill included: start the units its
+    window listed as stopped. The run's literal path (no ``$``, which systemd would expand) and ``systemctl`` by bare
+    name; after a normal end the list is gone and it does nothing, and it never fails the unit."""
+    listed = run_dir / "stopped-units"
+    return f"/bin/sh -c 'test -s {listed} && xargs -r systemctl start --no-block < {listed}; exit 0'"
+
+
 def run_exists(task_id: str) -> bool:
     """Whether the task's deploy run has work to do: queued, waiting, or killed and not yet resumed."""
     return state_file(task_id).exists()
@@ -376,14 +389,16 @@ def launch(task: str, *, postpone: bool = False, live: Path) -> str:
     """Start the run's detached root unit, which outlives worker restarts, including its own; the unit started.
 
     The launch is counted in the run's state first; a failed start puts the state back, so the run stays queued. A
-    run keeps one log: its first launch starts it empty, and every later launch of the run appends to it.
+    run keeps one log: its first launch starts it empty, and every later launch of the run appends to it. Whatever
+    ends the unit, its ``ExecStopPost=`` starts the units its window left stopped (``stop_post_command``).
     """
     path, state = spec_file(task), state_file(task)
     run = json.loads(state.read_text())
     unit = f"aura-deploy-{task}"
     log = f"{'append' if run.get('launches') else 'truncate'}:{path.with_name('deploy.log')}"
     props = [f"RuntimeMaxSec={DEPLOY_UNIT_MAX_SEC}", f"StandardOutput={log}", "StandardError=inherit",
-             f"Environment=PYTHONPATH={live}", "EnvironmentFile=-/etc/rmp/rmp.env", "EnvironmentFile=-/etc/openclaw/openclaw.env"]
+             f"Environment=PYTHONPATH={live}", "EnvironmentFile=-/etc/rmp/rmp.env", "EnvironmentFile=-/etc/openclaw/openclaw.env",
+             f"ExecStopPost={stop_post_command(path.parent)}"]
     argv = ["systemd-run", f"--unit={unit}", f"--working-directory={live}", "--collect", "--quiet",
             *[f"--property={prop}" for prop in props], "--",
             str(live / "venv" / "bin" / "python"), str(live / "ops" / "coding_deploy.py"), str(path),
@@ -658,15 +673,27 @@ def _affected(live: Path, head: str, changed: List[Tuple[str, str]]) -> List[str
     return restarts_for([path for _, path in changed] + stale)
 
 
-def _start_again(host: Host, units: List[str], log: Callable[[str], None]) -> None:
-    """Start the units a window stopped, after something inside it raised; a failure here is logged, so the window's
-    own failure is the one handled."""
+def _list_stopped(task: str, units: List[str]) -> None:
+    """Write the units a window is about to stop, atomically, for the unit's ``ExecStopPost=``."""
+    path = stopped_file(task)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text("".join(f"{unit}\n" for unit in units))
+    os.replace(tmp, path)
+
+
+def _start_again(host: Host, task: str, units: List[str], log: Callable[[str], None]) -> None:
+    """Start units a window stopped, outside its normal course; once they started the list of stopped units goes. A
+    failure here is logged, so the failure that brought the run here is the one handled, and the list stays for the
+    unit's ``ExecStopPost=``."""
     if not units:
         return
     try:
         host.systemctl("start", *units)
     except Exception as exc:
         log(f"starting {', '.join(units)} again failed: {exc}")
+        return
+    stopped_file(task).unlink(missing_ok=True)
 
 
 def _save(task: str, run: Dict[str, Any], **fields: Any) -> None:
@@ -693,17 +720,21 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
     reconciled, the requirements installed and the units started in one call (``restarted``, forward). Back, both
     counts are skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units
     are started before the window is left; a failure before the tree moved also puts the run back in its phase before
-    ``applying``. The commit the tree is at.
+    ``applying``. While units are stopped, ``stopped_file`` lists them, so the unit's ``ExecStopPost=`` starts them
+    after a kill that runs no Python. The commit the tree is at.
     """
     live, units, forward = host.live, run["affected"], direction == "forward"
     target = run["head"] if forward else run["revert"]
     before = _git(live, "rev-parse", "refs/heads/main").strip()
     moved = before != run["old"]
     try:
+        if units:
+            _list_stopped(task, units)
         if "rmp-api" in units:
             host.systemctl("stop", "rmp-api")
             if forward and not moved and not _idle(host, log):
                 host.systemctl("start", "rmp-api")
+                stopped_file(task).unlink(missing_ok=True)
                 _save(task, run, phase=_before_applying(run))
                 return None
         others = [unit for unit in units if unit != "rmp-api"]
@@ -722,11 +753,12 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
             host.pip_install()
         if units:
             host.systemctl("start", *units)
+            stopped_file(task).unlink(missing_ok=True)
         if forward:
             _save(task, run, phase="restarted")
         log(f"stopped and started {', '.join(units) or 'nothing'}")
     except BaseException:
-        _start_again(host, units, log)
+        _start_again(host, task, units, log)
         if forward and not moved:
             _save(task, run, phase=_before_applying(run))
         raise
@@ -820,12 +852,13 @@ def _resume(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
     if phase == "applying" and now == run["old"]:
         if run["affected"]:
             host.systemctl("start", *run["affected"])
+            stopped_file(task).unlink(missing_ok=True)
         return _apply(host, task, run, log)
     if phase in ("applying", "merged", "restarted") and now == run["head"]:
         return _change(host, task, run, log)
     if phase == "reverting" and now in (run["head"], run.get("revert")):
         return _rollback(host, task, run, log)
-    _start_again(host, run["affected"], log)
+    _start_again(host, task, run["affected"], log)
     return {"status": "failed", "summary": f"The live main is {now[:12]}, which this deploy did not make; please check it."}
 
 
