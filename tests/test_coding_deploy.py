@@ -1243,26 +1243,61 @@ def state(task="t1"):
     return json.loads(deploy.state_file(task).read_text())
 
 
-def test_a_unit_killed_after_the_fast_forward_resumes_from_its_merged_mark(repos, systemd_run):
-    head = repos.change({"app/a.py": "A = 2\n", "plugins/p/index.js": "v2\n"})
-    deploy.queue(reviewed(repos, head=head))
-    host = FakeHost(repos.live, kill_at=("start", 1))
-    with pytest.raises(deploy.Interrupted):
-        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
-    run = state()
-    assert run["phase"] == "merged" and run["old"] == repos.old and run["head"] == head
-    assert git(repos.live, "rev-parse", "main") == head and not deploy.spec_file("t1").with_name("result.json").exists()
+@pytest.mark.parametrize("source", ["reviewed", "github"])
+def test_a_unit_killed_after_the_fast_forward_resumes_from_its_merged_mark(repos, systemd_run, monkeypatch, source):
+    unit, seen = deploy_unit(monkeypatch)
+    files = {"app/a.py": "A = 2\n", "plugins/p/index.js": "v2\n"}
+    if source == "github":
+        head = merged_on_github(repos, files)
+        task, the_spec = deploy.MAIN, main_spec(head)
+    else:
+        head = repos.change(files)
+        task, the_spec = "t1", reviewed(repos, head=head)
+    deploy.queue(the_spec)
+    path = deploy.spec_file(task)
+    killed, resumed = FakeHost(repos.live, kill_at=("start", 1)), FakeHost(repos.live)
+    hosts = [killed, resumed]
+    monkeypatch.setattr(deploy, "Host", lambda: hosts.pop(0))
     units = ("openclaw-gateway", "rmp-api", "rmp-worker")
-    # The window starts what it stopped on its way out.
-    assert [c for c in host.calls if c[0] == "systemctl"][-1] == ("systemctl", "start", *units)
 
-    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t1" and "--postpone" not in systemd_run.argvs[-1]
-    host = FakeHost(repos.live)
-    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert deploy.next_deploy(FakeHost(repos.live)) == f"aura-deploy-{task}"
+    assert unit.main(str(path)) == 1
+    run = state(task)
+    assert run["phase"] == "merged" and run["old"] == repos.old and run["head"] == head
+    assert git(repos.live, "rev-parse", "main") == head and not path.with_name("result.json").exists()
+    # The window starts what it stopped on its way out.
+    assert [c for c in killed.calls if c[0] == "systemctl"][-1] == ("systemctl", "start", *units)
+    assert seen.added == [] and seen.notes == [] and seen.client.start_workflow.await_count == 0
+
+    assert deploy.next_deploy(FakeHost(repos.live)) == f"aura-deploy-{task}"
+    assert "--postpone" not in systemd_run.argvs[-1]
+    assert unit.main(str(path)) == 0
+    result = json.loads(path.with_name("result.json").read_text())
     assert result["status"] == "deployed" and result["old"] == repos.old and result["restarted"] == list(units)
-    assert [c for c in host.calls if c[0] in ("systemctl", "checks", "land", "wait_check", "count")] == [
+    # No step before the change runs again: no land, no CI wait, no count, no hand-edit or ancestry check.
+    assert [c for c in resumed.calls if c[0] in ("systemctl", "checks", "land", "wait_check", "count")] == [
         *switched(*units), ("checks", units, ("telemetry",))]
+    assert [event.event_payload["status"] for event in seen.added] == ["deployed"] and seen.notes == []
+    if source == "reviewed":
+        assert seen.client.start_workflow.await_args.args[1]["report"]["shipped"]["status"] == "deployed"
     assert (repos.mirror["plugins/"] / "p" / "index.js").read_text() == "v2\n"
+    assert not deploy.state_file(task).exists()
+
+
+def test_a_resumed_run_is_never_postponed(repos, systemd_run, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    queued_for(deploy.MAIN, 3 * 3600)
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live, kill_at=("start", 1)))
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+    assert unit.main(str(deploy.spec_file(deploy.MAIN))) == 1 and state(deploy.MAIN)["phase"] == "merged"
+    launches = len(systemd_run.argvs)
+
+    assert deploy.next_deploy(FakeHost(repos.live, busy=[1])) is None and len(systemd_run.argvs) == launches
+    assert state(deploy.MAIN)["phase"] == "merged"
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main" and len(systemd_run.argvs) == launches + 1
+    assert systemd_run.argvs[-1][-1] == str(deploy.spec_file(deploy.MAIN))
 
 
 def test_a_unit_killed_while_reverting_publishes_the_revert_once(repos):
