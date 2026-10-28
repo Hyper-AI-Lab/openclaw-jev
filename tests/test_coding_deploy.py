@@ -1391,12 +1391,14 @@ def test_each_phase_of_a_killed_run_resumes_where_it_stopped(repos, phase, at):
     result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
     assert result["status"] == "deployed" and result["pr"] == pr and git(repos.live, "rev-parse", "main") == head
     assert state()["phase"] == "restarted"
-    window = [] if phase == "restarted" else switched("rmp-api", "rmp-worker")
-    started = [("systemctl", "start", "rmp-api", "rmp-worker")] if at == "old" else []
-    # Only a run still at old counts again, before its window: a run whose tree moved finishes its window.
-    counts = [("count", 0)] * 2 if at == "old" else []
+    stop_api, stop_worker, start = switched("rmp-api", "rmp-worker")
     calls = [c for c in host.calls if c[0] in ("systemctl", "count", "land", "wait_check")]
-    assert calls == ([*started, counts[0], window[0], counts[1], *window[1:]] if at == "old" else window)
+    if at == "old":
+        # Its units start first (they may be stopped), then the run goes through the final count and the window.
+        assert calls == [start, ("count", 0), stop_api, ("count", 0), stop_worker, start]
+    else:
+        # A run whose tree moved finishes its window without counting, or only runs its checks once restarted.
+        assert calls == ([] if phase == "restarted" else [stop_api, stop_worker, start])
 
 
 def test_sigterm_in_the_window_starts_the_units_and_keeps_the_run(repos, monkeypatch):

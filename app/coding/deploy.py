@@ -965,10 +965,11 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
             return blocked
         baseline = host.readiness_baseline()
         run.update(old=old, head=head, affected=_affected(live, head, changed), baseline=baseline)
-        return _apply(host, task, run, log)
+        return _apply_when_idle(host, task, run, log)
 
 
-def _apply(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
+def _apply_when_idle(host: Host, task: str, run: Dict[str, Any],
+                     log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
     """From the time reserve on: the reserve, the final strict count, ``applying``, then the change."""
     if host.elapsed() > DEPLOY_UNIT_MAX_SEC - APPLY_RESERVE_SEC:
         log(f"waiting: less than {APPLY_RESERVE_SEC // 60} min of the unit's {DEPLOY_UNIT_MAX_SEC // 3600} h are left "
@@ -989,7 +990,7 @@ def _resume(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
         if run["affected"]:
             host.systemctl("start", *run["affected"])
             stopped_file(task).unlink(missing_ok=True)
-        return _apply(host, task, run, log)
+        return _apply_when_idle(host, task, run, log)
     if phase in ("applying", "merged", "restarted") and now == run["head"]:
         return _change(host, task, run, log)
     if phase == "reverting" and now in (run["head"], run.get("revert")):
