@@ -79,11 +79,12 @@ def postponed(run: dict) -> dict:
 
 
 def record(spec_path: str, spec: dict, result: dict) -> int:
-    """Record the run's result, then remove its state, then ``finish``; the unit's exit status."""
+    """Record the run's result (atomically, on disk before the state goes), then remove its state, then ``finish``;
+    the unit's exit status."""
     result = {**result, "suite": spec.get("suite"), "source": spec.get("source") or "reviewed",
               "head": result.get("head") or spec.get("head"), "ci": spec.get("ci")}
     log(f"result: {json.dumps(result)}")
-    Path(spec_path).with_name("result.json").write_text(json.dumps(result, indent=2) + "\n")
+    deploy.write_json(Path(spec_path).with_name("result.json"), result)
     deploy.state_file(spec["task_id"]).unlink(missing_ok=True)
     asyncio.run(finish(spec, result))
     return 0 if result["status"] == "deployed" else 1

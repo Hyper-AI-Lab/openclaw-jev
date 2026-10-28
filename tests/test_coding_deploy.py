@@ -568,15 +568,14 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
 
     monkeypatch.setattr(unit.deploy, "Host", lambda: LockProbingHost(repos.live))
     added, recorded, written = [], [], []
+    write_json = deploy.write_json
 
-    class RecordingPath(type(Path())):
-        """The unit's paths; each file written notes whether the run's state was still there."""
+    def recording_write_json(path, data):
+        """Each file written atomically notes whether the run's state was still there."""
+        written.append((path.name, deploy.state_file("t1").exists()))
+        write_json(path, data)
 
-        def write_text(self, *args, **kwargs):
-            written.append((self.name, deploy.state_file("t1").exists()))
-            return super().write_text(*args, **kwargs)
-
-    monkeypatch.setattr(unit, "Path", RecordingPath)
+    monkeypatch.setattr(unit.deploy, "write_json", recording_write_json)
 
     def add(event):
         # finish runs once the result is recorded and the run's state is gone.
@@ -596,8 +595,9 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
     path = deploy.spec_file("t1")
 
     assert unit.main(str(path)) == 0 and held == [True] * 3
-    # The result is written while the state is still there, so a unit that dies between the two loses no run.
-    assert written == [("result.json", True)]
+    # The result is written atomically while the state is still there, so a unit that dies between the two loses no
+    # run.
+    assert ("result.json", True) in written and written[-1] == ("result.json", True)
     assert recorded == [(True, False)] and not deploy.state_file("t1").exists()
     assert added[0].event_type == "coding.deploy" and added[0].event_payload["status"] == "deployed"
     name, payload = client.start_workflow.await_args.args
