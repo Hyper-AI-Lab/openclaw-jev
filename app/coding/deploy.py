@@ -544,6 +544,40 @@ def end_dead_runs(host: "Host") -> List[Tuple[str, Dict[str, Any], Dict[str, Any
         os.close(fd)
 
 
+def abort_run(task_id: str) -> str:
+    """Abort a deploy run by hand, as root:
+    ``/root/.openclaw/rmp/venv/bin/python -c 'from app.coding import deploy; print(deploy.abort_run("<task>"))'``.
+
+    Under the launch lock, taken blocking so it waits out a launch, it stops the run's unit, then reads its phase. A
+    run still ``queued`` or ``landed`` has changed nothing: it ends ``failed`` in ``result.json`` and its state is
+    removed; for GitHub's main, ``NOT_RETRIED`` then keeps the watcher from queueing that head again. A run in a later
+    phase keeps its state, and the next idle pass resumes it. What it did, in a sentence."""
+    if not RUNS_DIR.is_dir():
+        return f"There is no deploy run of {task_id}; nothing was done."
+    fd = os.open(RUNS_DIR / ".launch.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        # A unit that is not loaded makes systemctl fail; there is nothing to stop then.
+        subprocess.run(["systemctl", "stop", f"aura-deploy-{task_id}"], capture_output=True, timeout=300)
+        run = _read_json(state_file(task_id))
+        if run is None:
+            return f"The deploy of {task_id} has no run with work to do; nothing else was done."
+        phase = run.get("phase")
+        if phase in CHANGING:
+            return (f"The deploy of {task_id} is in phase {phase}, past the change, so its state is kept; the next idle "
+                    "pass resumes it.")
+        spec = _read_json(spec_file(task_id)) or {}
+        summary = "Aborted by hand; nothing was deployed; main is unchanged."
+        if phase == "landed":
+            summary += " GitHub's main has the change; it goes live with GitHub's main."
+        write_json(spec_file(task_id).with_name("result.json"),
+                   {"status": "failed", "source": _source(task_id, spec), "head": spec.get("head"), "summary": summary})
+        state_file(task_id).unlink()
+        return f"Aborted the deploy of {task_id} in phase {phase}: it is recorded failed, and its state is removed."
+    finally:
+        os.close(fd)
+
+
 def _source(task_id: str, spec: Dict[str, Any]) -> str:
     """Where the run's change comes from, also for a spec that cannot be read."""
     return spec.get("source") or ("github" if task_id == MAIN else "reviewed")

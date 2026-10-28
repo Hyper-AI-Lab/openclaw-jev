@@ -12,6 +12,7 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -443,14 +444,18 @@ def test_a_pull_request_pushes_the_branch_and_opens_the_pr_with_the_token(repos,
 
 @pytest.fixture
 def systemd_run(monkeypatch):
-    """systemd-run and systemctl's unit list as the launcher calls them: each start's argv is recorded, or raises while
-    ``fail`` is set, and ``units`` are the deploy units listed. Every other command runs for real."""
-    real, state = subprocess.run, SimpleNamespace(argvs=[], fail=False, units=[])
+    """systemd-run and systemctl's unit list and stop as the launcher and an abort call them: each start's argv is
+    recorded, or raises while ``fail`` is set, ``units`` are the deploy units listed, and each unit stopped is recorded
+    in ``stopped``. Every other command runs for real."""
+    real, state = subprocess.run, SimpleNamespace(argvs=[], fail=False, units=[], stopped=[])
 
     def run(argv, **kwargs):
         if argv[:2] == ["systemctl", "list-units"]:
             return SimpleNamespace(returncode=0, stderr="",
                                    stdout="".join(f"{unit} loaded active running Deploy\n" for unit in state.units))
+        if argv[:2] == ["systemctl", "stop"]:
+            state.stopped += argv[2:]
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         if argv[:1] != ["systemd-run"]:
             return real(argv, **kwargs)
         if state.fail:
@@ -1680,3 +1685,42 @@ def test_a_run_queued_by_batch_1_is_not_dead(repos, systemd_run):
     assert [deploy.next_deploy(FakeHost(repos.live)) for _ in range(3)] == ["aura-deploy-main"] * 2 + [None]
     [(task, spec, result)] = deploy.end_dead_runs(FakeHost(repos.live))
     assert task == deploy.MAIN and result["status"] == "failed" and spec == main_spec("c" * 40)
+
+
+def test_aborting_a_queued_run_by_hand_ends_it_and_main_is_not_queued_again(repos, github_ci, systemd_run):
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    deploy.write_json(deploy.state_file(deploy.MAIN), {**state(deploy.MAIN), "attempt": 1})
+    outcome = []
+    # The abort waits out a launch: it takes the launch lock, blocking.
+    with open(deploy.RUNS_DIR / ".launch.lock", "w") as launching:
+        fcntl.flock(launching, fcntl.LOCK_EX)
+        aborting = threading.Thread(target=lambda: outcome.append(deploy.abort_run(deploy.MAIN)))
+        aborting.start()
+        aborting.join(0.3)
+        assert aborting.is_alive() and systemd_run.stopped == []
+    aborting.join(10)
+    assert outcome == ["Aborted the deploy of main in phase queued: it is recorded failed, and its state is removed."]
+    assert systemd_run.stopped == ["aura-deploy-main"] and not deploy.state_file(deploy.MAIN).exists()
+    assert json.loads(deploy.spec_file(deploy.MAIN).with_name("result.json").read_text()) == {
+        "status": "failed", "source": "github", "head": head,
+        "summary": "Aborted by hand; nothing was deployed; main is unchanged."}
+    assert deploy.watch_main(FakeHost(repos.live)) is None
+    assert not deploy.state_file(deploy.MAIN).exists() and systemd_run.argvs == []
+
+    deploy.queue(reviewed(repos))
+    deploy.write_json(deploy.state_file("t1"), {**state(), "phase": "landed"})
+    deploy.abort_run("t1")
+    assert json.loads(deploy.spec_file("t1").with_name("result.json").read_text())["summary"] == (
+        "Aborted by hand; nothing was deployed; main is unchanged. GitHub's main has the change; it goes live with "
+        "GitHub's main.")
+
+
+def test_aborting_a_run_past_applying_keeps_it(repos, systemd_run):
+    deploy.queue(reviewed(repos))
+    deploy.write_json(deploy.state_file("t1"), {**state(), "phase": "merged", "old": repos.old, "head": "c" * 40})
+    before = deploy.state_file("t1").read_text()
+    assert deploy.abort_run("t1") == ("The deploy of t1 is in phase merged, past the change, so its state is kept; "
+                                      "the next idle pass resumes it.")
+    assert systemd_run.stopped == ["aura-deploy-t1"] and deploy.state_file("t1").read_text() == before
+    assert not deploy.spec_file("t1").with_name("result.json").exists()
