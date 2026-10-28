@@ -1864,29 +1864,34 @@ def test_a_hand_edit_made_during_the_readiness_baseline_blocks_the_deploy(repos)
     assert not [c for c in host.calls if c[0] in ("systemctl", "count")]
 
 
-def test_a_failure_reading_the_live_main_in_the_window_is_an_error_before_the_change(repos, monkeypatch):
+@pytest.mark.parametrize("failed_reads", [1, 2])
+def test_a_failure_reading_the_live_main_in_the_window_is_an_error_before_the_change(repos, monkeypatch,
+                                                                                      failed_reads):
     head = repos.change({"app/a.py": "A = 2\n"})
     deploy.queue(reviewed(repos, head=head))
     real_git, armed = deploy._git, []
 
-    def git_failing_once(repo, *args, env=None):
+    def git_failing(repo, *args, env=None):
         if armed and args == ("rev-parse", "refs/heads/main"):
-            armed.clear()
+            armed.pop()
             raise RuntimeError("git rev-parse failed: unable to read refs")
         return real_git(repo, *args, env=env)
 
     class ArmedAtTheFinalCount(FakeHost):
-        """The first read of the live main after the final count, the window's own, fails."""
+        """The next reads of the live main after the final count fail: the window's own, and its read after that."""
 
         def active_user_tasks(self):
-            armed.append(True)
+            armed.extend([True] * failed_reads)
             return super().active_user_tasks()
 
-    monkeypatch.setattr(deploy, "_git", git_failing_once)
+    monkeypatch.setattr(deploy, "_git", git_failing)
     host = ArmedAtTheFinalCount(repos.live)
     with pytest.raises(RuntimeError, match="unable to read refs"):
         deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
-    assert state()["phase"] == "landed" and git(repos.live, "rev-parse", "main") == repos.old
+    # Read again, the main is still at old: an error before the change. Unreadable twice, the run keeps applying,
+    # and its resume reads the live main; either way nothing is reverted.
+    assert state()["phase"] == ("landed" if failed_reads == 1 else "applying")
+    assert git(repos.live, "rev-parse", "main") == repos.old
     assert not [c for c in host.calls if c[0] in ("checks", "pip") or c[1:] == (f"aura/revert-{head[:12]}", "merge")]
     assert git(repos.origin, "rev-parse", "main") == head
 
