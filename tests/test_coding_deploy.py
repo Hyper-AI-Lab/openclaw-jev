@@ -1959,3 +1959,27 @@ def test_a_resumed_run_still_at_old_that_waits_goes_back_to_its_phase(repos, sys
     assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "start", "rmp-api", "rmp-worker")]
     # Before the change again, so a hand abort ends it.
     assert deploy.abort_run("t1").startswith("Aborted the deploy of t1 in phase landed")
+
+
+def test_a_rollback_over_a_merge_commit_restores_the_old_tree(repos):
+    """GitHub's main carries merge commits (a revert pull request merges with one), which git revert cannot take in a
+    range; the rollback's revert commit is the old tree itself."""
+    work = repos.tmp / "github-work"
+    git(repos.tmp, "clone", "-q", "-b", "main", str(repos.origin), str(work))
+    git(work, "checkout", "-q", "-b", "side")
+    write(work, {"docs/d.md": "a side change\n"})
+    commit(work, "a side change")
+    git(work, "checkout", "-q", "main")
+    write(work, {"app/a.py": "A = 2\n"})
+    commit(work, "a change on main")
+    git(work, "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff", "-m", "Merge the side change", "side")
+    head = git(work, "rev-parse", "HEAD")
+    git(work, "push", "-q", "origin", "main")
+    assert len(git(work, "rev-list", "--parents", "-n", "1", head).split()) == 3
+
+    host = FakeHost(repos.live, checks=[{"failure": "health failed", "canary": None}])
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and git(repos.live, "rev-parse", "main") == result["revert"]
+    assert git(repos.live, "rev-parse", "main^{tree}") == git(repos.live, "rev-parse", f"{repos.old}^{{tree}}")
+    assert git(repos.live, "rev-parse", "main^") == head
+    assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]
