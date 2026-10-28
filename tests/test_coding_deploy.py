@@ -1848,3 +1848,57 @@ def test_a_hand_edit_made_during_the_readiness_baseline_blocks_the_deploy(repos)
     assert result["status"] == "blocked" and ".cursor/rules/r.mdc" in result["summary"]
     assert git(repos.live, "rev-parse", "main") == repos.old and rule.read_text() == "edited by hand while readiness ran\n"
     assert not [c for c in host.calls if c[0] in ("systemctl", "count")]
+
+
+def test_a_failure_reading_the_live_main_in_the_window_is_an_error_before_the_change(repos, monkeypatch):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    real_git, armed = deploy._git, []
+
+    def git_failing_once(repo, *args, env=None):
+        if armed and args == ("rev-parse", "refs/heads/main"):
+            armed.clear()
+            raise RuntimeError("git rev-parse failed: unable to read refs")
+        return real_git(repo, *args, env=env)
+
+    class ArmedAtTheFinalCount(FakeHost):
+        """The first read of the live main after the final count, the window's own, fails."""
+
+        def active_user_tasks(self):
+            armed.append(True)
+            return super().active_user_tasks()
+
+    monkeypatch.setattr(deploy, "_git", git_failing_once)
+    host = ArmedAtTheFinalCount(repos.live)
+    with pytest.raises(RuntimeError, match="unable to read refs"):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert state()["phase"] == "landed" and git(repos.live, "rev-parse", "main") == repos.old
+    assert not [c for c in host.calls if c[0] in ("checks", "pip") or c[1:] == (f"aura/revert-{head[:12]}", "merge")]
+    assert git(repos.origin, "rev-parse", "main") == head
+
+
+@pytest.mark.parametrize("stop", [deploy.Interrupted("SIGTERM"), RuntimeError("the log could not be written")])
+def test_a_stop_right_after_the_fast_forward_counts_as_moved(repos, stop):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    stops = [stop]
+
+    def log(message):
+        # The first line after git merge returned; the stop comes once.
+        if message.startswith("main moved") and stops:
+            raise stops.pop()
+
+    host = FakeHost(repos.live)
+    if isinstance(stop, deploy.Interrupted):
+        with pytest.raises(deploy.Interrupted):
+            deploy.self_deploy(reviewed(repos, head=head), host, log=log)
+        # Killed after git merge returned and before the phase said so: the run resumes from applying at head.
+        assert state()["phase"] == "applying" and git(repos.live, "rev-parse", "main") == head
+        assert [c for c in host.calls if c[0] == "systemctl"][-1] == ("systemctl", "start", "rmp-api", "rmp-worker")
+        resumed = deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live), log=lambda m: None)
+        assert resumed["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    else:
+        result = deploy.self_deploy(reviewed(repos, head=head), host, log=log)
+        assert result["status"] == "rolled_back" and "the log could not be written" in result["summary"]
+        assert git(repos.live, "rev-parse", f"{result['revert']}^{{tree}}") == git(repos.live, "rev-parse",
+                                                                                   f"{repos.old}^{{tree}}")

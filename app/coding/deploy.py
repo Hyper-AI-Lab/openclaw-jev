@@ -855,20 +855,19 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
     (waiting). Then the tree moves (``merged``): forward to ``head``, back to the recorded revert commit. The mirrors
     are reconciled, the requirements installed and the units started in one call (``restarted``, forward). Back, both
     counts are skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units
-    are started before the window is left; a failure before the tree moved also puts the run back in its phase before
-    ``applying``. While units are stopped, ``stopped_file`` lists them, so the unit's ``ExecStopPost=`` starts them
+    are started before the window is left; a failure while the live main, read again then, is still at ``old`` also
+    puts the run back in its phase before ``applying``. While units are stopped, ``stopped_file`` lists them, so the unit's ``ExecStopPost=`` starts them
     after a kill that runs no Python. The commit the tree is at.
     """
     live, units, forward = host.live, run["affected"], direction == "forward"
     target = run["head"] if forward else run["revert"]
-    before = _git(live, "rev-parse", "refs/heads/main").strip()
-    moved = before != run["old"]
     try:
+        before = _live_main(live)
         if units:
             _list_stopped(task, units)
         if "rmp-api" in units:
             host.systemctl("stop", "rmp-api")
-            if forward and not moved and not _idle(host, log):
+            if forward and before == run["old"] and not _idle(host, log):
                 host.systemctl("start", "rmp-api")
                 stopped_file(task).unlink(missing_ok=True)
                 _save(task, run, phase=_before_applying(run))
@@ -879,7 +878,6 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
         if before != target:
             _git(live, "merge", "--ff-only", "--quiet", target)
             log(f"main moved {before[:12]}..{target[:12]}")
-        moved = True
         if forward:
             _save(task, run, phase="merged")
         changed = changes(live, run["old"] if forward else run["head"], target)
@@ -895,10 +893,23 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
         log(f"stopped and started {', '.join(units) or 'nothing'}")
     except BaseException:
         _start_again(host, task, units, log)
-        if forward and not moved:
+        if forward and _still_at_old(live, run):
             _save(task, run, phase=_before_applying(run))
         raise
     return target
+
+
+def _live_main(live: Path) -> str:
+    return _git(live, "rev-parse", "refs/heads/main").strip()
+
+
+def _still_at_old(live: Path, run: Dict[str, Any]) -> bool:
+    """Whether the live main is still at the run's ``old``, read again after a failure, whatever the failure
+    interrupted; False when it cannot be read: the run then keeps its phase, and its resume reads the live main."""
+    try:
+        return _live_main(live) == run["old"]
+    except Exception:
+        return False
 
 
 def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] = print) -> Optional[Dict[str, Any]]:
@@ -1009,7 +1020,9 @@ def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
             return None
         checked = host.checks(run["affected"], run["baseline"])
     except Exception as exc:
-        if run["phase"] not in CHANGING:
+        # A rollback only once the tree moved, by the live main; a main that cannot be read raises, and the run's
+        # resume reads it.
+        if run["phase"] not in CHANGING or _live_main(host.live) == run["old"]:
             raise
         checked = {"failure": f"applying the change failed ({str(exc)[:300]})", "canary": None}
     failure = checked["failure"]
