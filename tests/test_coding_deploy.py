@@ -1439,9 +1439,20 @@ def test_the_window_lists_its_stopped_units_until_they_start(repos, systemd_run)
     host = ListWatchingHost(repos.live)
     assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)["status"] == "deployed"
     listed = "openclaw-gateway\nrmp-api\nrmp-worker\n"
-    assert [c for c in host.calls if c[0] == "systemctl"] == [
-        ("systemctl", "stop", "rmp-api", listed), ("systemctl", "stop", "openclaw-gateway", "rmp-worker", listed),
-        ("systemctl", "start", "openclaw-gateway", "rmp-api", "rmp-worker", listed)]
+    window = [("systemctl", "stop", "rmp-api", listed), ("systemctl", "stop", "openclaw-gateway", "rmp-worker", listed),
+              ("systemctl", "start", "openclaw-gateway", "rmp-api", "rmp-worker", listed)]
+    assert [c for c in host.calls if c[0] == "systemctl"] == window
+    assert not deploy.stopped_file("t1").exists()
+
+    # The revert window lists the same units the same way.
+    repos.old = head
+    head = repos.change({"app/a.py": "A = 3\n", "plugins/p/index.js": "v3\n"}, on=head)
+    for path in (deploy.spec_file("t1"), deploy.state_file("t1")):
+        path.unlink()
+    deploy.queue(reviewed(repos, head=head))
+    host = ListWatchingHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)["status"] == "rolled_back"
+    assert [c for c in host.calls if c[0] == "systemctl"] == window * 2
     assert not deploy.stopped_file("t1").exists()
 
     deploy.state_file("t1").unlink()
