@@ -941,6 +941,12 @@ def test_a_held_launch_lock_launches_nothing(repos, systemd_run):
     assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t1" and len(systemd_run.argvs) == 1
 
 
+def test_a_host_without_a_runs_directory_launches_nothing_and_creates_nothing(repos, github_ci, systemd_run):
+    assert not deploy.RUNS_DIR.exists()
+    assert deploy.watch_main(FakeHost(repos.live)) is None
+    assert systemd_run.argvs == [] and not deploy.RUNS_DIR.exists()
+
+
 def test_a_run_keeps_one_log_of_its_launches(repos, systemd_run, monkeypatch, capsys):
     log = deploy.spec_file("t1").with_name("deploy.log")
     deploy.queue(reviewed(repos))

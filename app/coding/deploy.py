@@ -383,8 +383,10 @@ def next_deploy(host: "Host") -> Optional[str]:
 
     It runs under ``RUNS_DIR/.launch.lock``, so the worker's hand-off and the API's reconciler never launch two units
     at once: when the other holds it, the reconciler's next pass launches. A run queued for ``IDLE_WAIT_SEC`` is
-    launched without the gate, to record ``postponed``.
+    launched without the gate, to record ``postponed``. A host without ``RUNS_DIR`` yet has no queued run: None.
     """
+    if not RUNS_DIR.is_dir():
+        return None
     fd = os.open(RUNS_DIR / ".launch.lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
         try:
