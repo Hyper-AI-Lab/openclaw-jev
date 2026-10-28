@@ -1164,11 +1164,14 @@ def test_a_dm_during_the_ci_wait_defers_the_restart(repos):
 
 def test_a_task_created_while_the_api_drains_restarts_the_api_and_waits(repos):
     head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
     host = FakeHost(repos.live, busy=[0, 1])
-    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None) is None
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None) is None
     assert [c for c in host.calls if c[0] in ("systemctl", "count")] == [
         ("count", 0), ("systemctl", "stop", "rmp-api"), ("count", 1), ("systemctl", "start", "rmp-api")]
     assert git(repos.live, "rev-parse", "main") == repos.old
+    # The run is back in its phase before applying, with nothing stopped, and is launched again as it was.
+    assert state()["phase"] == "landed" and state()["attempt"] == 0 and not deploy.stopped_file("t1").exists()
 
 
 class MainWatchingHost(FakeHost):
@@ -1330,6 +1333,16 @@ def test_a_unit_killed_while_reverting_publishes_the_revert_once(repos):
         assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]
         assert [c for c in host.calls if c[0] in ("systemctl", "checks")] == [
             *switched("rmp-api", "rmp-worker"), ("checks", ("rmp-api", "rmp-worker"), ("telemetry",))]
+
+
+def test_a_run_to_resume_launches_before_the_queued_runs(repos, systemd_run):
+    deploy.queue(reviewed(repos, "t1"))
+    deploy.queue(main_spec("c" * 40))
+    deploy.queue(reviewed(repos, "t2"))
+    deploy.write_json(deploy.state_file("t2"), {**state("t2"), "phase": "merged"})
+    deploy.write_json(deploy.state_file(deploy.MAIN), {**state(deploy.MAIN), "phase": "restarted"})
+    assert [task for task, _ in deploy.queued_runs()] == ["t2", deploy.MAIN, "t1"]
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t2"
 
 
 def test_the_fast_forward_waits_for_a_full_reserve(repos):
