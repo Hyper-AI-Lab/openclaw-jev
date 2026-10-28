@@ -1929,3 +1929,22 @@ def test_the_deploy_log_shows_stop_move_start_in_both_windows(repos):
     assert deploy.self_deploy(spec(repos, head), FakeHost(repos.live, busy=[0, 1]), log=lines.append) is None
     assert lines[lines.index("stopped rmp-api"):] == ["stopped rmp-api", "waiting: 1 active user task(s)",
                                                        "started rmp-api again"]
+
+
+@pytest.mark.parametrize("waits_at", ["the reserve", "the final count"])
+def test_a_resumed_run_still_at_old_that_waits_goes_back_to_its_phase(repos, systemd_run, waits_at):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
+    pr = {"number": 7, "url": "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/7"}
+    deploy.write_json(deploy.state_file("t1"), {**state(), "phase": "applying", "pr": pr, "merge": head,
+                                                "old": repos.old, "head": head, "affected": ["rmp-api", "rmp-worker"],
+                                                "baseline": []})
+    host = FakeHost(repos.live, busy=[1] if waits_at == "the final count" else [])
+    if waits_at == "the reserve":
+        host.elapsed = lambda: deploy.DEPLOY_UNIT_MAX_SEC
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None) is None
+    assert state()["phase"] == "landed" and git(repos.live, "rev-parse", "main") == repos.old
+    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "start", "rmp-api", "rmp-worker")]
+    # Before the change again, so a hand abort ends it.
+    assert deploy.abort_run("t1").startswith("Aborted the deploy of t1 in phase landed")

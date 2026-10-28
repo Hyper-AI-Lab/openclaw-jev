@@ -986,12 +986,15 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
 
 def _apply_when_idle(host: Host, task: str, run: Dict[str, Any],
                      log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
-    """From the time reserve on: the reserve, the final strict count, ``applying``, then the change."""
-    if host.elapsed() > DEPLOY_UNIT_MAX_SEC - APPLY_RESERVE_SEC:
+    """From the time reserve on: the reserve, the final strict count, ``applying``, then the change. A resumed run
+    still at ``old`` that waits here goes back to its phase before ``applying``, like a run that never reached it."""
+    reserved = host.elapsed() <= DEPLOY_UNIT_MAX_SEC - APPLY_RESERVE_SEC
+    if not reserved:
         log(f"waiting: less than {APPLY_RESERVE_SEC // 60} min of the unit's {DEPLOY_UNIT_MAX_SEC // 3600} h are left "
             "for the change")
-        return None
-    if not _idle(host, log):
+    if not reserved or not _idle(host, log):
+        if run.get("phase") == "applying":
+            _save(task, run, phase=_before_applying(run))
         return None
     _save(task, run, phase="applying")
     return _change(host, task, run, log)
