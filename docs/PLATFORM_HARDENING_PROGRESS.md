@@ -3085,3 +3085,159 @@ Each has a mutation probe that fails on its revert. The fixer's harness at `e17f
 **WP04-20 pre-merge probe**, repeated just before the merge: env files `False`; every unit's `TEMPORAL_ADDRESS` count 0. **PASS.**
 
 **Label decision:** none; there is no `app/workflows` diff.
+
+## 2026-10-27 15:41 UTC · WP-04 batch 4 deployed; WP-04's first group (batches 1-4) complete
+
+**Gated merge:** `CLEAN`; latest `test` run success on head `b2d6119`, equal to the local HEAD; `main` still `25909f8`; one open PR. Squash-merged PR #48 as `0c30187`.
+
+**Deploy:** `deployed` (15:40Z); restarted rmp-api and rmp-worker; health, readiness and the canary passed; worker nondeterminism lines 0.
+
+**Host step WP04-21:**
+- `make -s readiness`: `temporal` **pass**. `temporal_persistence` warns only because a root shell lacks the service-only password; ledgered as `OPS-2026-10-21-make-readiness-env` (WP-19).
+- Worker `Temporal connect` lines since the deploy: **0**.
+- temporal, rmp-api and rmp-worker active.
+
+**Host step WP04-22:** a one-shot background check at 2026-10-28 15:45Z counts the sentinel's `never awaited` lines (expected 0), its runs, and any 134/SIGABRT.
+
+**Ledger** (WP-04 §7, "after batch 4"):
+- **timeouts-external-11 closed;**
+- `debt-scalability-06` note: the `:7233` residual is delivered;
+- R-103, R-123 (interceptor) and R-128: "WP-04 part delivered".
+
+**Rule 43's first group is complete.** WP-09 may start now.
+
+## 2026-10-27 15:42 UTC · WP-09 batch 1 started
+
+- **Branch:** `aura/wp-09-1-launcher` from `0c30187`.
+- **Items:** WP09-01…04 and WP09-33's lines, Tier 1 (deploy): one launcher through the gate; one log per run; an already-live head is `unchanged`; a reviewed deploy ships exactly the merge commit after CI.
+- **Workflow:** run `wf_33073096-101` (the hook works again).
+- **Host step:** the next programme PR's deploy is queued, launched within a minute of idle, with one log.
+
+## 2026-10-27 17:52 UTC · WP-09 batch 1 resumed after the usage limit
+
+**Run `wf_33073096-101`:** the implementer stopped after about 2 h. It left 7 commits and a clean tree, but no report:
+- `bc43ac8`: the disk queue and one launcher through the gate;
+- `2c475b5`: one log per run;
+- `47580cc`: `unchanged`;
+- `34214c5`: the exact merge commit, after CI;
+- `af6084c`: ARCHITECTURE;
+- `7156caa` and `544bf40`: test docs and a proof.
+
+**Backup:** `/root/.cache/wp09-b1-wip-1751/`.
+
+**Relaunch:** run `wf_d1a2b3e5-e47`. Its resume note asks the implementer to:
+- review the 7 commits critically;
+- check that this batch's own deploy is safe under the old deploy code;
+- finish what is missing, including the four layouts;
+- report.
+
+## 2026-10-27 22:52 UTC · WP-09 batch 1: implemented, round 1 approved; fix round resumed after the usage limit
+
+**Implementer** (resumed): kept the 7 commits, and added two:
+- `0b7f31c`: the merge-commit proof now has GitHub squash, so deploying the approved head would fail it;
+- `058dc8c`: this batch ships safely through the deploy code before it.
+
+Every new test fails on `0c30187`, and 11 deliberate breaks were caught. The rewritten tests are listed for the PR.
+
+**Round 1:** both reviewers approved, with non-blocking points. The ones that matter in production:
+- **(a)** an exception in `_queue_main` (a GitHub or network outage) skips `next_deploy`, so queued runs are neither launched nor postponed;
+- **(b)** a unit that dies before recording anything leaves its run `queued` and is relaunched on every pass, without end;
+- **(c)** the order result.json, then the state removal, then `finish` is untested;
+- **(d)** `next_deploy`'s "no unit active" check is untested.
+
+Also noted:
+- hand_off's own launch rarely passes the gate, because the task is still RUNNING; the reconciler launches within a minute;
+- the postpone clock counts from `queued_at`, which matters for runs killed after the fast-forward; batch 2's phases address it;
+- the reconciler's INFO wording, which §3 reserves for batch 2.
+
+**Fix round 1:** the fixer had not started when the limit hit. Resumed from cache.
+
+## 2026-10-28 04:00 UTC · WP-04 batch 3: 24-hour refusal check
+
+`journalctl` for every `rmp-*` unit since the deploy (2026-10-27 03:13Z), grepped for `(task|run) transition refused:`: **0 lines** (`/root/.cache/wp04-b3-refusals-24h.txt`). There was no refusal to explain, and the compare-and-set writer refused no status move in production in its first 24 h.
+
+## 2026-10-28 04:30 UTC · WP-09 batch 1: three review rounds, approved; spec amendments for batch 2
+
+**Run `wf_d1a2b3e5-e47`:** 9 agents, approved in round 3. The branch `aura/wp-09-1-launcher` has 14 commits over `0c30187`, head `4922383`.
+
+**Fix round 1:**
+- `e22218e`: `watch_main` runs the launcher in a `finally`, so queued runs launch and postpone during a GitHub outage. The GitHub error is raised afterwards for the reconciler's log. This was point (a).
+- `fd315a5`: proves that `next_deploy`'s own deploy-unit check holds back a postpone launch (d).
+- `1b824af`: proves that `result.json` is written before the state is removed (c).
+
+**Fix round 2:**
+- `84a8510`: a host with no runs directory launches nothing and creates nothing.
+- `4922383`: proves that a new head replacing a queued run starts its log empty.
+
+The fixer ran all four layouts on each round's head: 1833 passed, 1 skipped; node 58/58; leftovers 0. Every new or extended test was mutation-probed.
+
+**Not fixed in batch 1. Each is named in the PR body as interim and is closed by batch 2:**
+- A unit that dies before it records anything is relaunched without end (b). WP09-07 as written does **not** close this: it counts only exceptions that `main` catches. → **Spec amendment 1** (`specs/WP-09.md` §9):
+  - the unit checks in (`started`);
+  - the launcher skips a run whose last 3 launches never checked in;
+  - the reconciler ends such a run `failed`, with one note to Kirill.
+
+  Ledger `WP09-b1-dead-unit-relaunch` (WP-09, open).
+- The postponement counts from `queued_at`, so a run that waited behind another unit, or behind a held lock, is postponed while Aura is idle. A `--postpone` launch takes no code-reload lock (restore window). → **Spec amendment 2:** postpone only when the gate is closed by user tasks or a failing count. Ledger `WP09-b1-postpone-not-busy` (WP-09, open).
+- A run killed after its fast-forward is relaunched from `queued` or `landed`, and its result is misleading (`failed` "main moved", or `postponed`). The reconciler's INFO line and docstring are stale. A `wait_check` GitHub error after the merge ends as `failed`. `result.json` is not written atomically. Nothing says how to abort a run by hand. → **Spec amendment 3** lists each, with the proof batch 2 must add.
+- **Production notes for the PR body:**
+  - A reviewed deploy launches at the reconciler's next pass, within 60 s of its task turning `deploying`, not from the hand-off, whose own task is still `running`.
+  - `development_mode` is off on the host (checked), so the launcher pass runs.
+
+**Rejected, with the reason:** when both `_queue_main` and `next_deploy` raise, only the launcher's error is logged. GitHub's error is kept as `__context__`, and logging it twice would add noise to the common case.
+
+**Now:** my own four-layout verify on `4922383` is running. Then the PR and the gated merge.
+
+## 2026-10-28 05:10 UTC · WP-09 spec §9 amendments checked by two skeptics and rewritten
+
+Two independent checkers, one on mechanism and code and one on spec consistency, read amendments 1-3 against `4922383` and the whole spec. Both said **needs-change**: 3 blocking and 11 non-blocking points each, largely the same points. The new text in `specs/WP-09.md` §9 (backup of v1: `/root/.cache/WP-09.md.bak-amend-v1`) takes their fixes. Where they differed, I chose:
+
+**Amendment 1: dead runs.**
+- **The ending race:** a run is dead only when no deploy unit is active, and `end_dead_runs` runs under the launch lock. Without both, the third launch could be ended while still importing. A unit that finds no state records nothing.
+- **Batch 1's states:** `launch` writes `started` into a batch-1 state, so the upgrade rule takes effect.
+- **A dead run from `applying` on is kept**, noted once (`dead_noted`), and stops the queue until it is resumed by hand under §0. Deleting it would lose `old` and `previous` (D-8). Checker 1's choice. Checker 2 proposed ending it, which would let the next run deploy on an unverified tree.
+- **Escapes after `applying`** are counted too, so a resume that always raises cannot restart `rmp-api` without end. This was checker 1's point.
+- **The report** is a new `async report_ended_deploys()` in `reconciler_loop`, in its own `try`, before the watch. It runs even while GitHub fails, uses the reconciler's own session and never `engine.dispose()`. Checker 2's placement.
+- **Who hears about a dead run:**
+  - GitHub's main and stuck runs: Kirill gets a note.
+  - A reviewed run that ended: its reply run, not a note and not the false "never reported back" notice. This is `finish`'s split.
+
+**Amendment 2: postponing.**
+- `busy` means only "active user tasks". A failed count closes the gate without postponing (checker 1). The note now says "still busy 2 hours after it was queued".
+- The table has 4 rows.
+- A `--postpone` unit takes the code-reload lock with `LOCK_NB`; if it is held, the unit waits. Checker 1's fix for the restore race. Checker 2 relied on the restore's own check, which is not atomic.
+- The rewritten batch-1 tests are listed.
+
+**Amendment 3: interim behaviours.**
+- Added the silent `unchanged` that a GitHub-main run killed after its fast-forward records (both checkers).
+- A resumed run runs no pre-change step.
+- The kill and postpone proofs start from a real kill (`FakeHost(kill_at=…)`) and run for both sources; the first version's proof passed on batch 1.
+- Batch 2's own deploy, which runs on batch 1's code, must end `deployed`.
+- `wait_check` errors are retried, with `landed` wording on the third failure.
+- `write_json` for `result.json`, proved by a rewritten test.
+- Aborting by hand is a function, `deploy.abort_run(task)`, under the launch lock and only before `applying`. For main it records `failed`, so the head is not queued again. A shell one-liner would race the launcher, and for main the head would come back.
+
+**Consistency edits** in `specs/WP-09.md`:
+- §0's step 1 now also covers a state carrying `dead_noted`;
+- D-1, D-17, §2's `IDLE_WAIT_SEC`, and WP09-01's production behaviour;
+- the §3 row, §5, the §6 batch-2 row (adds amendments 1-3, an own-deploy check, and the closures of the two ledger items), §7's reconciler row, and a new WP-07 cross-WP effect;
+- §8 6.1 and 6.5.
+
+**Also in `work-packages.md`:** the §3 reconciler row, plus WP-07's "From WP-09" line.
+
+## 2026-10-28 05:30 UTC · WP-09 batch 1 verified by me
+
+**My harness run on `4922383`**, against base `0c30187`, which is unchanged as `origin/main`:
+
+| Layout | pytest | node | Leftovers | Placeholder grep | Hidden new files |
+|---|---|---|---|---|---|
+| Default | 1833 passed, 1 skipped (16:49) | 58/58 | 0 | clean | none |
+| coding-job | 1833 passed, 1 skipped (16:35) | — | 0 | clean | none |
+| direct | 1833 passed, 1 skipped (16:51) | — | 0 | clean | none |
+| live | 1833 passed, 1 skipped (18:15) | — | 0 | clean | none |
+
+Every layout ended `verify: exit 0` (logs: `/root/.cache/wp09-b1-verify-4922383/`).
+
+`git diff 0c30187 -- app/workflows requirements.txt` is empty, so no label is needed.
+
+**Next:** mirror this log into the docs, then the PR (body: `/root/.cache/pr-wp09-b1.md`), the gated merge and the deploy. This PR ships through batch 0's deploy code, so its own deploy is the old path. The host step for batch 1 is read on the **next** programme PR's deploy.
