@@ -964,9 +964,12 @@ def test_a_run_keeps_one_log_of_its_launches(repos, systemd_run, monkeypatch, ca
     deploy.state_file("t1").unlink()
     deploy.queue(reviewed(repos, head="d" * 40))
     assert deploy.next_deploy(host) == "aura-deploy-t1"
+    # A new head that replaces a run still queued, launched once already, is a new run too.
+    deploy.queue(reviewed(repos, head="e" * 40))
+    assert deploy.next_deploy(host) == "aura-deploy-t1"
     outputs = [[arg for arg in argv if arg.startswith("--property=StandardOutput=")] for argv in systemd_run.argvs]
     assert outputs == [[f"--property=StandardOutput=truncate:{log}"], [f"--property=StandardOutput=append:{log}"],
-                       [f"--property=StandardOutput=truncate:{log}"]]
+                       [f"--property=StandardOutput=truncate:{log}"], [f"--property=StandardOutput=truncate:{log}"]]
 
 
 def test_a_queued_githubs_main_already_shipped_by_a_reviewed_deploy_is_unchanged(repos, tmp_path, monkeypatch):
