@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 LIVE_REPO = Path(OPENCLAW_HOME) / "rmp"
 BUNDLES_DIR = CODE_ROOT / "bundles"
 CODE_RELOAD_LOCK = Path("/run/rmp-code-reload.lock")
-# The longest a run may stay queued; its next launch then records ``postponed``.
+# How long a run waits before a launcher pass that finds Aura busy launches it to record ``postponed``.
 IDLE_WAIT_SEC = 2 * 3600
 # How long a deploy unit waits for the code-reload lock before it ends, leaving its run queued.
 LOCK_WAIT_SEC = 300
@@ -337,19 +337,20 @@ def queued_runs() -> List[Tuple[str, Dict[str, Any]]]:
     return sorted(runs, key=lambda item: (item[0] == MAIN, item[1].get("queued_at", "")))
 
 
-def gate(host: "Host") -> Optional[str]:
-    """Why no deploy unit may start now, or None when the gate is open: no deploy unit runs, nothing holds the
-    code-reload lock and no user task is active, by the strict count."""
+def gate(host: "Host") -> Optional[Tuple[str, bool]]:
+    """Why no deploy unit may start now and whether Aura is busy, or None when the gate is open: no deploy unit runs,
+    nothing holds the code-reload lock and no user task is active, by the strict count. Only active user tasks make
+    Aura busy; a count that fails closes the gate too, but usually means the database is down."""
     if host.deploy_units():
-        return "a deploy unit is running"
+        return "a deploy unit is running", False
     if host.reload_lock_held():
-        return "the code-reload lock is held"
+        return "the code-reload lock is held", False
     try:
         active = host.active_user_tasks()
     except Exception as exc:
-        return f"the idle count failed: {exc}"
+        return f"the idle count failed: {exc}", False
     if active > 0:
-        return f"{active} active user task(s)"
+        return f"{active} active user task(s)", True
     return None
 
 
@@ -382,8 +383,10 @@ def next_deploy(host: "Host") -> Optional[str]:
     """The launcher: start the unit of the first queued run when the gate is open; the unit started, or None.
 
     It runs under ``RUNS_DIR/.launch.lock``, so the worker's hand-off and the API's reconciler never launch two units
-    at once: when the other holds it, the reconciler's next pass launches. A run queued for ``IDLE_WAIT_SEC`` is
-    launched without the gate, to record ``postponed``. A host without ``RUNS_DIR`` yet has no queued run: None.
+    at once: when the other holds it, the reconciler's next pass launches. A run still ``queued`` or ``landed``
+    ``IDLE_WAIT_SEC`` after it was queued is launched to record ``postponed``, only when Aura is busy; one waiting
+    behind another deploy unit, the code-reload lock or a failed count waits on. A host without ``RUNS_DIR`` yet has
+    no queued run: None.
     """
     if not RUNS_DIR.is_dir():
         return None
@@ -399,12 +402,13 @@ def next_deploy(host: "Host") -> Optional[str]:
         if not runs:
             return None
         task, run = runs[0]
-        waited = datetime.now(timezone.utc) - datetime.fromisoformat(run["queued_at"])
-        if run["phase"] in ("queued", "landed") and waited.total_seconds() >= IDLE_WAIT_SEC:
-            return launch(task, postpone=True, live=host.live)
-        reason = gate(host)
-        if reason is None:
+        closed = gate(host)
+        if closed is None:
             return launch(task, live=host.live)
+        reason, busy = closed
+        waited = datetime.now(timezone.utc) - datetime.fromisoformat(run["queued_at"])
+        if busy and run["phase"] in ("queued", "landed") and waited.total_seconds() >= IDLE_WAIT_SEC:
+            return launch(task, postpone=True, live=host.live)
         logger.debug("The deploy of %s waits: %s", task, reason)
         return None
     finally:

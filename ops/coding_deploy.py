@@ -5,12 +5,13 @@ Started by the launcher (``app.coding.deploy.next_deploy``) with the spec of a q
 directory: a reviewed job's approved commit, queued by the coding workflow's deploy activity, or a commit of
 GitHub's main that CI passed, queued by RMP's watcher (``aura-deploy-main``). It takes the code-reload lock
 within ``LOCK_WAIT_SEC``, holds it for the whole deploy, runs ``app.coding.deploy.self_deploy`` and records the
-result; when it cannot take the lock or Aura is busy, it records nothing and the run stays queued. A run queued
-for two hours is launched with ``--postpone`` and records ``postponed`` without the lock. Each launch first prints
-which launch of the run it is; the run's launches share one log, ``deploy.log``. After a result, a
-reviewed job gets a fresh run of its workflow, which sends Aura's judged reply on the new code; a deploy of
-GitHub's main sends Kirill a note with its pull requests' links when it did not go live (rolled back, blocked,
-failed, postponed) or when it changed files under ``ops/systemd/``, which it never installs.
+result; when it cannot take the lock or Aura is busy, it records nothing and the run stays queued. A run Aura still
+keeps busy two hours after it was queued is launched with ``--postpone`` and records ``postponed`` under the lock,
+taken at once or not at all. Each launch first prints which launch of the run it is; the run's launches share one
+log, ``deploy.log``. After a result, a reviewed job gets a fresh run of its workflow, which sends Aura's judged
+reply on the new code; a deploy of GitHub's main sends Kirill a note with its pull requests' links when it did not
+go live (rolled back, blocked, failed, postponed) or when it changed files under ``ops/systemd/``, which it never
+installs.
 """
 import asyncio
 import fcntl
@@ -84,47 +85,58 @@ def take_lock(lock) -> bool:
 
 
 def postponed(run: dict) -> dict:
-    """The result of a run that stayed queued for two hours; a reviewed run that landed is on GitHub's main already."""
+    """The result of a run Aura kept busy for two hours; a reviewed run that landed is on GitHub's main already."""
     if run.get("phase") == "landed":
-        return {"status": "postponed", "summary": "Aura stayed busy for 2 hours, so nothing was deployed; GitHub's main "
-                "has the change, and it goes live with GitHub's main once Aura is idle."}
-    return {"status": "postponed", "summary": "Aura stayed busy for 2 hours, so nothing was deployed; main is unchanged."}
+        return {"status": "postponed", "summary": "Aura was still busy 2 hours after this deploy was queued, so nothing "
+                "was deployed here; GitHub's main has the change, and it goes live with GitHub's main once Aura is idle."}
+    return {"status": "postponed", "summary": "Aura was still busy 2 hours after this deploy was queued, so nothing was "
+            "deployed; main is unchanged."}
 
 
-def main(spec_path: str, postpone: bool = False) -> int:
-    """Deploy the queued run of ``spec_path``. Waiting (the lock stayed held, or Aura is busy) records nothing, keeps
-    the run's state and exits 0; a result is recorded, then the state is removed, then ``finish`` runs."""
-    spec = json.loads(Path(spec_path).read_text())
-    state = deploy.state_file(spec["task_id"])
-    run = deploy._read_json(state) or {}
-    log(f"launch {run.get('launches', 0)} of the deploy of {spec['head'][:12]} (phase {run.get('phase')}"
-        f"{', postpone' if postpone else ''})")
-    if postpone:
-        result = postponed(run)
-    else:
-        with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
-            if not take_lock(lock):
-                log(f"waiting: {deploy.CODE_RELOAD_LOCK} stayed held for {deploy.LOCK_WAIT_SEC} s; the run stays queued")
-                return 0
-            what = "GitHub's main" if spec.get("source") == "github" else f"{spec['head'][:12]} over {spec['old'][:12]}"
-            log(f"holding {deploy.CODE_RELOAD_LOCK}; deploying {what}")
-            try:
-                result = deploy.self_deploy(spec, deploy.Host(), log=log)
-            except Exception as exc:
-                main_now = deploy._git(deploy.LIVE_REPO, "rev-parse", "refs/heads/main").strip()
-                result = {"status": "failed", "error": str(exc)[:500],
-                          "summary": f"The deploy stopped with an error ({str(exc)[:300]}); main is at {main_now[:12]}, "
-                                     "please check it."}
-            if result is None:
-                log("the run stays queued; the launcher's next pass tries again")
-                return 0
+def record(spec_path: str, spec: dict, result: dict) -> int:
+    """Record the run's result, then remove its state, then ``finish``; the unit's exit status."""
     result = {**result, "suite": spec.get("suite"), "source": spec.get("source") or "reviewed",
               "head": result.get("head") or spec.get("head"), "ci": spec.get("ci")}
     log(f"result: {json.dumps(result)}")
     Path(spec_path).with_name("result.json").write_text(json.dumps(result, indent=2) + "\n")
-    state.unlink(missing_ok=True)
+    deploy.state_file(spec["task_id"]).unlink(missing_ok=True)
     asyncio.run(finish(spec, result))
     return 0 if result["status"] == "deployed" else 1
+
+
+def main(spec_path: str, postpone: bool = False) -> int:
+    """Deploy the queued run of ``spec_path``. Waiting (the lock stayed held, or Aura is busy) records nothing, keeps
+    the run's state and exits 0; a result is recorded, then the state is removed, then ``finish`` runs. A postponed
+    run records its result under the code-reload lock, taken at once or not at all."""
+    spec = json.loads(Path(spec_path).read_text())
+    run = deploy._read_json(deploy.state_file(spec["task_id"])) or {}
+    log(f"launch {run.get('launches', 0)} of the deploy of {spec['head'][:12]} (phase {run.get('phase')}"
+        f"{', postpone' if postpone else ''})")
+    if postpone:
+        with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                log(f"waiting: {deploy.CODE_RELOAD_LOCK} is held; the run stays queued")
+                return 0
+            return record(spec_path, spec, postponed(run))
+    with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
+        if not take_lock(lock):
+            log(f"waiting: {deploy.CODE_RELOAD_LOCK} stayed held for {deploy.LOCK_WAIT_SEC} s; the run stays queued")
+            return 0
+        what = "GitHub's main" if spec.get("source") == "github" else f"{spec['head'][:12]} over {spec['old'][:12]}"
+        log(f"holding {deploy.CODE_RELOAD_LOCK}; deploying {what}")
+        try:
+            result = deploy.self_deploy(spec, deploy.Host(), log=log)
+        except Exception as exc:
+            main_now = deploy._git(deploy.LIVE_REPO, "rev-parse", "refs/heads/main").strip()
+            result = {"status": "failed", "error": str(exc)[:500],
+                      "summary": f"The deploy stopped with an error ({str(exc)[:300]}); main is at {main_now[:12]}, "
+                                 "please check it."}
+        if result is None:
+            log("the run stays queued; the launcher's next pass tries again")
+            return 0
+    return record(spec_path, spec, result)
 
 
 if __name__ == "__main__":

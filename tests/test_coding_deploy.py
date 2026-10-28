@@ -778,16 +778,16 @@ def queued_for(task, seconds):
 def test_githubs_main_is_queued_and_launched_only_through_the_gate(repos, github_ci, systemd_run):
     head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
     host = FakeHost(repos.live, busy=[1, 1])
-    assert deploy.gate(host) == "1 active user task(s)"
+    assert deploy.gate(host) == ("1 active user task(s)", True)
     assert deploy.watch_main(host) is None and systemd_run.argvs == []
     assert json.loads(deploy.spec_file(deploy.MAIN).read_text()) == main_spec(head)
     assert json.loads(deploy.state_file(deploy.MAIN).read_text())["phase"] == "queued"
 
     host.held = True
-    assert deploy.gate(host) == "the code-reload lock is held"
+    assert deploy.gate(host) == ("the code-reload lock is held", False)
     assert deploy.watch_main(host) is None and systemd_run.argvs == []
     host.held, host.units = False, ["aura-deploy-t9.service"]
-    assert deploy.gate(host) == "a deploy unit is running"
+    assert deploy.gate(host) == ("a deploy unit is running", False)
     assert deploy.watch_main(host) is None and systemd_run.argvs == []
     host.units = []
     assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 1
@@ -799,7 +799,7 @@ def test_githubs_main_is_queued_and_launched_only_through_the_gate(repos, github
 def test_an_idle_count_that_fails_keeps_the_deploy_queued(repos, github_ci, systemd_run):
     merged_on_github(repos, {"app/a.py": "A = 2\n"})
     host = FakeHost(repos.live, busy=[RuntimeError("could not connect to server"), RuntimeError("timeout")])
-    assert deploy.gate(host) == "the idle count failed: could not connect to server"
+    assert deploy.gate(host) == ("the idle count failed: could not connect to server", False)
     assert deploy.watch_main(host) is None and systemd_run.argvs == []
     assert json.loads(deploy.state_file(deploy.MAIN).read_text())["phase"] == "queued"
     assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 1
@@ -855,21 +855,26 @@ def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, 
     queued_for("t1", deploy.IDLE_WAIT_SEC - 60)
     assert deploy.next_deploy(busy) is None and systemd_run.argvs == []
     queued_for("t1", 60)
-    # The postponed launch skips the gate, but never starts while another deploy unit runs.
+    # The postponed launch needs a busy gate and never starts while another deploy unit runs.
     busy.units = ["aura-deploy-t9.service"]
     assert deploy.next_deploy(busy) is None and systemd_run.argvs == []
     busy.units = []
     assert deploy.next_deploy(busy) == "aura-deploy-t1"
     assert systemd_run.argvs[-1][-2:] == [str(deploy.spec_file("t1")), "--postpone"]
     capsys.readouterr()
+    queued = deploy.state_file("t1").read_text()
     with open(lock, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
-        assert unit.main(str(deploy.spec_file("t1")), postpone=True) == 1
+        assert unit.main(str(deploy.spec_file("t1")), postpone=True) == 0
     assert capsys.readouterr().out.splitlines()[0].endswith(
         " launch 1 of the deploy of cccccccccccc (phase queued, postpone)")
+    assert deploy.state_file("t1").read_text() == queued
+    assert not deploy.spec_file("t1").with_name("result.json").exists() and seen.added == []
+    assert unit.main(str(deploy.spec_file("t1")), postpone=True) == 1
     result = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())
     assert result["status"] == "postponed" and result["head"] == "c" * 40
-    assert result["summary"] == "Aura stayed busy for 2 hours, so nothing was deployed; main is unchanged."
+    assert result["summary"] == ("Aura was still busy 2 hours after this deploy was queued, so nothing was deployed; "
+                                 "main is unchanged.")
     assert not deploy.state_file("t1").exists() and seen.notes == []
     name, payload = seen.client.start_workflow.await_args.args
     assert name == "CodingTaskWorkflow" and payload["report"]["shipped"]["status"] == "postponed"
@@ -880,8 +885,8 @@ def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, 
     assert deploy.next_deploy(busy) == "aura-deploy-t2"
     assert unit.main(str(deploy.spec_file("t2")), postpone=True) == 1
     assert json.loads(deploy.spec_file("t2").with_name("result.json").read_text())["summary"] == (
-        "Aura stayed busy for 2 hours, so nothing was deployed; GitHub's main has the change, and it goes live with "
-        "GitHub's main once Aura is idle.")
+        "Aura was still busy 2 hours after this deploy was queued, so nothing was deployed here; GitHub's main has the "
+        "change, and it goes live with GitHub's main once Aura is idle.")
 
     head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
     assert deploy.watch_main(busy) is None
@@ -896,6 +901,59 @@ def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, 
     run = json.loads(deploy.state_file(deploy.MAIN).read_text())
     assert run["phase"] == "queued" and run["launches"] == 0
     assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == head
+
+
+def test_a_run_that_waited_behind_another_unit_deploys_when_the_gate_opens(repos, systemd_run):
+    deploy.queue(reviewed(repos))
+    queued_for("t1", deploy.IDLE_WAIT_SEC)
+    host = FakeHost(repos.live, units=["aura-deploy-t9.service"])
+    assert deploy.next_deploy(host) is None and systemd_run.argvs == []
+    host.units = []
+    assert deploy.next_deploy(host) == "aura-deploy-t1"
+    assert [argv[-1] for argv in systemd_run.argvs] == [str(deploy.spec_file("t1"))]
+
+
+def test_a_held_reload_lock_postpones_nothing(repos, systemd_run):
+    deploy.queue(reviewed(repos))
+    queued_for("t1", deploy.IDLE_WAIT_SEC)
+    assert deploy.next_deploy(FakeHost(repos.live, held=True, busy=[1])) is None and systemd_run.argvs == []
+
+
+def test_a_failed_count_postpones_nothing(repos, systemd_run):
+    deploy.queue(reviewed(repos))
+    queued_for("t1", deploy.IDLE_WAIT_SEC)
+    host = FakeHost(repos.live, busy=[RuntimeError("could not connect to server")])
+    assert deploy.next_deploy(host) is None and systemd_run.argvs == []
+
+
+def test_a_postponed_unit_waits_while_the_reload_lock_is_held(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    lock = repos.tmp / "code-reload.lock"
+    monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", lock)
+    deploy.queue(main_spec("c" * 40))
+    path = deploy.spec_file(deploy.MAIN)
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert unit.main(str(path), postpone=True) == 0
+    assert json.loads(deploy.state_file(deploy.MAIN).read_text())["phase"] == "queued"
+    assert not path.with_name("result.json").exists() and seen.added == [] and seen.notes == []
+
+    noted = []
+
+    async def notify(message, *, incident_id):
+        # The note is the last thing the postponed unit does; it still holds the lock.
+        with open(lock, "w") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                noted.append("free")
+            except BlockingIOError:
+                noted.append("held")
+        return True
+
+    monkeypatch.setattr(unit, "notify_ops_slack", notify)
+    assert unit.main(str(path), postpone=True) == 1
+    assert json.loads(path.with_name("result.json").read_text())["status"] == "postponed" and noted == ["held"]
+    assert not deploy.state_file(deploy.MAIN).exists()
 
 
 def test_a_unit_that_cannot_take_the_lock_leaves_its_run_queued(repos, monkeypatch):
