@@ -8,10 +8,11 @@ GitHub's main that CI passed, queued by RMP's watcher (``aura-deploy-main``). It
 done, and records the result; when the lock stays held or Aura is busy at the final check, it records nothing and
 the run stays queued. A run Aura still keeps busy two hours after it was queued is launched with ``--postpone`` and
 records ``postponed`` under the lock, taken at once or not at all. Each launch first prints which launch of the run
-it is; the run's launches share one log, ``deploy.log``. After a result, a reviewed job gets a fresh run of its
-workflow, which sends Aura's judged reply on the new code; a deploy of GitHub's main sends Kirill a note with its
-pull requests' links when it did not go live (rolled back, blocked, failed, postponed) or when it changed files
-under ``ops/systemd/``, which it never installs.
+it is, then checks in; the run's launches share one log, ``deploy.log``. An error or ``SIGTERM`` before the change is
+retried by the next launch, at most three times; one from ``applying`` on leaves the run to be resumed from its
+phase. After a result, a reviewed job gets a fresh run of its workflow, which sends Aura's judged reply on the new
+code; a deploy of GitHub's main sends Kirill a note with its pull requests' links when it did not go live (rolled
+back, blocked, failed, postponed) or when it changed files under ``ops/systemd/``, which it never installs.
 """
 import asyncio
 import fcntl

@@ -8,12 +8,13 @@ the full suite on that exact commit as aura-coder, then hands off; the unit land
 A deploy waits queued on disk (``RUNS_DIR/<task>``). One launcher, ``next_deploy``, run by the reconciler's
 ``watch_main`` every minute and by the hand-off, starts the detached root unit (``ops/coding_deploy.py``) of the
 next queued run, only when no deploy unit runs, nothing holds the code-reload lock and no user task is active.
-The unit holds the code-reload lock, checks once more that Aura is idle (else the run stays queued), refuses
-mirrors edited by hand, fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in
-full, restarts what changed or what the reconcile wrote and checks health, readiness and a canary. It never
-installs a unit file; the result names the changed ones. On failure it reverts the live ``main`` and restarts
-at once; the revert reaches GitHub as a pull request of its own. It records the result, then a reviewed job's
-workflow replies on the new code, or Kirill gets a note for Aura's own.
+The unit does its slow work first (a reviewed run's land and CI wait), then holds the code-reload lock, refuses
+mirrors edited by hand and, right after the strict idle count, stops the affected units, the API first with a
+second count; it fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in full and starts the units
+again, then checks health, readiness and a canary. It never installs a unit file; the result names the changed
+ones. On failure it reverts the live ``main`` the same way at once; the revert reaches GitHub as a pull request of
+its own. Each phase is written to the run's state as it happens, so a killed unit's run resumes from its phase. It
+records the result, then a reviewed job's workflow replies on the new code, or Kirill gets a note for Aura's own.
 """
 from __future__ import annotations
 
