@@ -63,6 +63,7 @@ def repos(tmp_path, monkeypatch):
         mirrors.append((prefix, target))
     monkeypatch.setattr(deploy, "MIRRORS", tuple(mirrors))
     monkeypatch.setattr(deploy, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
 
     def change(files: dict, deletes=(), on=None) -> str:
         if scratch.exists():
@@ -85,8 +86,8 @@ class FakeHost(deploy.Host):
     """GitHub is the origin repo: a pull request that merges is pushed onto its main as it is.
 
     The gate's probes answer from ``units`` (the deploy units running), ``held`` (the code-reload lock) and ``busy``
-    (the idle counts in turn, then 0; an exception in it is raised). CI's check on a commit answers from ``ci``, by
-    commit, else "success"."""
+    (the idle counts in turn, then 0; an exception in it is raised); each count is recorded. CI's check on a commit
+    answers from ``ci``, by commit, else "success"."""
 
     def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None):
         super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
@@ -95,6 +96,7 @@ class FakeHost(deploy.Host):
 
     def active_user_tasks(self):
         count = self.busy.pop(0) if self.busy else 0
+        self.calls.append(("count", count))
         if isinstance(count, Exception):
             raise count
         return count
@@ -139,6 +141,13 @@ def spec(repos, head):
             "body": "Body"}
 
 
+def switched(*units):
+    """The systemctl calls of a switch window over ``units``: rmp-api stops first, then the others, then all start."""
+    others = [unit for unit in units if unit != "rmp-api"]
+    return [*([("systemctl", "stop", "rmp-api")] if "rmp-api" in units else []),
+            *([("systemctl", "stop", *others)] if others else []), ("systemctl", "start", *units)]
+
+
 def test_a_reviewed_change_lands_through_a_pull_request_then_syncs_and_restarts_only_what_changed(repos):
     head = repos.change({"app/a.py": "A = 2\n", "plugins/p/index.js": "v2\n", "web-stack/backends/w.py": "W = 2\n",
                          ".cursor/rules/r.mdc": "rule v2\n", "docs/d.md": "more docs\n"}, deletes=["plugins/p/old.js"])
@@ -153,7 +162,7 @@ def test_a_reviewed_change_lands_through_a_pull_request_then_syncs_and_restarts_
     assert (plugins / "p" / "index.js").read_text() == "v2\n" and not (plugins / "p" / "old.js").exists()
     assert (web / "backends" / "w.py").read_text() == "W = 2\n" and (rules / "r.mdc").read_text() == "rule v2\n"
     services = ("aura-web-backends", "openclaw-gateway", "rmp-api", "rmp-worker")
-    assert [c for c in host.calls if c[0] in ("systemctl", "pip")] == [("systemctl", "restart", *services)]
+    assert [c for c in host.calls if c[0] in ("systemctl", "pip")] == switched(*services)
     assert ("checks", services, ("telemetry",)) in host.calls
 
 
@@ -162,7 +171,8 @@ def test_requirements_are_installed_before_the_restart_and_unit_files_are_not(re
     host = FakeHost(repos.live)
     assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
     assert [c for c in host.calls if c[0] in ("systemctl", "pip")] == [
-        ("pip",), ("systemctl", "restart", "rmp-api", "rmp-worker")]
+        ("systemctl", "stop", "rmp-api"), ("systemctl", "stop", "rmp-worker"), ("pip",),
+        ("systemctl", "start", "rmp-api", "rmp-worker")]
 
 
 def test_a_unit_file_change_is_never_installed_or_restarted(repos, monkeypatch):
@@ -232,8 +242,7 @@ def test_a_full_reconcile_converges_a_stale_mirror_file_outside_the_change(repos
     result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
     assert result["status"] == "deployed"
     assert (repos.mirror["web-stack/"] / "backends" / "w.py").read_text() == "W = 2\n"
-    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "aura-web-backends", "rmp-api",
-                                                               "rmp-worker")]
+    assert [c for c in host.calls if c[0] == "systemctl"] == switched("aura-web-backends", "rmp-api", "rmp-worker")
 
 
 def test_a_hand_edit_in_a_mirror_the_change_does_not_touch_blocks_the_deploy(repos):
@@ -253,8 +262,7 @@ def test_a_reconcile_restores_a_mirror_files_mode(repos):
     host = FakeHost(repos.live)
     assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
     assert oct(index.stat().st_mode & 0o777) == oct(0o644) and index.read_text() == "v1\n"
-    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "openclaw-gateway", "rmp-api",
-                                                               "rmp-worker")]
+    assert [c for c in host.calls if c[0] == "systemctl"] == switched("openclaw-gateway", "rmp-api", "rmp-worker")
 
 
 def test_an_executable_mirror_file_lands_at_0755_and_is_then_left_alone(repos):
@@ -271,7 +279,7 @@ def test_an_executable_mirror_file_lands_at_0755_and_is_then_left_alone(repos):
     host = FakeHost(repos.live)
     assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
     assert oct(script.stat().st_mode & 0o777) == oct(0o755)
-    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "rmp-api", "rmp-worker")]
+    assert [c for c in host.calls if c[0] == "systemctl"] == switched("rmp-api", "rmp-worker")
 
 
 def test_a_missing_mirror_file_is_restored_not_refused(repos):
@@ -303,8 +311,7 @@ def test_failed_checks_revert_main_at_once_restore_the_mirrors_restart_and_land_
     assert git(repos.origin, "rev-parse", "main") == revert
     plugins = repos.mirror["plugins/"]
     assert (plugins / "p" / "index.js").read_text() == "v1\n" and (plugins / "p" / "old.js").read_text() == "gone soon\n"
-    restarts = [c for c in host.calls if c[:2] == ("systemctl", "restart")]
-    assert restarts == [("systemctl", "restart", "openclaw-gateway", "rmp-api", "rmp-worker")] * 2
+    assert [c for c in host.calls if c[0] == "systemctl"] == switched("openclaw-gateway", "rmp-api", "rmp-worker") * 2
 
 
 def test_main_moving_while_the_deploy_waited_deploys_nothing(repos):
@@ -327,7 +334,7 @@ def test_a_deploy_of_githubs_main_ships_the_commit_ci_passed_and_then_finds_noth
     assert result["status"] == "deployed" and result["commits"] == ["the approved change"] and "pr" not in result
     assert result["units"] == [] and "ops/systemd/" not in result["summary"]
     assert git(repos.live, "rev-parse", "main") == head and not [c for c in host.calls if c[0] == "land"]
-    assert [c for c in host.calls if c[:2] == ("systemctl", "restart")] == [("systemctl", "restart", "rmp-api", "rmp-worker")]
+    assert [c for c in host.calls if c[0] == "systemctl"] == switched("rmp-api", "rmp-worker")
 
     again = deploy.self_deploy(main_spec(head), FakeHost(repos.live), log=lambda m: None)
     assert again["status"] == "unchanged" and "already live" in again["summary"] and again["restarted"] == []
@@ -530,25 +537,25 @@ def test_the_exact_commit_suite_runs_on_a_clean_checkout_of_the_head(repos, monk
     assert not (repos.tmp / "jobs" / "t1-deploy").exists()
 
 
-def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_run(tmp_path, monkeypatch):
+def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_run(repos, monkeypatch):
     module_spec = importlib.util.spec_from_file_location("coding_deploy", ROOT / "ops" / "coding_deploy.py")
     unit = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(unit)
-    lock = tmp_path / "code-reload.lock"
-    monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", lock)
-    monkeypatch.setattr(unit.deploy, "RUNS_DIR", tmp_path / "runs")
     held = []
 
-    def self_deploy(the_spec, host, *, log):
-        with open(lock, "w") as other:
-            try:
-                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                held.append(False)
-            except BlockingIOError:
-                held.append(True)
-        return {"status": "deployed", "summary": "Deployed cccccccccccc to main."}
+    class LockProbingHost(FakeHost):
+        """Notes, at each systemctl call, whether another process could take the code-reload lock."""
 
-    monkeypatch.setattr(unit.deploy, "self_deploy", self_deploy)
+        def systemctl(self, *args):
+            with open(deploy.CODE_RELOAD_LOCK, "w") as other:
+                try:
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held.append(False)
+                except BlockingIOError:
+                    held.append(True)
+            super().systemctl(*args)
+
+    monkeypatch.setattr(unit.deploy, "Host", lambda: LockProbingHost(repos.live))
     added, recorded, written = [], [], []
 
     class RecordingPath(type(Path())):
@@ -573,12 +580,11 @@ def test_the_deploy_unit_holds_the_lock_records_the_result_and_starts_the_reply_
     monkeypatch.setattr(unit, "engine", SimpleNamespace(dispose=AsyncMock()))
     client = SimpleNamespace(start_workflow=AsyncMock())
     monkeypatch.setattr(unit, "connect_temporal", AsyncMock(return_value=client))
-    context = {"task_id": "t1", "session_key": "s", "intent": "Fix it", "task_type": "user", "tags": []}
-    deploy.queue({"task_id": "t1", "old": "b" * 40, "head": "c" * 40, "context": context,
-                  "report": {"brief": {}, "review": {}, "evidence": {}}})
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
     path = deploy.spec_file("t1")
 
-    assert unit.main(str(path)) == 0 and held == [True]
+    assert unit.main(str(path)) == 0 and held == [True] * 3
     # The result is written while the state is still there, so a unit that dies between the two loses no run.
     assert written == [("result.json", True)]
     assert recorded == [(True, False)] and not deploy.state_file("t1").exists()
@@ -758,7 +764,7 @@ def test_a_deploy_that_only_adds_a_plugin_file_restarts_only_the_gateway(repos):
 
     assert result["status"] == "deployed"
     assert (repos.mirror["plugins/"] / "p" / "exec_cap.js").read_text() == "module.exports = {};\n"
-    assert [c for c in host.calls if c[0] == "systemctl"] == [("systemctl", "restart", "openclaw-gateway")]
+    assert [c for c in host.calls if c[0] == "systemctl"] == switched("openclaw-gateway")
 
 
 def reviewed(repos, task="t1", head="c" * 40):
@@ -958,18 +964,20 @@ def test_a_postponed_unit_waits_while_the_reload_lock_is_held(repos, monkeypatch
 
 def test_a_unit_that_cannot_take_the_lock_leaves_its_run_queued(repos, monkeypatch):
     unit, seen = deploy_unit(monkeypatch)
-    lock = repos.tmp / "code-reload.lock"
-    monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", lock)
     monkeypatch.setattr(deploy, "LOCK_WAIT_SEC", 1)
-    monkeypatch.setattr(deploy, "self_deploy", lambda *args, **kwargs: pytest.fail("deployed without the lock"))
-    deploy.queue(reviewed(repos))
-    queued = deploy.state_file("t1").read_text()
-    with open(lock, "w") as held:
+    host = FakeHost(repos.live)
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    queued = json.loads(deploy.state_file(deploy.MAIN).read_text())
+    with open(deploy.CODE_RELOAD_LOCK, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
-        assert unit.main(str(deploy.spec_file("t1"))) == 0
-    assert deploy.state_file("t1").read_text() == queued
-    assert not deploy.spec_file("t1").with_name("result.json").exists()
+        assert unit.main(str(deploy.spec_file(deploy.MAIN))) == 0
+    assert json.loads(deploy.state_file(deploy.MAIN).read_text())["phase"] == queued["phase"] == "queued"
+    assert not deploy.spec_file(deploy.MAIN).with_name("result.json").exists()
     assert seen.added == [] and seen.notes == [] and seen.client.start_workflow.await_count == 0
+    assert not [c for c in host.calls if c[0] in ("systemctl", "count")]
+    assert git(repos.live, "rev-parse", "main") == repos.old
 
 
 def test_a_unit_that_finds_aura_busy_leaves_its_run_queued(repos, monkeypatch):
@@ -977,15 +985,14 @@ def test_a_unit_that_finds_aura_busy_leaves_its_run_queued(repos, monkeypatch):
     for count in (1, RuntimeError("could not connect to server")):
         host = FakeHost(repos.live, busy=[count])
         assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None) is None
-        assert host.calls == [] and git(repos.live, "rev-parse", "main") == repos.old
+        assert not [c for c in host.calls if c[0] == "systemctl"] and git(repos.live, "rev-parse", "main") == repos.old
 
     unit, seen = deploy_unit(monkeypatch)
-    monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", repos.tmp / "code-reload.lock")
     monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live, busy=[1]))
     deploy.queue(reviewed(repos, head=head))
-    queued = deploy.state_file("t1").read_text()
     assert unit.main(str(deploy.spec_file("t1"))) == 0
-    assert deploy.state_file("t1").read_text() == queued
+    # The pull request landed before the final check, and the run keeps that.
+    assert json.loads(deploy.state_file("t1").read_text())["phase"] == "landed"
     assert not deploy.spec_file("t1").with_name("result.json").exists() and seen.added == []
     assert git(repos.live, "rev-parse", "main") == repos.old
 
@@ -1011,8 +1018,9 @@ def test_a_run_keeps_one_log_of_its_launches(repos, systemd_run, monkeypatch, ca
     host = FakeHost(repos.live)
     assert deploy.next_deploy(host) == "aura-deploy-t1"
     unit, seen = deploy_unit(monkeypatch)
-    monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", repos.tmp / "code-reload.lock")
-    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live, busy=[1]))
+    # The launch waits: its run stays queued.
+    monkeypatch.setattr(deploy, "self_deploy", lambda the_spec, host, *, log: None)
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live))
     capsys.readouterr()
     assert unit.main(str(deploy.spec_file("t1"))) == 0
     first = capsys.readouterr().out.splitlines()[0]
@@ -1122,3 +1130,95 @@ def test_what_the_previous_deploy_code_left_launches_nothing_and_the_next_head_q
     assert [task for task, _ in deploy.queued_runs()] == [deploy.MAIN]
     assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == head
     assert f"--property=StandardOutput=truncate:{deploy.RUNS_DIR / deploy.MAIN / 'deploy.log'}" in systemd_run.argvs[0]
+
+
+def test_a_dm_during_the_ci_wait_defers_the_restart(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = FakeHost(repos.live, busy=[1])
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None) is None
+    assert not [c for c in host.calls if c[0] == "systemctl"] and git(repos.live, "rev-parse", "main") == repos.old
+    assert json.loads(deploy.state_file("t1").read_text())["phase"] == "landed"
+    assert [c for c in host.calls if c[0] in ("land", "wait_check", "count")] == [
+        ("land", "aura/t1-x", "squash"), ("wait_check", head), ("count", 1)]
+
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert [c for c in host.calls if c[0] == "land"] == [("land", "aura/t1-x", "squash")]
+
+
+def test_a_task_created_while_the_api_drains_restarts_the_api_and_waits(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live, busy=[0, 1])
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None) is None
+    assert [c for c in host.calls if c[0] in ("systemctl", "count")] == [
+        ("count", 0), ("systemctl", "stop", "rmp-api"), ("count", 1), ("systemctl", "start", "rmp-api")]
+    assert git(repos.live, "rev-parse", "main") == repos.old
+
+
+class MainWatchingHost(FakeHost):
+    """Records, with each systemctl call, the live main it saw."""
+
+    def systemctl(self, *args):
+        self.calls.append(("systemctl", *args, git(self.live, "rev-parse", "main")))
+
+
+def test_the_units_stop_before_main_moves_and_start_after_the_switch(repos):
+    head = repos.change({"app/a.py": "A = 2\n", "plugins/p/index.js": "v2\n"})
+    host = MainWatchingHost(repos.live)
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
+    old = repos.old
+    assert [c for c in host.calls if c[0] in ("systemctl", "count")] == [
+        ("count", 0), ("systemctl", "stop", "rmp-api", old), ("count", 0),
+        ("systemctl", "stop", "openclaw-gateway", "rmp-worker", old),
+        ("systemctl", "start", "openclaw-gateway", "rmp-api", "rmp-worker", head)]
+
+
+class FailingHost(FakeHost):
+    """Raises at the systemctl call ``fail_at`` (its arguments), and at the first ``pip`` when ``pip_fails``; once."""
+
+    def __init__(self, live, *, fail_at=None, pip_fails=False, **kwargs):
+        super().__init__(live, **kwargs)
+        self.fail_at, self.pip_fails = fail_at, pip_fails
+
+    def systemctl(self, *args):
+        super().systemctl(*args)
+        if args == self.fail_at:
+            self.fail_at = None
+            raise subprocess.CalledProcessError(1, ["systemctl", *args])
+
+    def pip_install(self):
+        super().pip_install()
+        if self.pip_fails:
+            self.pip_fails = False
+            raise subprocess.CalledProcessError(1, ["pip"])
+
+
+def test_a_failure_inside_the_window_still_starts_the_units(repos):
+    head = repos.change({"app/a.py": "A = 2\n", "requirements.txt": "x==2\n"})
+    host = FailingHost(repos.live, fail_at=("stop", "rmp-worker"))
+    with pytest.raises(subprocess.CalledProcessError):
+        deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert [c for c in host.calls if c[0] == "systemctl"] == [
+        ("systemctl", "stop", "rmp-api"), ("systemctl", "stop", "rmp-worker"),
+        ("systemctl", "start", "rmp-api", "rmp-worker")]
+    assert git(repos.live, "rev-parse", "main") == repos.old
+
+    # Once main moved, a failure is a rollback, and both windows start the units.
+    host = FailingHost(repos.live, pip_fails=True)
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and "applying the change failed" in result["summary"]
+    assert [c for c in host.calls if c[0] in ("systemctl", "pip")] == [
+        ("systemctl", "stop", "rmp-api"), ("systemctl", "stop", "rmp-worker"), ("pip",),
+        ("systemctl", "start", "rmp-api", "rmp-worker"),
+        ("systemctl", "stop", "rmp-api"), ("systemctl", "stop", "rmp-worker"), ("pip",),
+        ("systemctl", "start", "rmp-api", "rmp-worker")]
+
+
+def test_a_change_that_restarts_nothing_moves_main_without_stopping_anything(repos):
+    head = repos.change({"docs/d.md": "more docs\n", "ops/tool.sh": "#!/bin/sh\n", "tests/t.py": "T = 1\n"})
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and result["restarted"] == [] and "Restarted nothing" in result["summary"]
+    assert git(repos.live, "rev-parse", "main") == head
+    assert [c for c in host.calls if c[0] in ("systemctl", "count")] == [("count", 0)]

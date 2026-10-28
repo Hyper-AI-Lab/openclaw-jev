@@ -26,10 +26,12 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from app.coding import github, verify, workspace
 from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
@@ -42,8 +44,9 @@ BUNDLES_DIR = CODE_ROOT / "bundles"
 CODE_RELOAD_LOCK = Path("/run/rmp-code-reload.lock")
 # How long a run waits before a launcher pass that finds Aura busy launches it to record ``postponed``.
 IDLE_WAIT_SEC = 2 * 3600
-# How long a deploy unit waits for the code-reload lock before it ends, leaving its run queued.
+# How long a deploy unit waits for the code-reload lock before it ends, leaving its run queued, and how often it tries.
 LOCK_WAIT_SEC = 300
+LOCK_POLL_SEC = 5
 DEPLOY_UNIT_MAX_SEC = 3 * 3600
 # (path or directory prefix, services restarted when it changes); docs, tests and ops restart nothing.
 SERVICE_PATHS = (
@@ -563,6 +566,27 @@ class Host:
             os.close(fd)
         return False
 
+    @contextmanager
+    def hold(self, lock: Path, wait_sec: float) -> Iterator[bool]:
+        """Hold the lock file ``lock`` for the ``with`` block, trying every ``LOCK_POLL_SEC`` for up to ``wait_sec``;
+        whether it was taken."""
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            deadline = time.monotonic() + wait_sec
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        yield False
+                        return
+                    time.sleep(min(LOCK_POLL_SEC, left))
+            yield True
+        finally:
+            os.close(fd)
+
     def systemctl(self, *args: str) -> None:
         subprocess.run(["systemctl", *args], check=True, capture_output=True, timeout=300)
 
@@ -594,38 +618,91 @@ class Host:
         return deploy_checks.run(self.live, restarted, baseline)
 
 
-def _apply(host: Host, old: str, new: str, changed: List[Tuple[str, str]]) -> List[str]:
-    """Reconcile every mirror to ``new``, install requirements and restart what changed between two commits or what the
-    reconcile wrote; the services restarted."""
-    paths = [path for _, path in changed]
-    written = []
-    for prefix, target in MIRRORS:
-        written += reconcile(host.live, new, changed, prefix, target)
-    if "requirements.txt" in paths:
-        host.pip_install()
-    services = restarts_for(paths + written)
-    if services:
-        host.systemctl("restart", *services)
-    return services
-
-
-def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] = print) -> Optional[Dict[str, Any]]:
-    """The deploy unit's work, once it holds the code-reload lock. Returns the result to record, or None when a user
-    task is active or the idle count fails: the run then stays queued, and the launcher's next pass tries again.
-
-    ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
-    approved ``head`` lands through a pull request first, the run's state records the merge commit (``landed``), and
-    exactly that commit is deployed once CI's test check passed on it.
-    """
-    live = host.live
+def _idle(host: Host, log: Callable[[str], None]) -> bool:
+    """Whether no user task is active by the strict count; a count above 0, or one that fails, is logged as waiting."""
     try:
         active = host.active_user_tasks()
     except Exception as exc:
         log(f"waiting: the idle count failed ({str(exc)[:300]})")
-        return None
+        return False
     if active > 0:
         log(f"waiting: {active} active user task(s)")
-        return None
+        return False
+    return True
+
+
+def _affected(live: Path, head: str, changed: List[Tuple[str, str]]) -> List[str]:
+    """The units a switch to ``head`` stops and starts: those of the changed paths and of the mirror files the
+    reconcile will write, found before anything is written."""
+    stale = [path for prefix, target in MIRRORS for _, _, path, _ in _out_of_date(live, head, prefix, target)]
+    return restarts_for([path for _, path in changed] + stale)
+
+
+def _start_again(host: Host, units: List[str], log: Callable[[str], None]) -> None:
+    """Start the units a window stopped, after something inside it raised; a failure here is logged, so the window's
+    own failure is the one handled."""
+    if not units:
+        return
+    try:
+        host.systemctl("start", *units)
+    except Exception as exc:
+        log(f"starting {', '.join(units)} again failed: {exc}")
+
+
+def _switch(host: Host, run: Dict[str, Any], direction: str, log: Callable[[str], None]) -> Optional[str]:
+    """The switch window: the tree, the mirrors and the requirements change only while the affected units are stopped.
+
+    Forward, ``rmp-api`` stops first, so its graceful stop finishes the requests in flight against the running worker,
+    and the strict count is taken again before the other units stop; a task created while it drained starts it again
+    and the window returns None (waiting). Then the tree moves (the fast-forward to ``head``; back, the revert commit),
+    the mirrors are reconciled, the requirements installed, and the units started in one call. Back, both counts are
+    skipped. Whatever raises inside, the units are started before the window is left. The commit the tree moved to.
+    """
+    live, units = host.live, run["affected"]
+    try:
+        if "rmp-api" in units:
+            host.systemctl("stop", "rmp-api")
+            if direction == "forward" and not _idle(host, log):
+                host.systemctl("start", "rmp-api")
+                return None
+        others = [unit for unit in units if unit != "rmp-api"]
+        if others:
+            host.systemctl("stop", *others)
+        if direction == "forward":
+            _git(live, "merge", "--ff-only", "--quiet", run["head"])
+            log(f"main fast-forwarded {run['old'][:12]}..{run['head'][:12]}")
+            moved, changed = run["head"], changes(live, run["old"], run["head"])
+        else:
+            _git(live, "revert", "--no-edit", "--no-commit", f"{run['old']}..{run['head']}")
+            _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit", "--quiet",
+                 "-m", f"Revert {run['head'][:12]}: the deploy's checks failed ({run['failure'][:200]})")
+            moved = _git(live, "rev-parse", "HEAD").strip()
+            changed = changes(live, run["head"], moved)
+        for prefix, target in MIRRORS:
+            reconcile(live, moved, changed, prefix, target)
+        if "requirements.txt" in [path for _, path in changed]:
+            host.pip_install()
+        if units:
+            host.systemctl("start", *units)
+        log(f"stopped and started {', '.join(units) or 'nothing'}")
+    except BaseException:
+        _start_again(host, units, log)
+        raise
+    return moved
+
+
+def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] = print) -> Optional[Dict[str, Any]]:
+    """The deploy unit's work. Returns the result to record, or None while the run waits: the code-reload lock stayed
+    held, or a user task was active (or the idle count failed) at the final check; the run then stays queued, and the
+    launcher's next pass tries again.
+
+    ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
+    approved ``head`` lands through a pull request first, the run's state records the merge commit (``landed``), and
+    exactly that commit is deployed once CI's test check passed on it. That slow work runs first, without the lock.
+    Then, holding the code-reload lock: the hand-edit check, the readiness baseline and, last before the units stop,
+    the strict idle count; then the switch window (``_switch``) and the checks, and on failure the revert window.
+    """
+    live = host.live
     old = _git(live, "rev-parse", "refs/heads/main").strip()
     landed = None
     if spec.get("source") == "github":
@@ -662,23 +739,40 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
             return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on the merged commit "
                     f"{head[:12]} is {check}, so nothing was deployed here; main is unchanged. GitHub's main has the "
                     "change; it goes live with GitHub's main once CI passes on a later commit."}
-    changed = changes(live, old, head)
-    blocked = _drift(live, old)
-    if blocked:
-        return blocked
-    baseline = host.readiness_baseline()
-    _git(live, "merge", "--ff-only", "--quiet", head)
-    log(f"main fast-forwarded {old[:12]}..{head[:12]}")
-    restarted = restarts_for(path for _, path in changed)
+    with host.hold(CODE_RELOAD_LOCK, LOCK_WAIT_SEC) as held:
+        if not held:
+            log(f"waiting: {CODE_RELOAD_LOCK} stayed held for {LOCK_WAIT_SEC} s; the run stays queued")
+            return None
+        log(f"holding {CODE_RELOAD_LOCK}")
+        changed = changes(live, old, head)
+        blocked = _drift(live, old)
+        if blocked:
+            return blocked
+        baseline = host.readiness_baseline()
+        if not _idle(host, log):
+            return None
+        run = {"old": old, "head": head, "affected": _affected(live, head, changed), "baseline": baseline}
+        if landed:
+            run["pr"] = landed["pr"]
+        return _deploy(host, run, log)
+
+
+def _deploy(host: Host, run: Dict[str, Any], log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
+    """The switch window, the checks and, when they fail, the revert window: the result, or None while the API's
+    drain found a task."""
+    live, old, head, restarted, baseline = host.live, run["old"], run["head"], run["affected"], run["baseline"]
     try:
-        restarted = _apply(host, old, head, changed)
-        log(f"restarted {restarted or 'nothing'}")
+        if _switch(host, run, "forward", log) is None:
+            return None
         checked = host.checks(restarted, baseline)
     except Exception as exc:
+        if _git(live, "rev-parse", "refs/heads/main").strip() != head:
+            raise
         checked = {"failure": f"applying the change failed ({str(exc)[:300]})", "canary": None}
     failure = checked["failure"]
+    changed = changes(live, old, head)
     shipped = {"old": old, "head": head, "restarted": restarted, "commits": _subjects(live, old, head),
-               **({"pr": landed["pr"]} if landed else {})}
+               **({"pr": run["pr"]} if run.get("pr") else {})}
     if failure is None:
         canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
         units = sorted(path[len(UNIT_DIR):] for _, path in changed if path.startswith(UNIT_DIR))
@@ -689,11 +783,7 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
                 "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
                 f"readiness passed and {canary}.{installs}"}
     log(f"verification failed: {failure}; reverting")
-    _git(live, "revert", "--no-edit", "--no-commit", f"{old}..{head}")
-    _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit", "--quiet",
-         "-m", f"Revert {head[:12]}: the deploy's checks failed ({failure[:200]})")
-    revert = _git(live, "rev-parse", "HEAD").strip()
-    _apply(host, head, revert, changes(live, head, revert))
+    revert = _switch(host, {**run, "failure": failure}, "back", log)
     still = host.checks(restarted, baseline)["failure"]
     published = _publish_revert(host, revert, head, failure, log)
     health = "Aura is healthy again" if still is None else f"the checks still fail: {still}"
