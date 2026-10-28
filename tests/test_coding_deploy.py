@@ -3,6 +3,7 @@
 git runs for real; the host's systemctl, pip, checks and the gate's probes are a recording fake, and so is the
 launcher's systemd-run.
 """
+import asyncio
 import fcntl
 import importlib.util
 import json
@@ -878,13 +879,12 @@ def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, 
     assert deploy.next_deploy(busy) == "aura-deploy-t1"
     assert systemd_run.argvs[-1][-2:] == [str(deploy.spec_file("t1")), "--postpone"]
     capsys.readouterr()
-    queued = deploy.state_file("t1").read_text()
     with open(lock, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         assert unit.main(str(deploy.spec_file("t1")), postpone=True) == 0
     assert capsys.readouterr().out.splitlines()[0].endswith(
         " launch 1 of the deploy of cccccccccccc (phase queued, postpone)")
-    assert deploy.state_file("t1").read_text() == queued
+    assert json.loads(deploy.state_file("t1").read_text())["phase"] == "queued"
     assert not deploy.spec_file("t1").with_name("result.json").exists() and seen.added == []
     assert unit.main(str(deploy.spec_file("t1")), postpone=True) == 1
     result = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())
@@ -1503,3 +1503,180 @@ def test_a_github_error_while_waiting_for_ci_on_the_merge_commit_is_retried(repo
         "change; it goes live with GitHub's main.")
     assert [c for c in host.calls if c[0] == "land"] == [("land", "aura/t1-x", "squash")]
     assert git(repos.live, "rev-parse", "main") == repos.old and not deploy.state_file("t1").exists()
+
+
+@pytest.fixture
+def reporting(repos, monkeypatch):
+    """The reconciler's report of ended deploy runs, with the database, Slack and Temporal faked: the events it added
+    (``events``), the notes it sent (``notes``) and the reply runs it started (``client``); ``host`` is the deploy host
+    it sees."""
+    from app import config, reconciler
+    from app.production import ops_notify
+
+    seen = SimpleNamespace(events=[], notes=[], client=SimpleNamespace(start_workflow=AsyncMock()),
+                           host=FakeHost(repos.live))
+    db = SimpleNamespace(add=seen.events.append, get=AsyncMock(return_value=None), commit=AsyncMock())
+    session = AsyncMock()
+    session.__aenter__.return_value = db
+    monkeypatch.setattr(reconciler, "AsyncSessionLocal", lambda: session)
+    monkeypatch.setattr(reconciler, "connect_temporal", AsyncMock(return_value=seen.client))
+    monkeypatch.setattr(config, "is_development_mode", lambda: False)
+    monkeypatch.setattr(config, "get_coding_config",
+                        lambda: {"repositories": {"rmp": {"remote": "Hyper-AI-Lab/openclaw-jev"}}})
+
+    async def notify(message, *, incident_id):
+        seen.notes.append((message, incident_id))
+        return True
+
+    monkeypatch.setattr(ops_notify, "notify_ops_slack", notify)
+    monkeypatch.setattr(deploy, "Host", lambda *args, **kwargs: seen.host)
+    seen.report = reconciler.report_ended_deploys
+    return seen
+
+
+def launched(task, launches, started=None, **fields):
+    """Give the run of ``task`` ``launches`` launches, of which ``started`` checked in (all when None)."""
+    deploy.write_json(deploy.state_file(task), {**state(task), "launches": launches,
+                                                "started": launches if started is None else started, **fields})
+
+
+async def test_a_run_whose_units_die_before_they_start_ends_failed_once(repos, systemd_run, reporting):
+    deploy.queue(main_spec("c" * 40))
+    host = FakeHost(repos.live)
+    # Each launch's unit dies before it runs main: it never checks in.
+    assert [deploy.next_deploy(host) for _ in range(4)] == ["aura-deploy-main"] * 3 + [None]
+    assert len(systemd_run.argvs) == 3 and state(deploy.MAIN)["launches"] == 3 and state(deploy.MAIN)["started"] == 0
+
+    await reporting.report()
+    log = deploy.RUNS_DIR / "main" / "deploy.log"
+    result = {"status": "failed", "source": "github", "head": "c" * 40, "ci": "success",
+              "summary": f"The deploy unit ended 3 times before it started (see {log}), so nothing was deployed; "
+                         "main is unchanged."}
+    assert json.loads(deploy.spec_file(deploy.MAIN).with_name("result.json").read_text()) == result
+    assert not deploy.state_file(deploy.MAIN).exists()
+    [event] = reporting.events
+    assert (event.event_type, event.entity_type, event.entity_id, event.event_payload) == (
+        "coding.deploy", "deploy", "main", result)
+    [(note, incident)] = reporting.notes
+    assert note.startswith("Aura's deploy: failed.") and result["summary"] in note
+    assert incident == "deploy:main:cccccccccccc"
+    reporting.client.start_workflow.assert_not_awaited()
+
+    await reporting.report()
+    assert len(reporting.events) == 1 and len(reporting.notes) == 1
+
+
+def test_a_run_whose_third_launch_is_starting_is_not_ended(repos):
+    deploy.queue(reviewed(repos))
+    launched("t1", 3, started=0)
+    before = deploy.state_file("t1").read_text()
+    assert deploy.end_dead_runs(FakeHost(repos.live, units=["aura-deploy-t1.service"])) == []
+    assert deploy.state_file("t1").read_text() == before
+
+
+def test_a_unit_whose_run_has_no_state_does_nothing(repos, monkeypatch, capsys):
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(deploy, "self_deploy", lambda *args, **kwargs: pytest.fail("a run without a state deployed"))
+    deploy.queue(reviewed(repos))
+    deploy.state_file("t1").unlink()
+    for postpone in (False, True):
+        assert unit.main(str(deploy.spec_file("t1")), postpone=postpone) == 0
+        assert capsys.readouterr().out.splitlines()[-1].endswith(" the run of t1 has no state; nothing to do")
+    assert not deploy.spec_file("t1").with_name("result.json").exists() and not deploy.state_file("t1").exists()
+    assert seen.added == [] and seen.notes == [] and seen.client.start_workflow.await_count == 0
+
+
+async def test_a_dead_reviewed_run_replies_and_lets_githubs_main_deploy(repos, systemd_run, reporting):
+    deploy.queue(reviewed(repos))
+    launched("t1", 3, started=0)
+    deploy.queue(main_spec("c" * 40))
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+
+    await reporting.report()
+    assert reporting.notes == [] and not deploy.state_file("t1").exists()
+    name, payload = reporting.client.start_workflow.await_args.args
+    assert name == "CodingTaskWorkflow" and reporting.client.start_workflow.await_args.kwargs["id"] == "workflow-t1"
+    assert payload["task_id"] == "t1" and payload["report"]["shipped"]["status"] == "failed"
+    assert payload["report"]["shipped"]["source"] == "reviewed"
+    [event] = reporting.events
+    assert event.entity_type == "task" and event.event_payload == payload["report"]["shipped"]
+    assert [argv[1] for argv in systemd_run.argvs] == ["--unit=aura-deploy-main"]
+
+
+@pytest.mark.parametrize("deaths", [{"started": 0}, {"escapes": 3}])
+async def test_a_dead_run_past_applying_keeps_its_state_and_stops_the_queue(repos, systemd_run, reporting, deaths):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    git(repos.live, "merge", "-q", "--ff-only", head)
+    deploy.queue(reviewed(repos, head=head))
+    launched("t1", 3, phase="merged", old=repos.old, head=head, affected=["rmp-api", "rmp-worker"], baseline=[],
+             previous="/root/.openclaw/venvs/rmp/0123456789abcdef", **deaths)
+    deploy.queue(main_spec("c" * 40))
+    assert deploy.next_deploy(FakeHost(repos.live)) is None
+
+    await reporting.report()
+    kept = state()
+    assert kept["phase"] == "merged" and kept["dead_noted"] is True
+    assert kept["old"] == repos.old and kept["previous"] == "/root/.openclaw/venvs/rmp/0123456789abcdef"
+    [(note, incident)] = reporting.notes
+    log = deploy.RUNS_DIR / "t1" / "deploy.log"
+    assert note.startswith("Aura's deploy: stuck.") and (
+        f"The deploy unit ended 3 times in phase merged with the live main at {head[:12]}, moved from "
+        f"{repos.old[:12]} and not verified (see {log}); nothing else deploys until it is resumed by hand "
+        "(specs/WP-09.md §0).") in note
+    assert incident == f"deploy:t1:{head[:12]}" and reporting.client.start_workflow.await_count == 0
+    assert not deploy.spec_file("t1").with_name("result.json").exists()
+
+    await reporting.report()
+    assert len(reporting.notes) == 1 and len(reporting.events) == 1
+    assert deploy.next_deploy(FakeHost(repos.live)) is None and systemd_run.argvs == []
+
+
+async def test_a_dead_run_is_reported_while_github_cannot_be_read(repos, systemd_run, reporting, monkeypatch):
+    from app import reconciler
+
+    deploy.queue(main_spec("c" * 40))
+    launched(deploy.MAIN, 3, started=0)
+
+    def fetch_main():
+        raise RuntimeError("git fetch failed: Could not resolve host: github.com")
+
+    reporting.host.fetch_main = fetch_main
+    monkeypatch.setattr(deploy, "_unit_active", lambda unit: False)
+    monkeypatch.setattr(reconciler, "prune_coding_jobs", lambda: [])
+    stop = asyncio.Event()
+
+    async def reconcile_once():
+        stop.set()
+        return {"skipped": True}
+
+    monkeypatch.setattr(reconciler, "reconcile_once", reconcile_once)
+    await reconciler.reconciler_loop(stop)
+    [(note, incident)] = reporting.notes
+    assert "The deploy unit ended 3 times before it started" in note and incident == "deploy:main:cccccccccccc"
+    assert not deploy.state_file(deploy.MAIN).exists() and systemd_run.argvs == []
+
+
+def test_a_unit_that_starts_and_waits_is_not_dead(repos, systemd_run, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live, busy=[1]))
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    for launch in range(1, 5):
+        assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+        assert unit.main(str(deploy.spec_file(deploy.MAIN))) == 0
+        assert state(deploy.MAIN)["started"] == state(deploy.MAIN)["launches"] == launch
+    assert deploy.end_dead_runs(FakeHost(repos.live)) == [] and state(deploy.MAIN)["phase"] == "queued"
+
+
+def test_a_run_queued_by_batch_1_is_not_dead(repos, systemd_run):
+    deploy.queue(main_spec("c" * 40))
+    # Batch 1's state: no started, no escapes.
+    deploy.write_json(deploy.state_file(deploy.MAIN), {"phase": "queued", "queued_at": state(deploy.MAIN)["queued_at"],
+                                                       "attempt": 0, "launches": 4})
+    assert deploy.end_dead_runs(FakeHost(repos.live)) == []
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+    assert state(deploy.MAIN)["launches"] == 5 and state(deploy.MAIN)["started"] == 4
+    # With the launch that gave it started, three launches that never check in make it dead.
+    assert [deploy.next_deploy(FakeHost(repos.live)) for _ in range(3)] == ["aura-deploy-main"] * 2 + [None]
+    [(task, spec, result)] = deploy.end_dead_runs(FakeHost(repos.live))
+    assert task == deploy.MAIN and result["status"] == "failed" and spec == main_spec("c" * 40)

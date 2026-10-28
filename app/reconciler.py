@@ -715,11 +715,52 @@ async def _end_open_runs(db, task_id: str, state: str, cause: str, now: datetime
 
 
 def watch_github_main():
-    """Start the deploy of GitHub's main once a merge moved it and CI passed on it (``app.coding.deploy``)."""
+    """Queue the deploy of GitHub's main once a merge moved it and CI passed on that commit, then run the launcher,
+    which starts the unit of the next queued run through its gate (no deploy unit, the code-reload lock free, Aura
+    idle); the unit started, or None (``app.coding.deploy.watch_main``)."""
     from app.coding.deploy import watch_main
     from app.config import is_development_mode
 
     return None if is_development_mode() else watch_main()
+
+
+async def report_ended_deploys() -> None:
+    """Report the deploy runs whose units kept dying (``app.coding.deploy.end_dead_runs``), each step on its own: the
+    ``coding.deploy`` event and the task's record, as the unit's ``finish`` writes them; Kirill's note for GitHub's
+    main and for a run stuck mid-change; the reply run for a reviewed run that ended, which ends its task."""
+    from app.coding import deploy
+    from app.config import get_coding_config, is_development_mode
+    from app.production.ops_notify import notify_ops_slack
+
+    if is_development_mode():
+        return
+    ended = await asyncio.to_thread(deploy.end_dead_runs, deploy.Host())
+    for task_id, spec, result in ended:
+        github = result["source"] == "github"
+        try:
+            async with AsyncSessionLocal() as db:
+                db.add(Event(correlation_id=task_id, entity_type="deploy" if github else "task", entity_id=task_id,
+                             event_type="coding.deploy", event_payload=result))
+                task = await db.get(Task, task_id)
+                if task is not None:
+                    task.supplementary_context = {**(task.supplementary_context or {}), "coding_deploy": result}
+                await db.commit()
+        except Exception as e:
+            logger.warning("Recording the ended deploy of %s failed: %s", task_id, e)
+        if github or result["status"] == "stuck":
+            try:
+                note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
+                await notify_ops_slack(note, incident_id=f"deploy:{task_id}:{(result.get('head') or '')[:12]}")
+            except Exception as e:
+                logger.warning("Telling Kirill about the ended deploy of %s failed: %s", task_id, e)
+        else:
+            try:
+                client = await connect_temporal()
+                await client.start_workflow(
+                    "CodingTaskWorkflow", {**spec["context"], "report": {**spec["report"], "shipped": result}},
+                    id=f"workflow-{task_id}", task_queue="openclaw-tasks")
+            except Exception as e:
+                logger.warning("Starting the reply run of the ended deploy of %s failed: %s", task_id, e)
 
 
 def prune_coding_jobs() -> list:
@@ -747,9 +788,13 @@ async def reconciler_loop(stop_event: asyncio.Event):
             except Exception as e:
                 logger.warning("Coding job prune failed: %s", e)
         try:
+            await report_ended_deploys()
+        except Exception as e:
+            logger.warning("Reporting ended deploys failed: %s", e)
+        try:
             started = await asyncio.to_thread(watch_github_main)
             if started:
-                logger.info("GitHub's main moved and passed CI; %s deploys it once Aura is idle", started)
+                logger.info("Launched the deploy unit %s", started)
         except Exception as e:
             logger.warning("Watching GitHub's main failed: %s", e)
         try:

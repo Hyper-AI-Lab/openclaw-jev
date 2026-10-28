@@ -71,10 +71,11 @@ async def finish(spec: dict, result: dict) -> None:
 def postponed(run: dict) -> dict:
     """The result of a run Aura kept busy for two hours; a reviewed run that landed is on GitHub's main already."""
     if run.get("phase") == "landed":
-        return {"status": "postponed", "summary": "Aura was still busy 2 hours after this deploy was queued, so nothing "
-                "was deployed here; GitHub's main has the change, and it goes live with GitHub's main once Aura is idle."}
-    return {"status": "postponed", "summary": "Aura was still busy 2 hours after this deploy was queued, so nothing was "
-            "deployed; main is unchanged."}
+        return {"status": "postponed", "summary": "Aura was still busy 2 hours after this deploy was queued, so "
+                "nothing was deployed here; GitHub's main has the change, and it goes live with GitHub's main once "
+                "Aura is idle."}
+    return {"status": "postponed", "summary": "Aura was still busy 2 hours after this deploy was queued, so nothing "
+            "was deployed; main is unchanged."}
 
 
 def record(spec_path: str, spec: dict, result: dict) -> int:
@@ -104,15 +105,20 @@ def main(spec_path: str, postpone: bool = False) -> int:
 
 
 def run_launch(spec_path: str, postpone: bool) -> int:
-    """One launch of the run of ``spec_path``. Waiting (the lock stayed held, or Aura is busy) records nothing, keeps
-    the run's state and exits 0; a result is recorded, then the state is removed, then ``finish`` runs. A postponed
-    run records its result under the code-reload lock, taken at once or not at all. An error or ``SIGTERM`` before
-    ``applying`` is an attempt (``deploy.record_attempt``): the run is retried, and the third ends it ``failed``. In a
-    phase from ``applying`` on it keeps the state, for the next idle pass to resume. Both exit 1."""
+    """One launch of the run of ``spec_path``. It first checks in (``deploy.mark_started``); a run without a state
+    does nothing. Waiting (the lock stayed held, or Aura is busy) records nothing, keeps the run's state and exits 0;
+    a result is recorded, then the state is removed, then ``finish`` runs. A postponed run records its result under
+    the code-reload lock, taken at once or not at all. An error or ``SIGTERM`` before ``applying`` is an attempt
+    (``deploy.record_attempt``): the run is retried, and the third ends it ``failed``. In a phase from ``applying`` on
+    it keeps the state, for the next idle pass to resume, and is counted as an escape. Both exit 1."""
     spec = json.loads(Path(spec_path).read_text())
-    run = deploy._read_json(deploy.state_file(spec["task_id"])) or {}
+    task, state = spec["task_id"], deploy.state_file(spec["task_id"])
+    run = deploy._read_json(state) or {}
     log(f"launch {run.get('launches', 0)} of the deploy of {spec['head'][:12]} (phase {run.get('phase')}"
         f"{', postpone' if postpone else ''})")
+    if not deploy.mark_started(task):
+        log(f"the run of {task} has no state; nothing to do")
+        return 0
     if postpone:
         with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
             try:
@@ -126,13 +132,16 @@ def run_launch(spec_path: str, postpone: bool) -> int:
     try:
         result = deploy.self_deploy(spec, deploy.Host(), log=log)
     except (Exception, deploy.Interrupted) as exc:
-        phase = (deploy._read_json(deploy.state_file(spec["task_id"])) or {}).get("phase")
-        if phase in deploy.CHANGING:
-            log(f"interrupted in phase {phase}; the next idle pass resumes it" if isinstance(exc, deploy.Interrupted)
-                else f"stopped in phase {phase} with an error ({str(exc)[:300]}); the next idle pass resumes it")
+        now = deploy._read_json(state) or {}
+        if now.get("phase") in deploy.CHANGING:
+            # Counted, so a resume that fails the same way every time ends dead (deploy.end_dead_runs).
+            deploy.write_json(state, {**now, "escapes": now.get("escapes", 0) + 1})
+            log(f"interrupted in phase {now['phase']}; the next idle pass resumes it"
+                if isinstance(exc, deploy.Interrupted) else
+                f"stopped in phase {now['phase']} with an error ({str(exc)[:300]}); the next idle pass resumes it")
             return 1
         error = str(exc) or type(exc).__name__
-        result = deploy.record_attempt(spec["task_id"], error)
+        result = deploy.record_attempt(task, error)
         if result is None:
             log(f"stopped before the change ({error[:300]}); the launcher's next pass tries again")
             return 1
