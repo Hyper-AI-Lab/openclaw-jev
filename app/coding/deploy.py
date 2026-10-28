@@ -389,13 +389,36 @@ def mark_started(task_id: str) -> bool:
     return True
 
 
-def _dead(run: Dict[str, Any]) -> bool:
-    """Whether the run's units keep dying: ``MAX_ATTEMPTS`` launches never checked in, or ``MAX_ATTEMPTS`` errors
-    escaped a phase from ``applying`` on. Only once no deploy unit is active: until a launched unit has ended, a
-    launch not checked in may still check in. A state from before ``started`` (batch 1's) counts every launch as
-    checked in."""
+def mark_ended(task_id: str) -> None:
+    """The unit's launch ended in a way it saw (waiting, an attempt, an escape, a result): ``ended`` becomes
+    ``started``. Nothing when the run has no state, as after its result."""
+    path = state_file(task_id)
+    run = _read_json(path)
+    if run is not None:
+        write_json(path, {**run, "ended": run.get("started", run.get("launches", 0))})
+
+
+def _deaths(run: Dict[str, Any]) -> Tuple[int, int, int]:
+    """How the run's launches ended badly, as (launches that never checked in, attempts, escapes).
+
+    A launch that checked in and never ended (``ended`` below ``started``; a missing ``ended`` reads as ``started``)
+    was killed without a word: ``SIGKILL``, the OOM killer, the stop timeout's ``SIGKILL``. Until ``launch`` folds it
+    into the state, it counts here as one more escape from ``applying`` on, and one more attempt before. A state from
+    before ``started`` (batch 1's) counts every launch as checked in."""
     launches = run.get("launches", 0)
-    return launches - run.get("started", launches) >= MAX_ATTEMPTS or run.get("escapes", 0) >= MAX_ATTEMPTS
+    started = run.get("started", launches)
+    silent = run.get("ended", started) < started
+    changing = run.get("phase") in CHANGING
+    return (launches - started, run.get("attempt", 0) + int(silent and not changing),
+            run.get("escapes", 0) + int(silent and changing))
+
+
+def _dead(run: Dict[str, Any]) -> bool:
+    """Whether the run's units keep dying: ``MAX_ATTEMPTS`` launches never checked in, ``MAX_ATTEMPTS`` attempts
+    before the change, or ``MAX_ATTEMPTS`` escapes from ``applying`` on (``_deaths``). Only once no deploy unit is
+    active: until a launched unit has ended, a launch may still check in or end. A third attempt the unit records
+    itself ends the run, so only deaths without a word leave a state that dies by its attempts."""
+    return max(_deaths(run)) >= MAX_ATTEMPTS
 
 
 def queued_runs() -> List[Tuple[str, Dict[str, Any]]]:
@@ -445,9 +468,12 @@ def launch(task: str, *, postpone: bool = False, live: Path) -> str:
             *[f"--property={prop}" for prop in props], "--",
             str(live / "venv" / "bin" / "python"), str(live / "ops" / "coding_deploy.py"), str(path),
             *(["--postpone"] if postpone else [])]
-    # A state from before ``started`` gets it here, in the write that counts the launch, so its later launches count.
-    write_json(state, {**run, "launches": run.get("launches", 0) + 1,
-                       "started": run.get("started", run.get("launches", 0))})
+    # A state from before ``started`` gets it here, in the write that counts the launch, so its later launches count;
+    # a launch that died without a word after it checked in is folded in as an attempt or an escape (``_deaths``).
+    started = run.get("started", run.get("launches", 0))
+    _, attempt, escapes = _deaths(run)
+    write_json(state, {**run, "launches": run.get("launches", 0) + 1, "started": started, "ended": started,
+                       "attempt": attempt, "escapes": escapes})
     try:
         subprocess.run(argv, check=True, capture_output=True, timeout=60)
     except Exception:
@@ -502,8 +528,8 @@ def end_dead_runs(host: "Host") -> List[Tuple[str, Dict[str, Any], Dict[str, Any
     """End the dead runs, under the launch lock and only while no deploy unit is active; (task, spec, result) for each
     to report, nothing when the lock is held or a unit runs.
 
-    A dead run still ``queued`` or ``landed`` changed nothing: it ends ``failed``, with ``result.json`` written and its
-    state removed. One in a phase from ``applying`` on may have left the host mid-change, and its state holds the only
+    A dead run still ``queued`` or ``landed`` changed nothing: it ends ``failed`` (its unit ended before it started,
+    or before it finished), with ``result.json`` written and its state removed. One in a phase from ``applying`` on may have left the host mid-change, and its state holds the only
     record of ``old``: it is kept, with ``dead_noted``, and reported ``stuck`` once; nothing else deploys until it is
     resumed by hand (specs/WP-09.md §0), and whoever does that removes its state."""
     if not RUNS_DIR.is_dir():
@@ -530,7 +556,8 @@ def end_dead_runs(host: "Host") -> List[Tuple[str, Dict[str, Any], Dict[str, Any
                           "nothing else deploys until it is resumed by hand (specs/WP-09.md §0)."}
                 write_json(state_file(task), {**run, "dead_noted": True})
             else:
-                summary = (f"The deploy unit ended {MAX_ATTEMPTS} times before it started (see {log}), so nothing was "
+                how = "started" if _deaths(run)[0] >= MAX_ATTEMPTS else "finished"
+                summary = (f"The deploy unit ended {MAX_ATTEMPTS} times before it {how} (see {log}), so nothing was "
                            "deployed; main is unchanged.")
                 if run.get("phase") == "landed":
                     summary += " GitHub's main has the change; it goes live with GitHub's main."

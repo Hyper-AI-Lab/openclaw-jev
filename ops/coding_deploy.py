@@ -107,20 +107,31 @@ def main(spec_path: str, postpone: bool = False) -> int:
 
 
 def run_launch(spec_path: str, postpone: bool) -> int:
-    """One launch of the run of ``spec_path``. It first checks in (``deploy.mark_started``); a run without a state
-    does nothing. Waiting (the lock stayed held, or Aura is busy) records nothing, keeps the run's state and exits 0;
-    a result is recorded, then the state is removed, then ``finish`` runs. A postponed run records its result under
-    the code-reload lock, taken at once or not at all. An error or ``SIGTERM`` before ``applying`` is an attempt
-    (``deploy.record_attempt``): the run is retried, and the third ends it ``failed``. In a phase from ``applying`` on
-    it keeps the state, for the next idle pass to resume, and is counted as an escape. Both exit 1."""
+    """One launch of the run of ``spec_path``. It first checks in (``deploy.mark_started``) and marks its end
+    (``deploy.mark_ended``) whichever way it ends; a run without a state does nothing. Waiting (the lock stayed held,
+    or Aura is busy) records nothing, keeps the run's state and exits 0; a result is recorded, then the state is
+    removed, then ``finish`` runs. A postponed run records its result under the code-reload lock, taken at once or not
+    at all. An error or ``SIGTERM`` before ``applying`` is an attempt (``deploy.record_attempt``): the run is retried,
+    and the third ends it ``failed``. In a phase from ``applying`` on it keeps the state, for the next idle pass to
+    resume, and is counted as an escape. Both exit 1."""
     spec = json.loads(Path(spec_path).read_text())
-    task, state = spec["task_id"], deploy.state_file(spec["task_id"])
-    run = deploy._read_json(state) or {}
+    task = spec["task_id"]
+    run = deploy._read_json(deploy.state_file(task)) or {}
     log(f"launch {run.get('launches', 0)} of the deploy of {spec['head'][:12]} (phase {run.get('phase')}"
         f"{', postpone' if postpone else ''})")
     if not deploy.mark_started(task):
         log(f"the run of {task} has no state; nothing to do")
         return 0
+    try:
+        return checked_in(spec_path, spec, run, postpone)
+    finally:
+        # Every end seen here; one without it is a kill without a word, which the next launch counts.
+        deploy.mark_ended(task)
+
+
+def checked_in(spec_path: str, spec: dict, run: dict, postpone: bool) -> int:
+    """The launch's work once it checked in, with ``run`` its state as the launch found it."""
+    task, state = spec["task_id"], deploy.state_file(spec["task_id"])
     if postpone:
         with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
             try:

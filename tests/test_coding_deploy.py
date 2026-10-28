@@ -2003,3 +2003,127 @@ def test_aborting_a_run_that_its_stop_ends_says_how_it_ended(repos, systemd_run,
     assert deploy.abort_run(deploy.MAIN) == f"Stopped aura-deploy-main; the stop ended the run: failed: {summary}"
     assert json.loads(path.with_name("result.json").read_text())["summary"] == summary
     assert not deploy.state_file(deploy.MAIN).exists() and len(seen.notes) == 1
+
+
+class KilledWithoutAWord(BaseException):
+    """Stands in for SIGKILL or the OOM killer: no handler of the unit sees it, so its main never ends the launch."""
+
+
+class KillingHost(FakeHost):
+    """Killed without a word at its first systemctl call, its readiness baseline or CI's wait, as ``kill_in`` names."""
+
+    def __init__(self, live, *, kill_in, **kwargs):
+        super().__init__(live, **kwargs)
+        self.kill_in = kill_in
+
+    def die(self, step):
+        if self.kill_in == step:
+            self.kill_in = None
+            raise KilledWithoutAWord(step)
+
+    def systemctl(self, *args):
+        self.die("systemctl")
+        super().systemctl(*args)
+
+    def readiness_baseline(self):
+        self.die("baseline")
+        return super().readiness_baseline()
+
+    def wait_check(self, sha):
+        self.die("wait_check")
+        return super().wait_check(sha)
+
+
+def killed_after_check_in(task, the_spec, host):
+    """One launch whose unit checks in, then is killed without a word: its main's own end never runs."""
+    assert deploy.mark_started(task)
+    with pytest.raises(KilledWithoutAWord):
+        deploy.self_deploy(the_spec, host, log=lambda m: None)
+
+
+@pytest.mark.parametrize("phase", ["merged", "reverting"])
+async def test_a_run_killed_without_a_word_three_times_mid_change_is_stuck_once(repos, systemd_run, reporting, phase):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    git(repos.live, "merge", "-q", "--ff-only", head)
+    deploy.queue(reviewed(repos, head=head))
+    deploy.write_json(deploy.state_file("t1"), {
+        **state(), "phase": phase, "old": repos.old, "head": head, "affected": ["rmp-api", "rmp-worker"],
+        "baseline": [], **({"failure": "CANARY FAIL: task failed"} if phase == "reverting" else {})})
+    deploy.queue(main_spec("c" * 40))
+    for _ in range(3):
+        assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t1"
+        killed_after_check_in("t1", reviewed(repos, head=head), KillingHost(repos.live, kill_in="systemctl"))
+    assert deploy.next_deploy(FakeHost(repos.live)) is None and len(systemd_run.argvs) == 3
+    assert state()["escapes"] == 2 and state()["attempt"] == 0
+
+    await reporting.report()
+    [(note, incident)] = reporting.notes
+    assert note.startswith("Aura's deploy: stuck.") and f"ended 3 times in phase {phase}" in note
+    assert state()["phase"] == phase and state()["dead_noted"] is True and state()["old"] == repos.old
+    await reporting.report()
+    assert len(reporting.notes) == 1 and deploy.next_deploy(FakeHost(repos.live)) is None
+    assert len(systemd_run.argvs) == 3
+
+
+@pytest.mark.parametrize("source", ["github", "reviewed"])
+async def test_a_run_killed_without_a_word_three_times_before_the_change_ends_failed_once(repos, systemd_run,
+                                                                                        reporting, source):
+    if source == "github":
+        head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+        task, the_spec, step = deploy.MAIN, main_spec(head), "baseline"
+    else:
+        head = repos.change({"app/a.py": "A = 2\n"})
+        task, the_spec, step = "t1", reviewed(repos, head=head), "wait_check"
+    deploy.queue(the_spec)
+    for _ in range(3):
+        assert deploy.next_deploy(FakeHost(repos.live)) == f"aura-deploy-{task}"
+        killed_after_check_in(task, the_spec, KillingHost(repos.live, kill_in=step))
+    assert deploy.next_deploy(FakeHost(repos.live)) is None and len(systemd_run.argvs) == 3
+
+    await reporting.report()
+    log = deploy.RUNS_DIR / task / "deploy.log"
+    summary = (f"The deploy unit ended 3 times before it finished (see {log}), so nothing was deployed; main is "
+               "unchanged.")
+    result = json.loads(deploy.spec_file(task).with_name("result.json").read_text())
+    assert result["status"] == "failed" and git(repos.live, "rev-parse", "main") == repos.old
+    assert not deploy.state_file(task).exists()
+    if source == "github":
+        assert result["summary"] == summary
+        [(note, incident)] = reporting.notes
+        assert note.startswith("Aura's deploy: failed.") and summary in note
+        reporting.client.start_workflow.assert_not_awaited()
+    else:
+        assert result["summary"] == f"{summary} GitHub's main has the change; it goes live with GitHub's main."
+        assert reporting.notes == []
+        shipped = reporting.client.start_workflow.await_args.args[1]["report"]["shipped"]
+        assert shipped == result
+    await reporting.report()
+    assert len(reporting.events) == 1
+
+
+@pytest.mark.parametrize("waits_on", ["the code-reload lock", "a busy count"])
+def test_a_resumed_launch_that_only_waits_is_not_counted(repos, systemd_run, monkeypatch, waits_on):
+    unit, seen = deploy_unit(monkeypatch)
+    head = repos.change({"app/a.py": "A = 2\n"})
+    git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
+    deploy.queue(reviewed(repos, head=head))
+    pr = {"number": 7, "url": "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/7"}
+    if waits_on == "the code-reload lock":
+        git(repos.live, "merge", "-q", "--ff-only", head)
+        phase, busy = "merged", []
+    else:
+        phase, busy = "applying", [1] * 8
+    deploy.write_json(deploy.state_file("t1"), {**state(), "phase": phase, "pr": pr, "merge": head, "old": repos.old,
+                                                "head": head, "affected": ["rmp-api", "rmp-worker"], "baseline": []})
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live, busy=busy))
+    monkeypatch.setattr(deploy, "LOCK_WAIT_SEC", 0)
+    with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
+        if waits_on == "the code-reload lock":
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        for launch in range(1, 5):
+            assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t1"
+            assert unit.main(str(deploy.spec_file("t1"))) == 0
+            run = state()
+            assert run["launches"] == run["started"] == run["ended"] == launch
+            assert run["attempt"] == run["escapes"] == 0
+    assert deploy.end_dead_runs(FakeHost(repos.live)) == [] and seen.added == []
