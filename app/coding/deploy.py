@@ -829,6 +829,7 @@ def _start_again(host: Host, task: str, units: List[str], log: Callable[[str], N
     except Exception as exc:
         log(f"starting {', '.join(units)} again failed: {exc}")
         return
+    log(f"started {', '.join(units)} again")
     stopped_file(task).unlink(missing_ok=True)
 
 
@@ -867,14 +868,17 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
             _list_stopped(task, units)
         if "rmp-api" in units:
             host.systemctl("stop", "rmp-api")
+            log("stopped rmp-api")
             if forward and before == run["old"] and not _idle(host, log):
                 host.systemctl("start", "rmp-api")
+                log("started rmp-api again")
                 stopped_file(task).unlink(missing_ok=True)
                 _save(task, run, phase=_before_applying(run))
                 return None
         others = [unit for unit in units if unit != "rmp-api"]
         if others:
             host.systemctl("stop", *others)
+            log(f"stopped {', '.join(others)}")
         if before != target:
             _git(live, "merge", "--ff-only", "--quiet", target)
             log(f"main moved {before[:12]}..{target[:12]}")
@@ -887,10 +891,10 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
             host.pip_install()
         if units:
             host.systemctl("start", *units)
+            log(f"started {', '.join(units)}")
             stopped_file(task).unlink(missing_ok=True)
         if forward:
             _save(task, run, phase="restarted")
-        log(f"stopped and started {', '.join(units) or 'nothing'}")
     except BaseException:
         _start_again(host, task, units, log)
         if forward and _still_at_old(live, run):
@@ -1001,6 +1005,7 @@ def _resume(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
     if phase == "applying" and now == run["old"]:
         if run["affected"]:
             host.systemctl("start", *run["affected"])
+            log(f"started {', '.join(run['affected'])}")
             stopped_file(task).unlink(missing_ok=True)
         return _apply_when_idle(host, task, run, log)
     if phase in ("applying", "merged", "restarted") and now == run["head"]:

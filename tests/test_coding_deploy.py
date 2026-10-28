@@ -1902,3 +1902,30 @@ def test_a_stop_right_after_the_fast_forward_counts_as_moved(repos, stop):
         assert result["status"] == "rolled_back" and "the log could not be written" in result["summary"]
         assert git(repos.live, "rev-parse", f"{result['revert']}^{{tree}}") == git(repos.live, "rev-parse",
                                                                                    f"{repos.old}^{{tree}}")
+
+
+def window_lines(lines):
+    """The log lines of the switch windows: each stop, the move and each start."""
+    return [line for line in lines if line.startswith(("stopped ", "started ", "main moved "))]
+
+
+def test_the_deploy_log_shows_stop_move_start_in_both_windows(repos):
+    head = repos.change({"app/a.py": "A = 2\n", "plugins/p/index.js": "v2\n"})
+    lines = []
+    host = FakeHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    result = deploy.self_deploy(spec(repos, head), host, log=lines.append)
+    assert result["status"] == "rolled_back"
+    old, revert, units = repos.old[:12], result["revert"][:12], "openclaw-gateway, rmp-api, rmp-worker"
+    assert window_lines(lines) == [
+        "stopped rmp-api", "stopped openclaw-gateway, rmp-worker", f"main moved {old}..{head[:12]}", f"started {units}",
+        "stopped rmp-api", "stopped openclaw-gateway, rmp-worker", f"main moved {head[:12]}..{revert}",
+        f"started {units}"]
+    # The second count comes between the API's stop and the others'.
+    assert lines.index("stopped rmp-api") < lines.index("stopped openclaw-gateway, rmp-worker")
+
+    repos.old = git(repos.live, "rev-parse", "main")
+    head = repos.change({"app/a.py": "A = 3\n"}, on=repos.old)
+    lines.clear()
+    assert deploy.self_deploy(spec(repos, head), FakeHost(repos.live, busy=[0, 1]), log=lines.append) is None
+    assert lines[lines.index("stopped rmp-api"):] == ["stopped rmp-api", "waiting: 1 active user task(s)",
+                                                       "started rmp-api again"]
