@@ -1232,11 +1232,14 @@ def test_a_failure_inside_the_window_still_starts_the_units(repos):
 
 def test_a_change_that_restarts_nothing_moves_main_without_stopping_anything(repos):
     head = repos.change({"docs/d.md": "more docs\n", "ops/tool.sh": "#!/bin/sh\n", "tests/t.py": "T = 1\n"})
+    deploy.queue(reviewed(repos, head=head))
     host = FakeHost(repos.live)
-    result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
     assert result["status"] == "deployed" and result["restarted"] == [] and "Restarted nothing" in result["summary"]
     assert git(repos.live, "rev-parse", "main") == head
     assert [c for c in host.calls if c[0] in ("systemctl", "count")] == [("count", 0)]
+    # Its phases are written all the same, and no list of stopped units is.
+    assert state()["phase"] == "restarted" and state()["affected"] == [] and not deploy.stopped_file("t1").exists()
 
 
 def state(task="t1"):
