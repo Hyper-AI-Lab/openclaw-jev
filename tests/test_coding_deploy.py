@@ -1263,7 +1263,7 @@ def test_a_unit_killed_after_the_fast_forward_resumes_from_its_merged_mark(repos
     assert deploy.next_deploy(FakeHost(repos.live)) == f"aura-deploy-{task}"
     assert unit.main(str(path)) == 1
     run = state(task)
-    assert run["phase"] == "merged" and run["old"] == repos.old and run["head"] == head
+    assert run["phase"] == "merged" and run["old"] == repos.old and run["head"] == head and run["escapes"] == 1
     assert git(repos.live, "rev-parse", "main") == head and not path.with_name("result.json").exists()
     # The window starts what it stopped on its way out.
     assert [c for c in killed.calls if c[0] == "systemctl"][-1] == ("systemctl", "start", *units)
@@ -1402,6 +1402,7 @@ def test_sigterm_in_the_window_starts_the_units_and_keeps_the_run(repos, monkeyp
     assert unit.main(str(deploy.spec_file(deploy.MAIN))) == 1
     assert signal.getsignal(signal.SIGTERM) == before
     assert state(deploy.MAIN)["phase"] == "merged" and git(repos.live, "rev-parse", "main") == head
+    assert state(deploy.MAIN)["escapes"] == 1 and state(deploy.MAIN)["attempt"] == 0
     assert [c for c in host.calls if c[0] == "systemctl"] == switched("rmp-api", "rmp-worker")
     assert not deploy.spec_file(deploy.MAIN).with_name("result.json").exists() and seen.added == [] and seen.notes == []
     assert not deploy.stopped_file(deploy.MAIN).exists()
