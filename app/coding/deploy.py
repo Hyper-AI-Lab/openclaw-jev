@@ -558,9 +558,15 @@ def abort_run(task_id: str) -> str:
     fd = os.open(RUNS_DIR / ".launch.lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+        before = _read_json(state_file(task_id))
         # A unit that is not loaded makes systemctl fail; there is nothing to stop then.
         subprocess.run(["systemctl", "stop", f"aura-deploy-{task_id}"], capture_output=True, timeout=300)
         run = _read_json(state_file(task_id))
+        if run is None and before is not None:
+            # The unit's own end on the stop's SIGTERM recorded a result (its last attempt).
+            ended = _read_json(spec_file(task_id).with_name("result.json")) or {}
+            return (f"Stopped aura-deploy-{task_id}; the stop ended the run: {ended.get('status')}: "
+                    f"{ended.get('summary')}")
         if run is None:
             return f"The deploy of {task_id} has no run with work to do; nothing else was done."
         phase = run.get("phase")

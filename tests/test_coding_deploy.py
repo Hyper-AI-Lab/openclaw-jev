@@ -446,8 +446,9 @@ def test_a_pull_request_pushes_the_branch_and_opens_the_pr_with_the_token(repos,
 def systemd_run(monkeypatch):
     """systemd-run and systemctl's unit list and stop as the launcher and an abort call them: each start's argv is
     recorded, or raises while ``fail`` is set, ``units`` are the deploy units listed, and each unit stopped is recorded
-    in ``stopped``. Every other command runs for real."""
-    real, state = subprocess.run, SimpleNamespace(argvs=[], fail=False, units=[], stopped=[])
+    in ``stopped``, after which ``on_stop`` runs (the unit's own end on the stop's SIGTERM). Every other command runs
+    for real."""
+    real, state = subprocess.run, SimpleNamespace(argvs=[], fail=False, units=[], stopped=[], on_stop=None)
 
     def run(argv, **kwargs):
         if argv[:2] == ["systemctl", "list-units"]:
@@ -455,6 +456,8 @@ def systemd_run(monkeypatch):
                                    stdout="".join(f"{unit} loaded active running Deploy\n" for unit in state.units))
         if argv[:2] == ["systemctl", "stop"]:
             state.stopped += argv[2:]
+            if state.on_stop:
+                state.on_stop()
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if argv[:1] != ["systemd-run"]:
             return real(argv, **kwargs)
@@ -1983,3 +1986,20 @@ def test_a_rollback_over_a_merge_commit_restores_the_old_tree(repos):
     assert git(repos.live, "rev-parse", "main^{tree}") == git(repos.live, "rev-parse", f"{repos.old}^{{tree}}")
     assert git(repos.live, "rev-parse", "main^") == head
     assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]
+
+
+def test_aborting_a_run_that_its_stop_ends_says_how_it_ended(repos, systemd_run, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    deploy.queue(main_spec("c" * 40))
+    deploy.write_json(deploy.state_file(deploy.MAIN), {**state(deploy.MAIN), "attempt": 2})
+    path = deploy.spec_file(deploy.MAIN)
+
+    def the_unit_ends_on_sigterm():
+        # The running unit, before the change: the stop's SIGTERM is its third attempt, which it records.
+        unit.record(str(path), json.loads(path.read_text()), deploy.record_attempt(deploy.MAIN, "SIGTERM"))
+
+    systemd_run.on_stop = the_unit_ends_on_sigterm
+    summary = "The deploy failed 3 times before changing anything (last: SIGTERM); main is unchanged."
+    assert deploy.abort_run(deploy.MAIN) == f"Stopped aura-deploy-main; the stop ended the run: failed: {summary}"
+    assert json.loads(path.with_name("result.json").read_text())["summary"] == summary
+    assert not deploy.state_file(deploy.MAIN).exists() and len(seen.notes) == 1
