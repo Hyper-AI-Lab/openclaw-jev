@@ -960,10 +960,11 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
             return None
         log(f"holding {CODE_RELOAD_LOCK}")
         changed = changes(live, old, head)
+        baseline = host.readiness_baseline()
+        # After the baseline, which can take a minute and a half: a hand edit made meanwhile still blocks.
         blocked = _drift(live, old)
         if blocked:
             return blocked
-        baseline = host.readiness_baseline()
         run.update(old=old, head=head, affected=_affected(live, head, changed), baseline=baseline)
         return _apply_when_idle(host, task, run, log)
 

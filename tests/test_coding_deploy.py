@@ -1832,3 +1832,19 @@ def test_a_run_the_previous_deploy_code_left_is_launched_and_deployed_by_this_co
     result = json.loads(deploy.spec_file(task).with_name("result.json").read_text())
     assert result["status"] == "deployed" and result["head"] == head and git(repos.live, "rev-parse", "main") == head
     assert not [c for c in host.calls if c[0] == "land"] and not deploy.state_file(task).exists()
+
+
+def test_a_hand_edit_made_during_the_readiness_baseline_blocks_the_deploy(repos):
+    rule = repos.mirror[".cursor/rules/"] / "r.mdc"
+
+    class EditedDuringTheBaseline(FakeHost):
+        def readiness_baseline(self):
+            rule.write_text("edited by hand while readiness ran\n")
+            return super().readiness_baseline()
+
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = EditedDuringTheBaseline(repos.live)
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "blocked" and ".cursor/rules/r.mdc" in result["summary"]
+    assert git(repos.live, "rev-parse", "main") == repos.old and rule.read_text() == "edited by hand while readiness ran\n"
+    assert not [c for c in host.calls if c[0] in ("systemctl", "count")]
