@@ -769,6 +769,8 @@ class Host:
         self.live = live
         self.repo = repo or get_coding_config()["repositories"]["rmp"]["remote"]
         self.born = time.monotonic()
+        # The lock files ``keeping`` keeps, each with its descriptor once a hold took it.
+        self._kept: Dict[Path, Optional[int]] = {}
 
     def elapsed(self) -> float:
         """Seconds since this host was made, at the deploy unit's start."""
@@ -799,10 +801,26 @@ class Host:
         return False
 
     @contextmanager
+    def keeping(self, lock: Path) -> Iterator[None]:
+        """Within this block, a hold of the lock file ``lock`` that was taken stays held past its own ``with`` block,
+        until this block ends, and a later hold of it is taken at once: the deploy unit records a result reached under
+        the code-reload lock without letting go of the lock in between."""
+        self._kept[lock] = None
+        try:
+            yield
+        finally:
+            fd = self._kept.pop(lock)
+            if fd is not None:
+                os.close(fd)
+
+    @contextmanager
     def hold(self, lock: Path, wait_sec: float) -> Iterator[bool]:
-        """Hold the lock file ``lock`` for the ``with`` block, trying every ``LOCK_POLL_SEC`` for up to ``wait_sec``;
-        whether it was taken."""
-        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+        """Hold the lock file ``lock`` for the ``with`` block, trying every ``LOCK_POLL_SEC`` for up to ``wait_sec``
+        (at 0, once: ``LOCK_NB``); whether it was taken. Inside ``keeping(lock)``, see there."""
+        if self._kept.get(lock) is not None:
+            yield True
+            return
+        fd: Optional[int] = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             deadline = time.monotonic() + wait_sec
             while True:
@@ -815,9 +833,12 @@ class Host:
                         yield False
                         return
                     time.sleep(min(LOCK_POLL_SEC, left))
+            if lock in self._kept:
+                self._kept[lock], fd = fd, None
             yield True
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
 
     def systemctl(self, *args: str) -> None:
         subprocess.run(["systemctl", *args], check=True, capture_output=True, timeout=300)

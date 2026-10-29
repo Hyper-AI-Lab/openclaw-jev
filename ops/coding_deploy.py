@@ -5,15 +5,16 @@ Started by the launcher (``app.coding.deploy.next_deploy``) with the spec of a q
 directory: a reviewed job's approved commit, queued by the coding workflow's deploy activity, or a commit of
 GitHub's main that CI passed, queued by RMP's watcher (``aura-deploy-main``). It runs
 ``app.coding.deploy.self_deploy``, which takes the code-reload lock within ``LOCK_WAIT_SEC`` once its slow work is
-done, and records the result; when the lock stays held or Aura is busy at the final check, it records nothing and
-the run stays queued. A run Aura still keeps busy two hours after it was queued is launched with ``--postpone`` and
-records ``postponed`` under the lock, taken at once or not at all. Each launch first prints which launch of the run
-it is, then checks in; the run's launches share one log, ``deploy.log``. An error or ``SIGTERM`` before the change is
-retried by the next launch, at most three times; one from ``applying`` on leaves the run to be resumed from its
-phase. After a result, a reviewed job gets a fresh run of its workflow, which sends Aura's judged reply on the new
-code; a deploy of GitHub's main sends Kirill a note with its pull requests' links when it did not go live (rolled
-back, blocked, failed, postponed), when it changed files under ``ops/systemd/``, which it never installs, or when
-readiness checks it added or tightened fail on this host, which do not count against it.
+done, and records the result under that lock; when the lock stays held or Aura is busy at the final check, it records
+nothing and the run stays queued. A result reached before the lock (unchanged, blocked, failed) is recorded under the
+lock taken at once, or the run waits. A run Aura still keeps busy two hours after it was queued is launched with
+``--postpone`` and records ``postponed`` under the lock, taken at once or not at all. Each launch first prints which
+launch of the run it is, then checks in; the run's launches share one log, ``deploy.log``. An error or ``SIGTERM``
+before the change is retried by the next launch, at most three times; one from ``applying`` on leaves the run to be
+resumed from its phase. After a result, a reviewed job gets a fresh run of its workflow, which sends Aura's judged
+reply on the new code; a deploy of GitHub's main sends Kirill a note with its pull requests' links when it did not go
+live (rolled back, blocked, failed, postponed), when it changed files under ``ops/systemd/``, which it never installs,
+or when readiness checks it added or tightened fail on this host, which do not count against it.
 """
 import asyncio
 import fcntl
@@ -142,7 +143,12 @@ def run_launch(spec_path: str, postpone: bool) -> int:
 
 
 def checked_in(spec_path: str, spec: dict, run: dict, postpone: bool) -> int:
-    """The launch's work once it checked in, with ``run`` its state as the launch found it."""
+    """The launch's work once it checked in, with ``run`` its state as the launch found it.
+
+    Every result is recorded, and ``finish`` runs, under the code-reload lock, so none is written while a restore or a
+    code reload holds it: a result reached under the lock without letting go of it (``Host.keeping``), any other under
+    a hold taken at once (``LOCK_NB``). When that lock is held, the launch waits and the run keeps its state; a last
+    attempt is then not counted, and the next launch tries again."""
     task, state = spec["task_id"], deploy.state_file(spec["task_id"])
     if postpone:
         with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
@@ -154,28 +160,41 @@ def checked_in(spec_path: str, spec: dict, run: dict, postpone: bool) -> int:
             return record(spec_path, spec, postponed(run))
     what = "GitHub's main" if spec.get("source") == "github" else f"{spec['head'][:12]} over {spec['old'][:12]}"
     log(f"deploying {what}")
-    try:
-        result = deploy.self_deploy(spec, deploy.Host(), log=log)
-    except (Exception, deploy.Interrupted) as exc:
-        now = deploy._read_json(state) or {}
-        if now.get("phase") in deploy.CHANGING:
-            # Counted, so a resume that fails the same way every time ends dead (deploy.end_dead_runs), and marked
-            # ended in the same write, so a kill right after cannot count it twice.
-            deploy.write_json(state, {**now, "escapes": now.get("escapes", 0) + 1,
-                                      "ended": now.get("started", now.get("launches", 0))})
-            log(f"interrupted in phase {now['phase']}; the next idle pass resumes it"
-                if isinstance(exc, deploy.Interrupted) else
-                f"stopped in phase {now['phase']} with an error ({str(exc)[:300]}); the next idle pass resumes it")
-            return 1
-        error = str(exc) or type(exc).__name__
-        result = deploy.record_attempt(task, error)
+    host = deploy.Host()
+    with host.keeping(deploy.CODE_RELOAD_LOCK):
+        try:
+            result = deploy.self_deploy(spec, host, log=log)
+        except (Exception, deploy.Interrupted) as exc:
+            now = deploy._read_json(state) or {}
+            if now.get("phase") in deploy.CHANGING:
+                # Counted, so a resume that fails the same way every time ends dead (deploy.end_dead_runs), and marked
+                # ended in the same write, so a kill right after cannot count it twice.
+                deploy.write_json(state, {**now, "escapes": now.get("escapes", 0) + 1,
+                                          "ended": now.get("started", now.get("launches", 0))})
+                log(f"interrupted in phase {now['phase']}; the next idle pass resumes it"
+                    if isinstance(exc, deploy.Interrupted) else
+                    f"stopped in phase {now['phase']} with an error ({str(exc)[:300]}); the next idle pass resumes it")
+                return 1
+            error = str(exc) or type(exc).__name__
+            with host.hold(deploy.CODE_RELOAD_LOCK, 0) as held:
+                if not held and now.get("attempt", 0) + 1 >= deploy.MAX_ATTEMPTS:
+                    log(f"waiting: {deploy.CODE_RELOAD_LOCK} is held, so the last attempt ({error[:300]}) is not "
+                        "counted; the launcher's next pass tries again")
+                    return 0
+                result = deploy.record_attempt(task, error)
+                if result is None:
+                    log(f"stopped before the change ({error[:300]}); the launcher's next pass tries again")
+                    return 1
+                return record(spec_path, spec, result)
         if result is None:
-            log(f"stopped before the change ({error[:300]}); the launcher's next pass tries again")
-            return 1
-    if result is None:
-        log("the run stays queued; the launcher's next pass tries again")
-        return 0
-    return record(spec_path, spec, result)
+            log("the run stays queued; the launcher's next pass tries again")
+            return 0
+        with host.hold(deploy.CODE_RELOAD_LOCK, 0) as held:
+            if not held:
+                log(f"waiting: {deploy.CODE_RELOAD_LOCK} is held, so the result ({result['status']}) is not recorded; "
+                    "the run keeps its state")
+                return 0
+            return record(spec_path, spec, result)
 
 
 if __name__ == "__main__":

@@ -648,7 +648,7 @@ def run_github_unit(tmp_path, monkeypatch, status, **fields):
     monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
         "status": status, "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Deployed cccccccccccc.",
         **fields})
-    monkeypatch.setattr(unit.deploy, "Host", lambda: None)
+    monkeypatch.setattr(unit.deploy, "Host", lambda: FakeHost(tmp_path))
     deploy.queue({"task_id": "main", "source": "github", "head": "c" * 40, "ci": "success"})
     path = deploy.spec_file("main")
 
@@ -2523,3 +2523,78 @@ async def test_the_reports_note_goes_first_on_its_own_and_is_retried(repos, syst
     assert reporting.events[0].event_payload["note_delivered"] is True
     assert "Recording the ended deploy of main failed: could not connect" in caplog.text
     assert "The ended deploy of main: told Kirill" in caplog.text
+
+
+def reload_lock_held():
+    """Whether the code-reload lock is held, here or by another process: a probe through a descriptor of its own."""
+    with open(deploy.CODE_RELOAD_LOCK, "w") as probe:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+@pytest.mark.parametrize("early, status", [("unchanged", "unchanged"), ("blocked", "blocked"),
+                                           ("main moved", "failed"), ("CI on the merge commit", "blocked"),
+                                           ("the third attempt", "failed")])
+def test_an_early_result_waits_while_a_restore_holds_the_lock(repos, monkeypatch, early, status):
+    """A result reached before the deploy takes the code-reload lock is recorded under it, taken at once: while a
+    restore holds it, nothing is recorded or sent, and the run keeps its state."""
+    unit, seen = deploy_unit(monkeypatch)
+    error = deploy.github.GitHubError("GET repos/x/commits/y/check-runs: 502 Bad Gateway")
+    if early == "unchanged":
+        head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+        git(repos.live, "merge", "-q", "--ff-only", head)
+        the_spec, host = main_spec(head), FakeHost(repos.live)
+    else:
+        head = repos.change({"app/a.py": "A = 2\n"})
+        the_spec = reviewed(repos, head=head)
+        host = {"blocked": FakeHost(repos.live, lands=["failure", "failure"]), "main moved": FakeHost(repos.live),
+                "CI on the merge commit": FakeHost(repos.live, ci={head: "failure"}),
+                "the third attempt": BlippingHost(repos.live, waits=[error, error])}[early]
+        if early == "main moved":
+            write(repos.live, {"docs/d.md": "another deploy\n"})
+            commit(repos.live, "another deploy")
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    task, path = the_spec["task_id"], deploy.spec_file(the_spec["task_id"])
+    deploy.queue(the_spec)
+    if early == "the third attempt":
+        deploy.write_json(deploy.state_file(task), {**state(task), "attempt": 2})
+
+    with open(deploy.CODE_RELOAD_LOCK, "w") as restore:
+        fcntl.flock(restore, fcntl.LOCK_EX)
+        assert unit.main(str(path)) == 0
+    assert not path.with_name("result.json").exists() and seen.added == [] and seen.notes == []
+    assert seen.client.start_workflow.await_count == 0
+    # The run keeps its state; a last attempt that found the lock held is not counted.
+    kept = state(task)
+    assert kept["attempt"] == (2 if early == "the third attempt" else 0)
+    assert kept["phase"] == ("landed" if early in ("CI on the merge commit", "the third attempt") else "queued")
+
+    held = []
+    seen.db.add = lambda event: held.append(reload_lock_held()) or seen.added.append(event)
+    unit.main(str(path))
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == status and held == [True] and not deploy.state_file(task).exists()
+    assert not reload_lock_held()
+
+
+def test_a_result_reached_under_the_lock_is_recorded_without_letting_go_of_it(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live))
+    real_self_deploy, returned = deploy.self_deploy, []
+
+    def self_deploy(*args, **kwargs):
+        result = real_self_deploy(*args, **kwargs)
+        returned.append(reload_lock_held())
+        return result
+
+    monkeypatch.setattr(deploy, "self_deploy", self_deploy)
+    held = []
+    seen.db.add = lambda event: held.append(reload_lock_held()) or seen.added.append(event)
+    deploy.queue(main_spec(merged_on_github(repos, {"app/a.py": "A = 2\n"})))
+    assert unit.main(str(deploy.spec_file(deploy.MAIN))) == 0
+    # Still held when the deploy returned its result, and while it is recorded; free once the unit is done.
+    assert returned == [True] and held == [True] and not reload_lock_held()
+    assert seen.added[0].event_payload["status"] == "deployed"
