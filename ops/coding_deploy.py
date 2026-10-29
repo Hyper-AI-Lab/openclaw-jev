@@ -108,7 +108,7 @@ def main(spec_path: str, postpone: bool = False) -> int:
 
 def run_launch(spec_path: str, postpone: bool) -> int:
     """One launch of the run of ``spec_path``. It first checks in (``deploy.mark_started``) and marks its end
-    (``deploy.mark_ended``) whichever way it ends; a run without a state does nothing. Waiting (the lock stayed held,
+    (``deploy.mark_ended``) once it returns; a run without a state does nothing. Waiting (the lock stayed held,
     or Aura is busy) records nothing, keeps the run's state and exits 0; a result is recorded, then the state is
     removed, then ``finish`` runs. A postponed run records its result under the code-reload lock, taken at once or not
     at all. An error or ``SIGTERM`` before ``applying`` is an attempt (``deploy.record_attempt``): the run is retried,
@@ -122,11 +122,11 @@ def run_launch(spec_path: str, postpone: bool) -> int:
     if not deploy.mark_started(task):
         log(f"the run of {task} has no state; nothing to do")
         return 0
-    try:
-        return checked_in(spec_path, spec, run, postpone)
-    finally:
-        # Every end seen here; one without it is a kill without a word, which the next launch counts.
-        deploy.mark_ended(task)
+    code = checked_in(spec_path, spec, run, postpone)
+    # Only a launch that returned ends here. An exception that escapes it after the check-in (an I/O error in
+    # record, say) counts like a kill without a word: the next launch folds it in as an attempt or an escape.
+    deploy.mark_ended(task)
+    return code
 
 
 def checked_in(spec_path: str, spec: dict, run: dict, postpone: bool) -> int:

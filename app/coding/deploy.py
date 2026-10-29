@@ -390,8 +390,9 @@ def mark_started(task_id: str) -> bool:
 
 
 def mark_ended(task_id: str) -> None:
-    """The unit's launch ended in a way it saw (waiting, an attempt, an escape, a result): ``ended`` becomes
-    ``started``. Nothing when the run has no state, as after its result."""
+    """The unit's launch returned (waiting, an attempt, an escape, a result): ``ended`` becomes ``started``. Nothing
+    when the run has no state, as after its result. A launch that never gets here, killed or ended by an exception it
+    did not catch, is counted by the next launch (``_deaths``)."""
     path = state_file(task_id)
     run = _read_json(path)
     if run is not None:
@@ -402,9 +403,9 @@ def _deaths(run: Dict[str, Any]) -> Tuple[int, int, int]:
     """How the run's launches ended badly, as (launches that never checked in, attempts, escapes).
 
     A launch that checked in and never ended (``ended`` below ``started``; a missing ``ended`` reads as ``started``)
-    was killed without a word: ``SIGKILL``, the OOM killer, the stop timeout's ``SIGKILL``. Until ``launch`` folds it
-    into the state, it counts here as one more escape from ``applying`` on, and one more attempt before. A state from
-    before ``started`` (batch 1's) counts every launch as checked in."""
+    died without a word: ``SIGKILL``, the OOM killer, the stop timeout's ``SIGKILL``, or an exception the unit did not
+    catch. Until ``launch`` folds it into the state, it counts here as one more escape from ``applying`` on, and one
+    more attempt before. A state from before ``started`` (batch 1's) counts every launch as checked in."""
     launches = run.get("launches", 0)
     started = run.get("started", launches)
     silent = run.get("ended", started) < started

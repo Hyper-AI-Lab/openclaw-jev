@@ -2157,3 +2157,40 @@ def test_a_stopping_deploy_unit_counts_as_running(repos, systemd_run):
     systemd_run.units = [("aura-deploy-t1.service", "inactive")]
     assert [task for task, _, _ in deploy.end_dead_runs(host)] == ["t1"]
     assert deploy.next_deploy(host) == "aura-deploy-main"
+
+
+@pytest.mark.parametrize("phase", ["queued", "restarted"])
+async def test_an_exception_escaping_the_launch_three_times_ends_the_run(repos, systemd_run, reporting, monkeypatch,
+                                                                         phase):
+    unit, seen = deploy_unit(monkeypatch)
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    git(repos.live, "merge", "-q", "--ff-only", head)
+    deploy.queue(main_spec(head))
+    if phase == "restarted":
+        deploy.write_json(deploy.state_file(deploy.MAIN), {**state(deploy.MAIN), "phase": "restarted",
+                                                           "old": repos.old, "head": head, "affected": ["rmp-api"],
+                                                           "baseline": []})
+    # Before the change, GitHub's head is live already (unchanged); restarted, the checks pass (deployed). Either way
+    # the result cannot be written, and the error escapes the unit with its state still there.
+    real_write_json, full = deploy.write_json, [True]
+
+    def write_json(path, data):
+        if full and path.name == "result.json":
+            raise OSError(28, "No space left on device")
+        real_write_json(path, data)
+
+    monkeypatch.setattr(deploy, "write_json", write_json)
+    for _ in range(3):
+        assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+        with pytest.raises(OSError, match="No space left"):
+            unit.main(str(deploy.spec_file(deploy.MAIN)))
+    assert deploy.next_deploy(FakeHost(repos.live)) is None and len(systemd_run.argvs) == 3
+
+    full.clear()
+    await reporting.report()
+    [(note, incident)] = reporting.notes
+    if phase == "queued":
+        assert "The deploy unit ended 3 times before it finished" in note and not deploy.state_file(deploy.MAIN).exists()
+        assert json.loads(deploy.spec_file(deploy.MAIN).with_name("result.json").read_text())["status"] == "failed"
+    else:
+        assert note.startswith("Aura's deploy: stuck.") and state(deploy.MAIN)["dead_noted"] is True
