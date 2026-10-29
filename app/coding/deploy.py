@@ -18,6 +18,7 @@ records the result, then a reviewed job's workflow replies on the new code, or K
 """
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import logging
@@ -32,7 +33,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from app.coding import github, verify, workspace
 from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
@@ -639,6 +640,8 @@ def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
 MAIN = "main"
 # A head whose deploy ended this way waits for a later commit instead of being tried again.
 NOT_RETRIED = ("blocked", "failed", "rolled_back")
+# Kirill's note is tried at once and again after each of these pauses while it is not delivered: about 2.5 minutes.
+NOTE_RETRY_SEC = (30, 120)
 
 
 def watch_main(host: Optional["Host"] = None) -> Optional[str]:
@@ -715,6 +718,24 @@ def deploy_note(result: Dict[str, Any], repo: str) -> str:
         result["status"], f"Aura's deploy: {result['status']}.")
     commits = "\n".join(f"• {linked(s)}" for s in result.get("commits") or [])
     return "\n".join(part for part in (headline, commits, result.get("summary", "")) if part)
+
+
+async def send_note(note: str, incident_id: str, notify: Callable[..., Awaitable[bool]],
+                    log: Callable[[str], None]) -> bool:
+    """Send Kirill ``note`` through ``notify`` (``notify_ops_slack``), on its own: a try that is not delivered (False,
+    as for a transient Slack error, or an error) is tried again after each ``NOTE_RETRY_SEC`` pause. Whether a try
+    delivered it; the log says "told Kirill" only then."""
+    for pause in (0, *NOTE_RETRY_SEC):
+        if pause:
+            await asyncio.sleep(pause)
+        try:
+            if await notify(note, incident_id=incident_id):
+                log("told Kirill")
+                return True
+        except Exception as exc:
+            log(f"a try of the note to Kirill failed ({str(exc)[:300]})")
+    log(f"the note to Kirill was not delivered after {len(NOTE_RETRY_SEC) + 1} tries")
+    return False
 
 
 def open_pull_request(job: workspace.Job, head: str, entry: Dict[str, Any], title: str, body: str,

@@ -46,29 +46,39 @@ def log(message: str) -> None:
 
 
 async def finish(spec: dict, result: dict) -> None:
-    """Record the result on the task, then start the run that replies, or tell Kirill when Aura's own deploy is not live,
-    changed unit files or found new or tightened readiness checks failing."""
-    task_id = spec["task_id"]
+    """Tell Kirill first, on its own and retried (``deploy.send_note``), when Aura's own deploy is not live, changed
+    unit files or found new or tightened readiness checks failing; then record the result on the task, with whether the
+    note was delivered; then, for a reviewed job, start the run that replies. Each step runs whatever the one before
+    did, and a failure is logged."""
+    task_id, github = spec["task_id"], spec.get("source") == "github"
+    recorded = result
+    if github and (result["status"] not in QUIET or result.get("units") or result.get("new_failing")):
+        note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
+        noted = await deploy.send_note(note, f"deploy:{task_id}:{(result.get('head') or '')[:12]}", notify_ops_slack,
+                                       log)
+        recorded = {**result, "note_delivered": noted}
     try:
         async with AsyncSessionLocal() as db:
-            db.add(Event(correlation_id=task_id, entity_type="deploy" if spec.get("source") == "github" else "task",
-                         entity_id=task_id, event_type="coding.deploy", event_payload=result))
+            db.add(Event(correlation_id=task_id, entity_type="deploy" if github else "task", entity_id=task_id,
+                         event_type="coding.deploy", event_payload=recorded))
             task = await db.get(Task, task_id)
             if task is not None:
-                task.supplementary_context = {**(task.supplementary_context or {}), "coding_deploy": result}
+                task.supplementary_context = {**(task.supplementary_context or {}), "coding_deploy": recorded}
             await db.commit()
+    except Exception as exc:
+        log(f"recording the result on the task failed ({str(exc)[:300]})")
     finally:
         await engine.dispose()
-    if spec.get("source") == "github":
-        if result["status"] not in QUIET or result.get("units") or result.get("new_failing"):
-            note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
-            await notify_ops_slack(note, incident_id=f"deploy:{task_id}:{(result.get('head') or '')[:12]}")
-            log("told Kirill")
+    if github:
         return
-    client = await connect_temporal()
-    await client.start_workflow("CodingTaskWorkflow", {**spec["context"], "report": {**spec["report"], "shipped": result}},
-                                id=f"workflow-{task_id}", task_queue=TASK_QUEUE)
-    log(f"started the reply run workflow-{task_id}")
+    try:
+        client = await connect_temporal()
+        await client.start_workflow("CodingTaskWorkflow",
+                                    {**spec["context"], "report": {**spec["report"], "shipped": result}},
+                                    id=f"workflow-{task_id}", task_queue=TASK_QUEUE)
+        log(f"started the reply run workflow-{task_id}")
+    except Exception as exc:
+        log(f"starting the reply run workflow-{task_id} failed ({str(exc)[:300]})")
 
 
 def postponed(run: dict) -> dict:

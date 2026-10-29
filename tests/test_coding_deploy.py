@@ -1582,17 +1582,17 @@ def test_a_github_error_while_waiting_for_ci_on_the_merge_commit_is_retried(repo
 
 @pytest.fixture
 def reporting(repos, monkeypatch):
-    """The reconciler's report of ended deploy runs, with the database, Slack and Temporal faked: the events it added
-    (``events``), the notes it sent (``notes``) and the reply runs it started (``client``); ``host`` is the deploy host
-    it sees."""
+    """The reconciler's report of ended deploy runs, with the database (``db``), Slack and Temporal faked: the events it
+    added (``events``), the notes it sent (``notes``) and the reply runs it started (``client``); ``host`` is the
+    deploy host it sees."""
     from app import config, reconciler
     from app.production import ops_notify
 
     seen = SimpleNamespace(events=[], notes=[], client=SimpleNamespace(start_workflow=AsyncMock()),
                            host=FakeHost(repos.live))
-    db = SimpleNamespace(add=seen.events.append, get=AsyncMock(return_value=None), commit=AsyncMock())
+    seen.db = SimpleNamespace(add=seen.events.append, get=AsyncMock(return_value=None), commit=AsyncMock())
     session = AsyncMock()
-    session.__aenter__.return_value = db
+    session.__aenter__.return_value = seen.db
     monkeypatch.setattr(reconciler, "AsyncSessionLocal", lambda: session)
     monkeypatch.setattr(reconciler, "connect_temporal", AsyncMock(return_value=seen.client))
     monkeypatch.setattr(config, "is_development_mode", lambda: False)
@@ -1631,7 +1631,7 @@ async def test_a_run_whose_units_die_before_they_start_ends_failed_once(repos, s
     assert not deploy.state_file(deploy.MAIN).exists()
     [event] = reporting.events
     assert (event.event_type, event.entity_type, event.entity_id, event.event_payload) == (
-        "coding.deploy", "deploy", "main", result)
+        "coding.deploy", "deploy", "main", {**result, "note_delivered": True})
     [(note, incident)] = reporting.notes
     assert note.startswith("Aura's deploy: failed.") and result["summary"] in note
     assert incident == "deploy:main:cccccccccccc"
@@ -2422,3 +2422,102 @@ def test_a_rollback_killed_after_its_publish_does_not_publish_again(repos):
     assert result["status"] == "rolled_back" and result["revert_pr"] == run["published"]
     assert "Aura is healthy again; GitHub's main is reverted too" in result["summary"]
     assert not [c for c in host.calls if c[0] == "land"]
+
+
+@pytest.fixture
+def pauses(monkeypatch):
+    """The pauses between the tries of Kirill's note, recorded instead of slept."""
+    seen = []
+
+    async def sleep(seconds):
+        seen.append(seconds)
+
+    monkeypatch.setattr(deploy.asyncio, "sleep", sleep)
+    return seen
+
+
+def run_noting_unit(tmp_path, monkeypatch, answers, *, source="github", commit=None):
+    """Run the deploy unit for a run that rolls back, whose tries of Kirill's note answer ``answers`` in turn (an
+    exception in it is raised) and whose database commit raises ``commit`` when given: the unit's exit status, the
+    order of its steps and what it recorded and started (``deploy_unit``)."""
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
+    monkeypatch.setattr(unit.deploy, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
+        "status": "rolled_back", "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Rolled back."})
+    host = FakeHost(tmp_path)
+    monkeypatch.setattr(unit.deploy, "Host", lambda: host)
+    steps, answers = [], list(answers)
+
+    async def notify(message, *, incident_id):
+        steps.append("note")
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(unit, "notify_ops_slack", notify)
+    seen.db.add = lambda event: steps.append("event") or seen.added.append(event)
+    if commit:
+        seen.db.commit = AsyncMock(side_effect=commit)
+    seen.client.start_workflow = AsyncMock(side_effect=lambda *args, **kwargs: steps.append("reply"))
+    the_spec = main_spec("c" * 40) if source == "github" else {
+        **reviewed(SimpleNamespace(old="b" * 40)), "context": {"task_id": "t1"}}
+    deploy.queue(the_spec)
+    code = unit.main(str(deploy.spec_file(the_spec["task_id"])))
+    return code, steps, seen
+
+
+def test_the_note_is_retried_and_logged_as_it_went(tmp_path, monkeypatch, capsys, pauses):
+    code, steps, seen = run_noting_unit(tmp_path, monkeypatch, [False, False, True])
+    out = capsys.readouterr().out
+    # The note goes first; the event is written once it was delivered.
+    assert code == 1 and steps == ["note", "note", "note", "event"] and pauses == [30, 120]
+    assert out.count("told Kirill") == 1 and "not delivered" not in out
+    assert seen.added[0].event_payload["note_delivered"] is True
+    assert seen.added[0].event_payload["status"] == "rolled_back"
+
+
+def test_the_note_goes_out_when_the_event_cannot_be_written(tmp_path, monkeypatch, capsys, pauses):
+    code, steps, seen = run_noting_unit(tmp_path, monkeypatch, [True], commit=RuntimeError("could not connect"))
+    out = capsys.readouterr().out
+    assert code == 1 and steps == ["note", "event"] and pauses == [] and "told Kirill" in out
+    assert "recording the result on the task failed (could not connect)" in out
+    assert json.loads((tmp_path / "runs" / "main" / "result.json").read_text())["status"] == "rolled_back"
+
+    # A reviewed job's reply run starts all the same; it sends no note of its own.
+    code, steps, seen = run_noting_unit(tmp_path, monkeypatch, [], source="reviewed",
+                                        commit=RuntimeError("could not connect"))
+    assert steps == ["event", "reply"] and seen.added[0].event_payload["status"] == "rolled_back"
+    assert "note_delivered" not in seen.added[0].event_payload
+
+
+def test_an_undelivered_note_is_logged_as_undelivered(tmp_path, monkeypatch, capsys, pauses):
+    code, steps, seen = run_noting_unit(tmp_path, monkeypatch, [False, RuntimeError("Slack is down"), False])
+    out = capsys.readouterr().out
+    assert steps == ["note", "note", "note", "event"] and pauses == [30, 120]
+    assert "told Kirill" not in out and "the note to Kirill was not delivered after 3 tries" in out
+    assert "a try of the note to Kirill failed (Slack is down)" in out
+    assert seen.added[0].event_payload["note_delivered"] is False
+
+
+async def test_the_reports_note_goes_first_on_its_own_and_is_retried(repos, systemd_run, reporting, pauses,
+                                                                      monkeypatch, caplog):
+    from app.production import ops_notify
+
+    deploy.queue(main_spec("c" * 40))
+    launched(deploy.MAIN, 3, started=0)
+    steps, answers = [], [False, True]
+
+    async def notify(message, *, incident_id):
+        steps.append("note")
+        return answers.pop(0)
+
+    monkeypatch.setattr(ops_notify, "notify_ops_slack", notify)
+    reporting.db.add = lambda event: steps.append("event") or reporting.events.append(event)
+    reporting.db.commit = AsyncMock(side_effect=RuntimeError("could not connect"))
+    await reporting.report()
+    assert steps == ["note", "note", "event"] and pauses == [30]
+    assert reporting.events[0].event_payload["note_delivered"] is True
+    assert "Recording the ended deploy of main failed: could not connect" in caplog.text
+    assert "The ended deploy of main: told Kirill" in caplog.text

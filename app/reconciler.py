@@ -725,9 +725,10 @@ def watch_github_main():
 
 
 async def report_ended_deploys() -> None:
-    """Report the deploy runs whose units kept dying (``app.coding.deploy.end_dead_runs``), each step on its own: the
-    ``coding.deploy`` event and the task's record, as the unit's ``finish`` writes them; Kirill's note for GitHub's
-    main and for a run stuck mid-change; the reply run for a reviewed run that ended, which ends its task."""
+    """Report the deploy runs whose units kept dying (``app.coding.deploy.end_dead_runs``), each step on its own, as
+    the unit's ``finish`` does: first Kirill's note, retried (``deploy.send_note``), for GitHub's main and for a run
+    stuck mid-change; then the ``coding.deploy`` event and the task's record, with whether the note was delivered; then
+    the reply run for a reviewed run that ended, which ends its task."""
     from app.coding import deploy
     from app.config import get_coding_config, is_development_mode
     from app.production.ops_notify import notify_ops_slack
@@ -736,24 +737,28 @@ async def report_ended_deploys() -> None:
         return
     ended = await asyncio.to_thread(deploy.end_dead_runs, deploy.Host())
     for task_id, spec, result in ended:
-        github = result["source"] == "github"
+        github, recorded = result["source"] == "github", result
+        tells_kirill = github or result["status"] == "stuck"
+        if tells_kirill:
+            try:
+                note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
+                delivered = await deploy.send_note(
+                    note, f"deploy:{task_id}:{(result.get('head') or '')[:12]}", notify_ops_slack,
+                    lambda message: logger.warning("The ended deploy of %s: %s", task_id, message))
+                recorded = {**result, "note_delivered": delivered}
+            except Exception as e:
+                logger.warning("Telling Kirill about the ended deploy of %s failed: %s", task_id, e)
         try:
             async with AsyncSessionLocal() as db:
                 db.add(Event(correlation_id=task_id, entity_type="deploy" if github else "task", entity_id=task_id,
-                             event_type="coding.deploy", event_payload=result))
+                             event_type="coding.deploy", event_payload=recorded))
                 task = await db.get(Task, task_id)
                 if task is not None:
-                    task.supplementary_context = {**(task.supplementary_context or {}), "coding_deploy": result}
+                    task.supplementary_context = {**(task.supplementary_context or {}), "coding_deploy": recorded}
                 await db.commit()
         except Exception as e:
             logger.warning("Recording the ended deploy of %s failed: %s", task_id, e)
-        if github or result["status"] == "stuck":
-            try:
-                note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
-                await notify_ops_slack(note, incident_id=f"deploy:{task_id}:{(result.get('head') or '')[:12]}")
-            except Exception as e:
-                logger.warning("Telling Kirill about the ended deploy of %s failed: %s", task_id, e)
-        else:
+        if not tells_kirill:
             try:
                 client = await connect_temporal()
                 await client.start_workflow(
