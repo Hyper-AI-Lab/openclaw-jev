@@ -2682,3 +2682,23 @@ def test_a_note_that_cannot_be_written_still_lets_the_result_be_recorded(tmp_pat
     out = capsys.readouterr().out
     assert steps == ["event"] and "writing the note to Kirill failed ('repositories')" in out
     assert seen.added[0].event_payload["note_delivered"] is False
+
+
+@pytest.mark.parametrize("slack, status", [("pass", "deployed"), ("fail", "rolled_back")])
+def test_a_run_the_previous_deploy_code_left_compares_its_baseline_as_that_code_did(repos, readiness, slack, status):
+    """The deploy code before this one recorded the readiness baseline as the list of the checks failing then. A run
+    of it that this code resumes counts every other check as passed then: a check failing now and then is ignored, and
+    one failing now only fails the deploy."""
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    git(repos.live, "merge", "-q", "--ff-only", head)
+    deploy.queue(main_spec(head))
+    deploy.write_json(deploy.state_file(deploy.MAIN), {
+        **batch_1_state(1, started=1, escapes=1), "phase": "restarted", "old": repos.old, "head": head,
+        "affected": ["rmp-api", "rmp-worker"], "baseline": ["telemetry"]})
+    readiness.after = {"telemetry": "fail", "slack": slack}
+    result = deploy.self_deploy(main_spec(head), ReadinessHost(repos.live, before={}), log=lambda m: None)
+    assert result["status"] == status
+    if status == "deployed":
+        assert result["new_failing"] == [] and git(repos.live, "rev-parse", "main") == head
+    else:
+        assert result["error"] == "readiness checks failed: slack"
