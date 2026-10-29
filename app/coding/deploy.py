@@ -8,12 +8,13 @@ the full suite on that exact commit as aura-coder, then hands off; the unit land
 A deploy waits queued on disk (``RUNS_DIR/<task>``). One launcher, ``next_deploy``, run by the reconciler's
 ``watch_main`` every minute and by the hand-off, starts the detached root unit (``ops/coding_deploy.py``) of the
 next queued run, only when no deploy unit runs, nothing holds the code-reload lock and no user task is active.
-The unit holds the code-reload lock, checks once more that Aura is idle (else the run stays queued), refuses
-mirrors edited by hand, fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in
-full, restarts what changed or what the reconcile wrote and checks health, readiness and a canary. It never
-installs a unit file; the result names the changed ones. On failure it reverts the live ``main`` and restarts
-at once; the revert reaches GitHub as a pull request of its own. It records the result, then a reviewed job's
-workflow replies on the new code, or Kirill gets a note for Aura's own.
+The unit does its slow work first (a reviewed run's land and CI wait), then holds the code-reload lock, refuses
+mirrors edited by hand and, right after the strict idle count, stops the affected units, the API first with a
+second count; it fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in full and starts the units
+again, then checks health, readiness and a canary. It never installs a unit file; the result names the changed
+ones. On failure it reverts the live ``main`` the same way at once; the revert reaches GitHub as a pull request of
+its own. Each phase is written to the run's state as it happens, so a killed unit's run resumes from its phase. It
+records the result, then a reviewed job's workflow replies on the new code, or Kirill gets a note for Aura's own.
 """
 from __future__ import annotations
 
@@ -26,10 +27,12 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from app.coding import github, verify, workspace
 from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
@@ -40,11 +43,18 @@ logger = logging.getLogger(__name__)
 LIVE_REPO = Path(OPENCLAW_HOME) / "rmp"
 BUNDLES_DIR = CODE_ROOT / "bundles"
 CODE_RELOAD_LOCK = Path("/run/rmp-code-reload.lock")
-# The longest a run may stay queued; its next launch then records ``postponed``.
+# How long a run waits before a launcher pass that finds Aura busy launches it to record ``postponed``.
 IDLE_WAIT_SEC = 2 * 3600
-# How long a deploy unit waits for the code-reload lock before it ends, leaving its run queued.
+# How long a deploy unit waits for the code-reload lock before it ends, leaving its run queued, and how often it tries.
 LOCK_WAIT_SEC = 300
+LOCK_POLL_SEC = 5
 DEPLOY_UNIT_MAX_SEC = 3 * 3600
+# The unit starts the change only while this much of its time is left: the window, the checks and a rollback.
+APPLY_RESERVE_SEC = 90 * 60
+# The run's phases from ``applying`` on: the host may be mid-change, so such a run is resumed, never started over.
+CHANGING = ("applying", "merged", "restarted", "reverting")
+# Errors before the change a run survives: the last of them ends it ``failed``.
+MAX_ATTEMPTS = 3
 # (path or directory prefix, services restarted when it changes); docs, tests and ops restart nothing.
 SERVICE_PATHS = (
     ("app/", ("rmp-api", "rmp-worker")),
@@ -73,6 +83,11 @@ RMP_UNIT_PREFIXES = ("rmp-", "aura-", "openclaw-", "temporal.", "temporal-")
 # or no directory.
 MISSING = " (missing)"
 NOT_REGULAR = " (not a regular file)"
+
+
+class Interrupted(BaseException):
+    """The deploy unit was told to stop (``SIGTERM``). A ``BaseException``, so no ``except Exception`` of the deploy
+    swallows it: it passes through the switch window, which starts the units it stopped, to the unit's ``main``."""
 
 
 def restarts_for(paths: Iterable[str]) -> List[str]:
@@ -291,6 +306,24 @@ def state_file(task_id: str) -> Path:
     return RUNS_DIR / task_id / "deploy-state.json"
 
 
+def stopped_file(task_id: str) -> Path:
+    """The units a switch window holds stopped, one name per line; it exists only while they are stopped."""
+    return RUNS_DIR / task_id / "stopped-units"
+
+
+def stop_post_command(run_dir: Path) -> str:
+    """The deploy unit's ``ExecStopPost=``, run after every end of the unit, a kill included: start the units its
+    window listed as stopped. The run's literal path (no ``$``, which systemd would expand) and ``systemctl`` by bare
+    name; after a normal end the list is gone and it does nothing, and it never fails the unit."""
+    listed = run_dir / "stopped-units"
+    return f"/bin/sh -c 'test -s {listed} && xargs -r systemctl start --no-block < {listed}; exit 0'"
+
+
+def run_exists(task_id: str) -> bool:
+    """Whether the task's deploy run has work to do: queued, waiting, or killed and not yet resumed."""
+    return state_file(task_id).exists()
+
+
 def write_json(path: Path, data: Dict[str, Any]) -> None:
     """Replace ``path`` atomically: a temporary file in its directory, flushed to disk, then renamed over it."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
@@ -303,6 +336,27 @@ def write_json(path: Path, data: Dict[str, Any]) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def record_attempt(task_id: str, error: str) -> Optional[Dict[str, Any]]:
+    """Count an error before the change (an exception or ``SIGTERM`` before ``applying``, when nothing on the host has
+    changed): the attempt and its error go into the run's state, quietly, and the launcher relaunches the run through
+    the gate. The ``MAX_ATTEMPTS``-th ends the run: its ``failed`` result. None while the run is retried, or when it has
+    no state."""
+    path = state_file(task_id)
+    run = _read_json(path)
+    if run is None:
+        return None
+    attempt = run.get("attempt", 0) + 1
+    # The launch is marked ended in the same write that counts it, so a kill right after cannot count it twice.
+    write_json(path, {**run, "attempt": attempt, "last_error": error[:300],
+                      "ended": run.get("started", run.get("launches", 0))})
+    if attempt < MAX_ATTEMPTS:
+        return None
+    summary = f"The deploy failed {attempt} times before changing anything (last: {error[:300]}); main is unchanged."
+    if run.get("phase") == "landed":
+        summary += " GitHub's main has the change; it goes live with GitHub's main."
+    return {"status": "failed", "summary": summary}
 
 
 def queue(spec: Dict[str, Any]) -> str:
@@ -322,34 +376,80 @@ def queue(spec: Dict[str, Any]) -> str:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     write_json(path, spec)
     write_json(state, {"phase": "queued", "queued_at": datetime.now(timezone.utc).isoformat(), "attempt": 0,
-                       "launches": 0})
+                       "launches": 0, "started": 0, "escapes": 0})
     return f"aura-deploy-{task}"
 
 
+def mark_started(task_id: str) -> bool:
+    """The unit checks in, first thing on every launch: the run's ``started`` becomes its ``launches``. False when
+    the run has no state: it was ended, or aborted by hand."""
+    path = state_file(task_id)
+    run = _read_json(path)
+    if run is None:
+        return False
+    write_json(path, {**run, "started": run.get("launches", 0)})
+    return True
+
+
+def mark_ended(task_id: str) -> None:
+    """The unit's launch returned (waiting, an attempt, an escape, a result): ``ended`` becomes ``started``. Nothing
+    when the run has no state, as after its result. A launch that never gets here, killed or ended by an exception it
+    did not catch, is counted by the next launch (``_deaths``)."""
+    path = state_file(task_id)
+    run = _read_json(path)
+    if run is not None:
+        write_json(path, {**run, "ended": run.get("started", run.get("launches", 0))})
+
+
+def _deaths(run: Dict[str, Any]) -> Tuple[int, int, int]:
+    """How the run's launches ended badly, as (launches that never checked in, attempts, escapes).
+
+    A launch that checked in and never ended (``ended`` below ``started``; a missing ``ended`` reads as ``started``)
+    died without a word: ``SIGKILL``, the OOM killer, the stop timeout's ``SIGKILL``, or an exception the unit did not
+    catch. Until ``launch`` folds it into the state, it counts here as one more escape from ``applying`` on, and one
+    more attempt before. A state from before ``started`` (batch 1's) counts every launch as checked in."""
+    launches = run.get("launches", 0)
+    started = run.get("started", launches)
+    silent = run.get("ended", started) < started
+    changing = run.get("phase") in CHANGING
+    return (launches - started, run.get("attempt", 0) + int(silent and not changing),
+            run.get("escapes", 0) + int(silent and changing))
+
+
+def _dead(run: Dict[str, Any]) -> bool:
+    """Whether the run's units keep dying: ``MAX_ATTEMPTS`` launches never checked in, ``MAX_ATTEMPTS`` attempts
+    before the change, or ``MAX_ATTEMPTS`` escapes from ``applying`` on (``_deaths``). Only once no deploy unit is
+    active: until a launched unit has ended, a launch may still check in or end. A third attempt the unit records
+    itself ends the run, so only deaths without a word leave a state that dies by its attempts."""
+    return max(_deaths(run)) >= MAX_ATTEMPTS
+
+
 def queued_runs() -> List[Tuple[str, Dict[str, Any]]]:
-    """The runs with work to do, as (task, state), in launch order: reviewed runs by when they were queued, then
-    GitHub's main."""
+    """The runs with work to do, as (task, state), in launch order: runs past ``landed``, to resume, then reviewed
+    runs by when they were queued, then GitHub's main."""
     runs = []
     for path in RUNS_DIR.glob("*/deploy-state.json"):
         run = _read_json(path)
         if run is not None:
             runs.append((path.parent.name, run))
-    return sorted(runs, key=lambda item: (item[0] == MAIN, item[1].get("queued_at", "")))
+    return sorted(runs, key=lambda item: (item[1].get("phase") not in CHANGING, item[0] == MAIN,
+                                          item[1].get("queued_at", "")))
 
 
-def gate(host: "Host") -> Optional[str]:
-    """Why no deploy unit may start now, or None when the gate is open: no deploy unit runs, nothing holds the
-    code-reload lock and no user task is active, by the strict count."""
+def gate(host: "Host") -> Optional[Tuple[str, bool]]:
+    """Why no deploy unit may start now and whether Aura is busy, or None when the gate is open: no deploy unit runs,
+    nothing holds the code-reload lock and no user task is active, by the strict count. Only active user tasks make
+    Aura busy; a count that fails closes the gate too, but usually means the database is down."""
     if host.deploy_units():
-        return "a deploy unit is running"
+        return "a deploy unit is running", False
     if host.reload_lock_held():
-        return "the code-reload lock is held"
+        return "the code-reload lock is held", False
     try:
         active = host.active_user_tasks()
     except Exception as exc:
-        return f"the idle count failed: {exc}"
+        return f"the idle count failed: {exc}", False
     if active > 0:
-        return f"{active} active user task(s)"
+        return f"{active} active user task(s)", True
     return None
 
 
@@ -357,19 +457,26 @@ def launch(task: str, *, postpone: bool = False, live: Path) -> str:
     """Start the run's detached root unit, which outlives worker restarts, including its own; the unit started.
 
     The launch is counted in the run's state first; a failed start puts the state back, so the run stays queued. A
-    run keeps one log: its first launch starts it empty, and every later launch of the run appends to it.
+    run keeps one log: its first launch starts it empty, and every later launch of the run appends to it. Whatever
+    ends the unit, its ``ExecStopPost=`` starts the units its window left stopped (``stop_post_command``).
     """
     path, state = spec_file(task), state_file(task)
     run = json.loads(state.read_text())
     unit = f"aura-deploy-{task}"
     log = f"{'append' if run.get('launches') else 'truncate'}:{path.with_name('deploy.log')}"
     props = [f"RuntimeMaxSec={DEPLOY_UNIT_MAX_SEC}", f"StandardOutput={log}", "StandardError=inherit",
-             f"Environment=PYTHONPATH={live}", "EnvironmentFile=-/etc/rmp/rmp.env", "EnvironmentFile=-/etc/openclaw/openclaw.env"]
+             f"Environment=PYTHONPATH={live}", "EnvironmentFile=-/etc/rmp/rmp.env",
+             "EnvironmentFile=-/etc/openclaw/openclaw.env", f"ExecStopPost={stop_post_command(path.parent)}"]
     argv = ["systemd-run", f"--unit={unit}", f"--working-directory={live}", "--collect", "--quiet",
             *[f"--property={prop}" for prop in props], "--",
             str(live / "venv" / "bin" / "python"), str(live / "ops" / "coding_deploy.py"), str(path),
             *(["--postpone"] if postpone else [])]
-    write_json(state, {**run, "launches": run.get("launches", 0) + 1})
+    # A state from before ``started`` gets it here, in the write that counts the launch, so its later launches count;
+    # a launch that died without a word after it checked in is folded in as an attempt or an escape (``_deaths``).
+    started = run.get("started", run.get("launches", 0))
+    _, attempt, escapes = _deaths(run)
+    write_json(state, {**run, "launches": run.get("launches", 0) + 1, "started": started, "ended": started,
+                       "attempt": attempt, "escapes": escapes})
     try:
         subprocess.run(argv, check=True, capture_output=True, timeout=60)
     except Exception:
@@ -382,8 +489,11 @@ def next_deploy(host: "Host") -> Optional[str]:
     """The launcher: start the unit of the first queued run when the gate is open; the unit started, or None.
 
     It runs under ``RUNS_DIR/.launch.lock``, so the worker's hand-off and the API's reconciler never launch two units
-    at once: when the other holds it, the reconciler's next pass launches. A run queued for ``IDLE_WAIT_SEC`` is
-    launched without the gate, to record ``postponed``. A host without ``RUNS_DIR`` yet has no queued run: None.
+    at once: when the other holds it, the reconciler's next pass launches. Dead runs (``_dead``) are skipped, and a
+    dead run in a phase from ``applying`` on launches nothing at all: the host may be mid-change. A run still
+    ``queued`` or ``landed`` ``IDLE_WAIT_SEC`` after it was queued is launched to record ``postponed``, only when Aura
+    is busy; one waiting behind another deploy unit, the code-reload lock or a failed count waits on. A host without
+    ``RUNS_DIR`` yet has no queued run: None.
     """
     if not RUNS_DIR.is_dir():
         return None
@@ -396,19 +506,119 @@ def next_deploy(host: "Host") -> Optional[str]:
         if host.deploy_units():
             return None
         runs = queued_runs()
+        stuck = [task for task, run in runs if _dead(run) and run.get("phase") in CHANGING]
+        if stuck:
+            logger.debug("Nothing deploys while the run of %s is dead mid-change", stuck[0])
+            return None
+        runs = [(task, run) for task, run in runs if not _dead(run)]
         if not runs:
             return None
         task, run = runs[0]
-        waited = datetime.now(timezone.utc) - datetime.fromisoformat(run["queued_at"])
-        if run["phase"] in ("queued", "landed") and waited.total_seconds() >= IDLE_WAIT_SEC:
-            return launch(task, postpone=True, live=host.live)
-        reason = gate(host)
-        if reason is None:
+        closed = gate(host)
+        if closed is None:
             return launch(task, live=host.live)
+        reason, busy = closed
+        waited = datetime.now(timezone.utc) - datetime.fromisoformat(run["queued_at"])
+        if busy and run["phase"] in ("queued", "landed") and waited.total_seconds() >= IDLE_WAIT_SEC:
+            return launch(task, postpone=True, live=host.live)
         logger.debug("The deploy of %s waits: %s", task, reason)
         return None
     finally:
         os.close(fd)
+
+
+def end_dead_runs(host: "Host") -> List[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """End the dead runs, under the launch lock and only while no deploy unit runs; (task, spec, result) for each
+    to report, nothing when the lock is held or a unit runs.
+
+    A dead run still ``queued`` or ``landed`` changed nothing: it ends ``failed`` (its unit ended before it started,
+    or before it finished), with ``result.json`` written and its state removed. One in a phase from ``applying`` on
+    may have left the host mid-change, and its state holds the only record of ``old``: it is kept, with
+    ``dead_noted``, and reported ``stuck`` once; nothing else deploys until it is resumed by hand (specs/WP-09.md §0),
+    and whoever does that removes its state."""
+    if not RUNS_DIR.is_dir():
+        return []
+    fd = os.open(RUNS_DIR / ".launch.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return []
+        if host.deploy_units():
+            return []
+        ended = []
+        for task, run in queued_runs():
+            if not _dead(run) or run.get("dead_noted"):
+                continue
+            spec = _read_json(spec_file(task)) or {}
+            source, log = _source(task, spec), spec_file(task).with_name("deploy.log")
+            if run.get("phase") in CHANGING:
+                now = _git(host.live, "rev-parse", "refs/heads/main").strip()
+                result = {"status": "stuck", "source": source, "head": spec.get("head"),
+                          "summary": f"The deploy unit ended {MAX_ATTEMPTS} times in phase {run['phase']} with the "
+                          f"live main at {now[:12]}, moved from {run['old'][:12]} and not verified (see {log}); "
+                          "nothing else deploys until it is resumed by hand (specs/WP-09.md §0)."}
+                write_json(state_file(task), {**run, "dead_noted": True})
+            else:
+                how = "started" if _deaths(run)[0] >= MAX_ATTEMPTS else "finished"
+                summary = (f"The deploy unit ended {MAX_ATTEMPTS} times before it {how} (see {log}), so nothing was "
+                           "deployed; main is unchanged.")
+                if run.get("phase") == "landed":
+                    summary += " GitHub's main has the change; it goes live with GitHub's main."
+                result = {"status": "failed", "source": source, "head": spec.get("head"), "ci": spec.get("ci"),
+                          "summary": summary}
+                write_json(spec_file(task).with_name("result.json"), result)
+                state_file(task).unlink()
+            logger.error("The deploy run of %s is dead: %s", task, result["summary"])
+            ended.append((task, spec, result))
+        return ended
+    finally:
+        os.close(fd)
+
+
+def abort_run(task_id: str) -> str:
+    """Abort a deploy run by hand, as root:
+    ``/root/.openclaw/rmp/venv/bin/python -c 'from app.coding import deploy; print(deploy.abort_run("<task>"))'``.
+
+    Under the launch lock, taken blocking so it waits out a launch, it stops the run's unit, then reads its phase. A
+    run still ``queued`` or ``landed`` has changed nothing: it ends ``failed`` in ``result.json`` and its state is
+    removed; for GitHub's main, ``NOT_RETRIED`` then keeps the watcher from queueing that head again. A run in a later
+    phase keeps its state, and the next idle pass resumes it. What it did, in a sentence."""
+    if not RUNS_DIR.is_dir():
+        return f"There is no deploy run of {task_id}; nothing was done."
+    fd = os.open(RUNS_DIR / ".launch.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        before = _read_json(state_file(task_id))
+        # A unit that is not loaded makes systemctl fail; there is nothing to stop then.
+        subprocess.run(["systemctl", "stop", f"aura-deploy-{task_id}"], capture_output=True, timeout=300)
+        run = _read_json(state_file(task_id))
+        if run is None and before is not None:
+            # The unit's own end on the stop's SIGTERM recorded a result (its last attempt).
+            ended = _read_json(spec_file(task_id).with_name("result.json")) or {}
+            return (f"Stopped aura-deploy-{task_id}; the stop ended the run: {ended.get('status')}: "
+                    f"{ended.get('summary')}")
+        if run is None:
+            return f"The deploy of {task_id} has no run with work to do; nothing else was done."
+        phase = run.get("phase")
+        if phase in CHANGING:
+            return (f"The deploy of {task_id} is in phase {phase}, past the change, so its state is kept; the next "
+                    "idle pass resumes it.")
+        spec = _read_json(spec_file(task_id)) or {}
+        summary = "Aborted by hand; nothing was deployed; main is unchanged."
+        if phase == "landed":
+            summary += " GitHub's main has the change; it goes live with GitHub's main."
+        write_json(spec_file(task_id).with_name("result.json"),
+                   {"status": "failed", "source": _source(task_id, spec), "head": spec.get("head"), "summary": summary})
+        state_file(task_id).unlink()
+        return f"Aborted the deploy of {task_id} in phase {phase}: it is recorded failed, and its state is removed."
+    finally:
+        os.close(fd)
+
+
+def _source(task_id: str, spec: Dict[str, Any]) -> str:
+    """Where the run's change comes from, also for a spec that cannot be read."""
+    return spec.get("source") or ("github" if task_id == MAIN else "reviewed")
 
 
 def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
@@ -536,6 +746,11 @@ class Host:
 
         self.live = live
         self.repo = repo or get_coding_config()["repositories"]["rmp"]["remote"]
+        self.born = time.monotonic()
+
+    def elapsed(self) -> float:
+        """Seconds since this host was made, at the deploy unit's start."""
+        return time.monotonic() - self.born
 
     def active_user_tasks(self) -> int:
         from app.production.canary_sentinel import count_active_user_tasks_sync
@@ -543,9 +758,11 @@ class Host:
         return count_active_user_tasks_sync(strict=True)
 
     def deploy_units(self) -> List[str]:
-        """The deploy units active or starting now."""
-        out = subprocess.run(["systemctl", "list-units", "--plain", "--no-legend", "--state=active,activating",
-                              "aura-deploy-*"], check=True, capture_output=True, text=True, timeout=60).stdout
+        """The deploy units running now: active, starting, or stopping (a unit in its ``SIGTERM`` handler or its
+        ``ExecStopPost=`` still runs, and its run is left alone until it has ended)."""
+        out = subprocess.run(["systemctl", "list-units", "--plain", "--no-legend",
+                              "--state=active,activating,deactivating", "aura-deploy-*"],
+                             check=True, capture_output=True, text=True, timeout=60).stdout
         return [line.split()[0] for line in out.splitlines() if line.strip()]
 
     def reload_lock_held(self) -> bool:
@@ -558,6 +775,27 @@ class Host:
         finally:
             os.close(fd)
         return False
+
+    @contextmanager
+    def hold(self, lock: Path, wait_sec: float) -> Iterator[bool]:
+        """Hold the lock file ``lock`` for the ``with`` block, trying every ``LOCK_POLL_SEC`` for up to ``wait_sec``;
+        whether it was taken."""
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            deadline = time.monotonic() + wait_sec
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        yield False
+                        return
+                    time.sleep(min(LOCK_POLL_SEC, left))
+            yield True
+        finally:
+            os.close(fd)
 
     def systemctl(self, *args: str) -> None:
         subprocess.run(["systemctl", *args], check=True, capture_output=True, timeout=300)
@@ -590,40 +828,159 @@ class Host:
         return deploy_checks.run(self.live, restarted, baseline)
 
 
-def _apply(host: Host, old: str, new: str, changed: List[Tuple[str, str]]) -> List[str]:
-    """Reconcile every mirror to ``new``, install requirements and restart what changed between two commits or what the
-    reconcile wrote; the services restarted."""
-    paths = [path for _, path in changed]
-    written = []
-    for prefix, target in MIRRORS:
-        written += reconcile(host.live, new, changed, prefix, target)
-    if "requirements.txt" in paths:
-        host.pip_install()
-    services = restarts_for(paths + written)
-    if services:
-        host.systemctl("restart", *services)
-    return services
-
-
-def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] = print) -> Optional[Dict[str, Any]]:
-    """The deploy unit's work, once it holds the code-reload lock. Returns the result to record, or None when a user
-    task is active or the idle count fails: the run then stays queued, and the launcher's next pass tries again.
-
-    ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
-    approved ``head`` lands through a pull request first, the run's state records the merge commit (``landed``), and
-    exactly that commit is deployed once CI's test check passed on it.
-    """
-    live = host.live
+def _idle(host: Host, log: Callable[[str], None]) -> bool:
+    """Whether no user task is active by the strict count; a count above 0, or one that fails, is logged as waiting."""
     try:
         active = host.active_user_tasks()
     except Exception as exc:
         log(f"waiting: the idle count failed ({str(exc)[:300]})")
-        return None
+        return False
     if active > 0:
         log(f"waiting: {active} active user task(s)")
-        return None
+        return False
+    return True
+
+
+def _affected(live: Path, head: str, changed: List[Tuple[str, str]]) -> List[str]:
+    """The units a switch to ``head`` stops and starts: those of the changed paths and of the mirror files the
+    reconcile will write, found before anything is written."""
+    stale = [path for prefix, target in MIRRORS for _, _, path, _ in _out_of_date(live, head, prefix, target)]
+    return restarts_for([path for _, path in changed] + stale)
+
+
+def _list_stopped(task: str, units: List[str]) -> None:
+    """Write the units a window is about to stop, atomically, for the unit's ``ExecStopPost=``."""
+    path = stopped_file(task)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text("".join(f"{unit}\n" for unit in units))
+    os.replace(tmp, path)
+
+
+def _start_again(host: Host, task: str, units: List[str], log: Callable[[str], None]) -> None:
+    """Start units a window stopped, outside its normal course; once they started the list of stopped units goes. A
+    failure here is logged, so the failure that brought the run here is the one handled, and the list stays for the
+    unit's ``ExecStopPost=``."""
+    if not units:
+        return
+    try:
+        host.systemctl("start", *units)
+    except Exception as exc:
+        log(f"starting {', '.join(units)} again failed: {exc}")
+        return
+    log(f"started {', '.join(units)} again")
+    stopped_file(task).unlink(missing_ok=True)
+
+
+def _save(task: str, run: Dict[str, Any], **fields: Any) -> None:
+    """Update the run with ``fields`` and write its state, atomically, while the state exists. A missing state means
+    the run was ended (``end_dead_runs``) or aborted (``abort_run``, by hand) and is never recreated: a recreated state
+    would make the launcher relaunch a run someone ended. A deploy called without a queued run (a test's direct call)
+    keeps its state in memory only."""
+    run.update(fields)
+    path = state_file(task)
+    if path.exists():
+        write_json(path, run)
+
+
+def _before_applying(run: Dict[str, Any]) -> str:
+    """The phase a run had before ``applying``: a reviewed run had landed its pull request."""
+    return "landed" if run.get("merge") else "queued"
+
+
+def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Callable[[str], None]) -> Optional[str]:
+    """The switch window: the tree, the mirrors and the requirements change only while the affected units are stopped.
+
+    Forward, ``rmp-api`` stops first, so its graceful stop finishes the requests in flight against the running worker;
+    while the tree is still at ``old``, the strict count is then taken again before the other units stop, and a task
+    created while the API drained starts it again, puts the run back in its phase before ``applying`` and returns None
+    (waiting). Then the tree moves (``merged``): forward to ``head``, back to the recorded revert commit. The mirrors
+    are reconciled, the requirements installed and the units started in one call (``restarted``, forward). Back, both
+    counts are skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units
+    are started before the window is left; a failure while the live main, read again then, is still at ``old`` also
+    puts the run back in its phase before ``applying``. While units are stopped, ``stopped_file`` lists them, so the
+    unit's ``ExecStopPost=`` starts them after a kill that runs no Python. The commit the tree is at.
+    """
+    live, units, forward = host.live, run["affected"], direction == "forward"
+    target = run["head"] if forward else run["revert"]
+    try:
+        before = _live_main(live)
+        if units:
+            _list_stopped(task, units)
+        if "rmp-api" in units:
+            host.systemctl("stop", "rmp-api")
+            log("stopped rmp-api")
+            if forward and before == run["old"] and not _idle(host, log):
+                host.systemctl("start", "rmp-api")
+                log("started rmp-api again")
+                stopped_file(task).unlink(missing_ok=True)
+                _save(task, run, phase=_before_applying(run))
+                return None
+        others = [unit for unit in units if unit != "rmp-api"]
+        if others:
+            host.systemctl("stop", *others)
+            log(f"stopped {', '.join(others)}")
+        if before != target:
+            _git(live, "merge", "--ff-only", "--quiet", target)
+            log(f"main moved {before[:12]}..{target[:12]}")
+        if forward:
+            _save(task, run, phase="merged")
+        changed = changes(live, run["old"] if forward else run["head"], target)
+        for prefix, mirror in MIRRORS:
+            reconcile(live, target, changed, prefix, mirror)
+        if "requirements.txt" in [path for _, path in changed]:
+            host.pip_install()
+        if units:
+            host.systemctl("start", *units)
+            log(f"started {', '.join(units)}")
+            stopped_file(task).unlink(missing_ok=True)
+        if forward:
+            _save(task, run, phase="restarted")
+    except BaseException:
+        _start_again(host, task, units, log)
+        if forward and _still_at_old(live, run):
+            _save(task, run, phase=_before_applying(run))
+        raise
+    return target
+
+
+def _live_main(live: Path) -> str:
+    return _git(live, "rev-parse", "refs/heads/main").strip()
+
+
+def _still_at_old(live: Path, run: Dict[str, Any]) -> bool:
+    """Whether the live main is still at the run's ``old``, read again after a failure, whatever the failure
+    interrupted; False when it cannot be read: the run then keeps its phase, and its resume reads the live main."""
+    try:
+        return _live_main(live) == run["old"]
+    except Exception:
+        return False
+
+
+def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] = print) -> Optional[Dict[str, Any]]:
+    """The deploy unit's work. Returns the result to record, or None while the run waits: the code-reload lock stayed
+    held, less than ``APPLY_RESERVE_SEC`` of the unit's time is left, or a user task was active (or the idle count
+    failed) at the final check; the run then keeps its state, and the launcher's next pass tries again.
+
+    ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
+    approved ``head`` lands through a pull request first, the run's state records the merge commit (``landed``), and
+    exactly that commit is deployed once CI's test check passed on it. That slow work runs first, without the lock.
+    Then, holding the code-reload lock: the hand-edit check, the readiness baseline and, last before the units stop,
+    the strict idle count; then ``applying`` and the switch window (``_switch``), the checks, and on failure the revert
+    window. A run whose state is past ``landed`` was killed during or after its change: it resumes from its phase
+    (``_resume``) and runs no step before the change.
+    """
+    task, live = spec["task_id"], host.live
+    run = _read_json(state_file(task))
+    if run is not None and run.get("phase") in CHANGING:
+        with host.hold(CODE_RELOAD_LOCK, LOCK_WAIT_SEC) as held:
+            if not held:
+                log(f"waiting: {CODE_RELOAD_LOCK} stayed held for {LOCK_WAIT_SEC} s; the run keeps its phase")
+                return None
+            log(f"holding {CODE_RELOAD_LOCK}")
+            return _resume(host, task, run, log)
+    run = run or {}
     old = _git(live, "rev-parse", "refs/heads/main").strip()
-    landed = None
     if spec.get("source") == "github":
         host.fetch_main()
         head = spec["head"]
@@ -639,58 +996,117 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         blocked = _drift(live, old)
         if blocked:
             return blocked
-        state = state_file(spec["task_id"])
-        run = _read_json(state)
-        if run is not None and run.get("phase") == "landed":
-            landed = {"status": "merged", "pr": run["pr"], "merge": run["merge"]}
-        else:
+        if run.get("phase") != "landed":
             landed = host.land(spec["head"], spec["branch"], spec["title"], spec["body"], "squash")
             if landed["status"] != "merged":
                 return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on {landed['pr']['url']} "
                         f"is {landed['check']}, so nothing was deployed; main is unchanged."}
-            if run is not None:
-                write_json(state, {**run, "phase": "landed", "pr": landed["pr"], "merge": landed["merge"]})
-        head = landed["merge"]
-        log(f"landed {landed['pr']['url']} as {head[:12]}")
+            _save(task, run, phase="landed", pr=landed["pr"], merge=landed["merge"])
+        head = run["merge"]
+        log(f"landed {run['pr']['url']} as {head[:12]}")
         host.fetch_main()
         check = host.wait_check(head)
         if check != "success":
-            return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on the merged commit "
+            return {"status": "blocked", "pr": run["pr"], "summary": f"CI's test check on the merged commit "
                     f"{head[:12]} is {check}, so nothing was deployed here; main is unchanged. GitHub's main has the "
                     "change; it goes live with GitHub's main once CI passes on a later commit."}
-    changed = changes(live, old, head)
-    blocked = _drift(live, old)
-    if blocked:
-        return blocked
-    baseline = host.readiness_baseline()
-    _git(live, "merge", "--ff-only", "--quiet", head)
-    log(f"main fast-forwarded {old[:12]}..{head[:12]}")
-    restarted = restarts_for(path for _, path in changed)
+    with host.hold(CODE_RELOAD_LOCK, LOCK_WAIT_SEC) as held:
+        if not held:
+            log(f"waiting: {CODE_RELOAD_LOCK} stayed held for {LOCK_WAIT_SEC} s; the run keeps its phase")
+            return None
+        log(f"holding {CODE_RELOAD_LOCK}")
+        changed = changes(live, old, head)
+        baseline = host.readiness_baseline()
+        # After the baseline, which can take a minute and a half: a hand edit made meanwhile still blocks.
+        blocked = _drift(live, old)
+        if blocked:
+            return blocked
+        run.update(old=old, head=head, affected=_affected(live, head, changed), baseline=baseline)
+        return _apply_when_idle(host, task, run, log)
+
+
+def _apply_when_idle(host: Host, task: str, run: Dict[str, Any],
+                     log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
+    """From the time reserve on: the reserve, the final strict count, ``applying``, then the change. A resumed run
+    still at ``old`` that waits here goes back to its phase before ``applying``, like a run that never reached it."""
+    reserved = host.elapsed() <= DEPLOY_UNIT_MAX_SEC - APPLY_RESERVE_SEC
+    if not reserved:
+        log(f"waiting: less than {APPLY_RESERVE_SEC // 60} min of the unit's {DEPLOY_UNIT_MAX_SEC // 3600} h are left "
+            "for the change")
+    if not reserved or not _idle(host, log):
+        if run.get("phase") == "applying":
+            _save(task, run, phase=_before_applying(run))
+        return None
+    _save(task, run, phase="applying")
+    return _change(host, task, run, log)
+
+
+def _resume(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
+    """Continue a run killed during or after its change, from its phase and the live main, with the ``old``,
+    ``head``, units and baseline its state recorded; no step before the change runs again."""
+    phase, now = run["phase"], _git(host.live, "rev-parse", "refs/heads/main").strip()
+    log(f"resuming from phase {phase}, the live main at {now[:12]}")
+    if phase == "applying" and now == run["old"]:
+        if run["affected"]:
+            host.systemctl("start", *run["affected"])
+            log(f"started {', '.join(run['affected'])}")
+            stopped_file(task).unlink(missing_ok=True)
+        return _apply_when_idle(host, task, run, log)
+    if phase in ("applying", "merged", "restarted") and now == run["head"]:
+        return _change(host, task, run, log)
+    if phase == "reverting" and now in (run["head"], run.get("revert")):
+        return _rollback(host, task, run, log)
+    _start_again(host, task, run["affected"], log)
+    return {"status": "failed",
+            "summary": f"The live main is {now[:12]}, which this deploy did not make; please check it."}
+
+
+def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
+    """The switch window (unless the run restarted its units already), then the checks: the result, or None while the
+    API's drain found a task. A failure once the tree moved is a rollback; one before it is raised."""
     try:
-        restarted = _apply(host, old, head, changed)
-        log(f"restarted {restarted or 'nothing'}")
-        checked = host.checks(restarted, baseline)
+        if run["phase"] != "restarted" and _switch(host, task, run, "forward", log) is None:
+            return None
+        checked = host.checks(run["affected"], run["baseline"])
     except Exception as exc:
+        # A rollback only once the tree moved, by the live main; a main that cannot be read raises, and the run's
+        # resume reads it.
+        if run["phase"] not in CHANGING or _live_main(host.live) == run["old"]:
+            raise
         checked = {"failure": f"applying the change failed ({str(exc)[:300]})", "canary": None}
     failure = checked["failure"]
-    shipped = {"old": old, "head": head, "restarted": restarted, "commits": _subjects(live, old, head),
-               **({"pr": landed["pr"]} if landed else {})}
-    if failure is None:
-        canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
-        units = sorted(path[len(UNIT_DIR):] for _, path in changed if path.startswith(UNIT_DIR))
-        installs = (f" Files under {UNIT_DIR} changed ({', '.join(units)}): the deploy does not install them; an "
-                    "operator reviews them, runs ops/install_units.py, then --apply --head with the sha it printed, in "
-                    "an idle window." if units else "")
-        return {"status": "deployed", **shipped, "canary": checked["canary"], "units": units,
-                "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
-                f"readiness passed and {canary}.{installs}"}
-    log(f"verification failed: {failure}; reverting")
-    _git(live, "revert", "--no-edit", "--no-commit", f"{old}..{head}")
-    _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit", "--quiet",
-         "-m", f"Revert {head[:12]}: the deploy's checks failed ({failure[:200]})")
-    revert = _git(live, "rev-parse", "HEAD").strip()
-    _apply(host, head, revert, changes(live, head, revert))
-    still = host.checks(restarted, baseline)["failure"]
+    if failure is not None:
+        log(f"verification failed: {failure}; reverting")
+        _save(task, run, phase="reverting", failure=failure)
+        return _rollback(host, task, run, log)
+    old, head, restarted = run["old"], run["head"], run["affected"]
+    canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
+    units = sorted(path[len(UNIT_DIR):] for _, path in changes(host.live, old, head) if path.startswith(UNIT_DIR))
+    installs = (f" Files under {UNIT_DIR} changed ({', '.join(units)}): the deploy does not install them; an "
+                "operator reviews them, runs ops/install_units.py, then --apply --head with the sha it printed, in "
+                "an idle window." if units else "")
+    return {"status": "deployed", **_shipped(host, run), "canary": checked["canary"], "units": units,
+            "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
+            f"readiness passed and {canary}.{installs}"}
+
+
+def _shipped(host: Host, run: Dict[str, Any]) -> Dict[str, Any]:
+    return {"old": run["old"], "head": run["head"], "restarted": run["affected"],
+            "commits": _subjects(host.live, run["old"], run["head"]), **({"pr": run["pr"]} if run.get("pr") else {})}
+
+
+def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], None]) -> Dict[str, Any]:
+    """The revert window, the re-check and the revert's pull request. The revert commit (the tree of ``old`` on top
+    of ``head``) is made and recorded before the tree moves to it, so a resumed rollback finds it and moves the tree
+    there, or finds the tree moved already."""
+    live, head, failure, restarted = host.live, run["head"], run["failure"], run["affected"]
+    if not run.get("revert"):
+        revert = _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
+                      f"{run['old']}^{{tree}}", "-p", head, "-m",
+                      f"Revert {head[:12]}: the deploy's checks failed ({failure[:200]})").strip()
+        _save(task, run, revert=revert)
+    revert = _switch(host, task, run, "back", log)
+    still = host.checks(restarted, run["baseline"])["failure"]
     published = _publish_revert(host, revert, head, failure, log)
     health = "Aura is healthy again" if still is None else f"the checks still fail: {still}"
     if published["status"] == "merged":
@@ -699,7 +1115,7 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         github_now = f"on GitHub the revert waits in {published['pr']['url']} (its test check is {published['check']})"
     else:
         github_now = f"the revert is not on GitHub yet ({published['error']})"
-    return {"status": "rolled_back", **shipped, "revert": revert, "revert_pr": published, "error": failure,
+    return {"status": "rolled_back", **_shipped(host, run), "revert": revert, "revert_pr": published, "error": failure,
             "summary": f"Deploying {head[:12]} failed its checks ({failure}), so I reverted main ({revert[:12]}) and restarted "
             f"{', '.join(restarted) or 'nothing'}; {health}; {github_now}."}
 

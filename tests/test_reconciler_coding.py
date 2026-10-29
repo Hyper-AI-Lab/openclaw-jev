@@ -117,6 +117,22 @@ async def test_a_deploying_task_belongs_to_its_deploy_unit_until_it_reports_back
     assert "deploy never reported back" in notify.await_args.args[1]
 
 
+async def test_a_deploying_task_whose_run_still_waits_is_not_closed(factory, tmp_path, monkeypatch):
+    from app.coding import deploy
+
+    monkeypatch.setattr(deploy, "RUNS_DIR", tmp_path / "runs")
+    deploy.queue({"task_id": "t1", "old": "b" * 40, "head": "c" * 40})
+    client = _client(WorkflowExecutionStatus.COMPLETED)
+    with patch.object(reconciler, "runner_unit_active", return_value=False):
+        closed, stop, notify, states, events = await _close(client, factory, status="deploying", minutes=300)
+        assert closed == [] and states == ("deploying", "running") and notify.await_count == 0 and events == []
+
+        deploy.state_file("t1").unlink()
+        closed, stop, notify, states, events = await _close(client, factory, status="deploying", minutes=300)
+    assert closed == ["t1"] and states[0] == "failed"
+    assert "deploy never reported back" in notify.await_args.args[1]
+
+
 async def test_a_coding_task_that_finished_meanwhile_is_left_as_it_ended(factory, caplog):
     """The workflow's own close lands while the reconciler looks for it: the reconciler's failure is refused, and it
     sends no notice and records no closing."""
