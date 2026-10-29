@@ -872,8 +872,10 @@ def _start_again(host: Host, task: str, units: List[str], log: Callable[[str], N
 
 
 def _save(task: str, run: Dict[str, Any], **fields: Any) -> None:
-    """Update the run with ``fields`` and write its state, atomically. A deploy called without a queued run (a test's
-    direct call) keeps its state in memory only."""
+    """Update the run with ``fields`` and write its state, atomically, while the state exists. A missing state means
+    the run was ended (``end_dead_runs``) or aborted (``abort_run``, by hand) and is never recreated: a recreated state
+    would make the launcher relaunch a run someone ended. A deploy called without a queued run (a test's direct call)
+    keeps its state in memory only."""
     run.update(fields)
     path = state_file(task)
     if path.exists():

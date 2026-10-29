@@ -2223,3 +2223,18 @@ def test_a_kill_right_after_a_death_is_counted_counts_it_once(repos, systemd_run
         unit.main(str(deploy.spec_file(deploy.MAIN)))
     assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
     assert state(deploy.MAIN)[counted] == 1 and state(deploy.MAIN)["escapes" if counted == "attempt" else "attempt"] == 0
+
+
+def test_a_removed_run_state_is_never_recreated(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+
+    class AbortedWhileLanding(FakeHost):
+        """The run's state is removed while the unit lands, as an end or an abort by hand would."""
+
+        def land(self, commit_sha, branch, title, body, method):
+            deploy.state_file("t1").unlink()
+            return super().land(commit_sha, branch, title, body, method)
+
+    result = deploy.self_deploy(reviewed(repos, head=head), AbortedWhileLanding(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed" and not deploy.state_file("t1").exists()
