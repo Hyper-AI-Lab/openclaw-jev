@@ -3241,3 +3241,281 @@ Every layout ended `verify: exit 0` (logs: `/root/.cache/wp09-b1-verify-4922383/
 `git diff 0c30187 -- app/workflows requirements.txt` is empty, so no label is needed.
 
 **Next:** mirror this log into the docs, then the PR (body: `/root/.cache/pr-wp09-b1.md`), the gated merge and the deploy. This PR ships through batch 0's deploy code, so its own deploy is the old path. The host step for batch 1 is read on the **next** programme PR's deploy.
+
+## 2026-10-28 05:40 UTC · WP-09 batch 1: PR opened, gated merge running
+
+**PR:** https://github.com/Hyper-AI-Lab/openclaw-jev/pull/49, head `512a7e6`. The commit after `4922383` adds the docs mirror only.
+
+**Gated job `bu1lae89x`:**
+1. Waits for CI's checks.
+2. Merges only when all of these hold:
+   - the PR is CLEAN;
+   - the latest `test` run succeeded;
+   - the PR head is the local head;
+   - `origin/main` is `0c30187`;
+   - this is the only open PR.
+3. Squash-merges.
+4. Waits up to 2.5 h for `result.json` on the merge commit, since the old code waits for idle up to 2 h.
+5. Reads the worker journal for nondeterminism.
+
+The app's PR tools timed out (hook unreachable), so the job reads CI through `aura-github`, as Kirill asked.
+
+## 2026-10-28 05:28 UTC · WP-09 batch 1 deployed
+
+**Correction to the two entries above.** Their times (05:30 and 05:40) were estimates, and wrong: by `date -u`, the verify ended at about 05:00 and the PR opened at about 05:03.
+
+**Merged:** PR #49, squash `200cb65`. The gate passed: CLEAN, latest `test` run `success`, PR head = local `512a7e6`, base `0c30187`, one open PR.
+
+**Deployed** through the old deploy code, at 05:26Z:
+- `result.json`: `deployed`, head `200cb65`;
+- restarted `rmp-api` and `rmp-worker`;
+- health, readiness and the canary passed; `units: []`; CI `success`;
+- nondeterminism lines in the worker journal: 0.
+
+**Afterwards:**
+- the live checkout is at `200cb65`, and both services are active;
+- the new launcher ran: `runs/.launch.lock` was created at the first reconciler pass;
+- no `deploy-state.json` exists, so the old runs launch nothing;
+- no `aura-deploy-*` unit is active;
+- `rmp-api`'s journal since the restart has no "Watching GitHub's main failed", error or traceback;
+- `/health` returns ok.
+
+**Ledger** (WP-09 §7, after batch 1), closed by PR #49:
+- `B4-coding-R7` and `coding-R7`;
+- `B4-flow-direct-claude-session-R10` and its seed;
+- `B4-flow-direct-claude-session-R13` and its seed.
+
+**Batch 1's host step**, "the next programme PR's deploy is queued, launched within a minute of idle, with one log", is read on batch 2's deploy, the next programme PR.
+
+**Next:** WP-09 batch 2, from `200cb65`: WP09-05 to WP09-10, plus §9 amendments 1-3.
+
+**Correction to the correction.** These are the times from the file and GitHub records:
+
+| Event | Time (UTC) |
+|---|---|
+| Verify ended | 05:13:59 |
+| Docs commit | 05:14:38 |
+| PR #49 opened | 05:15:08 |
+| PR #49 merged | 05:20:38 |
+| Deployed | 05:26:14 |
+
+From now on, entry times are taken from `date -u` when the entry is written.
+
+## 2026-10-28 05:37 UTC · WP-09 batch 2 started
+
+**Branch:** `aura/wp-09-2-switch` from `200cb65`, in `/root/work/wp-01`.
+
+**Scope:** items WP09-05 to WP09-10, plus §9 amendments 1-3 and WP09-33's lines for this batch.
+
+**Pipeline:** the Workflow tool's hook timed out again, so this batch uses the manual pipeline. The prompts were rendered to `/root/.cache/wp-batch-manual/wp09-b2/`, and the implementer runs as a background agent. The implementer was told to commit after each item, so that a usage-limit interruption leaves usable work.
+
+**Host steps of this batch:**
+- before the merge: WP09-06's `ExecStopPost=` probe prints 0;
+- this batch's own deploy, which runs batch 1's code, is also batch 1's host step and must end `deployed` (§9 amendment 3.1);
+- after: the next deploy's log shows stop → move → start.
+
+## 2026-10-28 15:45 UTC · WP-04 batch 4: 24-hour sentinel check; WP-09 batch 2 resumed after the usage limit
+
+**Sentinel since the WP-04 batch 4 deploy (2026-10-27 15:30Z):**
+- 22 runs;
+- 0 "never awaited" lines;
+- 0 abort or SIGABRT/134 lines.
+
+The one cached Temporal client per process and the async cancel (WP04-20 to WP04-23) left no un-awaited coroutine in the sentinel over 24 h. **PASS.**
+
+**WP-09 batch 2:** the implementer hit the session limit (reset 09:00Z) after 16 commits (`d29992a` to `d86143d`), with the default layout passed. The tree is clean. Sent it a message to continue with the coding-job, direct and live layouts and then report.
+
+**Sentinel follow-up (15:46 UTC).** The unit itself failed (exit 1) in 37 of the 48 runs since 15:30Z yesterday, all up to about 10:15Z today. Every failure is the same issue: `llm_usage`, "live session agent:main:main carries 99,455 context tokens (limit 60,000)". It was alerted once, then held back by cooldown. It is unrelated to WP-04 batch 4: the same failures appear before that deploy (from 12:26Z on 10-27) and on 10-20, 10-21 and 10-26. It cleared by itself today. New ledger item `OPS-2026-10-28-main-session-context` (WP-24): either OpenClaw's compaction keeps the main session under the limit, or the limit follows the model's real budget.
+
+The WP-04 batch 4 check itself (0 "never awaited", 0 aborts) stands.
+
+## 2026-10-28 16:08 UTC · WP-09 batch 2 implemented; round-1 reviews running; WP09-06's host probe passes
+
+**Implementer** (manual pipeline): 16 commits, `d29992a` to `d86143d`, on `200cb65`, with a clean tree.
+- **Scope:** WP09-05 to WP09-10, §9 amendments 1-3 (3.1 to 3.5), and WP09-33's batch-2 lines.
+- **Harness, all four layouts on `d86143d`:** 1875 passed, 1 skipped; node 58/58; leftovers 0; placeholder grep clean.
+- **Every new test fails on `200cb65`'s code,** except two:
+  - the sandbox characterisation test, by design;
+  - the SIGTERM test, which kills pytest there because batch 1 has no handler.
+- **27 mutation probes** were each caught (`/root/.cache/wp09b2-probes/`).
+- **Scratch experiment:** batch 1's deploy code deployed `d86143d` onto a repo at `200cb65` and ended `deployed`, restarting only `rmp-api` and `rmp-worker`.
+
+**Deviations reported** (the reviewers judge them):
+1. The revert commit is `git commit-tree <old>^{tree} -p <head>`, recorded before the tree moves, instead of `git revert old..head`.
+   - With `git revert`, a kill between the commit and the state write leaves an unrecorded revert.
+   - A kill in the middle of a `git revert` leaves `.git/sequencer` behind.
+   - A merge commit in the range makes the revert fail.
+2. `_drift` runs before the readiness baseline, as in batch 1.
+
+**Not handled, for the programme to decide:**
+- A unit SIGKILLed or OOM-killed after it checks in, from `applying` on, is resumed without bound. It is neither a missed check-in nor an escape.
+- `git merge --ff-only` is not atomic against a kill mid-checkout.
+- A kill after the revert PR is published but before the result is written republishes on resume.
+
+**Host step WP09-06** (before the merge; K-4: it takes nothing offline):
+- `systemd-run --wait --collect --quiet --unit=rmp-probe-execstoppost -p 'ExecStopPost=/bin/true' /bin/true` → **0**.
+- **Extra checks:**
+  - The batch's real command form, `/bin/sh -c 'test -s <list> && xargs -r systemctl start --no-block < <list>; exit 0'`, with an empty list → **0**.
+  - A transient `sleep 60` unit killed with `systemctl kill -s KILL` ran its `ExecStopPost=` (marker written). So the post command does run after a SIGKILL on this host (systemd 255).
+- All three probe units were collected, and the scratch directory was removed. Rollback: none.
+
+**Round 1:** two Tier-1 reviewers (correctness, closure) run in the background. Each is asked to:
+- rule on both deviations;
+- say whether the unbounded SIGKILL/OOM resume must be bounded in this batch.
+
+## 2026-10-28 16:52 UTC · WP-09 batch 2 round 1: both reviewers request changes; fix round started
+
+**Both Tier-1 reviewers request changes.** Each ran the full default layout: 1875 passed, 1 skipped; node 58/58. The new tests fail against `200cb65`'s code (36 failed and 5 errors, plus the two expected passes).
+
+**Deviations:**
+- **Deviation 1, the `commit-tree` revert: accepted by both.** It keeps the same tree, records the revert before the tree moves, leaves no sequencer state, and works where `git revert old..head` exits 128 on the merge commit that `--merge` revert PRs leave.
+- **Deviation 2, `_drift` before the baseline: rejected by both.** A hand edit made during the baseline is deployed over.
+
+**Blocking:**
+- **(a) Silent deaths are unbounded.** A unit SIGKILLed or OOM-killed after check-in, from `applying` on, is never counted. The probes ran 6 and 9 such resumes: each stopped and started `rmp-api`, the run never became dead and no note went out, while the queue was blocked and `abort_run` refused. Amendment 1 and §8 6.5 promise this bound.
+- **(b) The log order cannot be read.** `deploy.log` cannot show stop → move → start (`_switch` logs only "main moved" and "stopped and started"), which this batch's host step and §8.4 need.
+- **(c) Deviation 2,** as above.
+
+**Decisions for the fix round** (sent to the implementer, which has the context):
+- **(a): the correctness reviewer's mechanism.** `mark_ended` in a `finally` after check-in; a launch that checked in and never ended is a silent death. `launch` folds it in: one escape from `applying` on, one attempt before `applying`, so an OOM loop before the change is bounded too. `_dead` also on `attempt >= 3`. I chose this over the closure reviewer's count-at-check-in and take-back, because each end that Python sees clears one mark, with no +1/−1 bookkeeping.
+- **(b):** log each stop, the move and each start, in both windows, with a test.
+- **(c):** the baseline first, then `_drift`, with a test.
+
+**Non-blocking, also fixed now:**
+- decide `moved` by re-reading main; read `before` inside the `try`;
+- a resumed `applying` run that waits puts its phase back;
+- a test for the revert window's stopped-units list;
+- a test for deviation 1 with a merge commit in the range;
+- `abort_run` reports when its stop ended the run;
+- `_save` on a missing state.
+
+**Ledgered for batch 3, no code now:**
+- `WP09-b2-early-results-unlocked`: results reached before the lock are recorded without it;
+- `WP09-b2-land-retry-after-lost-response`.
+
+**Residual the reviewers accept:** `merge --ff-only` is not atomic against a kill mid-checkout, as is true of any fast-forward.
+
+## 2026-10-29 11:33 UTC · WP-09 batch 2 fix round resumed after the usage limit
+
+The implementer hit the session limit (reset 2026-10-28 20:40Z) after 9 fix commits, `9780cbb` to `47054d7`, on `d86143d`:
+
+| Commit | Fix |
+|---|---|
+| `9780cbb` | The readiness baseline runs before `_drift`; deviation 2 is reverted |
+| `7b56628` | `moved` is decided by re-reading main |
+| `a97b9b1` | The log shows stop → move → start in both windows |
+| `7f11312` | A resumed run still at `old` that waits puts its phase back |
+| `59c4ced` | Test for the revert window's stopped-units list |
+| `7c2d397` | Test for a merge commit in the rollback range |
+| `390c8d2` | `abort_run` reports the run its stop ended |
+| `cfff75d` | Silent deaths after check-in are bounded by `mark_ended` and folded in at the next launch |
+| `47054d7` | A window that cannot read the live main twice keeps `applying` |
+
+Its last check: batch 1's deploy code still deploys `47054d7`. Kirill's "Try again" came at 11:33Z. I sent the implementer a message to continue: check that every fix item is covered, run the four layouts, and report.
+
+## 2026-10-29 12:15 UTC · WP-09 batch 2 fix round 1 done; round-2 re-reviews running
+
+**Fix round:** all 9 commits, `9780cbb` to `47054d7`. Each fix has a test that fails without it, and all 16 mutation probes of the fixes were caught (`/root/.cache/wp09b2-probes/results_r1.txt`).
+
+**Harness on `47054d7`:** 1891 passed, 1 skipped in all four layouts; node 58/58; leftovers 0; placeholder grep clean.
+
+**Batch 1 still deploys this head.** The implementer re-ran the scratch experiment: `200cb65`'s code deployed `47054d7` and ended `deployed`, restarting only `rmp-api` and `rmp-worker`. While that unit ran, and after it, this head's reconciler pass ended and launched nothing.
+
+**Fix item 9 kept:** `_save` still skips a missing state. In production the state always exists while a unit runs, so writing anyway could only resurrect a state that an operator removed by hand. **Accepted:** that is the safer failure, and the reviewers are asked to judge it too.
+
+**Rewritten tests:** the list is unchanged from round 1; no older test was rewritten in the fix round.
+
+**Round 2:** the same two reviewers, continued with their round-1 context, re-review `d86143d..47054d7`.
+
+## 2026-10-29 16:31 UTC · WP-09 batch 2 round 2: closure approves; correctness resumed after the usage limit
+
+**Closure reviewer: approve.**
+- All three round-1 blocking issues are closed.
+- §8 6.5 holds for silent deaths. The reviewer showed this with **real SIGKILLs** of the real unit `main`, run in a forked child:
+  - three kills mid-change → `stuck` once, the state kept, a second pass silent;
+  - three kills before the change → `failed` once ("…before it finished"), main unchanged.
+- Its full default layout on `47054d7`: 1891 passed, 1 skipped; node 58/58; leftovers 0.
+- **Item 9's reason** (`_save`: do not resurrect a removed state) is accepted.
+
+**Its non-blocking points, all for the round-2 fixes:**
+1. **An uncaught exception after check-in** passes the `finally`, is marked ended, and counts as neither an attempt nor an escape. This is reachable only through I/O errors in `record()` or in the `except` handler's state writes. **Decision:** mark the end only when the checked-in part returns normally, so such an exception counts as a silent death. This is a one-line refinement of amendment 4.2's try/finally.
+2. Two docstring lines are over 120 characters; rewrap them.
+3. `_save`'s docstring states the production reason.
+4. **Batch 4** must keep `applying` in `_apply_when_idle`'s fall-back when the venv link is not at the recorded previous one (resume row 2). This goes into the spec as a forward note.
+
+**Correctness reviewer:** cut off by the session limit after its default layout (green). Continued now.
+
+## 2026-10-29 16:32 UTC · WP-09 batch 2 round 2: correctness approves too; small fix round 2
+
+**Correctness reviewer: approve.**
+- Its runs on `47054d7`: default layout 1891 passed, 1 skipped; node 58/58. Focused runs: coding-job 123 passed, direct 123 passed.
+- All 7 round-1 issues are fixed. It traced every `moved` path, and checked the silent-death bookkeeping with probes.
+- It accepts item 9's reason.
+- It agrees with the closure reviewer's proposal: mark the end only when the checked-in part of the launch returns normally.
+
+**Its further non-blocking points:**
+- **(a) A double count.** A SIGKILL in the milliseconds between the escape or attempt write and `mark_ended` counts one death twice (probe). Fix: set `ended` in the same write.
+- **(b) A stopping unit.** A unit still running its SIGTERM handler is `deactivating`, so it is not listed by `deploy_units()`. `end_dead_runs` or the gate could then act on its run.
+
+**Decisions** (spec §9 amendment 4.4):
+- mark the end only after a normal return;
+- set `ended` in the escape and attempt writes;
+- list `deactivating` units as running;
+- `_save`'s docstring gives the production reason;
+- rewrap the two long docstring lines.
+
+All of these go to the implementer as fix round 2. The correctness reviewer then checks just that round.
+
+## 2026-10-29 21:32 UTC · WP-09 batch 2 fix round 2 done; my verify and the round-3 check running
+
+**Fix round 2:** 6 commits, `e7774e2` to `ad16d4c`, implementing §9 amendment 4.4:
+
+| Commit | Change |
+|---|---|
+| `e7774e2` | A unit still stopping (`deactivating`) counts as running |
+| `6da8160` | A launch is marked ended only on a normal return, so an uncaught exception counts like a kill |
+| `7b60f78` | `ended` is written in the same write as the escape or attempt count |
+| `91942d5` | `_save`'s docstring gives the production reason, with a test that a removed state is never recreated |
+| `00776fd` | Docstring rewraps |
+| `ad16d4c` | ARCHITECTURE.md |
+
+- **Probes:** 5 mutation probes, all caught (`results_r2.txt`).
+- **Implementer's harness on `ad16d4c`:** all four layouts, 1897 passed, 1 skipped; node 58/58.
+- **Batch 1 still deploys this head:** in the scratch experiment it ends `deployed`, restarting `rmp-api` and `rmp-worker` only.
+
+**Now running:**
+- my own four-layout verify on `ad16d4c`, in the background;
+- the correctness reviewer's round-3 check of `47054d7..ad16d4c`, on focused runs.
+
+`origin/main` is still `200cb65`.
+
+## 2026-10-29 21:36 UTC · WP-09 batch 2 round 3: correctness approves fix round 2
+
+**Verdict: approve.** All four parts of amendment 4.4 are correct and complete.
+
+**Bookkeeping traced and probed:** a normal wait, a postponed result, an exception before check-in, an uncaught error after check-in, a SIGTERM after a counted escape, and an error after a counted attempt are each counted exactly once. The reviewer found no path that counts zero times or twice.
+
+**Runs:** focused, 128 passed (my verify runs at the same time).
+
+**Two optional notes**, ledgered for batch 3 as `WP09-b2-queue-main-deactivating`:
+- `_queue_main` still uses `is-active` for main's unit. A deactivating unit can see its queued run replaced, which is benign: the next pass re-queues.
+- `_save`'s docstring wording.
+
+**Batch 2 review is complete:** three rounds, both reviewers approve. Waiting for my four-layout verify.
+
+## 2026-10-29 22:40 UTC · WP-09 batch 2 verified by me
+
+**My harness run on `ad16d4c`** (base `200cb65`, unchanged as `origin/main`):
+
+| Layout | pytest | Time | node | Leftovers | Placeholder grep | Hidden new files |
+|---|---|---|---|---|---|---|
+| Default | 1897 passed, 1 skipped | 16:30 | 58/58 | 0 | clean | none |
+| coding-job | 1897 passed, 1 skipped | 16:40 | — | 0 | clean | none |
+| direct | 1897 passed, 1 skipped | 16:24 | — | 0 | clean | none |
+| live | 1897 passed, 1 skipped | 17:07 | — | 0 | clean | none |
+
+Every layout ended `verify: exit 0` (logs: `/root/.cache/wp09-b2-verify-ad16d4c/`).
+
+`git diff 200cb65 -- app/workflows requirements.txt` is empty, so no label is needed.
+
+**Next:** the docs mirror, the PR and the gated merge. This deploy is batch 1's host step, read from `runs/main/deploy-state.json`, `deploy.log` and the unit's journal.
