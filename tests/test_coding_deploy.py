@@ -2356,8 +2356,8 @@ def test_a_revert_window_that_fails_still_publishes_the_revert_and_says_so(repos
     result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
     assert result["status"] == "rolled_back"
     assert (f"; reverting main to {result['revert'][:12]} and restarting rmp-api, rmp-worker failed (Command "
-            "'['systemctl', 'stop', 'rmp-api']' returned non-zero exit status 1.); Aura is healthy again; GitHub's main "
-            "is reverted too") in result["summary"]
+            "'['systemctl', 'stop', 'rmp-api']' returned non-zero exit status 1.); Aura is healthy again; GitHub's "
+            "main is reverted too") in result["summary"]
     # The window started what it stopped; the publish and the re-check still ran.
     assert [c for c in host.calls if c[0] in ("systemctl", "checks", "land")][-3:] == [
         ("systemctl", "start", "rmp-api", "rmp-worker"), ("land", f"aura/revert-{head[:12]}", "merge"),
@@ -2389,12 +2389,14 @@ def test_a_rollback_reports_healthy_again_when_only_the_github_ancestor_clause_f
         url = result["revert_pr"]["pr"]["url"]
         assert f"; Aura is healthy again; on GitHub the revert waits in {url} (its test check is failure)." in (
             result["summary"])
-        assert calls == [("checks", units, ("telemetry", "claude_direct")), ("land", f"aura/revert-{head[:12]}", "merge"),
+        assert calls == [("checks", units, ("telemetry", "claude_direct")),
+                         ("land", f"aura/revert-{head[:12]}", "merge"),
                          ("checks", units, ("telemetry", "claude_direct"), ("claude_direct",))]
     else:
         assert "; Aura is healthy again; GitHub's main is reverted too" in result["summary"]
         # The re-check comes after the publish, with nothing left out once the revert merged.
-        assert calls == [("checks", units, ("telemetry", "claude_direct")), ("land", f"aura/revert-{head[:12]}", "merge"),
+        assert calls == [("checks", units, ("telemetry", "claude_direct")),
+                         ("land", f"aura/revert-{head[:12]}", "merge"),
                          ("checks", units, ("telemetry", "claude_direct"))]
 
 
