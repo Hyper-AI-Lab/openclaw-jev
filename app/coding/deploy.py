@@ -823,10 +823,10 @@ class Host:
 
         return deploy_checks.readiness_report()
 
-    def checks(self, restarted: List[str], baseline: Dict[str, str]) -> Dict[str, Any]:
+    def checks(self, restarted: List[str], baseline: Dict[str, str], *, ignore: Iterable[str] = ()) -> Dict[str, Any]:
         from app.coding import deploy_checks
 
-        return deploy_checks.run(self.live, restarted, baseline)
+        return deploy_checks.run(self.live, restarted, baseline, ignore=ignore)
 
 
 def _idle(host: Host, log: Callable[[str], None]) -> bool:
@@ -1101,10 +1101,12 @@ def _shipped(host: Host, run: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], None]) -> Dict[str, Any]:
-    """The revert window, the re-check and the revert's pull request. The revert commit (the tree of ``old`` on top
+    """The revert window, the revert's pull request, then the re-check. The revert commit (the tree of ``old`` on top
     of ``head``) is made and recorded before the tree moves to it, so a resumed rollback finds it and moves the tree
     there, or finds the tree moved already. Once it exists, each step runs on its own: one that fails is named in the
-    summary and the next still runs, so the revert always reaches GitHub."""
+    summary and the next still runs, so the revert always reaches GitHub. What the publish did is recorded, so a
+    resumed rollback publishes no second time. The re-check leaves ``claude_direct`` out while the revert waits on
+    GitHub: its clause that GitHub's main contains the live main fails until the revert merges there."""
     live, head, failure, restarted = host.live, run["head"], run["failure"], run["affected"]
     if not run.get("revert"):
         revert = _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
@@ -1118,11 +1120,15 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     except Exception as exc:
         log(f"the revert window failed: {exc}")
         reverted = f"; reverting main to {revert[:12]} and restarting {units} failed ({str(exc)[:300]})"
+    published = run.get("published")
+    if published is None:
+        published = _publish_revert(host, revert, head, failure, log)
+        _save(task, run, published=published)
     try:
-        still = host.checks(restarted, run["baseline"])["failure"]
+        still = host.checks(restarted, run["baseline"],
+                            ignore=() if published["status"] == "merged" else ("claude_direct",))["failure"]
     except Exception as exc:
         still = f"the checks failed ({str(exc)[:300]})"
-    published = _publish_revert(host, revert, head, failure, log)
     health = "Aura is healthy again" if still is None else f"the checks still fail: {still}"
     if published["status"] == "merged":
         github_now = f"GitHub's main is reverted too ({published['pr']['url']})"

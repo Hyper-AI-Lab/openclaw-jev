@@ -143,8 +143,8 @@ class FakeHost(deploy.Host):
     def readiness_report(self):
         return {"telemetry": "fail"}
 
-    def checks(self, restarted, baseline):
-        self.calls.append(("checks", tuple(restarted), tuple(baseline)))
+    def checks(self, restarted, baseline, *, ignore=()):
+        self.calls.append(("checks", tuple(restarted), tuple(baseline), *([tuple(ignore)] if ignore else [])))
         return self.results.pop(0) if self.results else {"failure": None, "canary": "ok"}
 
 
@@ -2264,9 +2264,9 @@ class ReadinessHost(FakeHost):
     def readiness_report(self):
         return dict(self.before)
 
-    def checks(self, restarted, baseline):
-        self.calls.append(("checks", tuple(restarted), tuple(baseline)))
-        return super(FakeHost, self).checks(restarted, baseline)
+    def checks(self, restarted, baseline, *, ignore=()):
+        self.calls.append(("checks", tuple(restarted), tuple(baseline), *([tuple(ignore)] if ignore else [])))
+        return super(FakeHost, self).checks(restarted, baseline, ignore=ignore)
 
 
 def ship_main(repos, monkeypatch, host):
@@ -2358,8 +2358,67 @@ def test_a_revert_window_that_fails_still_publishes_the_revert_and_says_so(repos
     assert (f"; reverting main to {result['revert'][:12]} and restarting rmp-api, rmp-worker failed (Command "
             "'['systemctl', 'stop', 'rmp-api']' returned non-zero exit status 1.); Aura is healthy again; GitHub's main "
             "is reverted too") in result["summary"]
-    # The window started what it stopped; the re-check and the publish still ran.
+    # The window started what it stopped; the publish and the re-check still ran.
     assert [c for c in host.calls if c[0] in ("systemctl", "checks", "land")][-3:] == [
-        ("systemctl", "start", "rmp-api", "rmp-worker"), ("checks", ("rmp-api", "rmp-worker"), ("telemetry",)),
-        ("land", f"aura/revert-{head[:12]}", "merge")]
+        ("systemctl", "start", "rmp-api", "rmp-worker"), ("land", f"aura/revert-{head[:12]}", "merge"),
+        ("checks", ("rmp-api", "rmp-worker"), ("telemetry",))]
     assert git(repos.origin, "rev-parse", "main") == result["revert"]
+
+
+@pytest.mark.parametrize("publish", ["blocked", "merged"])
+def test_a_rollback_reports_healthy_again_when_only_the_github_ancestor_clause_fails(repos, monkeypatch, readiness,
+                                                                                     publish):
+    from app.coding import deploy_checks
+
+    def report():
+        # claude_direct's clause that fails until GitHub's main holds the revert: GitHub's main contains the live main.
+        contained = subprocess.run(["git", "merge-base", "--is-ancestor", git(repos.live, "rev-parse", "main"), "main"],
+                                   cwd=repos.origin, capture_output=True).returncode == 0
+        return {"telemetry": "pass", "claude_direct": "pass" if contained else "fail"}
+
+    monkeypatch.setattr(deploy_checks, "readiness_report", report)
+    readiness.canaries = ["CANARY FAIL: task failed"]
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    # The revert's pull request waits for a label, so its test check fails; or it merges.
+    host = ReadinessHost(repos.live, before=report(), lands=["failure"] if publish == "blocked" else [])
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["error"] == "CANARY FAIL: task failed"
+    calls = [c for c in host.calls if c[0] in ("checks", "land")]
+    units = ("rmp-api", "rmp-worker")
+    if publish == "blocked":
+        url = result["revert_pr"]["pr"]["url"]
+        assert f"; Aura is healthy again; on GitHub the revert waits in {url} (its test check is failure)." in (
+            result["summary"])
+        assert calls == [("checks", units, ("telemetry", "claude_direct")), ("land", f"aura/revert-{head[:12]}", "merge"),
+                         ("checks", units, ("telemetry", "claude_direct"), ("claude_direct",))]
+    else:
+        assert "; Aura is healthy again; GitHub's main is reverted too" in result["summary"]
+        # The re-check comes after the publish, with nothing left out once the revert merged.
+        assert calls == [("checks", units, ("telemetry", "claude_direct")), ("land", f"aura/revert-{head[:12]}", "merge"),
+                         ("checks", units, ("telemetry", "claude_direct"))]
+
+
+def test_a_rollback_killed_after_its_publish_does_not_publish_again(repos):
+    class KilledInTheReCheck(FakeHost):
+        """Killed in its second checks, the re-check after the revert was published."""
+
+        def checks(self, restarted, baseline, **kwargs):
+            result = super().checks(restarted, baseline, **kwargs)
+            if len([c for c in self.calls if c[0] == "checks"]) == 2:
+                raise deploy.Interrupted("SIGTERM")
+            return result
+
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = KilledInTheReCheck(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    run = state()
+    assert run["phase"] == "reverting" and run["published"]["status"] == "merged"
+    assert git(repos.origin, "rev-parse", "main") == run["revert"]
+
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["revert_pr"] == run["published"]
+    assert "Aura is healthy again; GitHub's main is reverted too" in result["summary"]
+    assert not [c for c in host.calls if c[0] == "land"]
