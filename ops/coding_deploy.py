@@ -147,8 +147,10 @@ def checked_in(spec_path: str, spec: dict, run: dict, postpone: bool) -> int:
     except (Exception, deploy.Interrupted) as exc:
         now = deploy._read_json(state) or {}
         if now.get("phase") in deploy.CHANGING:
-            # Counted, so a resume that fails the same way every time ends dead (deploy.end_dead_runs).
-            deploy.write_json(state, {**now, "escapes": now.get("escapes", 0) + 1})
+            # Counted, so a resume that fails the same way every time ends dead (deploy.end_dead_runs), and marked
+            # ended in the same write, so a kill right after cannot count it twice.
+            deploy.write_json(state, {**now, "escapes": now.get("escapes", 0) + 1,
+                                      "ended": now.get("started", now.get("launches", 0))})
             log(f"interrupted in phase {now['phase']}; the next idle pass resumes it"
                 if isinstance(exc, deploy.Interrupted) else
                 f"stopped in phase {now['phase']} with an error ({str(exc)[:300]}); the next idle pass resumes it")

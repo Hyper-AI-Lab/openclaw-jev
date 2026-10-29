@@ -348,7 +348,9 @@ def record_attempt(task_id: str, error: str) -> Optional[Dict[str, Any]]:
     if run is None:
         return None
     attempt = run.get("attempt", 0) + 1
-    write_json(path, {**run, "attempt": attempt, "last_error": error[:300]})
+    # The launch is marked ended in the same write that counts it, so a kill right after cannot count it twice.
+    write_json(path, {**run, "attempt": attempt, "last_error": error[:300],
+                      "ended": run.get("started", run.get("launches", 0))})
     if attempt < MAX_ATTEMPTS:
         return None
     summary = f"The deploy failed {attempt} times before changing anything (last: {error[:300]}); main is unchanged."

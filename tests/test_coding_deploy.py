@@ -2194,3 +2194,32 @@ async def test_an_exception_escaping_the_launch_three_times_ends_the_run(repos, 
         assert json.loads(deploy.spec_file(deploy.MAIN).with_name("result.json").read_text())["status"] == "failed"
     else:
         assert note.startswith("Aura's deploy: stuck.") and state(deploy.MAIN)["dead_noted"] is True
+
+
+@pytest.mark.parametrize("counted", ["escapes", "attempt"])
+def test_a_kill_right_after_a_death_is_counted_counts_it_once(repos, systemd_run, monkeypatch, counted):
+    unit, seen = deploy_unit(monkeypatch)
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    if counted == "escapes":
+        git(repos.live, "merge", "-q", "--ff-only", head)
+        deploy.write_json(deploy.state_file(deploy.MAIN), {**state(deploy.MAIN), "phase": "merged", "old": repos.old,
+                                                           "head": head, "affected": ["rmp-api"], "baseline": []})
+        host = FakeHost(repos.live, kill_at=("stop", 1))
+    else:
+        host = BlippingHost(repos.live, baselines=[RuntimeError("could not connect to server")])
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    real_write_json, armed = deploy.write_json, [True]
+
+    def write_json(path, data):
+        real_write_json(path, data)
+        if armed and path.name == "deploy-state.json" and data.get(counted) == 1:
+            armed.clear()
+            raise KilledWithoutAWord("right after the death was counted")
+
+    monkeypatch.setattr(deploy, "write_json", write_json)
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+    with pytest.raises(KilledWithoutAWord):
+        unit.main(str(deploy.spec_file(deploy.MAIN)))
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+    assert state(deploy.MAIN)[counted] == 1 and state(deploy.MAIN)["escapes" if counted == "attempt" else "attempt"] == 0
