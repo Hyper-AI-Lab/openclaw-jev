@@ -659,8 +659,9 @@ def watch_main(host: Optional["Host"] = None) -> Optional[str]:
 
 
 def _queue_main(host: "Host") -> None:
-    """Queue GitHub's main unless its deploy unit runs or its run is past ``queued``, which is never replaced."""
-    if _unit_active(f"aura-deploy-{MAIN}"):
+    """Queue GitHub's main unless its deploy unit runs (``Host.deploy_units``: a unit still stopping runs too) or its
+    run is past ``queued``, which is never replaced."""
+    if f"aura-deploy-{MAIN}.service" in host.deploy_units():
         return
     run = _read_json(state_file(MAIN))
     if run is not None and run.get("phase") != "queued":
@@ -685,10 +686,6 @@ def pending_main(repo: str, *, live: Path = LIVE_REPO) -> Optional[Dict[str, Any
     committed = github.api("GET", f"repos/{repo}/commits/{head}")["commit"]["committer"]["date"]
     age = datetime.now(timezone.utc) - datetime.fromisoformat(committed.replace("Z", "+00:00"))
     return {"head": head, "age_hours": round(age.total_seconds() / 3600, 1)}
-
-
-def _unit_active(unit: str) -> bool:
-    return subprocess.run(["systemctl", "is-active", "--quiet", unit], capture_output=True).returncode == 0
 
 
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -920,10 +917,11 @@ def _start_again(host: Host, task: str, units: List[str], log: Callable[[str], N
 
 
 def _save(task: str, run: Dict[str, Any], **fields: Any) -> None:
-    """Update the run with ``fields`` and write its state, atomically, while the state exists. A missing state means
-    the run was ended (``end_dead_runs``) or aborted (``abort_run``, by hand) and is never recreated: a recreated state
-    would make the launcher relaunch a run someone ended. A deploy called without a queued run (a test's direct call)
-    keeps its state in memory only."""
+    """Update the run with ``fields`` and write its state, atomically, while the state exists. Before the unit records
+    its result, its run's state is only ever removed by hand: ``end_dead_runs`` acts only once no deploy unit runs, and
+    ``abort_run`` stops the unit first. A missing state therefore means someone ended the run, and it is never
+    recreated: a recreated state would make the launcher relaunch it. A deploy called without a queued run (a test's
+    direct call) keeps its state in memory only."""
     run.update(fields)
     path = state_file(task)
     if path.exists():

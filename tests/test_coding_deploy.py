@@ -540,11 +540,11 @@ def test_a_deploy_of_githubs_main_starts_once_while_one_is_waiting(repos, github
     first = merged_on_github(repos, {"app/a.py": "A = 2\n"})
     host = FakeHost(repos.live)
     assert deploy.watch_main(host) == "aura-deploy-main"
-    github_ci.active, host.units = True, ["aura-deploy-main.service"]
+    host.units = ["aura-deploy-main.service"]
     later = repos.change({"app/a.py": "A = 3\n"}, on=first)
     git(repos.live, "push", "-q", "origin", f"{later}:refs/heads/main")
     assert deploy.watch_main(host) is None and len(systemd_run.argvs) == 1
-    github_ci.active, host.units = False, []
+    host.units = []
     assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 2
     assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == later
 
@@ -702,10 +702,9 @@ def test_a_deploy_of_githubs_main_that_is_not_live_still_tells_kirill(tmp_path, 
 
 @pytest.fixture
 def github_ci(monkeypatch):
-    """CI's test check on GitHub's main (``check``) and whether the deploy unit of GitHub's main runs (``active``)."""
-    state = SimpleNamespace(check="success", active=False)
+    """CI's test check on GitHub's main (``check``); whether the deploy unit of GitHub's main runs is the host's."""
+    state = SimpleNamespace(check="success")
     monkeypatch.setattr(deploy.github, "check", lambda sha, repo: state.check)
-    monkeypatch.setattr(deploy, "_unit_active", lambda unit: state.active)
     return state
 
 
@@ -737,9 +736,9 @@ def test_the_watcher_deploys_githubs_main_once_ci_passed_on_that_commit(repos, w
     for check in ("missing", "pending", "failure"):
         watching.check = check
         assert deploy.watch_main(host) is None
-    watching.check, watching.active = "success", True
+    watching.check, host.units = "success", ["aura-deploy-main.service"]
     assert deploy.watch_main(host) is None
-    watching.active = False
+    host.units = []
     assert deploy.watch_main(host) == "aura-deploy-main"
     assert watching.started == [{"task_id": "main", "source": "github", "head": head, "ci": "success"}]
 
@@ -1149,12 +1148,12 @@ def test_what_the_previous_deploy_code_left_launches_nothing_and_the_next_head_q
                                        "deploy.log": "the previous code's unit\n"})
     head = repos.change({"app/a.py": "A = 3\n"}, on=shipped)
     git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
-    github_ci.active, host = True, FakeHost(repos.live, units=["aura-deploy-main.service"])
+    host = FakeHost(repos.live, units=["aura-deploy-main.service"])
     assert deploy.watch_main(host) is None and systemd_run.argvs == [] and deploy.queued_runs() == []
 
     for task, done in left.items():
         (deploy.RUNS_DIR / task / "result.json").write_text(json.dumps({"status": "deployed", "head": done}) + "\n")
-    github_ci.active, host.units = False, []
+    host.units = []
     assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 1
     assert [task for task, _ in deploy.queued_runs()] == [deploy.MAIN]
     assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == head
@@ -1725,7 +1724,6 @@ async def test_a_dead_run_is_reported_while_github_cannot_be_read(repos, systemd
         raise RuntimeError("git fetch failed: Could not resolve host: github.com")
 
     reporting.host.fetch_main = fetch_main
-    monkeypatch.setattr(deploy, "_unit_active", lambda unit: False)
     monkeypatch.setattr(reconciler, "prune_coding_jobs", lambda: [])
     stop = asyncio.Event()
 
@@ -1819,14 +1817,14 @@ def test_this_code_leaves_a_unit_of_the_previous_deploy_code_alone_while_it_runs
     deploy.queue(main_spec(head))
     deploy.write_json(deploy.state_file(deploy.MAIN), batch_1_state(1))
     before = deploy.state_file(deploy.MAIN).read_text()
-    github_ci.active, host = True, FakeHost(repos.live, units=["aura-deploy-main.service"])
+    host = FakeHost(repos.live, units=["aura-deploy-main.service"])
     assert deploy.end_dead_runs(host) == [] and deploy.watch_main(host) is None
     assert deploy.state_file(deploy.MAIN).read_text() == before and systemd_run.argvs == []
 
     git(repos.live, "merge", "-q", "--ff-only", head)
     deploy.write_json(deploy.spec_file(deploy.MAIN).with_name("result.json"), {"status": "deployed", "head": head})
     deploy.state_file(deploy.MAIN).unlink()
-    github_ci.active, host.units = False, []
+    host.units = []
     assert deploy.end_dead_runs(host) == [] and deploy.watch_main(host) is None and systemd_run.argvs == []
 
 
@@ -2651,3 +2649,25 @@ def test_a_retried_land_that_github_never_merged_lands_again(repos, monkeypatch)
     assert json.loads(path.with_name("result.json").read_text())["status"] == "deployed"
     assert [c for c in host.calls if c[0] in ("land", "merged_pull")] == [
         ("land", "aura/t1-x", "squash"), ("merged_pull", "aura/t1-x"), ("land", "aura/t1-x", "squash")]
+
+
+def test_the_watcher_leaves_a_stopping_main_unit_its_run(repos, github_ci, systemd_run):
+    class ListingHost(FakeHost):
+        """Lists the deploy units the way the host does, through systemctl."""
+
+        deploy_units = deploy.Host.deploy_units
+
+    first = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = ListingHost(repos.live)
+    assert deploy.watch_main(host) == "aura-deploy-main"
+    queued = (deploy.spec_file(deploy.MAIN).read_text(), deploy.state_file(deploy.MAIN).read_text())
+    later = repos.change({"app/a.py": "A = 3\n"}, on=first)
+    git(repos.live, "push", "-q", "origin", f"{later}:refs/heads/main")
+    # Its unit is still in its SIGTERM handler or its ExecStopPost=: the run it may still record is left as it is.
+    systemd_run.units = [("aura-deploy-main.service", "deactivating")]
+    assert deploy.watch_main(host) is None and len(systemd_run.argvs) == 1
+    assert (deploy.spec_file(deploy.MAIN).read_text(), deploy.state_file(deploy.MAIN).read_text()) == queued
+
+    systemd_run.units = [("aura-deploy-main.service", "inactive")]
+    assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 2
+    assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == later
