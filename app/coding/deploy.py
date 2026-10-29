@@ -532,9 +532,10 @@ def end_dead_runs(host: "Host") -> List[Tuple[str, Dict[str, Any], Dict[str, Any
     to report, nothing when the lock is held or a unit runs.
 
     A dead run still ``queued`` or ``landed`` changed nothing: it ends ``failed`` (its unit ended before it started,
-    or before it finished), with ``result.json`` written and its state removed. One in a phase from ``applying`` on may have left the host mid-change, and its state holds the only
-    record of ``old``: it is kept, with ``dead_noted``, and reported ``stuck`` once; nothing else deploys until it is
-    resumed by hand (specs/WP-09.md §0), and whoever does that removes its state."""
+    or before it finished), with ``result.json`` written and its state removed. One in a phase from ``applying`` on
+    may have left the host mid-change, and its state holds the only record of ``old``: it is kept, with
+    ``dead_noted``, and reported ``stuck`` once; nothing else deploys until it is resumed by hand (specs/WP-09.md §0),
+    and whoever does that removes its state."""
     if not RUNS_DIR.is_dir():
         return []
     fd = os.open(RUNS_DIR / ".launch.lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -601,8 +602,8 @@ def abort_run(task_id: str) -> str:
             return f"The deploy of {task_id} has no run with work to do; nothing else was done."
         phase = run.get("phase")
         if phase in CHANGING:
-            return (f"The deploy of {task_id} is in phase {phase}, past the change, so its state is kept; the next idle "
-                    "pass resumes it.")
+            return (f"The deploy of {task_id} is in phase {phase}, past the change, so its state is kept; the next "
+                    "idle pass resumes it.")
         spec = _read_json(spec_file(task_id)) or {}
         summary = "Aborted by hand; nothing was deployed; main is unchanged."
         if phase == "landed":
@@ -897,8 +898,8 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
     are reconciled, the requirements installed and the units started in one call (``restarted``, forward). Back, both
     counts are skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units
     are started before the window is left; a failure while the live main, read again then, is still at ``old`` also
-    puts the run back in its phase before ``applying``. While units are stopped, ``stopped_file`` lists them, so the unit's ``ExecStopPost=`` starts them
-    after a kill that runs no Python. The commit the tree is at.
+    puts the run back in its phase before ``applying``. While units are stopped, ``stopped_file`` lists them, so the
+    unit's ``ExecStopPost=`` starts them after a kill that runs no Python. The commit the tree is at.
     """
     live, units, forward = host.live, run["affected"], direction == "forward"
     target = run["head"] if forward else run["revert"]
