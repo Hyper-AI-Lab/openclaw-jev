@@ -140,8 +140,8 @@ class FakeHost(deploy.Host):
         self.calls.append(("wait_check", sha))
         return self.ci.get(sha, "success")
 
-    def readiness_baseline(self):
-        return ["telemetry"]
+    def readiness_report(self):
+        return {"telemetry": "fail"}
 
     def checks(self, restarted, baseline):
         self.calls.append(("checks", tuple(restarted), tuple(baseline)))
@@ -1500,10 +1500,10 @@ class BlippingHost(FakeHost):
         super().__init__(live, **kwargs)
         self.baselines, self.waits = list(baselines), list(waits)
 
-    def readiness_baseline(self):
+    def readiness_report(self):
         if self.baselines:
             raise self.baselines.pop(0)
-        return super().readiness_baseline()
+        return super().readiness_report()
 
     def wait_check(self, sha):
         if self.waits:
@@ -1854,9 +1854,9 @@ def test_a_hand_edit_made_during_the_readiness_baseline_blocks_the_deploy(repos)
     rule = repos.mirror[".cursor/rules/"] / "r.mdc"
 
     class EditedDuringTheBaseline(FakeHost):
-        def readiness_baseline(self):
+        def readiness_report(self):
             rule.write_text("edited by hand while readiness ran\n")
-            return super().readiness_baseline()
+            return super().readiness_report()
 
     head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
     host = EditedDuringTheBaseline(repos.live)
@@ -2032,9 +2032,9 @@ class KillingHost(FakeHost):
         self.die("systemctl")
         super().systemctl(*args)
 
-    def readiness_baseline(self):
+    def readiness_report(self):
         self.die("baseline")
-        return super().readiness_baseline()
+        return super().readiness_report()
 
     def wait_check(self, sha):
         self.die("wait_check")
@@ -2238,3 +2238,87 @@ def test_a_removed_run_state_is_never_recreated(repos):
 
     result = deploy.self_deploy(reviewed(repos, head=head), AbortedWhileLanding(repos.live), log=lambda m: None)
     assert result["status"] == "deployed" and not deploy.state_file("t1").exists()
+
+
+@pytest.fixture
+def readiness(monkeypatch):
+    """The real checks after a deploy (``deploy_checks.run``), with RMP's health and the gateway answering, readiness
+    reporting ``after`` (set by the test) once the change is live, and the canary passing unless ``canaries`` holds
+    its lines, in turn."""
+    from app.coding import deploy_checks
+
+    seen = SimpleNamespace(after={}, canaries=[])
+    monkeypatch.setattr(deploy_checks, "_wait_ok", lambda url, seconds: True)
+    monkeypatch.setattr(deploy_checks, "readiness_report", lambda: dict(seen.after))
+    monkeypatch.setattr(deploy_checks, "canary", lambda live: seen.canaries.pop(0) if seen.canaries else "ok")
+    return seen
+
+
+class ReadinessHost(FakeHost):
+    """Takes ``before`` as its readiness baseline and runs the real checks."""
+
+    def __init__(self, live, *, before, **kwargs):
+        super().__init__(live, **kwargs)
+        self.before = before
+
+    def readiness_report(self):
+        return dict(self.before)
+
+    def checks(self, restarted, baseline):
+        self.calls.append(("checks", tuple(restarted), tuple(baseline)))
+        return super(FakeHost, self).checks(restarted, baseline)
+
+
+def ship_main(repos, monkeypatch, host):
+    """Deploy a change to app/ on GitHub's main through the deploy unit on ``host``: its exit status, the result it
+    recorded, and what it recorded and said (``deploy_unit``)."""
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    deploy.queue(main_spec(merged_on_github(repos, {"app/a.py": "A = 2\n"})))
+    path = deploy.spec_file(deploy.MAIN)
+    code = unit.main(str(path))
+    return code, json.loads(path.with_name("result.json").read_text()), seen
+
+
+NEW_FAILING = ("New or tightened readiness checks fail on this host: backup_manifest; they did not count against the "
+               "deploy.")
+
+
+def test_a_new_failing_check_is_reported_not_reverted(repos, monkeypatch, readiness):
+    readiness.after = {"telemetry": "pass", "backup_manifest": "fail"}
+    host = ReadinessHost(repos.live, before={"telemetry": "pass"})
+    code, result, seen = ship_main(repos, monkeypatch, host)
+    assert code == 0 and result["status"] == "deployed" and result["new_failing"] == ["backup_manifest"]
+    assert NEW_FAILING in result["summary"] and git(repos.live, "rev-parse", "main") == result["head"]
+    assert not [c for c in host.calls if c[0] == "land"]
+    [(note, incident)] = seen.notes
+    assert note.startswith("Aura's change is live.") and NEW_FAILING in note
+    assert incident == f"deploy:main:{result['head'][:12]}"
+
+
+def test_a_tightened_check_is_reported_not_reverted(repos, monkeypatch, readiness):
+    readiness.after = {"telemetry": "pass", "backup_manifest": "fail"}
+    host = ReadinessHost(repos.live, before={"telemetry": "pass", "backup_manifest": "warn"})
+    code, result, seen = ship_main(repos, monkeypatch, host)
+    assert code == 0 and result["status"] == "deployed" and result["new_failing"] == ["backup_manifest"]
+    assert NEW_FAILING in result["summary"] and not [c for c in host.calls if c[0] == "land"]
+    [(note, _)] = seen.notes
+    assert NEW_FAILING in note
+
+
+def test_a_passing_check_that_fails_rolls_back(repos, readiness):
+    readiness.after = {"telemetry": "pass", "backup_manifest": "fail"}
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = ReadinessHost(repos.live, before={"telemetry": "pass", "backup_manifest": "pass"})
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["error"] == "readiness checks failed: backup_manifest"
+    assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]
+    assert git(repos.live, "rev-parse", "main^{tree}") == git(repos.live, "rev-parse", f"{repos.old}^{{tree}}")
+
+
+def test_a_check_failing_before_and_after_is_ignored(repos, monkeypatch, readiness):
+    readiness.after = {"telemetry": "fail", "slack": "pass"}
+    host = ReadinessHost(repos.live, before={"telemetry": "fail", "slack": "pass"})
+    code, result, seen = ship_main(repos, monkeypatch, host)
+    assert code == 0 and result["status"] == "deployed" and result["new_failing"] == []
+    assert "readiness checks fail" not in result["summary"] and seen.notes == []

@@ -12,7 +12,8 @@ it is, then checks in; the run's launches share one log, ``deploy.log``. An erro
 retried by the next launch, at most three times; one from ``applying`` on leaves the run to be resumed from its
 phase. After a result, a reviewed job gets a fresh run of its workflow, which sends Aura's judged reply on the new
 code; a deploy of GitHub's main sends Kirill a note with its pull requests' links when it did not go live (rolled
-back, blocked, failed, postponed) or when it changed files under ``ops/systemd/``, which it never installs.
+back, blocked, failed, postponed), when it changed files under ``ops/systemd/``, which it never installs, or when
+readiness checks it added or tightened fail on this host, which do not count against it.
 """
 import asyncio
 import fcntl
@@ -35,7 +36,8 @@ from app.production.ops_notify import notify_ops_slack  # noqa: E402
 from app.temporal_control import connect_temporal  # noqa: E402
 
 TASK_QUEUE = "openclaw-tasks"
-# A deploy of GitHub's main that is live needs no note, unless it changed unit files; the Event records it.
+# A deploy of GitHub's main that is live needs no note, unless it changed unit files or new or tightened readiness
+# checks fail; the Event records it.
 QUIET = ("deployed", "unchanged")
 
 
@@ -44,8 +46,8 @@ def log(message: str) -> None:
 
 
 async def finish(spec: dict, result: dict) -> None:
-    """Record the result on the task, then start the run that replies, or tell Kirill when Aura's own deploy is not live
-    or changed unit files."""
+    """Record the result on the task, then start the run that replies, or tell Kirill when Aura's own deploy is not live,
+    changed unit files or found new or tightened readiness checks failing."""
     task_id = spec["task_id"]
     try:
         async with AsyncSessionLocal() as db:
@@ -58,7 +60,7 @@ async def finish(spec: dict, result: dict) -> None:
     finally:
         await engine.dispose()
     if spec.get("source") == "github":
-        if result["status"] not in QUIET or result.get("units"):
+        if result["status"] not in QUIET or result.get("units") or result.get("new_failing"):
             note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
             await notify_ops_slack(note, incident_id=f"deploy:{task_id}:{(result.get('head') or '')[:12]}")
             log("told Kirill")

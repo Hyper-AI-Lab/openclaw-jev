@@ -607,7 +607,7 @@ def test_an_enabled_offsite_copy_passes_when_the_newest_backup_was_copied(backup
 
 def test_the_backup_warnings_fail_no_deploy(backups, monkeypatch):
     """The deploy gate reads the readiness endpoint and counts failed checks only, so the permanent K-7 warning and a
-    backup warning never revert a deploy."""
+    backup warning never revert a deploy: the report it compares holds them as warnings."""
     import io
     import urllib.request
     from dataclasses import asdict
@@ -619,4 +619,4 @@ def test_the_backup_warnings_fail_no_deploy(backups, monkeypatch):
     assert [(c.name, c.status) for c in checks] == [("backups", "warn"), ("offsite_backup", "warn")]
     report = json.dumps({"checks": [asdict(c) for c in checks]}).encode()
     monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout: io.BytesIO(report))
-    assert deploy_checks.readiness_failures() == []
+    assert deploy_checks.readiness_report() == {"backups": "warn", "offsite_backup": "warn"}

@@ -738,7 +738,8 @@ def open_pull_request(job: workspace.Job, head: str, entry: Dict[str, Any], titl
 class Host:
     """What a self-deploy does to this machine; tests replace it.
 
-    ``checks`` returns ``{"failure": None or what failed, "canary": "ok" or "skipped"}``.
+    ``checks`` returns ``{"failure": None or what failed, "canary": "ok" or "skipped"}``, and once they passed,
+    ``new_failing``: the readiness checks failing now that were absent or a warning in the baseline.
     """
 
     def __init__(self, live: Path = LIVE_REPO, repo: Optional[str] = None):
@@ -817,12 +818,12 @@ class Host:
         """CI's test check on ``sha`` once it finished, or its state when the wait ran out."""
         return github.wait_check(sha, self.repo)
 
-    def readiness_baseline(self) -> List[str]:
+    def readiness_report(self) -> Dict[str, str]:
         from app.coding import deploy_checks
 
-        return deploy_checks.readiness_failures()
+        return deploy_checks.readiness_report()
 
-    def checks(self, restarted: List[str], baseline: List[str]) -> Dict[str, Any]:
+    def checks(self, restarted: List[str], baseline: Dict[str, str]) -> Dict[str, Any]:
         from app.coding import deploy_checks
 
         return deploy_checks.run(self.live, restarted, baseline)
@@ -1016,7 +1017,7 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
             return None
         log(f"holding {CODE_RELOAD_LOCK}")
         changed = changes(live, old, head)
-        baseline = host.readiness_baseline()
+        baseline = host.readiness_report()
         # After the baseline, which can take a minute and a half: a hand edit made meanwhile still blocks.
         blocked = _drift(live, old)
         if blocked:
@@ -1081,13 +1082,17 @@ def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
         return _rollback(host, task, run, log)
     old, head, restarted = run["old"], run["head"], run["affected"]
     canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
+    new_failing = checked.get("new_failing") or []
+    tightened = (f" New or tightened readiness checks fail on this host: {', '.join(new_failing)}; they did not count "
+                 "against the deploy." if new_failing else "")
     units = sorted(path[len(UNIT_DIR):] for _, path in changes(host.live, old, head) if path.startswith(UNIT_DIR))
     installs = (f" Files under {UNIT_DIR} changed ({', '.join(units)}): the deploy does not install them; an "
                 "operator reviews them, runs ops/install_units.py, then --apply --head with the sha it printed, in "
                 "an idle window." if units else "")
     return {"status": "deployed", **_shipped(host, run), "canary": checked["canary"], "units": units,
+            "new_failing": new_failing,
             "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
-            f"readiness passed and {canary}.{installs}"}
+            f"readiness passed and {canary}.{tightened}{installs}"}
 
 
 def _shipped(host: Host, run: Dict[str, Any]) -> Dict[str, Any]:
