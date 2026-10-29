@@ -1103,15 +1103,25 @@ def _shipped(host: Host, run: Dict[str, Any]) -> Dict[str, Any]:
 def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], None]) -> Dict[str, Any]:
     """The revert window, the re-check and the revert's pull request. The revert commit (the tree of ``old`` on top
     of ``head``) is made and recorded before the tree moves to it, so a resumed rollback finds it and moves the tree
-    there, or finds the tree moved already."""
+    there, or finds the tree moved already. Once it exists, each step runs on its own: one that fails is named in the
+    summary and the next still runs, so the revert always reaches GitHub."""
     live, head, failure, restarted = host.live, run["head"], run["failure"], run["affected"]
     if not run.get("revert"):
         revert = _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
                       f"{run['old']}^{{tree}}", "-p", head, "-m",
                       f"Revert {head[:12]}: the deploy's checks failed ({failure[:200]})").strip()
         _save(task, run, revert=revert)
-    revert = _switch(host, task, run, "back", log)
-    still = host.checks(restarted, run["baseline"])["failure"]
+    revert, units = run["revert"], ", ".join(restarted) or "nothing"
+    try:
+        _switch(host, task, run, "back", log)
+        reverted = f", so I reverted main ({revert[:12]}) and restarted {units}"
+    except Exception as exc:
+        log(f"the revert window failed: {exc}")
+        reverted = f"; reverting main to {revert[:12]} and restarting {units} failed ({str(exc)[:300]})"
+    try:
+        still = host.checks(restarted, run["baseline"])["failure"]
+    except Exception as exc:
+        still = f"the checks failed ({str(exc)[:300]})"
     published = _publish_revert(host, revert, head, failure, log)
     health = "Aura is healthy again" if still is None else f"the checks still fail: {still}"
     if published["status"] == "merged":
@@ -1121,8 +1131,7 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     else:
         github_now = f"the revert is not on GitHub yet ({published['error']})"
     return {"status": "rolled_back", **_shipped(host, run), "revert": revert, "revert_pr": published, "error": failure,
-            "summary": f"Deploying {head[:12]} failed its checks ({failure}), so I reverted main ({revert[:12]}) and restarted "
-            f"{', '.join(restarted) or 'nothing'}; {health}; {github_now}."}
+            "summary": f"Deploying {head[:12]} failed its checks ({failure}){reverted}; {health}; {github_now}."}
 
 
 def _drift(live: Path, old: str) -> Optional[Dict[str, Any]]:

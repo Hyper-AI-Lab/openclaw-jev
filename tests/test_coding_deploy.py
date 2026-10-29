@@ -2322,3 +2322,44 @@ def test_a_check_failing_before_and_after_is_ignored(repos, monkeypatch, readine
     code, result, seen = ship_main(repos, monkeypatch, host)
     assert code == 0 and result["status"] == "deployed" and result["new_failing"] == []
     assert "readiness checks fail" not in result["summary"] and seen.notes == []
+
+
+def test_a_canary_that_times_out_in_both_checks_still_publishes_the_revert(repos):
+    class TimingOutHost(FakeHost):
+        """Its checks raise the canary's timeout, after the change and again after the revert."""
+
+        def checks(self, restarted, baseline, **kwargs):
+            super().checks(restarted, baseline, **kwargs)
+            raise subprocess.TimeoutExpired(["bash", "ops/canary.sh"], 600)
+
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = TimingOutHost(repos.live)
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and len([c for c in host.calls if c[0] == "checks"]) == 2
+    assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]
+    timeout = "Command '['bash', 'ops/canary.sh']' timed out after 600 seconds"
+    assert f"the checks still fail: the checks failed ({timeout})" in result["summary"]
+    assert git(repos.live, "rev-parse", "main") == result["revert"] == git(repos.origin, "rev-parse", "main")
+
+
+def test_a_revert_window_that_fails_still_publishes_the_revert_and_says_so(repos):
+    class FailingBack(FakeHost):
+        """The revert window's stop of rmp-api fails."""
+
+        def systemctl(self, *args):
+            super().systemctl(*args)
+            if self.calls.count(("systemctl", "stop", "rmp-api")) == 2 and args == ("stop", "rmp-api"):
+                raise subprocess.CalledProcessError(1, ["systemctl", *args])
+
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = FailingBack(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back"
+    assert (f"; reverting main to {result['revert'][:12]} and restarting rmp-api, rmp-worker failed (Command "
+            "'['systemctl', 'stop', 'rmp-api']' returned non-zero exit status 1.); Aura is healthy again; GitHub's main "
+            "is reverted too") in result["summary"]
+    # The window started what it stopped; the re-check and the publish still ran.
+    assert [c for c in host.calls if c[0] in ("systemctl", "checks", "land")][-3:] == [
+        ("systemctl", "start", "rmp-api", "rmp-worker"), ("checks", ("rmp-api", "rmp-worker"), ("telemetry",)),
+        ("land", f"aura/revert-{head[:12]}", "merge")]
+    assert git(repos.origin, "rev-parse", "main") == result["revert"]

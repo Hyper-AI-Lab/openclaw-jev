@@ -83,3 +83,48 @@ def test_a_baseline_the_deploy_code_before_this_one_recorded_compares_as_it_did(
         "failure": "readiness checks failed: backup_manifest", "canary": None}
     assert deploy_checks.run(LIVE, ["rmp-api"], ["telemetry", "backup_manifest"]) == {
         "failure": None, "canary": "ok", "new_failing": []}
+
+
+@pytest.fixture
+def canary_runs(monkeypatch):
+    """canary.sh's runs: each answers the next of ``outputs`` (an exception in it is raised); each argv, cwd, timeout
+    and the sentinel switch it was run with are recorded, and the waits between runs."""
+    seen = {"outputs": [], "runs": [], "sleeps": []}
+
+    def run(argv, *, cwd, capture_output, text, timeout, env):
+        seen["runs"].append((argv, cwd, timeout, env.get("RMP_CANARY_SKIP_SENTINEL")))
+        output = seen["outputs"].pop(0)
+        if isinstance(output, BaseException):
+            raise output
+        return deploy_checks.subprocess.CompletedProcess(argv, 0 if "CANARY OK" in output else 1, stdout=output)
+
+    monkeypatch.setattr(deploy_checks.subprocess, "run", run)
+    monkeypatch.setattr(deploy_checks.time, "sleep", seen["sleeps"].append)
+    return seen
+
+
+@pytest.mark.parametrize("error, line", [
+    (deploy_checks.subprocess.TimeoutExpired(["bash", "canary.sh"], 600),
+     "CANARY ERROR: the canary did not finish (TimeoutExpired: Command '['bash', 'canary.sh']' timed out after 600 "
+     "seconds)"),
+    (FileNotFoundError(2, "No such file or directory"),
+     "CANARY ERROR: the canary did not finish (FileNotFoundError: [Errno 2] No such file or directory)")])
+def test_the_canary_returns_a_line_on_a_timeout(canary_runs, error, line):
+    canary_runs["outputs"] = [error]
+    assert deploy_checks.canary(LIVE) == line
+    assert canary_runs["runs"] == [(["bash", str(LIVE / "ops" / "canary.sh")], LIVE, deploy_checks.CANARY_TIMEOUT_SEC,
+                                    "1")]
+
+
+def test_the_checks_never_raise(probes, monkeypatch):
+    def broken(url, seconds):
+        raise ValueError("unknown url type")
+
+    monkeypatch.setattr(deploy_checks, "_wait_ok", broken)
+    assert deploy_checks.run(LIVE, ["rmp-api"], {}) == {"failure": "the checks failed (unknown url type)",
+                                                        "canary": None}
+    probes["report"] = {"telemetry": "pass"}
+    monkeypatch.setattr(deploy_checks, "_wait_ok", lambda url, seconds: True)
+    monkeypatch.setattr(deploy_checks, "canary", lambda live: 1 / 0)
+    assert deploy_checks.run(LIVE, ["rmp-api"], {}) == {"failure": "the checks failed (division by zero)",
+                                                        "canary": None}

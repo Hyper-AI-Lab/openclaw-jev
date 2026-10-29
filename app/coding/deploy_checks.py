@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 import urllib.error
@@ -13,6 +14,7 @@ RMP = "http://127.0.0.1:8000"
 GATEWAY_READY = "http://127.0.0.1:18789/readyz"
 CANARY_TRIES = 5
 CANARY_WAIT_SEC = 30
+CANARY_TIMEOUT_SEC = 600
 
 
 def _status(url: str, timeout: float = 10) -> int:
@@ -45,9 +47,15 @@ def readiness_report() -> Dict[str, str]:
 
 
 def canary(live: Path) -> str:
-    """"ok", "skipped" while user tasks keep the canary from running, or the failure line."""
+    """"ok", "skipped" while user tasks keep the canary from running, or the failure line. It runs without the
+    sentinel, whose recovery canary would outlast ``CANARY_TIMEOUT_SEC``; a canary that does not finish within it, or
+    cannot start, is a "CANARY ERROR" line."""
     for _ in range(CANARY_TRIES):
-        run = subprocess.run(["bash", str(live / "ops" / "canary.sh")], cwd=live, capture_output=True, text=True, timeout=600)
+        try:
+            run = subprocess.run(["bash", str(live / "ops" / "canary.sh")], cwd=live, capture_output=True, text=True,
+                                 timeout=CANARY_TIMEOUT_SEC, env={**os.environ, "RMP_CANARY_SKIP_SENTINEL": "1"})
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return f"CANARY ERROR: the canary did not finish ({type(exc).__name__}: {exc})"
         if "CANARY OK" in run.stdout:
             return "ok"
         if "CANARY SKIP" not in run.stdout:
@@ -64,24 +72,27 @@ def run(live: Path, restarted: Iterable[str], baseline: Union[Dict[str, str], Li
     failed then too is ignored, and so is every name in ``ignore``.
 
     A run's state from the deploy code before this one holds the names failing then as a list; every other check counts
-    as passed then, as that code compared."""
-    if not _wait_ok(f"{RMP}/health", 120):
-        return {"failure": "RMP's /health did not answer within 2 minutes", "canary": None}
-    if "openclaw-gateway" in restarted and not _wait_ok(GATEWAY_READY, 300):
-        return {"failure": "the gateway was not ready within 5 minutes", "canary": None}
+    as passed then, as that code compared. It never raises: an error is a failure."""
     try:
-        now = readiness_report()
+        if not _wait_ok(f"{RMP}/health", 120):
+            return {"failure": "RMP's /health did not answer within 2 minutes", "canary": None}
+        if "openclaw-gateway" in restarted and not _wait_ok(GATEWAY_READY, 300):
+            return {"failure": "the gateway was not ready within 5 minutes", "canary": None}
+        try:
+            now = readiness_report()
+        except Exception as exc:
+            return {"failure": f"the readiness report failed ({exc})", "canary": None}
+        if isinstance(baseline, list):
+            baseline = {name: "fail" if name in baseline else "pass" for name in now}
+        ignored = set(ignore)
+        failing = sorted(name for name, status in now.items() if status == "fail" and name not in ignored)
+        regressions = [name for name in failing if baseline.get(name) == "pass"]
+        if regressions:
+            return {"failure": f"readiness checks failed: {', '.join(regressions)}", "canary": None}
+        result = canary(live)
+        if result not in ("ok", "skipped"):
+            return {"failure": result, "canary": None}
+        return {"failure": None, "canary": result,
+                "new_failing": [name for name in failing if baseline.get(name, "warn") == "warn"]}
     except Exception as exc:
-        return {"failure": f"the readiness report failed ({exc})", "canary": None}
-    if isinstance(baseline, list):
-        baseline = {name: "fail" if name in baseline else "pass" for name in now}
-    ignored = set(ignore)
-    failing = sorted(name for name, status in now.items() if status == "fail" and name not in ignored)
-    regressions = [name for name in failing if baseline.get(name) == "pass"]
-    if regressions:
-        return {"failure": f"readiness checks failed: {', '.join(regressions)}", "canary": None}
-    result = canary(live)
-    if result not in ("ok", "skipped"):
-        return {"failure": result, "canary": None}
-    return {"failure": None, "canary": result,
-            "new_failing": [name for name in failing if baseline.get(name, "warn") == "warn"]}
+        return {"failure": f"the checks failed ({exc})", "canary": None}
