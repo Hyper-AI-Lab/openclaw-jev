@@ -445,15 +445,17 @@ def test_a_pull_request_pushes_the_branch_and_opens_the_pr_with_the_token(repos,
 @pytest.fixture
 def systemd_run(monkeypatch):
     """systemd-run and systemctl's unit list and stop as the launcher and an abort call them: each start's argv is
-    recorded, or raises while ``fail`` is set, ``units`` are the deploy units listed, and each unit stopped is recorded
-    in ``stopped``, after which ``on_stop`` runs (the unit's own end on the stop's SIGTERM). Every other command runs
-    for real."""
+    recorded, or raises while ``fail`` is set, ``units`` are the deploy units, listed when the list asks for their
+    state (a name is active; a (name, state) pair has that state), and each unit stopped is recorded in ``stopped``,
+    after which ``on_stop`` runs (the unit's own end on the stop's SIGTERM). Every other command runs for real."""
     real, state = subprocess.run, SimpleNamespace(argvs=[], fail=False, units=[], stopped=[], on_stop=None)
 
     def run(argv, **kwargs):
         if argv[:2] == ["systemctl", "list-units"]:
-            return SimpleNamespace(returncode=0, stderr="",
-                                   stdout="".join(f"{unit} loaded active running Deploy\n" for unit in state.units))
+            wanted = next(arg for arg in argv if arg.startswith("--state=")).split("=", 1)[1].split(",")
+            units = [(unit, "active") if isinstance(unit, str) else unit for unit in state.units]
+            return SimpleNamespace(returncode=0, stderr="", stdout="".join(
+                f"{unit} loaded {active} running Deploy\n" for unit, active in units if active in wanted))
         if argv[:2] == ["systemctl", "stop"]:
             state.stopped += argv[2:]
             if state.on_stop:
@@ -2132,3 +2134,26 @@ def test_a_resumed_launch_that_only_waits_is_not_counted(repos, systemd_run, mon
             assert run["launches"] == run["started"] == run["ended"] == launch
             assert run["attempt"] == run["escapes"] == 0
     assert deploy.end_dead_runs(FakeHost(repos.live)) == [] and seen.added == []
+
+
+def test_a_stopping_deploy_unit_counts_as_running(repos, systemd_run):
+    class ListingHost(FakeHost):
+        """Lists the deploy units the way the host does, through systemctl."""
+
+        deploy_units = deploy.Host.deploy_units
+
+    deploy.queue(reviewed(repos))
+    launched("t1", 3, started=0)
+    deploy.queue(main_spec("c" * 40))
+    before = deploy.state_file("t1").read_text()
+    # Its unit is still in its SIGTERM handler or its ExecStopPost=: the run is left alone, and nothing launches.
+    systemd_run.units = [("aura-deploy-t1.service", "deactivating")]
+    host = ListingHost(repos.live)
+    assert host.deploy_units() == ["aura-deploy-t1.service"]
+    assert deploy.gate(host) == ("a deploy unit is running", False)
+    assert deploy.end_dead_runs(host) == [] and deploy.next_deploy(host) is None
+    assert deploy.state_file("t1").read_text() == before and systemd_run.argvs == []
+
+    systemd_run.units = [("aura-deploy-t1.service", "inactive")]
+    assert [task for task, _, _ in deploy.end_dead_runs(host)] == ["t1"]
+    assert deploy.next_deploy(host) == "aura-deploy-main"

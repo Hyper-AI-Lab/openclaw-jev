@@ -525,7 +525,7 @@ def next_deploy(host: "Host") -> Optional[str]:
 
 
 def end_dead_runs(host: "Host") -> List[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
-    """End the dead runs, under the launch lock and only while no deploy unit is active; (task, spec, result) for each
+    """End the dead runs, under the launch lock and only while no deploy unit runs; (task, spec, result) for each
     to report, nothing when the lock is held or a unit runs.
 
     A dead run still ``queued`` or ``landed`` changed nothing: it ends ``failed`` (its unit ended before it started,
@@ -754,9 +754,11 @@ class Host:
         return count_active_user_tasks_sync(strict=True)
 
     def deploy_units(self) -> List[str]:
-        """The deploy units active or starting now."""
-        out = subprocess.run(["systemctl", "list-units", "--plain", "--no-legend", "--state=active,activating",
-                              "aura-deploy-*"], check=True, capture_output=True, text=True, timeout=60).stdout
+        """The deploy units running now: active, starting, or stopping (a unit in its ``SIGTERM`` handler or its
+        ``ExecStopPost=`` still runs, and its run is left alone until it has ended)."""
+        out = subprocess.run(["systemctl", "list-units", "--plain", "--no-legend",
+                              "--state=active,activating,deactivating", "aura-deploy-*"],
+                             check=True, capture_output=True, text=True, timeout=60).stdout
         return [line.split()[0] for line in out.splitlines() if line.strip()]
 
     def reload_lock_held(self) -> bool:
