@@ -11,10 +11,12 @@ next queued run, only when no deploy unit runs, nothing holds the code-reload lo
 The unit does its slow work first (a reviewed run's land and CI wait), then holds the code-reload lock, refuses
 mirrors edited by hand and, right after the strict idle count, stops the affected units, the API first with a
 second count; it fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in full and starts the units
-again, then checks health, readiness and a canary. It never installs a unit file; the result names the changed
-ones. On failure it reverts the live ``main`` the same way at once; the revert reaches GitHub as a pull request of
-its own. Each phase is written to the run's state as it happens, so a killed unit's run resumes from its phase. It
-records the result, then a reviewed job's workflow replies on the new code, or Kirill gets a note for Aura's own.
+again, then checks health, readiness (like with like: only a check that passed before can fail it) and a canary.
+It never installs a unit file; the result names the changed ones. On failure it reverts the live ``main`` the same
+way at once, lands the revert on GitHub as a pull request of its own whatever that window did, then checks health
+again. Each phase is written to the run's state as it happens, so a killed unit's run resumes from its phase. It
+records the result under the code-reload lock: Kirill's note for Aura's own first, retried, then the event; a
+reviewed job's workflow then replies on the new code.
 """
 from __future__ import annotations
 
