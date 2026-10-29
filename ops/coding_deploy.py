@@ -54,9 +54,14 @@ async def finish(spec: dict, result: dict) -> None:
     task_id, github = spec["task_id"], spec.get("source") == "github"
     recorded = result
     if github and (result["status"] not in QUIET or result.get("units") or result.get("new_failing")):
-        note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
-        noted = await deploy.send_note(note, f"deploy:{task_id}:{(result.get('head') or '')[:12]}", notify_ops_slack,
-                                       log)
+        noted = False
+        try:
+            note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
+        except Exception as exc:
+            log(f"writing the note to Kirill failed ({str(exc)[:300]})")
+        else:
+            noted = await deploy.send_note(note, f"deploy:{task_id}:{(result.get('head') or '')[:12]}",
+                                           notify_ops_slack, log)
         recorded = {**result, "note_delivered": noted}
     try:
         async with AsyncSessionLocal() as db:

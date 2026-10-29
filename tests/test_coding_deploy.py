@@ -2671,3 +2671,14 @@ def test_the_watcher_leaves_a_stopping_main_unit_its_run(repos, github_ci, syste
     systemd_run.units = [("aura-deploy-main.service", "inactive")]
     assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 2
     assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == later
+
+
+def test_a_note_that_cannot_be_written_still_lets_the_result_be_recorded(tmp_path, monkeypatch, capsys, pauses):
+    def unwritable(result, repo):
+        raise KeyError("repositories")
+
+    monkeypatch.setattr(deploy, "deploy_note", unwritable)
+    code, steps, seen = run_noting_unit(tmp_path, monkeypatch, [True])
+    out = capsys.readouterr().out
+    assert steps == ["event"] and "writing the note to Kirill failed ('repositories')" in out
+    assert seen.added[0].event_payload["note_delivered"] is False
