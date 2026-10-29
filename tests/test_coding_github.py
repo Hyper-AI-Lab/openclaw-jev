@@ -107,3 +107,19 @@ def test_kirills_note_links_each_pull_request():
                                "summary": "Deployed abc to main."}, REPO)
     assert note == ("Aura's change is live.\n• Fix the greeting (#12) https://github.com/Hyper-AI-Lab/openclaw-jev/pull/12\n"
                     "• Tidy the logs\nDeployed abc to main.")
+
+
+def test_the_pull_request_that_merged_a_branchs_commit_is_found_by_that_commit(monkeypatch):
+    calls = []
+    pulls = [{"number": 5, "html_url": "u5", "merged_at": None, "head": {"sha": "abc"}, "merge_commit_sha": "m5"},
+             {"number": 6, "html_url": "u6", "merged_at": "2026-10-29T10:00:00Z", "head": {"sha": "old"},
+              "merge_commit_sha": "m6"},
+             {"number": 7, "html_url": "u7", "merged_at": "2026-10-29T11:00:00Z", "head": {"sha": "abc"},
+              "merge_commit_sha": "m7"}]
+    monkeypatch.setattr(github, "api", lambda method, path, body=None: calls.append((method, path)) or pulls)
+    assert github.merged_pull("aura/t1-x", "abc", REPO) == {"pr": {"number": 7, "url": "u7"}, "merge": "m7"}
+    assert calls == [("GET", f"repos/{REPO}/pulls?state=closed&head=Hyper-AI-Lab:aura/t1-x&base=main")]
+    # A closed pull request that never merged, or one that merged another commit of the branch, is not it.
+    assert github.merged_pull("aura/t1-x", "def", REPO) is None
+    pulls[:] = pulls[:1]
+    assert github.merged_pull("aura/t1-x", "abc", REPO) is None

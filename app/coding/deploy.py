@@ -856,6 +856,10 @@ class Host:
     def land(self, commit: str, branch: str, title: str, body: str, method: str) -> Dict[str, Any]:
         return github.land(self.live, commit, branch, title, body, repo=self.repo, method=method)
 
+    def merged_pull(self, commit: str, branch: str) -> Optional[Dict[str, Any]]:
+        """The pull request from ``branch`` that merged ``commit`` on GitHub, with its merge commit; None if none did."""
+        return github.merged_pull(branch, commit, self.repo)
+
     def wait_check(self, sha: str) -> str:
         """CI's test check on ``sha`` once it finished, or its state when the wait ran out."""
         return github.wait_check(sha, self.repo)
@@ -1040,10 +1044,15 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         if blocked:
             return blocked
         if run.get("phase") != "landed":
-            landed = host.land(spec["head"], spec["branch"], spec["title"], spec["body"], "squash")
-            if landed["status"] != "merged":
-                return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on {landed['pr']['url']} "
-                        f"is {landed['check']}, so nothing was deployed; main is unchanged."}
+            # A try before may have merged the pull request and lost GitHub's answer: that land is found, not repeated.
+            landed = host.merged_pull(spec["head"], spec["branch"]) if run.get("attempt", 0) > 0 else None
+            if landed:
+                log(f"{landed['pr']['url']} was merged by an earlier try")
+            else:
+                landed = host.land(spec["head"], spec["branch"], spec["title"], spec["body"], "squash")
+                if landed["status"] != "merged":
+                    return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on "
+                            f"{landed['pr']['url']} is {landed['check']}, so nothing was deployed; main is unchanged."}
             _save(task, run, phase="landed", pr=landed["pr"], merge=landed["merge"])
         head = run["merge"]
         log(f"landed {run['pr']['url']} as {head[:12]}")

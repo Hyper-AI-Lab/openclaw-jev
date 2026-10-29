@@ -93,13 +93,16 @@ class FakeHost(deploy.Host):
     The gate's probes answer from ``units`` (the deploy units running), ``held`` (the code-reload lock) and ``busy``
     (the idle counts in turn, then 0; an exception in it is raised); each count is recorded. CI's check on a commit
     answers from ``ci``, by commit, else "success". ``kill_at`` (a systemctl verb and n) kills the unit at its n-th
-    systemctl call of that verb: ``deploy.Interrupted`` is raised there, once, before the call is made."""
+    systemctl call of that verb: ``deploy.Interrupted`` is raised there, once, before the call is made. ``merged`` is
+    GitHub's record of the pull requests that merged, by branch, which a land adds to; hosts can share it."""
 
-    def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None, kill_at=None):
+    def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None, kill_at=None,
+                 merged=None):
         super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
         self.calls, self.busy, self.results, self.lands = [], list(busy), list(checks), list(lands)
         self.units, self.held, self.ci = list(units), held, dict(ci or {})
         self.kill_at = list(kill_at) if kill_at else None
+        self.merged = {} if merged is None else merged
 
     def active_user_tasks(self):
         count = self.busy.pop(0) if self.busy else 0
@@ -134,7 +137,13 @@ class FakeHost(deploy.Host):
         if outcome != "merged":
             return {"status": "blocked", "pr": pr, "check": outcome}
         git(self.live, "push", "-q", "origin", f"{commit}:refs/heads/main")
+        self.merged[branch] = {"commit": commit, "pr": pr, "merge": commit}
         return {"status": "merged", "pr": pr, "merge": commit}
+
+    def merged_pull(self, commit, branch):
+        self.calls.append(("merged_pull", branch))
+        found = self.merged.get(branch)
+        return {"pr": found["pr"], "merge": found["merge"]} if found and found["commit"] == commit else None
 
     def wait_check(self, sha):
         self.calls.append(("wait_check", sha))
@@ -2598,3 +2607,47 @@ def test_a_result_reached_under_the_lock_is_recorded_without_letting_go_of_it(re
     # Still held when the deploy returned its result, and while it is recorded; free once the unit is done.
     assert returned == [True] and held == [True] and not reload_lock_held()
     assert seen.added[0].event_payload["status"] == "deployed"
+
+
+def test_a_land_whose_response_was_lost_is_found_merged_and_not_landed_again(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    github = {}
+
+    class LosesTheLandsAnswer(FakeHost):
+        """GitHub merges the pull request, and its answer never arrives."""
+
+        def land(self, commit_sha, branch, title, body, method):
+            super().land(commit_sha, branch, title, body, method)
+            raise deploy.github.GitHubError("PUT repos/x/pulls/3/merge: connection reset by peer")
+
+    head = repos.change({"app/a.py": "A = 2\n"})
+    hosts = [LosesTheLandsAnswer(repos.live, merged=github), FakeHost(repos.live, merged=github)]
+    monkeypatch.setattr(deploy, "Host", lambda: hosts.pop(0))
+    deploy.queue(reviewed(repos, head=head))
+    path = deploy.spec_file("t1")
+    first, relaunched = hosts
+
+    assert unit.main(str(path)) == 1
+    assert state()["phase"] == "queued" and state()["attempt"] == 1 and git(repos.origin, "rev-parse", "main") == head
+    # The first try looks nothing up: it has no earlier try.
+    assert [c for c in first.calls if c[0] in ("land", "merged_pull")] == [("land", "aura/t1-x", "squash")]
+
+    assert unit.main(str(path)) == 0
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == "deployed" and result["pr"] == github["aura/t1-x"]["pr"] and result["head"] == head
+    assert [c for c in relaunched.calls if c[0] in ("land", "merged_pull")] == [("merged_pull", "aura/t1-x")]
+    assert git(repos.live, "rev-parse", "main") == head and ("wait_check", head) in relaunched.calls
+
+
+def test_a_retried_land_that_github_never_merged_lands_again(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live, lands=[deploy.github.GitHubError("POST repos/x/pulls: 502 Bad Gateway")])
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    deploy.queue(reviewed(repos, head=head))
+    path = deploy.spec_file("t1")
+    assert unit.main(str(path)) == 1 and state()["attempt"] == 1
+    assert unit.main(str(path)) == 0
+    assert json.loads(path.with_name("result.json").read_text())["status"] == "deployed"
+    assert [c for c in host.calls if c[0] in ("land", "merged_pull")] == [
+        ("land", "aura/t1-x", "squash"), ("merged_pull", "aura/t1-x"), ("land", "aura/t1-x", "squash")]
