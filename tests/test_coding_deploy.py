@@ -7,6 +7,7 @@ import asyncio
 import fcntl
 import importlib.util
 import json
+import logging
 import os
 import re
 import shutil
@@ -2576,11 +2577,14 @@ async def test_the_reports_note_goes_first_on_its_own_and_is_retried(repos, syst
     monkeypatch.setattr(ops_notify, "notify_ops_slack", notify)
     reporting.db.add = lambda event: steps.append("event") or reporting.events.append(event)
     reporting.db.commit = AsyncMock(side_effect=RuntimeError("could not connect"))
+    caplog.set_level(logging.INFO, logger="rmp.reconciler")
     await reporting.report()
     assert steps == ["note", "note", "event"] and pauses == [30]
     assert reporting.events[0].event_payload["note_delivered"] is True
     assert "Recording the ended deploy of main failed: could not connect" in caplog.text
-    assert "The ended deploy of main: told Kirill" in caplog.text
+    # A delivered note is logged as information, not as a warning.
+    told = [r for r in caplog.records if r.getMessage() == "The ended deploy of main: told Kirill"]
+    assert [r.levelno for r in told] == [logging.INFO]
 
 
 async def test_a_report_whose_note_cannot_be_written_records_it_undelivered(repos, systemd_run, reporting,

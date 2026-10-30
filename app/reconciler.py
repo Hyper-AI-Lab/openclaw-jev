@@ -745,7 +745,8 @@ async def report_ended_deploys() -> None:
                 note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
                 delivered = await deploy.send_note(
                     note, f"deploy:{task_id}:{(result.get('head') or '')[:12]}", notify_ops_slack,
-                    lambda message: logger.warning("The ended deploy of %s: %s", task_id, message))
+                    lambda message: logger.log(logging.INFO if message == "told Kirill" else logging.WARNING,
+                                               "The ended deploy of %s: %s", task_id, message))
             except Exception as e:
                 logger.warning("Telling Kirill about the ended deploy of %s failed: %s", task_id, e)
             recorded = {**result, "note_delivered": delivered}
