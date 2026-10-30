@@ -241,6 +241,7 @@ def test_requirements_are_installed_before_the_restart_and_unit_files_are_not(re
     assert [c for c in host.calls if c[0] == "systemctl"] == switched("rmp-api", "rmp-worker")
     assert os.readlink(repos.link) == str(target)
     assert (deploy.RUNS_DIR / "t1" / "lock" / "requirements.txt").read_text() == "x==2\n"
+    assert deploy.restarts_for(["requirements-dev.txt"]) == ["rmp-api", "rmp-worker"]
 
 
 def test_a_unit_file_change_is_never_installed_or_restarted(repos, monkeypatch):
@@ -3173,6 +3174,34 @@ def test_a_failure_between_the_switch_and_the_fast_forward_switches_the_venv_bac
     result = deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live), log=lambda m: None)
     assert result["status"] == "deployed" and os.readlink(repos.link) == str(built_venv())
     assert state()["venv"]["previous"] == previous
+
+
+def test_a_kill_inside_the_first_switch_leaves_the_link_at_the_new_venv(repos, monkeypatch):
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    real_replace, armed = os.replace, [True]
+
+    def replace(src, dst):
+        # SIGTERM lands after production's directory moved and before the new link took its place.
+        if armed and Path(dst) == repos.link:
+            armed.clear()
+            raise deploy.Interrupted("SIGTERM")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(venvs.os, "replace", replace)
+    host = FakeHost(repos.live)
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    # The link it was making went in before the units started: they start on a venv, the old tree on the new one.
+    run = state()
+    assert os.readlink(repos.link) == str(built_venv()) and run["phase"] == "applying"
+    assert venvs.stamp_of(Path(run["venv"]["previous"])) == run["venv"]["adopt"]
+    assert [c[:2] for c in host.calls if c[0] in ("systemctl", "switch_venv")][-3:] == [
+        ("switch_venv", str(built_venv())), ("switch_venv", str(built_venv())), ("systemctl", "start")]
+    assert git(repos.live, "rev-parse", "main") == repos.old
+
+    result = deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed" and os.readlink(repos.link) == str(built_venv())
 
 
 @pytest.mark.parametrize("waits_at", ["the reserve", "the final count", "the drain"])
