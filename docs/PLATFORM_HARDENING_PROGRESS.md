@@ -3669,3 +3669,106 @@ Every layout ended `verify: exit 0`, with node run in every layout (logs: `/root
 No label is needed: `app/workflows` and `requirements.txt` are untouched.
 
 **Next:** the docs mirror, the PR and the gated merge. The deploy is batch 2's host step: its log must show stop → move → start.
+
+## 2026-10-30 15:39 UTC · WP-09 batch 3: PR opened, gated merge running
+
+**PR:** https://github.com/Hyper-AI-Lab/openclaw-jev/pull/51, head `40d9f12`. The commit after `6a4d674` adds the docs mirror only.
+
+**Gated job `byaed7600`:** the same gate as before. After the merge it records the run's state every 10 s in `/root/.cache/wp09-b3-deploy-timeline.txt`, then prints `result.json` and the whole `deploy.log`. That log is batch 2's host step: stop → move → start.
+
+## 2026-10-30 15:52 UTC · WP-09 batch 3 deployed; a log bug found in batch 2's host step
+
+**Merged:** PR #51, squash `039f0a1`, at 15:44:41Z. The gate passed: CLEAN, `test` `success`, head = local `40d9f12`, base `fc70a93`, one open PR.
+
+**Deployed** by batch 2's code, at 15:51:11Z:
+- `result.json`: `deployed`, head `039f0a1`;
+- restarted `rmp-api` and `rmp-worker`;
+- health, readiness and the canary passed; `units: []`;
+- nondeterminism lines in the worker journal: 0.
+
+**The run, sampled every 10 s:**
+
+| Time (UTC) | State |
+|---|---|
+| 15:50:02 | Queued |
+| 15:50:03 | Unit started |
+| 15:50:08 | `queued`, launches 1, `started` 1 (checked in) |
+| 15:50:19 | `restarted`: batch 2's phases written live |
+| 15:51:08 | Unit ended (`Deactivated successfully`); state removed |
+
+**Afterwards:** the live checkout is at `039f0a1`; both services are active; there are no errors in `rmp-api`'s journal; `/health` returns ok.
+
+**Batch 2's host step could not be read.** `deploy.log` is **0 bytes**, and the unit's journal holds only systemd's start and stop lines. Cause, confirmed by a host probe:
+- a run's first launch uses `StandardOutput=truncate:`;
+- systemd re-opens, and so truncates, the file when it spawns the `ExecStopPost=` that batch 2 added;
+- so every first launch loses its log at the unit's end.
+
+| Probe | Log size |
+|---|---|
+| `truncate:` with `ExecStopPost=/bin/true` | 0 bytes |
+| `truncate:` without it | 6 bytes |
+| `append:` with it | 6 bytes |
+
+Deploys still work, and results are still recorded; only the first launch's log is lost. New ledger item `WP09-b2-first-launch-log-wiped`. **Spec §9 amendment 6:** always use `append:`; the launcher empties the log on a run's first launch. This ships as hotfix batch 3a, before batch 4. Its own deploy (run by batch 3's code) is read by copying `deploy.log` every few seconds while the unit runs. That also completes batch 2's host step.
+
+**Ledger** (WP-09 §7, after batch 3): closed `B2b-03`, `B3a-01`, `TRI-020`, `TRI-021`, `coding-R5`, `flow-direct-claude-session-R4`, `WP09-b2-early-results-unlocked`, `WP09-b2-land-retry-after-lost-response` and `WP09-b2-queue-main-deactivating`.
+
+**`ordering.md` rule 38:** gains "Lifted when WP-09 batch 3 deployed (2026-10-30, PR #51, 039f0a1)".
+
+## 2026-10-30 16:03 UTC · WP-09 hotfix 3a started
+
+**Branch:** `aura/wp-09-3a-log` from `039f0a1`.
+
+**Scope:** spec §9 amendment 6 only. `append:` on every launch, and the launcher empties the log on a run's first launch.
+
+**Pipeline:** the Workflow hook timed out, so this uses the manual pipeline (`/root/.cache/wp-batch-manual/wp09-b3a/`), with the implementer as a background agent. Two Tier-1 reviewers follow.
+
+## 2026-10-30 17:32 UTC · WP-09 hotfix 3a implemented; reviews and my verify running
+
+**Implementer:** 2 commits, `2ef8a85` and `92334c7`, on `039f0a1`.
+- **The fix:** `launch` always passes `append:`. On a run's first launch, the launcher empties the log first, then sets 0600 with `fchmod`, because the host's systemd-created logs are 0644.
+- **Docs:** the docstring and ARCHITECTURE.md describe this.
+- **Tests:** `test_a_run_keeps_one_log_of_its_launches` is rewritten, and one argv assertion is updated. No `truncate:` is left in the repo.
+- **Mutation probes:** 6/6 caught.
+
+**Batch 3's code ships this head,** shown both by reading and by a scratch execution. Batch 3's code deployed this head and ended `deployed`, with its log reading stop → move → start. In the same run, this code relaunched runs that batch 3 had killed and finished them.
+
+**Implementer's harness on `92334c7`:** all four layouts, 1960 passed, 1 skipped; node 58/58 in each layout.
+
+**Now running:** two Tier-1 reviewers (on focused runs) and my own four-layout verify (`b2g0bxkup`).
+
+## 2026-10-30 17:48 UTC · WP-09 hotfix 3a: both reviewers approve
+
+**Closure reviewer: approve.**
+- It reproduced the amendment's host probe on systemd 255, and showed that the new design ends at 0600 and keeps every append.
+- It accepts the `fchmod`.
+- In its own scratch run, `039f0a1`'s code deployed this head: stop → stop → start.
+- 5 of its 6 mutants were caught.
+
+**Correctness reviewer: approve.**
+- The emptying runs under `.launch.lock`, with no unit active, activating or deactivating, so it can never race a unit that is still writing the log.
+- Run directories are root-only.
+- Its focused runs passed in all four layouts: 151 passed each.
+
+**Non-blocking test gaps**, one from each reviewer; the code is right in both cases:
+- a later launch after a unit that never checked in;
+- a postponed first launch.
+
+They are ledgered as `WP09-b3a-log-test-gaps`, for batch 4, which edits the same test file. Not added now, because that would restart the verify.
+
+**Waiting:** my four-layout verify (`b2g0bxkup`).
+
+## 2026-10-30 18:47 UTC · WP-09 hotfix 3a verified by me
+
+**My harness run on `92334c7`** (base `039f0a1`, unchanged as `origin/main`):
+
+| Layout | pytest | Time | node | Leftovers | Placeholder grep | Hidden new files |
+|---|---|---|---|---|---|---|
+| Default | 1960 passed, 1 skipped | 19:06 | 58/58 | 0 | clean | none |
+| coding-job | 1960 passed, 1 skipped | 20:17 | 58/58 | 0 | clean | none |
+| direct | 1960 passed, 1 skipped | 17:05 | 58/58 | 0 | clean | none |
+| live | 1960 passed, 1 skipped | 17:41 | 58/58 | 0 | clean | none |
+
+Every layout ended `verify: exit 0` (logs: `/root/.cache/wp09-b3a-myverify-92334c7/`).
+
+**Next:** the docs mirror, the PR and the gated merge. While the unit runs, the job copies `deploy.log` every 2 s to read batch 2's host step.
