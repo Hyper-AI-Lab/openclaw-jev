@@ -132,7 +132,8 @@ def test_the_shared_venv_is_rebuilt_only_when_the_trusted_requirements_change(en
     venv = verify.ensure_shared_venv("demo", requirements)
     assert (venv / "bin" / "python").exists()
     stamp = (venv / ".rmp-lock.sha256").stat().st_mtime_ns
-    assert verify.ensure_shared_venv("demo", requirements) == venv and (venv / ".rmp-lock.sha256").stat().st_mtime_ns == stamp
+    assert verify.ensure_shared_venv("demo", requirements) == venv
+    assert (venv / ".rmp-lock.sha256").stat().st_mtime_ns == stamp
     requirements.write_text("# changed\n")
     verify.ensure_shared_venv("demo", requirements)
     assert (venv / ".rmp-lock.sha256").read_text().strip() == venvs.lock_hash(env.tmp)
