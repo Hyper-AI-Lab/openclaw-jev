@@ -1043,9 +1043,23 @@ def test_a_host_without_a_runs_directory_launches_nothing_and_creates_nothing(re
 
 def test_a_run_keeps_one_log_of_its_launches(repos, systemd_run, monkeypatch, capsys):
     log = deploy.spec_file("t1").with_name("deploy.log")
+    faked = deploy.subprocess.run
+
+    def run(argv, **kwargs):
+        # The unit's output, which systemd appends to the log from the unit's start.
+        if argv[:1] == ["systemd-run"]:
+            with log.open("a") as out:
+                out.write(f"unit {len(systemd_run.argvs) + 1}\n")
+        return faked(argv, **kwargs)
+
+    monkeypatch.setattr(deploy.subprocess, "run", run)
     deploy.queue(reviewed(repos))
+    log.write_text("an earlier run's log\n")
+    log.chmod(0o644)
     host = FakeHost(repos.live)
     assert deploy.next_deploy(host) == "aura-deploy-t1"
+    # The run's first launch empties the log before its unit starts.
+    assert log.read_text() == "unit 1\n" and log.stat().st_mode & 0o777 == 0o600
     unit, seen = deploy_unit(monkeypatch)
     # The launch waits: its run stays queued.
     monkeypatch.setattr(deploy, "self_deploy", lambda the_spec, host, *, log: None)
@@ -1055,16 +1069,16 @@ def test_a_run_keeps_one_log_of_its_launches(repos, systemd_run, monkeypatch, ca
     first = capsys.readouterr().out.splitlines()[0]
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ launch 1 of the deploy of cccccccccccc \(phase queued\)", first)
 
-    assert deploy.next_deploy(host) == "aura-deploy-t1"
+    # A later launch of the run keeps the log.
+    assert deploy.next_deploy(host) == "aura-deploy-t1" and log.read_text() == "unit 1\nunit 2\n"
     deploy.state_file("t1").unlink()
     deploy.queue(reviewed(repos, head="d" * 40))
-    assert deploy.next_deploy(host) == "aura-deploy-t1"
+    assert deploy.next_deploy(host) == "aura-deploy-t1" and log.read_text() == "unit 3\n"
     # A new head that replaces a run still queued, launched once already, is a new run too.
     deploy.queue(reviewed(repos, head="e" * 40))
-    assert deploy.next_deploy(host) == "aura-deploy-t1"
+    assert deploy.next_deploy(host) == "aura-deploy-t1" and log.read_text() == "unit 4\n"
     outputs = [[arg for arg in argv if arg.startswith("--property=StandardOutput=")] for argv in systemd_run.argvs]
-    assert outputs == [[f"--property=StandardOutput=truncate:{log}"], [f"--property=StandardOutput=append:{log}"],
-                       [f"--property=StandardOutput=truncate:{log}"], [f"--property=StandardOutput=truncate:{log}"]]
+    assert outputs == [[f"--property=StandardOutput=append:{log}"]] * 4
 
 
 def test_a_queued_githubs_main_already_shipped_by_a_reviewed_deploy_is_unchanged(repos, tmp_path, monkeypatch):
@@ -1158,7 +1172,8 @@ def test_what_the_previous_deploy_code_left_launches_nothing_and_the_next_head_q
     assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 1
     assert [task for task, _ in deploy.queued_runs()] == [deploy.MAIN]
     assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == head
-    assert f"--property=StandardOutput=truncate:{deploy.RUNS_DIR / deploy.MAIN / 'deploy.log'}" in systemd_run.argvs[0]
+    log = deploy.RUNS_DIR / deploy.MAIN / "deploy.log"
+    assert f"--property=StandardOutput=append:{log}" in systemd_run.argvs[0] and log.read_text() == ""
 
 
 def test_a_dm_during_the_ci_wait_defers_the_restart(repos):

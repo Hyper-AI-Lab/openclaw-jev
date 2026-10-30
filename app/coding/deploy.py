@@ -460,20 +460,26 @@ def launch(task: str, *, postpone: bool = False, live: Path) -> str:
     """Start the run's detached root unit, which outlives worker restarts, including its own; the unit started.
 
     The launch is counted in the run's state first; a failed start puts the state back, so the run stays queued. A
-    run keeps one log: its first launch starts it empty, and every later launch of the run appends to it. Whatever
-    ends the unit, its ``ExecStopPost=`` starts the units its window left stopped (``stop_post_command``).
+    run keeps one log: the launcher empties it before the run's first launch, and every launch appends to it. The
+    unit never empties it itself: systemd opens the unit's output again for its ``ExecStopPost=``, which would wipe
+    the log at the unit's end. Whatever ends the unit, its ``ExecStopPost=`` starts the units its window left stopped
+    (``stop_post_command``).
     """
     path, state = spec_file(task), state_file(task)
     run = json.loads(state.read_text())
     unit = f"aura-deploy-{task}"
-    log = f"{'append' if run.get('launches') else 'truncate'}:{path.with_name('deploy.log')}"
-    props = [f"RuntimeMaxSec={DEPLOY_UNIT_MAX_SEC}", f"StandardOutput={log}", "StandardError=inherit",
+    log = path.with_name("deploy.log")
+    props = [f"RuntimeMaxSec={DEPLOY_UNIT_MAX_SEC}", f"StandardOutput=append:{log}", "StandardError=inherit",
              f"Environment=PYTHONPATH={live}", "EnvironmentFile=-/etc/rmp/rmp.env",
              "EnvironmentFile=-/etc/openclaw/openclaw.env", f"ExecStopPost={stop_post_command(path.parent)}"]
     argv = ["systemd-run", f"--unit={unit}", f"--working-directory={live}", "--collect", "--quiet",
             *[f"--property={prop}" for prop in props], "--",
             str(live / "venv" / "bin" / "python"), str(live / "ops" / "coding_deploy.py"), str(path),
             *(["--postpone"] if postpone else [])]
+    if not run.get("launches"):
+        # A new run starts its log empty, 0600 even when an earlier run's unit created it (systemd makes it 0644).
+        with open(log, "w", opener=lambda name, flags: os.open(name, flags, 0o600)) as empty:
+            os.fchmod(empty.fileno(), 0o600)
     # A state from before ``started`` gets it here, in the write that counts the launch, so its later launches count;
     # a launch that died without a word after it checked in is folded in as an attempt or an escape (``_deaths``).
     started = run.get("started", run.get("launches", 0))
