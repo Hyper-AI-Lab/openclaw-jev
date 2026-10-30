@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from app import config
-from app.coding import deploy, direct
+from app.coding import deploy, direct, venvs
 from app.llm import quota_broker
 from app.production import canary_sentinel
 from tests import production_guard
@@ -46,6 +46,7 @@ PRODUCTION = {
     "app.coding.deploy.LIVE_REPO": "/root/.openclaw/rmp",
     "app.coding.deploy.PLUGINS_MIRROR": "/root/.openclaw/plugins",
     "app.coding.deploy.WEB_STACK_MIRROR": "/root/.openclaw/web-stack",
+    "app.coding.venvs.VENVS_ROOT": "/root/.openclaw/venvs",
 }
 # Every other host setting a module reads from config, with its value in production.
 PRODUCTION_SETTINGS = {"app.config.TEMPORAL_ADDRESS": "localhost:7233"}
@@ -107,6 +108,7 @@ def test_under_the_test_environment_nothing_resolves_to_production(monkeypatch):
     assert deploy.LIVE_REPO == Path(config.OPENCLAW_HOME) / "rmp"
     assert deploy.PLUGINS_MIRROR == Path(config.OPENCLAW_HOME) / "plugins"
     assert deploy.WEB_STACK_MIRROR == Path(config.OPENCLAW_HOME) / "web-stack"
+    assert venvs.VENVS_ROOT == Path(config.OPENCLAW_HOME) / "venvs"
     assert [target for _, target in deploy.MIRRORS] == [deploy.PLUGINS_MIRROR, deploy.WEB_STACK_MIRROR,
                                                         deploy.CURSOR_RULES_MIRROR]
 
