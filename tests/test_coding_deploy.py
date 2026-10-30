@@ -2693,9 +2693,12 @@ def test_a_host_that_cannot_be_made_is_an_error_before_the_change(repos, monkeyp
     assert run["attempt"] == 1 and run["last_error"].startswith("settings.json: Expecting value")
     assert run["ended"] == run["started"] and "stopped before the change (settings.json" in capsys.readouterr().out
 
-    deploy.write_json(deploy.state_file(deploy.MAIN), {**state(deploy.MAIN), "attempt": 2})
     with open(deploy.CODE_RELOAD_LOCK, "w") as restore:
         fcntl.flock(restore, fcntl.LOCK_EX)
+        # An attempt before the last is counted while a restore holds the lock, and records nothing.
+        assert unit.main(str(path)) == 1
+        assert state(deploy.MAIN)["attempt"] == 2 and not path.with_name("result.json").exists() and seen.added == []
+        # The last one waits, uncounted.
         assert unit.main(str(path)) == 0
     assert state(deploy.MAIN)["attempt"] == 2 and not path.with_name("result.json").exists() and seen.added == []
 
