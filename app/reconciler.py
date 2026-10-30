@@ -740,14 +740,15 @@ async def report_ended_deploys() -> None:
         github, recorded = result["source"] == "github", result
         tells_kirill = github or result["status"] == "stuck"
         if tells_kirill:
+            delivered = False
             try:
                 note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
                 delivered = await deploy.send_note(
                     note, f"deploy:{task_id}:{(result.get('head') or '')[:12]}", notify_ops_slack,
                     lambda message: logger.warning("The ended deploy of %s: %s", task_id, message))
-                recorded = {**result, "note_delivered": delivered}
             except Exception as e:
                 logger.warning("Telling Kirill about the ended deploy of %s failed: %s", task_id, e)
+            recorded = {**result, "note_delivered": delivered}
         try:
             async with AsyncSessionLocal() as db:
                 db.add(Event(correlation_id=task_id, entity_type="deploy" if github else "task", entity_id=task_id,

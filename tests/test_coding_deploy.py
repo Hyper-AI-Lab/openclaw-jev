@@ -2560,6 +2560,21 @@ async def test_the_reports_note_goes_first_on_its_own_and_is_retried(repos, syst
     assert "The ended deploy of main: told Kirill" in caplog.text
 
 
+async def test_a_report_whose_note_cannot_be_written_records_it_undelivered(repos, systemd_run, reporting,
+                                                                         monkeypatch, caplog):
+    def unwritable(result, repo):
+        raise KeyError("repositories")
+
+    monkeypatch.setattr(deploy, "deploy_note", unwritable)
+    deploy.queue(main_spec("c" * 40))
+    launched(deploy.MAIN, 3, started=0)
+    await reporting.report()
+    [event] = reporting.events
+    assert reporting.notes == [] and event.event_payload["note_delivered"] is False
+    assert event.event_payload["status"] == "failed"
+    assert "Telling Kirill about the ended deploy of main failed: 'repositories'" in caplog.text
+
+
 def reload_lock_held():
     """Whether the code-reload lock is held, here or by another process: a probe through a descriptor of its own."""
     with open(deploy.CODE_RELOAD_LOCK, "w") as probe:
