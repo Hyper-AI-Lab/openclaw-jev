@@ -2607,6 +2607,36 @@ def test_a_result_reached_under_the_lock_is_recorded_without_letting_go_of_it(re
     assert seen.added[0].event_payload["status"] == "deployed"
 
 
+def test_a_host_that_cannot_be_made_is_an_error_before_the_change(repos, monkeypatch, capsys):
+    """Making the deploy's host reads the coding settings; a failure there is retried like any error before the change,
+    and its last attempt is recorded under the code-reload lock, taken at once, or waits while a restore holds it."""
+    unit, seen = deploy_unit(monkeypatch)
+
+    def unreadable():
+        raise ValueError("settings.json: Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr(deploy, "Host", unreadable)
+    deploy.queue(main_spec(merged_on_github(repos, {"app/a.py": "A = 2\n"})))
+    path = deploy.spec_file(deploy.MAIN)
+    assert unit.main(str(path)) == 1 and not path.with_name("result.json").exists() and seen.added == []
+    run = state(deploy.MAIN)
+    assert run["attempt"] == 1 and run["last_error"].startswith("settings.json: Expecting value")
+    assert run["ended"] == run["started"] and "stopped before the change (settings.json" in capsys.readouterr().out
+
+    deploy.write_json(deploy.state_file(deploy.MAIN), {**state(deploy.MAIN), "attempt": 2})
+    with open(deploy.CODE_RELOAD_LOCK, "w") as restore:
+        fcntl.flock(restore, fcntl.LOCK_EX)
+        assert unit.main(str(path)) == 0
+    assert state(deploy.MAIN)["attempt"] == 2 and not path.with_name("result.json").exists() and seen.added == []
+
+    held = []
+    seen.db.add = lambda event: held.append(reload_lock_held()) or seen.added.append(event)
+    assert unit.main(str(path)) == 1
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == "failed" and "(last: settings.json: Expecting value" in result["summary"]
+    assert held == [True] and not deploy.state_file(deploy.MAIN).exists() and not reload_lock_held()
+
+
 def test_a_land_whose_response_was_lost_is_found_merged_and_not_landed_again(repos, monkeypatch):
     unit, seen = deploy_unit(monkeypatch)
     github = {}

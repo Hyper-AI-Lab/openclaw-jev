@@ -21,6 +21,7 @@ import fcntl
 import json
 import signal
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -147,6 +148,18 @@ def run_launch(spec_path: str, postpone: bool) -> int:
     return code
 
 
+@contextmanager
+def locked_now():
+    """The code-reload lock for the ``with`` block, taken at once (``LOCK_NB``) or not at all; whether it was taken."""
+    with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
 def checked_in(spec_path: str, spec: dict, run: dict, postpone: bool) -> int:
     """The launch's work once it checked in, with ``run`` its state as the launch found it.
 
@@ -154,43 +167,23 @@ def checked_in(spec_path: str, spec: dict, run: dict, postpone: bool) -> int:
     code reload holds it: a result reached under the lock without letting go of it (``Host.keeping``), any other under
     a hold taken at once (``LOCK_NB``). When that lock is held, the launch waits and the run keeps its state; a last
     attempt is then not counted, and the next launch tries again."""
-    task, state = spec["task_id"], deploy.state_file(spec["task_id"])
     if postpone:
-        with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+        with locked_now() as held:
+            if not held:
                 log(f"waiting: {deploy.CODE_RELOAD_LOCK} is held; the run stays queued")
                 return 0
             return record(spec_path, spec, postponed(run))
     what = "GitHub's main" if spec.get("source") == "github" else f"{spec['head'][:12]} over {spec['old'][:12]}"
     log(f"deploying {what}")
-    host = deploy.Host()
+    try:
+        host = deploy.Host()
+    except (Exception, deploy.Interrupted) as exc:
+        return stopped(spec_path, spec, exc, locked_now)
     with host.keeping(deploy.CODE_RELOAD_LOCK):
         try:
             result = deploy.self_deploy(spec, host, log=log)
         except (Exception, deploy.Interrupted) as exc:
-            now = deploy._read_json(state) or {}
-            if now.get("phase") in deploy.CHANGING:
-                # Counted, so a resume that fails the same way every time ends dead (deploy.end_dead_runs), and marked
-                # ended in the same write, so a kill right after cannot count it twice.
-                deploy.write_json(state, {**now, "escapes": now.get("escapes", 0) + 1,
-                                          "ended": now.get("started", now.get("launches", 0))})
-                log(f"interrupted in phase {now['phase']}; the next idle pass resumes it"
-                    if isinstance(exc, deploy.Interrupted) else
-                    f"stopped in phase {now['phase']} with an error ({str(exc)[:300]}); the next idle pass resumes it")
-                return 1
-            error = str(exc) or type(exc).__name__
-            with host.hold(deploy.CODE_RELOAD_LOCK, 0) as held:
-                if not held and now.get("attempt", 0) + 1 >= deploy.MAX_ATTEMPTS:
-                    log(f"waiting: {deploy.CODE_RELOAD_LOCK} is held, so the last attempt ({error[:300]}) is not "
-                        "counted; the launcher's next pass tries again")
-                    return 0
-                result = deploy.record_attempt(task, error)
-                if result is None:
-                    log(f"stopped before the change ({error[:300]}); the launcher's next pass tries again")
-                    return 1
-                return record(spec_path, spec, result)
+            return stopped(spec_path, spec, exc, lambda: host.hold(deploy.CODE_RELOAD_LOCK, 0))
         if result is None:
             log("the run stays queued; the launcher's next pass tries again")
             return 0
@@ -200,6 +193,36 @@ def checked_in(spec_path: str, spec: dict, run: dict, postpone: bool) -> int:
                     "the run keeps its state")
                 return 0
             return record(spec_path, spec, result)
+
+
+def stopped(spec_path: str, spec: dict, exc: BaseException, hold) -> int:
+    """The end of a launch that an exception or ``SIGTERM`` stopped before it reached a result, from making the
+    deploy's host on. From ``applying`` on, the run keeps its state for the next idle pass to resume, and the escape is
+    counted. Before it, it is an attempt (``deploy.record_attempt``); the last attempt's ``failed`` is recorded under
+    the code-reload lock, which ``hold`` takes at once, and while another process holds that lock the attempt is not
+    counted and the launch waits."""
+    task, state = spec["task_id"], deploy.state_file(spec["task_id"])
+    now = deploy._read_json(state) or {}
+    if now.get("phase") in deploy.CHANGING:
+        # Counted, so a resume that fails the same way every time ends dead (deploy.end_dead_runs), and marked ended in
+        # the same write, so a kill right after cannot count it twice.
+        deploy.write_json(state, {**now, "escapes": now.get("escapes", 0) + 1,
+                                  "ended": now.get("started", now.get("launches", 0))})
+        log(f"interrupted in phase {now['phase']}; the next idle pass resumes it"
+            if isinstance(exc, deploy.Interrupted) else
+            f"stopped in phase {now['phase']} with an error ({str(exc)[:300]}); the next idle pass resumes it")
+        return 1
+    error = str(exc) or type(exc).__name__
+    with hold() as held:
+        if not held and now.get("attempt", 0) + 1 >= deploy.MAX_ATTEMPTS:
+            log(f"waiting: {deploy.CODE_RELOAD_LOCK} is held, so the last attempt ({error[:300]}) is not counted; the "
+                "launcher's next pass tries again")
+            return 0
+        result = deploy.record_attempt(task, error)
+        if result is None:
+            log(f"stopped before the change ({error[:300]}); the launcher's next pass tries again")
+            return 1
+        return record(spec_path, spec, result)
 
 
 if __name__ == "__main__":
