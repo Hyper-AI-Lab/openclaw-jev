@@ -35,7 +35,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 from app.coding import github, verify, workspace
 from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
@@ -869,7 +869,8 @@ class Host:
 
         return deploy_checks.readiness_report()
 
-    def checks(self, restarted: List[str], baseline: Dict[str, str], *, ignore: Iterable[str] = ()) -> Dict[str, Any]:
+    def checks(self, restarted: List[str], baseline: Union[Dict[str, str], List[str]], *,
+               ignore: Iterable[str] = ()) -> Dict[str, Any]:
         from app.coding import deploy_checks
 
         return deploy_checks.run(self.live, restarted, baseline, ignore=ignore)
