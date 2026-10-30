@@ -46,6 +46,7 @@ PRODUCTION = {
     "app.coding.deploy.LIVE_REPO": "/root/.openclaw/rmp",
     "app.coding.deploy.PLUGINS_MIRROR": "/root/.openclaw/plugins",
     "app.coding.deploy.WEB_STACK_MIRROR": "/root/.openclaw/web-stack",
+    "app.coding.deploy.WEB_VENV": "/root/.openclaw/web-stack/backends/.venv",
     "app.coding.venvs.VENVS_ROOT": "/root/.openclaw/venvs",
 }
 # Every other host setting a module reads from config, with its value in production.

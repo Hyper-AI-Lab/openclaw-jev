@@ -1,4 +1,5 @@
-"""The checks after a deploy: RMP's health, the gateway, readiness compared like with like, and a canary.
+"""The checks after a deploy: RMP's health, the gateway, the web backends, readiness compared like with like, and a
+canary.
 
 Nothing here reaches a port or runs the canary: urlopen, the clock, the readiness report and canary.sh are fakes.
 """
@@ -244,6 +245,23 @@ def test_the_gateway_is_awaited_only_when_it_was_restarted(probes):
     probes["ok"], probes["waits"] = {}, []
     assert deploy_checks.run(LIVE, ["openclaw-gateway"], {}) == {"failure": None, "canary": "ok", "new_failing": []}
     assert probes["waits"] == [("http://127.0.0.1:8000/health", 120), (deploy_checks.GATEWAY_READY, 300)]
+
+
+def test_the_web_backends_are_awaited_only_when_they_were_restarted(probes):
+    assert deploy_checks.WEB_HEALTH == "http://127.0.0.1:8791/health"
+    probes["ok"] = {deploy_checks.WEB_HEALTH: False}
+    assert deploy_checks.run(LIVE, ["rmp-api", "openclaw-gateway"], {}) == {
+        "failure": None, "canary": "ok", "new_failing": []}
+    assert (deploy_checks.WEB_HEALTH, 60) not in probes["waits"]
+    assert deploy_checks.run(LIVE, ["aura-web-backends"], {}) == {
+        "failure": "the web backends did not answer /health within 60 s", "canary": None}
+    assert probes["waits"][-1] == (deploy_checks.WEB_HEALTH, 60)
+    # Back within the minute, the backends let the checks go on to readiness and the canary.
+    probes["ok"], probes["waits"] = {}, []
+    assert deploy_checks.run(LIVE, ["aura-web-backends", "openclaw-gateway"], {}) == {
+        "failure": None, "canary": "ok", "new_failing": []}
+    assert probes["waits"] == [("http://127.0.0.1:8000/health", 120), (deploy_checks.GATEWAY_READY, 300),
+                               (deploy_checks.WEB_HEALTH, 60)]
 
 
 def test_a_readiness_report_that_fails_fails_the_checks(probes):

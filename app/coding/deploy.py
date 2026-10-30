@@ -74,6 +74,9 @@ VENV_KIND = "rmp"
 PLUGINS_MIRROR = Path(OPENCLAW_HOME) / "plugins"
 WEB_STACK_MIRROR = Path(OPENCLAW_HOME) / "web-stack"
 CURSOR_RULES_MIRROR = Path("/root/.cursor/rules")
+# The web backends' venv, untracked in their mirror, and the requirements installed into it in place when they change.
+WEB_VENV = WEB_STACK_MIRROR / "backends" / ".venv"
+WEB_REQUIREMENTS = "web-stack/backends/requirements.txt"
 MIRRORS = (
     ("plugins/", PLUGINS_MIRROR),
     ("web-stack/", WEB_STACK_MIRROR),
@@ -864,6 +867,11 @@ class Host:
     def prune(self, kind_root: Path, keep: Iterable[str]) -> List[str]:
         return venvs.prune(kind_root, keep)
 
+    def install_web_stack(self) -> None:
+        """The live web stack's requirements, installed into the web backends' venv in place."""
+        venvs.run([str(WEB_VENV / "bin" / "python"), "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r",
+                   str(self.live / WEB_REQUIREMENTS)], timeout=venvs.INSTALL_TIMEOUT_SEC)
+
     def fetch_main(self) -> str:
         """GitHub's main, fetched into the live repo; its commit."""
         with workspace.github_auth() as env:
@@ -1015,6 +1023,40 @@ def _venv_moved(live: Path, run: Dict[str, Any]) -> bool:
     return not link.is_dir()
 
 
+def _web_venv_copy(task: str) -> Path:
+    return WEB_VENV.with_name(f".venv.before-{task}")
+
+
+def _web_venv_failed(task: str) -> Path:
+    return WEB_VENV.with_name(f".venv.failed-{task}")
+
+
+def _copy_web_venv(task: str, changed: List[Tuple[str, str]], log: Callable[[str], None]) -> None:
+    """Before the change, when the web stack's requirements changed: an exact copy of the web backends' venv next to
+    it, on the same filesystem, which a revert renames back. The venv holds what its requirements do not (the heavy
+    backends, installed by hand), so the copy, not a rebuild, is the way back. A copy an earlier launch left goes
+    first."""
+    if WEB_REQUIREMENTS not in [path for _, path in changed]:
+        return
+    copy = _web_venv_copy(task)
+    shutil.rmtree(copy, ignore_errors=True)
+    shutil.copytree(WEB_VENV, copy, symlinks=True)
+    log(f"copied {WEB_VENV} to {copy}")
+
+
+def _restore_web_venv(task: str, log: Callable[[str], None]) -> None:
+    """The revert of the web stack's install: its venv goes aside as ``.venv.failed-<task>`` and the copy taken before
+    the change is renamed back. Nothing once the copy is back, or when none was taken."""
+    copy, failed = _web_venv_copy(task), _web_venv_failed(task)
+    if not copy.is_dir():
+        return
+    if os.path.lexists(WEB_VENV):
+        shutil.rmtree(failed, ignore_errors=True)
+        os.rename(WEB_VENV, failed)
+    os.rename(copy, WEB_VENV)
+    log(f"renamed {copy} back to {WEB_VENV}")
+
+
 def _point_venv(host: Host, run: Dict[str, Any], which: str, log: Callable[[str], None]) -> None:
     """Point the venv link at the run's recorded ``which`` venv ("previous" or "target") on the way out of a window
     that failed or was killed. A switch that fails is logged, so the failure that brought the run here is the one
@@ -1036,14 +1078,15 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
     created while the API drained starts it again, puts the run back in its phase before ``applying`` and returns None
     (waiting). Then, forward, the venv link goes to the run's planned venv before the tree moves to ``head``
     (``merged``); back, the tree moves to the recorded revert commit before the link goes back to the recorded previous
-    venv. The mirrors are reconciled and the units started in one call (``restarted``, forward). Back, both counts are
-    skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units are started
-    before the window is left. While the live main, read again then, is still at ``old``, a failure first points the
-    venv link back at the recorded previous venv; a kill (``Interrupted``) leaves it where the switch got to, only
-    completing a link the first switch left missing. Either puts the run back in its phase before ``applying`` once
-    the link is at the recorded previous venv, so a run whose venv moved stays ``applying``, also when it waits, until
-    its window completes. While units are stopped, ``stopped_file`` lists them, so the unit's ``ExecStopPost=`` starts
-    them after a kill that runs no Python. The commit the tree is at.
+    venv. The web stack's changed requirements are installed into its venv (back: its copy from before the change is
+    renamed back), the mirrors are reconciled and the units started in one call (``restarted``, forward). Back, both
+    counts are skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units
+    are started before the window is left. While the live main, read again then, is still at ``old``, a failure first
+    points the venv link back at the recorded previous venv; a kill (``Interrupted``) leaves it where the switch got
+    to, only completing a link the first switch left missing. Either puts the run back in its phase before
+    ``applying`` once the link is at the recorded previous venv, so a run whose venv moved stays ``applying``, also
+    when it waits, until its window completes. While units are stopped, ``stopped_file`` lists them, so the unit's
+    ``ExecStopPost=`` starts them after a kill that runs no Python. The commit the tree is at.
     """
     live, units, forward = host.live, run["affected"], direction == "forward"
     target = run["head"] if forward else run["revert"]
@@ -1078,6 +1121,12 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
             host.switch_venv(live / "venv", Path(plan["previous"]), _venv_root())
             log(f"switched the venv back to {plan['previous']}")
         changed = changes(live, run["old"] if forward else run["head"], target)
+        if WEB_REQUIREMENTS in [path for _, path in changed]:
+            if forward:
+                host.install_web_stack()
+                log("installed the web stack's requirements")
+            else:
+                _restore_web_venv(task, log)
         for prefix, mirror in MIRRORS:
             reconcile(live, target, changed, prefix, mirror)
         if units:
@@ -1122,7 +1171,8 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
     approved ``head`` lands through a pull request first, the run's state records the merge commit (``landed``), and
     exactly that commit is deployed once CI's test check passed on it. That slow work runs first, without the lock, and
-    so does the build of the head's venv when the change moves the lock files (``_build_venv``). Then, holding the
+    so does the build of the head's venv when the change moves the lock files (``_build_venv``), and the copy of the
+    web backends' venv when their requirements change (``_copy_web_venv``). Then, holding the
     code-reload lock: the hand-edit check, the readiness baseline and, last before the units stop, the strict idle
     count; then ``applying`` with the venv plan, the switch window (``_switch``), the checks, and on failure the revert
     window. A run whose state is past ``landed`` was killed during or after its change: it resumes from its phase
@@ -1175,6 +1225,7 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
                     "change; it goes live with GitHub's main once CI passes on a later commit."}
     changed = changes(live, old, head)
     target = _build_venv(host, task, head, changed, log)
+    _copy_web_venv(task, changed, log)
     with host.hold(CODE_RELOAD_LOCK, LOCK_WAIT_SEC) as held:
         if not held:
             log(f"waiting: {CODE_RELOAD_LOCK} stayed held for {LOCK_WAIT_SEC} s; the run keeps its phase")
@@ -1250,6 +1301,7 @@ def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
         return _rollback(host, task, run, log)
     old, head, restarted = run["old"], run["head"], run["affected"]
     _prune_venvs(host, run, log)
+    shutil.rmtree(_web_venv_copy(task), ignore_errors=True)
     canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
     new_failing = checked.get("new_failing") or []
     tightened = (f" New or tightened readiness checks fail on this host: {', '.join(new_failing)}; they did not count "
@@ -1321,6 +1373,7 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
         github_now = f"on GitHub the revert waits in {published['pr']['url']} (its test check is {published['check']})"
     else:
         github_now = f"the revert is not on GitHub yet ({published['error']})"
+    shutil.rmtree(_web_venv_failed(task), ignore_errors=True)
     return {"status": "rolled_back", **_shipped(host, run), "revert": revert, "revert_pr": published, "error": failure,
             "summary": f"Deploying {head[:12]} failed its checks ({failure}){reverted}; {health}; {github_now}."}
 

@@ -161,6 +161,9 @@ class FakeHost(deploy.Host):
         self.calls.append(("prune", tuple(sorted(keep))))
         return super().prune(kind_root, keep)
 
+    def install_web_stack(self):
+        self.calls.append(("install_web_stack",))
+
     def land(self, commit, branch, title, body, method):
         self.calls.append(("land", branch, method))
         pr = {"number": len(self.calls), "url": f"https://github.com/Hyper-AI-Lab/openclaw-jev/pull/{len(self.calls)}"}
@@ -3166,3 +3169,84 @@ def test_a_revert_killed_between_the_tree_and_the_venv_switches_back(repos):
     assert result["status"] == "rolled_back" and os.readlink(repos.link) == run["venv"]["previous"]
     assert [c[:2] for c in host.calls if c[0] == "switch_venv"] == [("switch_venv", run["venv"]["previous"])]
     assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]
+
+
+@pytest.fixture
+def web_venv(repos, monkeypatch):
+    """The web backends' venv, untracked in the tmp_path web-stack mirror, with what its requirements do not name."""
+    venv = repos.mirror["web-stack/"] / "backends" / ".venv"
+    monkeypatch.setattr(deploy, "WEB_VENV", venv)
+    write(venv, {"bin/python3": "web's\n", "lib/heavy.py": "installed by hand\n"})
+    (venv / "bin" / "python").symlink_to("python3")
+    return venv
+
+
+class WebInstallingHost(MainWatchingHost):
+    """Its install of the web stack's requirements writes ``lib/installed.py`` into the venv in place, and records the
+    live main and whether the copy from before the change was there."""
+
+    def install_web_stack(self):
+        venv = deploy.WEB_VENV
+        self.calls.append(("install_web_stack", git(self.live, "rev-parse", "main"),
+                           venv.with_name(".venv.before-t1").is_dir()))
+        write(venv, {"lib/installed.py": f"{git(self.live, 'rev-parse', 'main')}\n"})
+
+
+def files_in(tree: Path):
+    """Every file and link under ``tree`` with its content or target."""
+    return {str(path.relative_to(tree)): os.readlink(path) if path.is_symlink() else path.read_text()
+            for path in sorted(tree.rglob("*")) if path.is_symlink() or path.is_file()}
+
+
+def test_a_web_stack_requirements_change_installs_inside_the_window_and_restores_on_rollback(repos, web_venv):
+    before = files_in(web_venv)
+    head = repos.change({"web-stack/backends/requirements.txt": "fastapi==1\n", "web-stack/backends/w.py": "W = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = WebInstallingHost(repos.live)
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)["status"] == "deployed"
+    # Copied before anything stopped, installed while the backends were stopped and the tree at head.
+    assert [c for c in host.calls if c[0] in ("systemctl", "install_web_stack")] == [
+        ("systemctl", "stop", "aura-web-backends", repos.old), ("install_web_stack", head, True),
+        ("systemctl", "start", "aura-web-backends", head)]
+    assert files_in(web_venv) == {**before, "lib/installed.py": f"{head}\n"}
+    # The reconcile wrote the tracked files around the untracked venv; deployed, the copy is gone.
+    assert (repos.mirror["web-stack/"] / "backends" / "requirements.txt").read_text() == "fastapi==1\n"
+    assert sorted(os.listdir(web_venv.parent)) == [".venv", "requirements.txt", "w.py"]
+
+    repos.old, installed = head, files_in(web_venv)
+    head = repos.change({"web-stack/backends/requirements.txt": "fastapi==2\n"}, on=head)
+    for path in (deploy.spec_file("t1"), deploy.state_file("t1")):
+        path.unlink()
+    deploy.queue(reviewed(repos, head=head))
+    host = WebInstallingHost(repos.live, checks=[{"failure": "the web backends did not answer /health within 60 s",
+                                                  "canary": None}])
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and git(repos.live, "rev-parse", "main") == result["revert"]
+    # The revert renamed the copy back, links and all, and deleted the venv the failed change installed into.
+    assert files_in(web_venv) == installed and (web_venv / "bin" / "python").is_symlink()
+    assert sorted(os.listdir(web_venv.parent)) == [".venv", "requirements.txt", "w.py"]
+    assert [c[:2] for c in host.calls if c[0] in ("systemctl", "install_web_stack")] == [
+        ("systemctl", "stop"), ("install_web_stack", head), ("systemctl", "start"), ("systemctl", "stop"),
+        ("systemctl", "start")]
+
+
+def test_a_web_stack_change_that_keeps_its_requirements_installs_nothing(repos, web_venv):
+    head = repos.change({"web-stack/backends/w.py": "W = 2\n"})
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
+    assert ("install_web_stack",) not in host.calls and sorted(os.listdir(web_venv.parent)) == [".venv", "w.py"]
+
+
+def test_a_restarted_web_backend_without_health_fails_the_deploy(repos, readiness, monkeypatch):
+    from app.coding import deploy_checks
+
+    waits = []
+    monkeypatch.setattr(deploy_checks, "_wait_ok", lambda url, seconds: waits.append((url, seconds)) or (
+        url != deploy_checks.WEB_HEALTH))
+    head = merged_on_github(repos, {"web-stack/backends/w.py": "W = 2\n"})
+    host = ReadinessHost(repos.live, before={"telemetry": "pass"})
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back"
+    assert result["error"] == "the web backends did not answer /health within 60 s"
+    assert ("http://127.0.0.1:8791/health", 60) in waits
+    assert git(repos.live, "rev-parse", "main^{tree}") == git(repos.live, "rev-parse", f"{repos.old}^{{tree}}")
