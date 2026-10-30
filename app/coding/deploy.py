@@ -856,7 +856,8 @@ class Host:
         return github.land(self.live, commit, branch, title, body, repo=self.repo, method=method)
 
     def merged_pull(self, commit: str, branch: str) -> Optional[Dict[str, Any]]:
-        """The pull request from ``branch`` that merged ``commit`` on GitHub, with its merge commit; None if none did."""
+        """The pull request from ``branch`` that merged ``commit`` on GitHub, with its merge commit; None if none
+        did."""
         return github.merged_pull(branch, commit, self.repo)
 
     def wait_check(self, sha: str) -> str:
