@@ -2406,27 +2406,93 @@ def test_a_canary_that_times_out_in_both_checks_still_publishes_the_revert(repos
     assert git(repos.live, "rev-parse", "main") == result["revert"] == git(repos.origin, "rev-parse", "main")
 
 
+class FailingBack(FakeHost):
+    """The revert window's first ``systemctl`` call ``fail`` (its arguments) fails, once, after it is recorded."""
+
+    def __init__(self, live, *, fail, **kwargs):
+        super().__init__(live, **kwargs)
+        self.fail = fail
+
+    def systemctl(self, *args):
+        super().systemctl(*args)
+        reverting = deploy.state_file(deploy.MAIN).exists() and state(deploy.MAIN)["phase"] == "reverting"
+        if args == self.fail and reverting:
+            self.fail = None
+            raise subprocess.CalledProcessError(1, ["systemctl", *args])
+
+
 def test_a_revert_window_that_fails_still_publishes_the_revert_and_says_so(repos):
-    class FailingBack(FakeHost):
-        """The revert window's stop of rmp-api fails."""
-
-        def systemctl(self, *args):
-            super().systemctl(*args)
-            if self.calls.count(("systemctl", "stop", "rmp-api")) == 2 and args == ("stop", "rmp-api"):
-                raise subprocess.CalledProcessError(1, ["systemctl", *args])
-
     head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
-    host = FailingBack(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    deploy.queue(main_spec(head))
+    # The units' start fails once the tree moved back; the window starts them again on its way out.
+    host = FailingBack(repos.live, fail=("start", "rmp-api", "rmp-worker"),
+                       checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
     result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
-    assert result["status"] == "rolled_back"
+    assert result["status"] == "rolled_back" and git(repos.live, "rev-parse", "main") == result["revert"]
     assert (f"; reverting main to {result['revert'][:12]} and restarting rmp-api, rmp-worker failed (Command "
-            "'['systemctl', 'stop', 'rmp-api']' returned non-zero exit status 1.); Aura is healthy again; GitHub's "
-            "main is reverted too") in result["summary"]
+            "'['systemctl', 'start', 'rmp-api', 'rmp-worker']' returned non-zero exit status 1.); Aura is healthy "
+            "again; GitHub's main is reverted too") in result["summary"]
     # The window started what it stopped; the publish and the re-check still ran.
-    assert [c for c in host.calls if c[0] in ("systemctl", "checks", "land")][-3:] == [
-        ("systemctl", "start", "rmp-api", "rmp-worker"), ("land", f"aura/revert-{head[:12]}", "merge"),
-        ("checks", ("rmp-api", "rmp-worker"), ("telemetry",))]
+    assert [c for c in host.calls if c[0] in ("systemctl", "checks", "land")][-4:] == [
+        ("systemctl", "start", "rmp-api", "rmp-worker"), ("systemctl", "start", "rmp-api", "rmp-worker"),
+        ("land", f"aura/revert-{head[:12]}", "merge"), ("checks", ("rmp-api", "rmp-worker"), ("telemetry",))]
     assert git(repos.origin, "rev-parse", "main") == result["revert"]
+
+
+def test_a_revert_window_that_fails_before_the_tree_moved_is_resumed_without_publishing_again(repos, monkeypatch,
+                                                                                             systemd_run):
+    unit, seen = deploy_unit(monkeypatch)
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    path = deploy.spec_file(deploy.MAIN)
+    # The revert window's stop of rmp-api fails: the live main is still at the failed head.
+    host = FailingBack(repos.live, fail=("stop", "rmp-api"), checks=[{"failure": "CANARY FAIL: task failed",
+                                                                      "canary": None}])
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+    assert unit.main(str(path)) == 1
+    run = state(deploy.MAIN)
+    # Published all the same, and recorded; the run keeps reverting, with the escape counted.
+    assert run["phase"] == "reverting" and run["published"]["status"] == "merged" and run["escapes"] == 1
+    assert git(repos.live, "rev-parse", "main") == head and git(repos.origin, "rev-parse", "main") == run["revert"]
+    assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]
+    assert not [c for c in host.calls if c[0] == "checks"][1:] and not path.with_name("result.json").exists()
+    assert seen.added == [] and seen.notes == []
+
+    # The next pass resumes the window, and does not publish again.
+    host = FakeHost(repos.live)
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+    assert unit.main(str(path)) == 1
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == "rolled_back" and result["revert_pr"] == run["published"]
+    assert git(repos.live, "rev-parse", "main") == run["revert"] and not deploy.state_file(deploy.MAIN).exists()
+    assert not [c for c in host.calls if c[0] == "land"]
+    assert [c for c in host.calls if c[0] in ("systemctl", "checks")] == [
+        *switched("rmp-api", "rmp-worker"), ("checks", ("rmp-api", "rmp-worker"), ("telemetry",))]
+    [(note, _)] = seen.notes
+    assert note.startswith("Aura's change failed its checks and was rolled back.")
+
+
+async def test_a_revert_window_that_keeps_failing_before_the_tree_moved_leaves_the_run_stuck(repos, monkeypatch,
+                                                                                             systemd_run, reporting):
+    unit, seen = deploy_unit(monkeypatch)
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    deploy.queue(main_spec(head))
+    path = deploy.spec_file(deploy.MAIN)
+    hosts = [FailingBack(repos.live, fail=("stop", "rmp-api"), checks=[{"failure": "CANARY FAIL: task failed",
+                                                                        "canary": None}])]
+    hosts += [FailingBack(repos.live, fail=("stop", "rmp-api")) for _ in range(2)]
+    monkeypatch.setattr(deploy, "Host", lambda: hosts.pop(0))
+    for _ in range(3):
+        assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-main"
+        assert unit.main(str(path)) == 1
+    assert state(deploy.MAIN)["escapes"] == 3 and deploy.next_deploy(FakeHost(repos.live)) is None
+    monkeypatch.setattr(deploy, "Host", lambda *args, **kwargs: reporting.host)
+    await reporting.report()
+    [(note, _)] = reporting.notes
+    assert note.startswith("Aura's deploy: stuck.") and "ended 3 times in phase reverting" in note
+    assert git(repos.live, "rev-parse", "main") == head and state(deploy.MAIN)["published"]["status"] == "merged"
+    assert git(repos.origin, "rev-parse", "main") == state(deploy.MAIN)["revert"]
 
 
 @pytest.mark.parametrize("publish", ["blocked", "failed", "merged"])

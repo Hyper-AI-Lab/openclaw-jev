@@ -1136,7 +1136,7 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
         if forward:
             _save(task, run, phase="restarted")
     except BaseException as exc:
-        at_old = forward and _still_at_old(live, run)
+        at_old = forward and _main_at(live, run["old"])
         if at_old and isinstance(exc, Exception) and _venv_moved(live, run):
             _point_venv(host, run, "previous", log)
         elif forward and plan and not os.path.lexists(live / "venv"):
@@ -1154,11 +1154,11 @@ def _live_main(live: Path) -> str:
     return _git(live, "rev-parse", "refs/heads/main").strip()
 
 
-def _still_at_old(live: Path, run: Dict[str, Any]) -> bool:
-    """Whether the live main is still at the run's ``old``, read again after a failure, whatever the failure
-    interrupted; False when it cannot be read: the run then keeps its phase, and its resume reads the live main."""
+def _main_at(live: Path, commit: str) -> bool:
+    """Whether the live main is at ``commit``, read again after a failure, whatever the failure interrupted; False when
+    it cannot be read: the run then keeps its phase, and its resume reads the live main."""
     try:
-        return _live_main(live) == run["old"]
+        return _live_main(live) == commit
     except Exception:
         return False
 
@@ -1341,9 +1341,12 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     of ``head``) is made and recorded before the tree moves to it, so a resumed rollback finds it and moves the tree
     there, or finds the tree moved already. Once it exists, each step runs on its own: one that fails is named in the
     summary and the next still runs, so the revert always reaches GitHub. What the publish did is recorded, so a
-    resumed rollback publishes no second time; only a publish that failed with an error is tried again. The
-    re-check leaves ``claude_direct`` out while the revert waits on GitHub: its clause that GitHub's main contains the
-    live main fails until the revert merges there."""
+    resumed rollback publishes no second time; only a publish that failed with an error is tried again. A revert
+    window that failed before the tree moved to the revert commit is not the end: once the revert is published, its
+    error is raised, so the run keeps ``reverting``, the escape is counted, and the next idle pass resumes the window
+    (three such escapes leave the run stuck, ``end_dead_runs``). The re-check leaves ``claude_direct`` out while the
+    revert waits on GitHub: its clause that GitHub's main contains the live main fails until the revert merges
+    there."""
     live, head, failure, restarted = host.live, run["head"], run["failure"], run["affected"]
     if not run.get("revert"):
         revert = _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
@@ -1351,16 +1354,21 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
                       f"Revert {head[:12]}: the deploy's checks failed ({failure[:200]})").strip()
         _save(task, run, revert=revert)
     revert, units = run["revert"], ", ".join(restarted) or "nothing"
+    unmoved: Optional[Exception] = None
     try:
         _switch(host, task, run, "back", log)
         reverted = f", so I reverted main ({revert[:12]}) and restarted {units}"
     except Exception as exc:
         log(f"the revert window failed: {exc}")
         reverted = f"; reverting main to {revert[:12]} and restarting {units} failed ({str(exc)[:300]})"
+        unmoved = None if _main_at(live, revert) else exc
     published = run.get("published")
     if published is None or published["status"] == "failed":
         published = _publish_revert(host, revert, head, failure, log)
         _save(task, run, published=published)
+    if unmoved is not None:
+        log("the live main is not at the revert yet; the run keeps reverting, and the next idle pass resumes it")
+        raise unmoved
     try:
         still = host.checks(restarted, run["baseline"],
                             ignore=() if published["status"] == "merged" else ("claude_direct",))["failure"]
