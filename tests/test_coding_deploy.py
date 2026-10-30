@@ -2372,7 +2372,7 @@ def test_a_revert_window_that_fails_still_publishes_the_revert_and_says_so(repos
     assert git(repos.origin, "rev-parse", "main") == result["revert"]
 
 
-@pytest.mark.parametrize("publish", ["blocked", "merged"])
+@pytest.mark.parametrize("publish", ["blocked", "failed", "merged"])
 def test_a_rollback_reports_healthy_again_when_only_the_github_ancestor_clause_fails(repos, monkeypatch, readiness,
                                                                                      publish):
     from app.coding import deploy_checks
@@ -2386,8 +2386,10 @@ def test_a_rollback_reports_healthy_again_when_only_the_github_ancestor_clause_f
     monkeypatch.setattr(deploy_checks, "readiness_report", report)
     readiness.canaries = ["CANARY FAIL: task failed"]
     head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
-    # The revert's pull request waits for a label, so its test check fails; or it merges.
-    host = ReadinessHost(repos.live, before=report(), lands=["failure"] if publish == "blocked" else [])
+    # The revert's pull request waits for a label, so its test check fails; or GitHub cannot be reached; or it merges.
+    lands = {"blocked": ["failure"], "failed": [deploy.github.GitHubError("POST repos/x/pulls: 502 Bad Gateway")],
+             "merged": []}[publish]
+    host = ReadinessHost(repos.live, before=report(), lands=lands)
     result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
     assert result["status"] == "rolled_back" and result["error"] == "CANARY FAIL: task failed"
     calls = [c for c in host.calls if c[0] in ("checks", "land")]
@@ -2396,6 +2398,12 @@ def test_a_rollback_reports_healthy_again_when_only_the_github_ancestor_clause_f
         url = result["revert_pr"]["pr"]["url"]
         assert f"; Aura is healthy again; on GitHub the revert waits in {url} (its test check is failure)." in (
             result["summary"])
+        assert calls == [("checks", units, ("telemetry", "claude_direct")),
+                         ("land", f"aura/revert-{head[:12]}", "merge"),
+                         ("checks", units, ("telemetry", "claude_direct"), ("claude_direct",))]
+    elif publish == "failed":
+        assert ("; Aura is healthy again; the revert is not on GitHub yet (POST repos/x/pulls: 502 Bad Gateway)."
+                in result["summary"])
         assert calls == [("checks", units, ("telemetry", "claude_direct")),
                          ("land", f"aura/revert-{head[:12]}", "merge"),
                          ("checks", units, ("telemetry", "claude_direct"), ("claude_direct",))]
@@ -2527,6 +2535,21 @@ def test_the_note_goes_out_when_the_event_cannot_be_written(tmp_path, monkeypatc
                                         commit=RuntimeError("could not connect"))
     assert steps == ["event", "reply"] and seen.added[0].event_payload["status"] == "rolled_back"
     assert "note_delivered" not in seen.added[0].event_payload
+
+
+def test_a_reply_run_that_cannot_start_is_logged_once_the_result_is_recorded(tmp_path, monkeypatch, capsys, pauses):
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
+    monkeypatch.setattr(unit.deploy, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
+        "status": "deployed", "head": "c" * 40, "summary": "Deployed cccccccccccc."})
+    monkeypatch.setattr(unit.deploy, "Host", lambda: FakeHost(tmp_path))
+    monkeypatch.setattr(unit, "connect_temporal", AsyncMock(side_effect=RuntimeError("Temporal is unavailable")))
+    the_spec = {**reviewed(SimpleNamespace(old="b" * 40)), "context": {"task_id": "t1"}}
+    deploy.queue(the_spec)
+    assert unit.main(str(deploy.spec_file("t1"))) == 0
+    assert "starting the reply run workflow-t1 failed (Temporal is unavailable)" in capsys.readouterr().out
+    assert seen.added[0].event_payload["status"] == "deployed" and not deploy.state_file("t1").exists()
 
 
 def test_an_undelivered_note_is_logged_as_undelivered(tmp_path, monkeypatch, capsys, pauses):
