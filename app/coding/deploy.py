@@ -1156,8 +1156,9 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     of ``head``) is made and recorded before the tree moves to it, so a resumed rollback finds it and moves the tree
     there, or finds the tree moved already. Once it exists, each step runs on its own: one that fails is named in the
     summary and the next still runs, so the revert always reaches GitHub. What the publish did is recorded, so a
-    resumed rollback publishes no second time. The re-check leaves ``claude_direct`` out while the revert waits on
-    GitHub: its clause that GitHub's main contains the live main fails until the revert merges there."""
+    resumed rollback publishes no second time; only a publish that failed with an error is tried again. The
+    re-check leaves ``claude_direct`` out while the revert waits on GitHub: its clause that GitHub's main contains the
+    live main fails until the revert merges there."""
     live, head, failure, restarted = host.live, run["head"], run["failure"], run["affected"]
     if not run.get("revert"):
         revert = _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
@@ -1172,7 +1173,7 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
         log(f"the revert window failed: {exc}")
         reverted = f"; reverting main to {revert[:12]} and restarting {units} failed ({str(exc)[:300]})"
     published = run.get("published")
-    if published is None:
+    if published is None or published["status"] == "failed":
         published = _publish_revert(host, revert, head, failure, log)
         _save(task, run, published=published)
     try:

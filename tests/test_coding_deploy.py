@@ -2407,16 +2407,17 @@ def test_a_rollback_reports_healthy_again_when_only_the_github_ancestor_clause_f
                          ("checks", units, ("telemetry", "claude_direct"))]
 
 
+class KilledInTheReCheck(FakeHost):
+    """Killed in its second checks, the re-check after the revert was published."""
+
+    def checks(self, restarted, baseline, **kwargs):
+        result = super().checks(restarted, baseline, **kwargs)
+        if len([c for c in self.calls if c[0] == "checks"]) == 2:
+            raise deploy.Interrupted("SIGTERM")
+        return result
+
+
 def test_a_rollback_killed_after_its_publish_does_not_publish_again(repos):
-    class KilledInTheReCheck(FakeHost):
-        """Killed in its second checks, the re-check after the revert was published."""
-
-        def checks(self, restarted, baseline, **kwargs):
-            result = super().checks(restarted, baseline, **kwargs)
-            if len([c for c in self.calls if c[0] == "checks"]) == 2:
-                raise deploy.Interrupted("SIGTERM")
-            return result
-
     head = repos.change({"app/a.py": "A = 2\n"})
     deploy.queue(reviewed(repos, head=head))
     host = KilledInTheReCheck(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
@@ -2431,6 +2432,33 @@ def test_a_rollback_killed_after_its_publish_does_not_publish_again(repos):
     assert result["status"] == "rolled_back" and result["revert_pr"] == run["published"]
     assert "Aura is healthy again; GitHub's main is reverted too" in result["summary"]
     assert not [c for c in host.calls if c[0] == "land"]
+
+
+@pytest.mark.parametrize("first", [deploy.github.GitHubError("POST repos/x/pulls: 502 Bad Gateway"), "failure"],
+                         ids=["error", "waiting"])
+def test_a_resumed_rollback_publishes_again_only_after_a_publish_that_failed_with_an_error(repos, first):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = KilledInTheReCheck(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}],
+                              lands=["merged", first])
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    run = state()
+    assert run["phase"] == "reverting" and run["published"]["status"] == ("failed" if first != "failure" else "blocked")
+    assert git(repos.origin, "rev-parse", "main") == head
+
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    lands = [c for c in host.calls if c[0] == "land"]
+    if first == "failure":
+        # The revert's pull request is on GitHub, waiting: it is not opened again.
+        assert lands == [] and result["revert_pr"] == run["published"]
+        assert f"on GitHub the revert waits in {run['published']['pr']['url']}" in result["summary"]
+    else:
+        assert lands == [("land", f"aura/revert-{head[:12]}", "merge")] and result["revert_pr"]["status"] == "merged"
+        assert "GitHub's main is reverted too" in result["summary"]
+        assert git(repos.origin, "rev-parse", "main") == run["revert"]
+    assert result["status"] == "rolled_back"
 
 
 @pytest.fixture
