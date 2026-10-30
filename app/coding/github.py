@@ -76,6 +76,16 @@ def open_pull(branch: str, title: str, body: str, repo: str) -> Dict[str, Any]:
     return {"number": pr["number"], "url": pr["html_url"]}
 
 
+def merged_pull(branch: str, commit: str, repo: str) -> Optional[Dict[str, Any]]:
+    """The pull request from ``branch`` that merged exactly ``commit`` into main, and the commit main got from it; None
+    when none did."""
+    owner = repo.split("/")[0]
+    for pr in api("GET", f"repos/{repo}/pulls?state=closed&head={owner}:{branch}&base=main"):
+        if pr.get("merged_at") and pr["head"]["sha"] == commit:
+            return {"pr": {"number": pr["number"], "url": pr["html_url"]}, "merge": pr["merge_commit_sha"]}
+    return None
+
+
 def land(live: Path, commit: str, branch: str, title: str, body: str, *, repo: str, method: str,
          sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
     """Push ``commit`` as ``branch``, open its pull request, and merge it once the test check passed."""

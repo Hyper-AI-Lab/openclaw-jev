@@ -11,13 +11,16 @@ next queued run, only when no deploy unit runs, nothing holds the code-reload lo
 The unit does its slow work first (a reviewed run's land and CI wait), then holds the code-reload lock, refuses
 mirrors edited by hand and, right after the strict idle count, stops the affected units, the API first with a
 second count; it fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in full and starts the units
-again, then checks health, readiness and a canary. It never installs a unit file; the result names the changed
-ones. On failure it reverts the live ``main`` the same way at once; the revert reaches GitHub as a pull request of
-its own. Each phase is written to the run's state as it happens, so a killed unit's run resumes from its phase. It
-records the result, then a reviewed job's workflow replies on the new code, or Kirill gets a note for Aura's own.
+again, then checks health, readiness (like with like: only a check that passed before can fail it) and a canary.
+It never installs a unit file; the result names the changed ones. On failure it reverts the live ``main`` the same
+way at once, lands the revert on GitHub as a pull request of its own whatever that window did, then checks health
+again. Each phase is written to the run's state as it happens, so a killed unit's run resumes from its phase. It
+records the result under the code-reload lock: Kirill's note for Aura's own first, retried, then the event; a
+reviewed job's workflow then replies on the new code.
 """
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import logging
@@ -32,7 +35,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 from app.coding import github, verify, workspace
 from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
@@ -639,6 +642,8 @@ def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
 MAIN = "main"
 # A head whose deploy ended this way waits for a later commit instead of being tried again.
 NOT_RETRIED = ("blocked", "failed", "rolled_back")
+# Kirill's note is tried at once and again after each of these pauses while it is not delivered: about 2.5 minutes.
+NOTE_RETRY_SEC = (30, 120)
 
 
 def watch_main(host: Optional["Host"] = None) -> Optional[str]:
@@ -656,8 +661,9 @@ def watch_main(host: Optional["Host"] = None) -> Optional[str]:
 
 
 def _queue_main(host: "Host") -> None:
-    """Queue GitHub's main unless its deploy unit runs or its run is past ``queued``, which is never replaced."""
-    if _unit_active(f"aura-deploy-{MAIN}"):
+    """Queue GitHub's main unless its deploy unit runs (``Host.deploy_units``: a unit still stopping runs too) or its
+    run is past ``queued``, which is never replaced."""
+    if f"aura-deploy-{MAIN}.service" in host.deploy_units():
         return
     run = _read_json(state_file(MAIN))
     if run is not None and run.get("phase") != "queued":
@@ -682,10 +688,6 @@ def pending_main(repo: str, *, live: Path = LIVE_REPO) -> Optional[Dict[str, Any
     committed = github.api("GET", f"repos/{repo}/commits/{head}")["commit"]["committer"]["date"]
     age = datetime.now(timezone.utc) - datetime.fromisoformat(committed.replace("Z", "+00:00"))
     return {"head": head, "age_hours": round(age.total_seconds() / 3600, 1)}
-
-
-def _unit_active(unit: str) -> bool:
-    return subprocess.run(["systemctl", "is-active", "--quiet", unit], capture_output=True).returncode == 0
 
 
 def _read_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -717,6 +719,24 @@ def deploy_note(result: Dict[str, Any], repo: str) -> str:
     return "\n".join(part for part in (headline, commits, result.get("summary", "")) if part)
 
 
+async def send_note(note: str, incident_id: str, notify: Callable[..., Awaitable[bool]],
+                    log: Callable[[str], None]) -> bool:
+    """Send Kirill ``note`` through ``notify`` (``notify_ops_slack``), on its own: a try that is not delivered (False,
+    as for a transient Slack error, or an error) is tried again after each ``NOTE_RETRY_SEC`` pause. Whether a try
+    delivered it; the log says "told Kirill" only then."""
+    for pause in (0, *NOTE_RETRY_SEC):
+        if pause:
+            await asyncio.sleep(pause)
+        try:
+            if await notify(note, incident_id=incident_id):
+                log("told Kirill")
+                return True
+        except Exception as exc:
+            log(f"a try of the note to Kirill failed ({str(exc)[:300]})")
+    log(f"the note to Kirill was not delivered after {len(NOTE_RETRY_SEC) + 1} tries")
+    return False
+
+
 def open_pull_request(job: workspace.Job, head: str, entry: Dict[str, Any], title: str, body: str,
                       *, gh: str = "gh") -> Dict[str, Any]:
     """Push the approved commit as the job's branch and open a PR; the token is read only by these commands."""
@@ -738,7 +758,8 @@ def open_pull_request(job: workspace.Job, head: str, entry: Dict[str, Any], titl
 class Host:
     """What a self-deploy does to this machine; tests replace it.
 
-    ``checks`` returns ``{"failure": None or what failed, "canary": "ok" or "skipped"}``.
+    ``checks`` returns ``{"failure": None or what failed, "canary": "ok" or "skipped"}``, and once they passed,
+    ``new_failing``: the readiness checks failing now that were absent or a warning in the baseline.
     """
 
     def __init__(self, live: Path = LIVE_REPO, repo: Optional[str] = None):
@@ -747,6 +768,8 @@ class Host:
         self.live = live
         self.repo = repo or get_coding_config()["repositories"]["rmp"]["remote"]
         self.born = time.monotonic()
+        # The lock files ``keeping`` keeps, each with its descriptor once a hold took it.
+        self._kept: Dict[Path, Optional[int]] = {}
 
     def elapsed(self) -> float:
         """Seconds since this host was made, at the deploy unit's start."""
@@ -777,10 +800,26 @@ class Host:
         return False
 
     @contextmanager
+    def keeping(self, lock: Path) -> Iterator[None]:
+        """Within this block, a hold of the lock file ``lock`` that was taken stays held past its own ``with`` block,
+        until this block ends, and a later hold of it is taken at once: the deploy unit records a result reached under
+        the code-reload lock without letting go of the lock in between."""
+        self._kept[lock] = None
+        try:
+            yield
+        finally:
+            fd = self._kept.pop(lock)
+            if fd is not None:
+                os.close(fd)
+
+    @contextmanager
     def hold(self, lock: Path, wait_sec: float) -> Iterator[bool]:
-        """Hold the lock file ``lock`` for the ``with`` block, trying every ``LOCK_POLL_SEC`` for up to ``wait_sec``;
-        whether it was taken."""
-        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+        """Hold the lock file ``lock`` for the ``with`` block, trying every ``LOCK_POLL_SEC`` for up to ``wait_sec``
+        (at 0, once: ``LOCK_NB``); whether it was taken. Inside ``keeping(lock)``, see there."""
+        if self._kept.get(lock) is not None:
+            yield True
+            return
+        fd: Optional[int] = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             deadline = time.monotonic() + wait_sec
             while True:
@@ -793,9 +832,12 @@ class Host:
                         yield False
                         return
                     time.sleep(min(LOCK_POLL_SEC, left))
+            if lock in self._kept:
+                self._kept[lock], fd = fd, None
             yield True
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
 
     def systemctl(self, *args: str) -> None:
         subprocess.run(["systemctl", *args], check=True, capture_output=True, timeout=300)
@@ -813,19 +855,25 @@ class Host:
     def land(self, commit: str, branch: str, title: str, body: str, method: str) -> Dict[str, Any]:
         return github.land(self.live, commit, branch, title, body, repo=self.repo, method=method)
 
+    def merged_pull(self, commit: str, branch: str) -> Optional[Dict[str, Any]]:
+        """The pull request from ``branch`` that merged ``commit`` on GitHub, with its merge commit; None if none
+        did."""
+        return github.merged_pull(branch, commit, self.repo)
+
     def wait_check(self, sha: str) -> str:
         """CI's test check on ``sha`` once it finished, or its state when the wait ran out."""
         return github.wait_check(sha, self.repo)
 
-    def readiness_baseline(self) -> List[str]:
+    def readiness_report(self) -> Dict[str, str]:
         from app.coding import deploy_checks
 
-        return deploy_checks.readiness_failures()
+        return deploy_checks.readiness_report()
 
-    def checks(self, restarted: List[str], baseline: List[str]) -> Dict[str, Any]:
+    def checks(self, restarted: List[str], baseline: Union[Dict[str, str], List[str]], *,
+               ignore: Iterable[str] = ()) -> Dict[str, Any]:
         from app.coding import deploy_checks
 
-        return deploy_checks.run(self.live, restarted, baseline)
+        return deploy_checks.run(self.live, restarted, baseline, ignore=ignore)
 
 
 def _idle(host: Host, log: Callable[[str], None]) -> bool:
@@ -873,10 +921,11 @@ def _start_again(host: Host, task: str, units: List[str], log: Callable[[str], N
 
 
 def _save(task: str, run: Dict[str, Any], **fields: Any) -> None:
-    """Update the run with ``fields`` and write its state, atomically, while the state exists. A missing state means
-    the run was ended (``end_dead_runs``) or aborted (``abort_run``, by hand) and is never recreated: a recreated state
-    would make the launcher relaunch a run someone ended. A deploy called without a queued run (a test's direct call)
-    keeps its state in memory only."""
+    """Update the run with ``fields`` and write its state, atomically, while the state exists. Before the unit records
+    its result, its run's state is only ever removed by hand: ``end_dead_runs`` acts only once no deploy unit runs, and
+    ``abort_run`` stops the unit first. A missing state therefore means someone ended the run, and it is never
+    recreated: a recreated state would make the launcher relaunch it. A deploy called without a queued run (a test's
+    direct call) keeps its state in memory only."""
     run.update(fields)
     path = state_file(task)
     if path.exists():
@@ -997,10 +1046,15 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         if blocked:
             return blocked
         if run.get("phase") != "landed":
-            landed = host.land(spec["head"], spec["branch"], spec["title"], spec["body"], "squash")
-            if landed["status"] != "merged":
-                return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on {landed['pr']['url']} "
-                        f"is {landed['check']}, so nothing was deployed; main is unchanged."}
+            # A try before may have merged the pull request and lost GitHub's answer: that land is found, not repeated.
+            landed = host.merged_pull(spec["head"], spec["branch"]) if run.get("attempt", 0) > 0 else None
+            if landed:
+                log(f"{landed['pr']['url']} was merged by an earlier try")
+            else:
+                landed = host.land(spec["head"], spec["branch"], spec["title"], spec["body"], "squash")
+                if landed["status"] != "merged":
+                    return {"status": "blocked", "pr": landed["pr"], "summary": f"CI's test check on "
+                            f"{landed['pr']['url']} is {landed['check']}, so nothing was deployed; main is unchanged."}
             _save(task, run, phase="landed", pr=landed["pr"], merge=landed["merge"])
         head = run["merge"]
         log(f"landed {run['pr']['url']} as {head[:12]}")
@@ -1016,7 +1070,7 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
             return None
         log(f"holding {CODE_RELOAD_LOCK}")
         changed = changes(live, old, head)
-        baseline = host.readiness_baseline()
+        baseline = host.readiness_report()
         # After the baseline, which can take a minute and a half: a hand edit made meanwhile still blocks.
         blocked = _drift(live, old)
         if blocked:
@@ -1081,13 +1135,17 @@ def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
         return _rollback(host, task, run, log)
     old, head, restarted = run["old"], run["head"], run["affected"]
     canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
+    new_failing = checked.get("new_failing") or []
+    tightened = (f" New or tightened readiness checks fail on this host: {', '.join(new_failing)}; they did not count "
+                 "against the deploy." if new_failing else "")
     units = sorted(path[len(UNIT_DIR):] for _, path in changes(host.live, old, head) if path.startswith(UNIT_DIR))
     installs = (f" Files under {UNIT_DIR} changed ({', '.join(units)}): the deploy does not install them; an "
                 "operator reviews them, runs ops/install_units.py, then --apply --head with the sha it printed, in "
                 "an idle window." if units else "")
     return {"status": "deployed", **_shipped(host, run), "canary": checked["canary"], "units": units,
+            "new_failing": new_failing,
             "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
-            f"readiness passed and {canary}.{installs}"}
+            f"readiness passed and {canary}.{tightened}{installs}"}
 
 
 def _shipped(host: Host, run: Dict[str, Any]) -> Dict[str, Any]:
@@ -1096,18 +1154,35 @@ def _shipped(host: Host, run: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], None]) -> Dict[str, Any]:
-    """The revert window, the re-check and the revert's pull request. The revert commit (the tree of ``old`` on top
+    """The revert window, the revert's pull request, then the re-check. The revert commit (the tree of ``old`` on top
     of ``head``) is made and recorded before the tree moves to it, so a resumed rollback finds it and moves the tree
-    there, or finds the tree moved already."""
+    there, or finds the tree moved already. Once it exists, each step runs on its own: one that fails is named in the
+    summary and the next still runs, so the revert always reaches GitHub. What the publish did is recorded, so a
+    resumed rollback publishes no second time; only a publish that failed with an error is tried again. The
+    re-check leaves ``claude_direct`` out while the revert waits on GitHub: its clause that GitHub's main contains the
+    live main fails until the revert merges there."""
     live, head, failure, restarted = host.live, run["head"], run["failure"], run["affected"]
     if not run.get("revert"):
         revert = _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
                       f"{run['old']}^{{tree}}", "-p", head, "-m",
                       f"Revert {head[:12]}: the deploy's checks failed ({failure[:200]})").strip()
         _save(task, run, revert=revert)
-    revert = _switch(host, task, run, "back", log)
-    still = host.checks(restarted, run["baseline"])["failure"]
-    published = _publish_revert(host, revert, head, failure, log)
+    revert, units = run["revert"], ", ".join(restarted) or "nothing"
+    try:
+        _switch(host, task, run, "back", log)
+        reverted = f", so I reverted main ({revert[:12]}) and restarted {units}"
+    except Exception as exc:
+        log(f"the revert window failed: {exc}")
+        reverted = f"; reverting main to {revert[:12]} and restarting {units} failed ({str(exc)[:300]})"
+    published = run.get("published")
+    if published is None or published["status"] == "failed":
+        published = _publish_revert(host, revert, head, failure, log)
+        _save(task, run, published=published)
+    try:
+        still = host.checks(restarted, run["baseline"],
+                            ignore=() if published["status"] == "merged" else ("claude_direct",))["failure"]
+    except Exception as exc:
+        still = f"the checks failed ({str(exc)[:300]})"
     health = "Aura is healthy again" if still is None else f"the checks still fail: {still}"
     if published["status"] == "merged":
         github_now = f"GitHub's main is reverted too ({published['pr']['url']})"
@@ -1116,8 +1191,7 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     else:
         github_now = f"the revert is not on GitHub yet ({published['error']})"
     return {"status": "rolled_back", **_shipped(host, run), "revert": revert, "revert_pr": published, "error": failure,
-            "summary": f"Deploying {head[:12]} failed its checks ({failure}), so I reverted main ({revert[:12]}) and restarted "
-            f"{', '.join(restarted) or 'nothing'}; {health}; {github_now}."}
+            "summary": f"Deploying {head[:12]} failed its checks ({failure}){reverted}; {health}; {github_now}."}
 
 
 def _drift(live: Path, old: str) -> Optional[Dict[str, Any]]:

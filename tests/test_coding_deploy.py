@@ -7,6 +7,7 @@ import asyncio
 import fcntl
 import importlib.util
 import json
+import logging
 import os
 import re
 import shutil
@@ -93,13 +94,16 @@ class FakeHost(deploy.Host):
     The gate's probes answer from ``units`` (the deploy units running), ``held`` (the code-reload lock) and ``busy``
     (the idle counts in turn, then 0; an exception in it is raised); each count is recorded. CI's check on a commit
     answers from ``ci``, by commit, else "success". ``kill_at`` (a systemctl verb and n) kills the unit at its n-th
-    systemctl call of that verb: ``deploy.Interrupted`` is raised there, once, before the call is made."""
+    systemctl call of that verb: ``deploy.Interrupted`` is raised there, once, before the call is made. ``merged`` is
+    GitHub's record of the pull requests that merged, by branch, which a land adds to; hosts can share it."""
 
-    def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None, kill_at=None):
+    def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None, kill_at=None,
+                 merged=None):
         super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
         self.calls, self.busy, self.results, self.lands = [], list(busy), list(checks), list(lands)
         self.units, self.held, self.ci = list(units), held, dict(ci or {})
         self.kill_at = list(kill_at) if kill_at else None
+        self.merged = {} if merged is None else merged
 
     def active_user_tasks(self):
         count = self.busy.pop(0) if self.busy else 0
@@ -134,17 +138,23 @@ class FakeHost(deploy.Host):
         if outcome != "merged":
             return {"status": "blocked", "pr": pr, "check": outcome}
         git(self.live, "push", "-q", "origin", f"{commit}:refs/heads/main")
+        self.merged[branch] = {"commit": commit, "pr": pr, "merge": commit}
         return {"status": "merged", "pr": pr, "merge": commit}
+
+    def merged_pull(self, commit, branch):
+        self.calls.append(("merged_pull", branch))
+        found = self.merged.get(branch)
+        return {"pr": found["pr"], "merge": found["merge"]} if found and found["commit"] == commit else None
 
     def wait_check(self, sha):
         self.calls.append(("wait_check", sha))
         return self.ci.get(sha, "success")
 
-    def readiness_baseline(self):
-        return ["telemetry"]
+    def readiness_report(self):
+        return {"telemetry": "fail"}
 
-    def checks(self, restarted, baseline):
-        self.calls.append(("checks", tuple(restarted), tuple(baseline)))
+    def checks(self, restarted, baseline, *, ignore=()):
+        self.calls.append(("checks", tuple(restarted), tuple(baseline), *([tuple(ignore)] if ignore else [])))
         return self.results.pop(0) if self.results else {"failure": None, "canary": "ok"}
 
 
@@ -531,11 +541,11 @@ def test_a_deploy_of_githubs_main_starts_once_while_one_is_waiting(repos, github
     first = merged_on_github(repos, {"app/a.py": "A = 2\n"})
     host = FakeHost(repos.live)
     assert deploy.watch_main(host) == "aura-deploy-main"
-    github_ci.active, host.units = True, ["aura-deploy-main.service"]
+    host.units = ["aura-deploy-main.service"]
     later = repos.change({"app/a.py": "A = 3\n"}, on=first)
     git(repos.live, "push", "-q", "origin", f"{later}:refs/heads/main")
     assert deploy.watch_main(host) is None and len(systemd_run.argvs) == 1
-    github_ci.active, host.units = False, []
+    host.units = []
     assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 2
     assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == later
 
@@ -648,7 +658,7 @@ def run_github_unit(tmp_path, monkeypatch, status, **fields):
     monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
         "status": status, "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Deployed cccccccccccc.",
         **fields})
-    monkeypatch.setattr(unit.deploy, "Host", lambda: None)
+    monkeypatch.setattr(unit.deploy, "Host", lambda: FakeHost(tmp_path))
     deploy.queue({"task_id": "main", "source": "github", "head": "c" * 40, "ci": "success"})
     path = deploy.spec_file("main")
 
@@ -693,10 +703,9 @@ def test_a_deploy_of_githubs_main_that_is_not_live_still_tells_kirill(tmp_path, 
 
 @pytest.fixture
 def github_ci(monkeypatch):
-    """CI's test check on GitHub's main (``check``) and whether the deploy unit of GitHub's main runs (``active``)."""
-    state = SimpleNamespace(check="success", active=False)
+    """CI's test check on GitHub's main (``check``); whether the deploy unit of GitHub's main runs is the host's."""
+    state = SimpleNamespace(check="success")
     monkeypatch.setattr(deploy.github, "check", lambda sha, repo: state.check)
-    monkeypatch.setattr(deploy, "_unit_active", lambda unit: state.active)
     return state
 
 
@@ -728,9 +737,9 @@ def test_the_watcher_deploys_githubs_main_once_ci_passed_on_that_commit(repos, w
     for check in ("missing", "pending", "failure"):
         watching.check = check
         assert deploy.watch_main(host) is None
-    watching.check, watching.active = "success", True
+    watching.check, host.units = "success", ["aura-deploy-main.service"]
     assert deploy.watch_main(host) is None
-    watching.active = False
+    host.units = []
     assert deploy.watch_main(host) == "aura-deploy-main"
     assert watching.started == [{"task_id": "main", "source": "github", "head": head, "ci": "success"}]
 
@@ -1140,12 +1149,12 @@ def test_what_the_previous_deploy_code_left_launches_nothing_and_the_next_head_q
                                        "deploy.log": "the previous code's unit\n"})
     head = repos.change({"app/a.py": "A = 3\n"}, on=shipped)
     git(repos.live, "push", "-q", "origin", f"{head}:refs/heads/main")
-    github_ci.active, host = True, FakeHost(repos.live, units=["aura-deploy-main.service"])
+    host = FakeHost(repos.live, units=["aura-deploy-main.service"])
     assert deploy.watch_main(host) is None and systemd_run.argvs == [] and deploy.queued_runs() == []
 
     for task, done in left.items():
         (deploy.RUNS_DIR / task / "result.json").write_text(json.dumps({"status": "deployed", "head": done}) + "\n")
-    github_ci.active, host.units = False, []
+    host.units = []
     assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 1
     assert [task for task, _ in deploy.queued_runs()] == [deploy.MAIN]
     assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == head
@@ -1500,10 +1509,10 @@ class BlippingHost(FakeHost):
         super().__init__(live, **kwargs)
         self.baselines, self.waits = list(baselines), list(waits)
 
-    def readiness_baseline(self):
+    def readiness_report(self):
         if self.baselines:
             raise self.baselines.pop(0)
-        return super().readiness_baseline()
+        return super().readiness_report()
 
     def wait_check(self, sha):
         if self.waits:
@@ -1582,17 +1591,17 @@ def test_a_github_error_while_waiting_for_ci_on_the_merge_commit_is_retried(repo
 
 @pytest.fixture
 def reporting(repos, monkeypatch):
-    """The reconciler's report of ended deploy runs, with the database, Slack and Temporal faked: the events it added
-    (``events``), the notes it sent (``notes``) and the reply runs it started (``client``); ``host`` is the deploy host
-    it sees."""
+    """The reconciler's report of ended deploy runs, with the database (``db``), Slack and Temporal faked: the events it
+    added (``events``), the notes it sent (``notes``) and the reply runs it started (``client``); ``host`` is the
+    deploy host it sees."""
     from app import config, reconciler
     from app.production import ops_notify
 
     seen = SimpleNamespace(events=[], notes=[], client=SimpleNamespace(start_workflow=AsyncMock()),
                            host=FakeHost(repos.live))
-    db = SimpleNamespace(add=seen.events.append, get=AsyncMock(return_value=None), commit=AsyncMock())
+    seen.db = SimpleNamespace(add=seen.events.append, get=AsyncMock(return_value=None), commit=AsyncMock())
     session = AsyncMock()
-    session.__aenter__.return_value = db
+    session.__aenter__.return_value = seen.db
     monkeypatch.setattr(reconciler, "AsyncSessionLocal", lambda: session)
     monkeypatch.setattr(reconciler, "connect_temporal", AsyncMock(return_value=seen.client))
     monkeypatch.setattr(config, "is_development_mode", lambda: False)
@@ -1631,7 +1640,7 @@ async def test_a_run_whose_units_die_before_they_start_ends_failed_once(repos, s
     assert not deploy.state_file(deploy.MAIN).exists()
     [event] = reporting.events
     assert (event.event_type, event.entity_type, event.entity_id, event.event_payload) == (
-        "coding.deploy", "deploy", "main", result)
+        "coding.deploy", "deploy", "main", {**result, "note_delivered": True})
     [(note, incident)] = reporting.notes
     assert note.startswith("Aura's deploy: failed.") and result["summary"] in note
     assert incident == "deploy:main:cccccccccccc"
@@ -1716,7 +1725,6 @@ async def test_a_dead_run_is_reported_while_github_cannot_be_read(repos, systemd
         raise RuntimeError("git fetch failed: Could not resolve host: github.com")
 
     reporting.host.fetch_main = fetch_main
-    monkeypatch.setattr(deploy, "_unit_active", lambda unit: False)
     monkeypatch.setattr(reconciler, "prune_coding_jobs", lambda: [])
     stop = asyncio.Event()
 
@@ -1810,14 +1818,14 @@ def test_this_code_leaves_a_unit_of_the_previous_deploy_code_alone_while_it_runs
     deploy.queue(main_spec(head))
     deploy.write_json(deploy.state_file(deploy.MAIN), batch_1_state(1))
     before = deploy.state_file(deploy.MAIN).read_text()
-    github_ci.active, host = True, FakeHost(repos.live, units=["aura-deploy-main.service"])
+    host = FakeHost(repos.live, units=["aura-deploy-main.service"])
     assert deploy.end_dead_runs(host) == [] and deploy.watch_main(host) is None
     assert deploy.state_file(deploy.MAIN).read_text() == before and systemd_run.argvs == []
 
     git(repos.live, "merge", "-q", "--ff-only", head)
     deploy.write_json(deploy.spec_file(deploy.MAIN).with_name("result.json"), {"status": "deployed", "head": head})
     deploy.state_file(deploy.MAIN).unlink()
-    github_ci.active, host.units = False, []
+    host.units = []
     assert deploy.end_dead_runs(host) == [] and deploy.watch_main(host) is None and systemd_run.argvs == []
 
 
@@ -1854,9 +1862,9 @@ def test_a_hand_edit_made_during_the_readiness_baseline_blocks_the_deploy(repos)
     rule = repos.mirror[".cursor/rules/"] / "r.mdc"
 
     class EditedDuringTheBaseline(FakeHost):
-        def readiness_baseline(self):
+        def readiness_report(self):
             rule.write_text("edited by hand while readiness ran\n")
-            return super().readiness_baseline()
+            return super().readiness_report()
 
     head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
     host = EditedDuringTheBaseline(repos.live)
@@ -2032,9 +2040,9 @@ class KillingHost(FakeHost):
         self.die("systemctl")
         super().systemctl(*args)
 
-    def readiness_baseline(self):
+    def readiness_report(self):
         self.die("baseline")
-        return super().readiness_baseline()
+        return super().readiness_report()
 
     def wait_check(self, sha):
         self.die("wait_check")
@@ -2238,3 +2246,590 @@ def test_a_removed_run_state_is_never_recreated(repos):
 
     result = deploy.self_deploy(reviewed(repos, head=head), AbortedWhileLanding(repos.live), log=lambda m: None)
     assert result["status"] == "deployed" and not deploy.state_file("t1").exists()
+
+
+@pytest.fixture
+def readiness(monkeypatch):
+    """The real checks after a deploy (``deploy_checks.run``), with RMP's health and the gateway answering, readiness
+    reporting ``after`` (set by the test) once the change is live, and the canary passing unless ``canaries`` holds
+    its lines, in turn."""
+    from app.coding import deploy_checks
+
+    seen = SimpleNamespace(after={}, canaries=[])
+    monkeypatch.setattr(deploy_checks, "_wait_ok", lambda url, seconds: True)
+    monkeypatch.setattr(deploy_checks, "readiness_report", lambda: dict(seen.after))
+    monkeypatch.setattr(deploy_checks, "canary", lambda live: seen.canaries.pop(0) if seen.canaries else "ok")
+    return seen
+
+
+class ReadinessHost(FakeHost):
+    """Takes ``before`` as its readiness baseline and runs the real checks."""
+
+    def __init__(self, live, *, before, **kwargs):
+        super().__init__(live, **kwargs)
+        self.before = before
+
+    def readiness_report(self):
+        return dict(self.before)
+
+    def checks(self, restarted, baseline, *, ignore=()):
+        self.calls.append(("checks", tuple(restarted), tuple(baseline), *([tuple(ignore)] if ignore else [])))
+        return super(FakeHost, self).checks(restarted, baseline, ignore=ignore)
+
+
+def ship_main(repos, monkeypatch, host):
+    """Deploy a change to app/ on GitHub's main through the deploy unit on ``host``: its exit status, the result it
+    recorded, and what it recorded and said (``deploy_unit``)."""
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    deploy.queue(main_spec(merged_on_github(repos, {"app/a.py": "A = 2\n"})))
+    path = deploy.spec_file(deploy.MAIN)
+    code = unit.main(str(path))
+    return code, json.loads(path.with_name("result.json").read_text()), seen
+
+
+NEW_FAILING = ("New or tightened readiness checks fail on this host: backup_manifest; they did not count against the "
+               "deploy.")
+
+
+def test_a_new_failing_check_is_reported_not_reverted(repos, monkeypatch, readiness):
+    readiness.after = {"telemetry": "pass", "backup_manifest": "fail"}
+    host = ReadinessHost(repos.live, before={"telemetry": "pass"})
+    code, result, seen = ship_main(repos, monkeypatch, host)
+    assert code == 0 and result["status"] == "deployed" and result["new_failing"] == ["backup_manifest"]
+    assert NEW_FAILING in result["summary"] and git(repos.live, "rev-parse", "main") == result["head"]
+    assert not [c for c in host.calls if c[0] == "land"]
+    [(note, incident)] = seen.notes
+    assert note.startswith("Aura's change is live.") and NEW_FAILING in note
+    assert incident == f"deploy:main:{result['head'][:12]}"
+
+
+def test_a_tightened_check_is_reported_not_reverted(repos, monkeypatch, readiness):
+    readiness.after = {"telemetry": "pass", "backup_manifest": "fail"}
+    host = ReadinessHost(repos.live, before={"telemetry": "pass", "backup_manifest": "warn"})
+    code, result, seen = ship_main(repos, monkeypatch, host)
+    assert code == 0 and result["status"] == "deployed" and result["new_failing"] == ["backup_manifest"]
+    assert NEW_FAILING in result["summary"] and not [c for c in host.calls if c[0] == "land"]
+    [(note, _)] = seen.notes
+    assert NEW_FAILING in note
+
+
+def test_a_passing_check_that_fails_rolls_back(repos, readiness):
+    readiness.after = {"telemetry": "pass", "backup_manifest": "fail"}
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = ReadinessHost(repos.live, before={"telemetry": "pass", "backup_manifest": "pass"})
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["error"] == "readiness checks failed: backup_manifest"
+    assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]
+    assert git(repos.live, "rev-parse", "main^{tree}") == git(repos.live, "rev-parse", f"{repos.old}^{{tree}}")
+
+
+def test_a_check_failing_before_and_after_is_ignored(repos, monkeypatch, readiness):
+    readiness.after = {"telemetry": "fail", "slack": "pass"}
+    host = ReadinessHost(repos.live, before={"telemetry": "fail", "slack": "pass"})
+    code, result, seen = ship_main(repos, monkeypatch, host)
+    assert code == 0 and result["status"] == "deployed" and result["new_failing"] == []
+    assert "readiness checks fail" not in result["summary"] and seen.notes == []
+
+
+def test_a_canary_that_times_out_in_both_checks_still_publishes_the_revert(repos):
+    class TimingOutHost(FakeHost):
+        """Its checks raise the canary's timeout, after the change and again after the revert."""
+
+        def checks(self, restarted, baseline, **kwargs):
+            super().checks(restarted, baseline, **kwargs)
+            raise subprocess.TimeoutExpired(["bash", "ops/canary.sh"], 600)
+
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = TimingOutHost(repos.live)
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and len([c for c in host.calls if c[0] == "checks"]) == 2
+    assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]
+    timeout = "Command '['bash', 'ops/canary.sh']' timed out after 600 seconds"
+    assert f"the checks still fail: the checks failed ({timeout})" in result["summary"]
+    assert git(repos.live, "rev-parse", "main") == result["revert"] == git(repos.origin, "rev-parse", "main")
+
+
+def test_a_revert_window_that_fails_still_publishes_the_revert_and_says_so(repos):
+    class FailingBack(FakeHost):
+        """The revert window's stop of rmp-api fails."""
+
+        def systemctl(self, *args):
+            super().systemctl(*args)
+            if self.calls.count(("systemctl", "stop", "rmp-api")) == 2 and args == ("stop", "rmp-api"):
+                raise subprocess.CalledProcessError(1, ["systemctl", *args])
+
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = FailingBack(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back"
+    assert (f"; reverting main to {result['revert'][:12]} and restarting rmp-api, rmp-worker failed (Command "
+            "'['systemctl', 'stop', 'rmp-api']' returned non-zero exit status 1.); Aura is healthy again; GitHub's "
+            "main is reverted too") in result["summary"]
+    # The window started what it stopped; the publish and the re-check still ran.
+    assert [c for c in host.calls if c[0] in ("systemctl", "checks", "land")][-3:] == [
+        ("systemctl", "start", "rmp-api", "rmp-worker"), ("land", f"aura/revert-{head[:12]}", "merge"),
+        ("checks", ("rmp-api", "rmp-worker"), ("telemetry",))]
+    assert git(repos.origin, "rev-parse", "main") == result["revert"]
+
+
+@pytest.mark.parametrize("publish", ["blocked", "failed", "merged"])
+def test_a_rollback_reports_healthy_again_when_only_the_github_ancestor_clause_fails(repos, monkeypatch, readiness,
+                                                                                     publish):
+    from app.coding import deploy_checks
+
+    def report():
+        # claude_direct's clause that fails until GitHub's main holds the revert: GitHub's main contains the live main.
+        contained = subprocess.run(["git", "merge-base", "--is-ancestor", git(repos.live, "rev-parse", "main"), "main"],
+                                   cwd=repos.origin, capture_output=True).returncode == 0
+        return {"telemetry": "pass", "claude_direct": "pass" if contained else "fail"}
+
+    monkeypatch.setattr(deploy_checks, "readiness_report", report)
+    readiness.canaries = ["CANARY FAIL: task failed"]
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    # The revert's pull request waits for a label, so its test check fails; or GitHub cannot be reached; or it merges.
+    lands = {"blocked": ["failure"], "failed": [deploy.github.GitHubError("POST repos/x/pulls: 502 Bad Gateway")],
+             "merged": []}[publish]
+    host = ReadinessHost(repos.live, before=report(), lands=lands)
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["error"] == "CANARY FAIL: task failed"
+    calls = [c for c in host.calls if c[0] in ("checks", "land")]
+    units = ("rmp-api", "rmp-worker")
+    if publish == "blocked":
+        url = result["revert_pr"]["pr"]["url"]
+        assert f"; Aura is healthy again; on GitHub the revert waits in {url} (its test check is failure)." in (
+            result["summary"])
+        assert calls == [("checks", units, ("telemetry", "claude_direct")),
+                         ("land", f"aura/revert-{head[:12]}", "merge"),
+                         ("checks", units, ("telemetry", "claude_direct"), ("claude_direct",))]
+    elif publish == "failed":
+        assert ("; Aura is healthy again; the revert is not on GitHub yet (POST repos/x/pulls: 502 Bad Gateway)."
+                in result["summary"])
+        assert calls == [("checks", units, ("telemetry", "claude_direct")),
+                         ("land", f"aura/revert-{head[:12]}", "merge"),
+                         ("checks", units, ("telemetry", "claude_direct"), ("claude_direct",))]
+    else:
+        assert "; Aura is healthy again; GitHub's main is reverted too" in result["summary"]
+        # The re-check comes after the publish, with nothing left out once the revert merged.
+        assert calls == [("checks", units, ("telemetry", "claude_direct")),
+                         ("land", f"aura/revert-{head[:12]}", "merge"),
+                         ("checks", units, ("telemetry", "claude_direct"))]
+
+
+class KilledInTheReCheck(FakeHost):
+    """Killed in its second checks, the re-check after the revert was published."""
+
+    def checks(self, restarted, baseline, **kwargs):
+        result = super().checks(restarted, baseline, **kwargs)
+        if len([c for c in self.calls if c[0] == "checks"]) == 2:
+            raise deploy.Interrupted("SIGTERM")
+        return result
+
+
+def test_a_rollback_killed_after_its_publish_does_not_publish_again(repos):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = KilledInTheReCheck(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    run = state()
+    assert run["phase"] == "reverting" and run["published"]["status"] == "merged"
+    assert git(repos.origin, "rev-parse", "main") == run["revert"]
+
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["revert_pr"] == run["published"]
+    assert "Aura is healthy again; GitHub's main is reverted too" in result["summary"]
+    assert not [c for c in host.calls if c[0] == "land"]
+
+
+@pytest.mark.parametrize("first", [deploy.github.GitHubError("POST repos/x/pulls: 502 Bad Gateway"), "failure"],
+                         ids=["error", "waiting"])
+def test_a_resumed_rollback_publishes_again_only_after_a_publish_that_failed_with_an_error(repos, first):
+    head = repos.change({"app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = KilledInTheReCheck(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}],
+                              lands=["merged", first])
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    run = state()
+    assert run["phase"] == "reverting" and run["published"]["status"] == ("failed" if first != "failure" else "blocked")
+    assert git(repos.origin, "rev-parse", "main") == head
+
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    lands = [c for c in host.calls if c[0] == "land"]
+    if first == "failure":
+        # The revert's pull request is on GitHub, waiting: it is not opened again.
+        assert lands == [] and result["revert_pr"] == run["published"]
+        assert f"on GitHub the revert waits in {run['published']['pr']['url']}" in result["summary"]
+    else:
+        assert lands == [("land", f"aura/revert-{head[:12]}", "merge")] and result["revert_pr"]["status"] == "merged"
+        assert "GitHub's main is reverted too" in result["summary"]
+        assert git(repos.origin, "rev-parse", "main") == run["revert"]
+    assert result["status"] == "rolled_back"
+
+
+@pytest.fixture
+def pauses(monkeypatch):
+    """The pauses between the tries of Kirill's note, recorded instead of slept."""
+    seen = []
+
+    async def sleep(seconds):
+        seen.append(seconds)
+
+    monkeypatch.setattr(deploy.asyncio, "sleep", sleep)
+    return seen
+
+
+def run_noting_unit(tmp_path, monkeypatch, answers, *, source="github", commit=None):
+    """Run the deploy unit for a run that rolls back, whose tries of Kirill's note answer ``answers`` in turn (an
+    exception in it is raised) and whose database commit raises ``commit`` when given: the unit's exit status, the
+    order of its steps and what it recorded and started (``deploy_unit``)."""
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
+    monkeypatch.setattr(unit.deploy, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
+        "status": "rolled_back", "head": "c" * 40, "commits": ["Fix the greeting (#12)"], "summary": "Rolled back."})
+    host = FakeHost(tmp_path)
+    monkeypatch.setattr(unit.deploy, "Host", lambda: host)
+    steps, answers = [], list(answers)
+
+    async def notify(message, *, incident_id):
+        steps.append("note")
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(unit, "notify_ops_slack", notify)
+    seen.db.add = lambda event: steps.append("event") or seen.added.append(event)
+    if commit:
+        seen.db.commit = AsyncMock(side_effect=commit)
+    seen.client.start_workflow = AsyncMock(side_effect=lambda *args, **kwargs: steps.append("reply"))
+    the_spec = main_spec("c" * 40) if source == "github" else {
+        **reviewed(SimpleNamespace(old="b" * 40)), "context": {"task_id": "t1"}}
+    deploy.queue(the_spec)
+    code = unit.main(str(deploy.spec_file(the_spec["task_id"])))
+    return code, steps, seen
+
+
+def test_the_note_is_retried_and_logged_as_it_went(tmp_path, monkeypatch, capsys, pauses):
+    code, steps, seen = run_noting_unit(tmp_path, monkeypatch, [False, False, True])
+    out = capsys.readouterr().out
+    # The note goes first; the event is written once it was delivered.
+    assert code == 1 and steps == ["note", "note", "note", "event"] and pauses == [30, 120]
+    assert out.count("told Kirill") == 1 and "not delivered" not in out
+    assert seen.added[0].event_payload["note_delivered"] is True
+    assert seen.added[0].event_payload["status"] == "rolled_back"
+
+
+def test_the_note_goes_out_when_the_event_cannot_be_written(tmp_path, monkeypatch, capsys, pauses):
+    code, steps, seen = run_noting_unit(tmp_path, monkeypatch, [True], commit=RuntimeError("could not connect"))
+    out = capsys.readouterr().out
+    assert code == 1 and steps == ["note", "event"] and pauses == [] and "told Kirill" in out
+    assert "recording the result on the task failed (could not connect)" in out
+    assert json.loads((tmp_path / "runs" / "main" / "result.json").read_text())["status"] == "rolled_back"
+
+    # A reviewed job's reply run starts all the same; it sends no note of its own.
+    code, steps, seen = run_noting_unit(tmp_path, monkeypatch, [], source="reviewed",
+                                        commit=RuntimeError("could not connect"))
+    assert steps == ["event", "reply"] and seen.added[0].event_payload["status"] == "rolled_back"
+    assert "note_delivered" not in seen.added[0].event_payload
+
+
+def test_a_reply_run_that_cannot_start_is_logged_once_the_result_is_recorded(tmp_path, monkeypatch, capsys, pauses):
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(unit.deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
+    monkeypatch.setattr(unit.deploy, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(unit.deploy, "self_deploy", lambda the_spec, host, *, log: {
+        "status": "deployed", "head": "c" * 40, "summary": "Deployed cccccccccccc."})
+    monkeypatch.setattr(unit.deploy, "Host", lambda: FakeHost(tmp_path))
+    monkeypatch.setattr(unit, "connect_temporal", AsyncMock(side_effect=RuntimeError("Temporal is unavailable")))
+    the_spec = {**reviewed(SimpleNamespace(old="b" * 40)), "context": {"task_id": "t1"}}
+    deploy.queue(the_spec)
+    assert unit.main(str(deploy.spec_file("t1"))) == 0
+    assert "starting the reply run workflow-t1 failed (Temporal is unavailable)" in capsys.readouterr().out
+    assert seen.added[0].event_payload["status"] == "deployed" and not deploy.state_file("t1").exists()
+
+
+def test_an_undelivered_note_is_logged_as_undelivered(tmp_path, monkeypatch, capsys, pauses):
+    code, steps, seen = run_noting_unit(tmp_path, monkeypatch, [False, RuntimeError("Slack is down"), False])
+    out = capsys.readouterr().out
+    assert steps == ["note", "note", "note", "event"] and pauses == [30, 120]
+    assert "told Kirill" not in out and "the note to Kirill was not delivered after 3 tries" in out
+    assert "a try of the note to Kirill failed (Slack is down)" in out
+    assert seen.added[0].event_payload["note_delivered"] is False
+
+
+async def test_the_reports_note_goes_first_on_its_own_and_is_retried(repos, systemd_run, reporting, pauses,
+                                                                      monkeypatch, caplog):
+    from app.production import ops_notify
+
+    deploy.queue(main_spec("c" * 40))
+    launched(deploy.MAIN, 3, started=0)
+    steps, answers = [], [False, True]
+
+    async def notify(message, *, incident_id):
+        steps.append("note")
+        return answers.pop(0)
+
+    monkeypatch.setattr(ops_notify, "notify_ops_slack", notify)
+    reporting.db.add = lambda event: steps.append("event") or reporting.events.append(event)
+    reporting.db.commit = AsyncMock(side_effect=RuntimeError("could not connect"))
+    caplog.set_level(logging.INFO, logger="rmp.reconciler")
+    await reporting.report()
+    assert steps == ["note", "note", "event"] and pauses == [30]
+    assert reporting.events[0].event_payload["note_delivered"] is True
+    assert "Recording the ended deploy of main failed: could not connect" in caplog.text
+    # A delivered note is logged as information, not as a warning.
+    told = [r for r in caplog.records if r.getMessage() == "The ended deploy of main: told Kirill"]
+    assert [r.levelno for r in told] == [logging.INFO]
+
+
+async def test_a_report_whose_note_cannot_be_written_records_it_undelivered(repos, systemd_run, reporting,
+                                                                         monkeypatch, caplog):
+    def unwritable(result, repo):
+        raise KeyError("repositories")
+
+    monkeypatch.setattr(deploy, "deploy_note", unwritable)
+    deploy.queue(main_spec("c" * 40))
+    launched(deploy.MAIN, 3, started=0)
+    await reporting.report()
+    [event] = reporting.events
+    assert reporting.notes == [] and event.event_payload["note_delivered"] is False
+    assert event.event_payload["status"] == "failed"
+    assert "Telling Kirill about the ended deploy of main failed: 'repositories'" in caplog.text
+
+
+def reload_lock_held():
+    """Whether the code-reload lock is held, here or by another process: a probe through a descriptor of its own."""
+    with open(deploy.CODE_RELOAD_LOCK, "w") as probe:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+@pytest.mark.parametrize("early, status", [("unchanged", "unchanged"), ("blocked", "blocked"),
+                                           ("main moved", "failed"), ("CI on the merge commit", "blocked"),
+                                           ("the third attempt", "failed")])
+def test_an_early_result_waits_while_a_restore_holds_the_lock(repos, monkeypatch, early, status):
+    """A result reached before the deploy takes the code-reload lock is recorded under it, taken at once: while a
+    restore holds it, nothing is recorded or sent, and the run keeps its state."""
+    unit, seen = deploy_unit(monkeypatch)
+    error = deploy.github.GitHubError("GET repos/x/commits/y/check-runs: 502 Bad Gateway")
+    if early == "unchanged":
+        head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+        git(repos.live, "merge", "-q", "--ff-only", head)
+        the_spec, host = main_spec(head), FakeHost(repos.live)
+    else:
+        head = repos.change({"app/a.py": "A = 2\n"})
+        the_spec = reviewed(repos, head=head)
+        host = {"blocked": FakeHost(repos.live, lands=["failure", "failure"]), "main moved": FakeHost(repos.live),
+                "CI on the merge commit": FakeHost(repos.live, ci={head: "failure"}),
+                "the third attempt": BlippingHost(repos.live, waits=[error, error])}[early]
+        if early == "main moved":
+            write(repos.live, {"docs/d.md": "another deploy\n"})
+            commit(repos.live, "another deploy")
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    task, path = the_spec["task_id"], deploy.spec_file(the_spec["task_id"])
+    deploy.queue(the_spec)
+    if early == "the third attempt":
+        deploy.write_json(deploy.state_file(task), {**state(task), "attempt": 2})
+
+    with open(deploy.CODE_RELOAD_LOCK, "w") as restore:
+        fcntl.flock(restore, fcntl.LOCK_EX)
+        assert unit.main(str(path)) == 0
+    assert not path.with_name("result.json").exists() and seen.added == [] and seen.notes == []
+    assert seen.client.start_workflow.await_count == 0
+    # The run keeps its state; a last attempt that found the lock held is not counted.
+    kept = state(task)
+    assert kept["attempt"] == (2 if early == "the third attempt" else 0)
+    assert kept["phase"] == ("landed" if early in ("CI on the merge commit", "the third attempt") else "queued")
+
+    held = []
+    seen.db.add = lambda event: held.append(reload_lock_held()) or seen.added.append(event)
+    unit.main(str(path))
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == status and held == [True] and not deploy.state_file(task).exists()
+    assert not reload_lock_held()
+
+
+def test_a_result_reached_under_the_lock_is_recorded_without_letting_go_of_it(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live))
+    real_self_deploy, returned = deploy.self_deploy, []
+
+    def self_deploy(*args, **kwargs):
+        result = real_self_deploy(*args, **kwargs)
+        returned.append(reload_lock_held())
+        return result
+
+    monkeypatch.setattr(deploy, "self_deploy", self_deploy)
+    held = []
+    seen.db.add = lambda event: held.append(reload_lock_held()) or seen.added.append(event)
+    deploy.queue(main_spec(merged_on_github(repos, {"app/a.py": "A = 2\n"})))
+    assert unit.main(str(deploy.spec_file(deploy.MAIN))) == 0
+    # Still held when the deploy returned its result, and while it is recorded; free once the unit is done.
+    assert returned == [True] and held == [True] and not reload_lock_held()
+    assert seen.added[0].event_payload["status"] == "deployed"
+
+
+def test_a_host_that_cannot_be_made_is_an_error_before_the_change(repos, monkeypatch, capsys):
+    """Making the deploy's host reads the coding settings; a failure there is retried like any error before the change,
+    and its last attempt is recorded under the code-reload lock, taken at once, or waits while a restore holds it."""
+    unit, seen = deploy_unit(monkeypatch)
+
+    def unreadable():
+        raise ValueError("settings.json: Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr(deploy, "Host", unreadable)
+    deploy.queue(main_spec(merged_on_github(repos, {"app/a.py": "A = 2\n"})))
+    path = deploy.spec_file(deploy.MAIN)
+    assert unit.main(str(path)) == 1 and not path.with_name("result.json").exists() and seen.added == []
+    run = state(deploy.MAIN)
+    assert run["attempt"] == 1 and run["last_error"].startswith("settings.json: Expecting value")
+    assert run["ended"] == run["started"] and "stopped before the change (settings.json" in capsys.readouterr().out
+
+    with open(deploy.CODE_RELOAD_LOCK, "w") as restore:
+        fcntl.flock(restore, fcntl.LOCK_EX)
+        # An attempt before the last is counted while a restore holds the lock, and records nothing.
+        assert unit.main(str(path)) == 1
+        assert state(deploy.MAIN)["attempt"] == 2 and not path.with_name("result.json").exists() and seen.added == []
+        # The last one waits, uncounted.
+        assert unit.main(str(path)) == 0
+    assert state(deploy.MAIN)["attempt"] == 2 and not path.with_name("result.json").exists() and seen.added == []
+
+    held = []
+    seen.db.add = lambda event: held.append(reload_lock_held()) or seen.added.append(event)
+    assert unit.main(str(path)) == 1
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == "failed" and "(last: settings.json: Expecting value" in result["summary"]
+    assert held == [True] and not deploy.state_file(deploy.MAIN).exists() and not reload_lock_held()
+
+
+def test_a_land_whose_response_was_lost_is_found_merged_and_not_landed_again(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    github = {}
+
+    class LosesTheLandsAnswer(FakeHost):
+        """GitHub merges the pull request, and its answer never arrives."""
+
+        def land(self, commit_sha, branch, title, body, method):
+            super().land(commit_sha, branch, title, body, method)
+            raise deploy.github.GitHubError("PUT repos/x/pulls/3/merge: connection reset by peer")
+
+    head = repos.change({"app/a.py": "A = 2\n"})
+    hosts = [LosesTheLandsAnswer(repos.live, merged=github), FakeHost(repos.live, merged=github)]
+    monkeypatch.setattr(deploy, "Host", lambda: hosts.pop(0))
+    deploy.queue(reviewed(repos, head=head))
+    path = deploy.spec_file("t1")
+    first, relaunched = hosts
+
+    assert unit.main(str(path)) == 1
+    assert state()["phase"] == "queued" and state()["attempt"] == 1 and git(repos.origin, "rev-parse", "main") == head
+    # The first try looks nothing up: it has no earlier try.
+    assert [c for c in first.calls if c[0] in ("land", "merged_pull")] == [("land", "aura/t1-x", "squash")]
+
+    assert unit.main(str(path)) == 0
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == "deployed" and result["pr"] == github["aura/t1-x"]["pr"] and result["head"] == head
+    assert [c for c in relaunched.calls if c[0] in ("land", "merged_pull")] == [("merged_pull", "aura/t1-x")]
+    assert git(repos.live, "rev-parse", "main") == head and ("wait_check", head) in relaunched.calls
+
+
+def test_a_retried_land_that_github_never_merged_lands_again(repos, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    head = repos.change({"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live, lands=[deploy.github.GitHubError("POST repos/x/pulls: 502 Bad Gateway")])
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    deploy.queue(reviewed(repos, head=head))
+    path = deploy.spec_file("t1")
+    assert unit.main(str(path)) == 1 and state()["attempt"] == 1
+    assert unit.main(str(path)) == 0
+    assert json.loads(path.with_name("result.json").read_text())["status"] == "deployed"
+    assert [c for c in host.calls if c[0] in ("land", "merged_pull")] == [
+        ("land", "aura/t1-x", "squash"), ("merged_pull", "aura/t1-x"), ("land", "aura/t1-x", "squash")]
+
+
+def test_the_watcher_leaves_a_stopping_main_unit_its_run(repos, github_ci, systemd_run):
+    class ListingHost(FakeHost):
+        """Lists the deploy units the way the host does, through systemctl."""
+
+        deploy_units = deploy.Host.deploy_units
+
+    first = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = ListingHost(repos.live)
+    assert deploy.watch_main(host) == "aura-deploy-main"
+    queued = (deploy.spec_file(deploy.MAIN).read_text(), deploy.state_file(deploy.MAIN).read_text())
+    later = repos.change({"app/a.py": "A = 3\n"}, on=first)
+    git(repos.live, "push", "-q", "origin", f"{later}:refs/heads/main")
+    # Its unit is still in its SIGTERM handler or its ExecStopPost=: the run it may still record is left as it is.
+    systemd_run.units = [("aura-deploy-main.service", "deactivating")]
+    assert deploy.watch_main(host) is None and len(systemd_run.argvs) == 1
+    assert (deploy.spec_file(deploy.MAIN).read_text(), deploy.state_file(deploy.MAIN).read_text()) == queued
+
+    systemd_run.units = [("aura-deploy-main.service", "inactive")]
+    assert deploy.watch_main(host) == "aura-deploy-main" and len(systemd_run.argvs) == 2
+    assert json.loads(deploy.spec_file(deploy.MAIN).read_text())["head"] == later
+
+
+def test_a_note_that_cannot_be_written_still_lets_the_result_be_recorded(tmp_path, monkeypatch, capsys, pauses):
+    def unwritable(result, repo):
+        raise KeyError("repositories")
+
+    monkeypatch.setattr(deploy, "deploy_note", unwritable)
+    code, steps, seen = run_noting_unit(tmp_path, monkeypatch, [True])
+    out = capsys.readouterr().out
+    assert steps == ["event"] and "writing the note to Kirill failed ('repositories')" in out
+    assert seen.added[0].event_payload["note_delivered"] is False
+
+
+@pytest.mark.parametrize("slack, status", [("pass", "deployed"), ("fail", "rolled_back")])
+def test_a_run_the_previous_deploy_code_left_compares_its_baseline_as_that_code_did(repos, readiness, slack, status):
+    """The deploy code before this one recorded the readiness baseline as the list of the checks failing then. A run
+    of it that this code resumes counts every other check as passed then: a check failing now and then is ignored, and
+    one failing now only fails the deploy."""
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    git(repos.live, "merge", "-q", "--ff-only", head)
+    deploy.queue(main_spec(head))
+    deploy.write_json(deploy.state_file(deploy.MAIN), {
+        **batch_1_state(1, started=1, escapes=1), "phase": "restarted", "old": repos.old, "head": head,
+        "affected": ["rmp-api", "rmp-worker"], "baseline": ["telemetry"]})
+    readiness.after = {"telemetry": "fail", "slack": slack}
+    result = deploy.self_deploy(main_spec(head), ReadinessHost(repos.live, before={}), log=lambda m: None)
+    assert result["status"] == status
+    if status == "deployed":
+        assert result["new_failing"] == [] and git(repos.live, "rev-parse", "main") == head
+    else:
+        assert result["error"] == "readiness checks failed: slack"
+
+
+@pytest.mark.parametrize("publish", ["merged", "blocked"])
+def test_a_rollback_the_previous_deploy_code_left_is_published_once_and_rechecked_as_that_code_compared(
+        repos, readiness, publish):
+    """A run the deploy code before this one was killed in while it reverted: the tree moved back to its recorded
+    revert, its baseline the list of the checks failing then, and no publish recorded. This code finishes the revert
+    window, publishes the revert once, then re-checks, counting every check missing from the list as passed then and
+    leaving ``claude_direct`` out while the revert waits on GitHub."""
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    git(repos.live, "merge", "-q", "--ff-only", head)
+    revert = git(repos.live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
+                 f"{repos.old}^{{tree}}", "-p", head, "-m", f"Revert {head[:12]}: the deploy's checks failed")
+    git(repos.live, "merge", "-q", "--ff-only", revert)
+    deploy.queue(main_spec(head))
+    deploy.write_json(deploy.state_file(deploy.MAIN), {
+        **batch_1_state(1, started=1, escapes=1), "phase": "reverting", "old": repos.old, "head": head,
+        "affected": ["rmp-api", "rmp-worker"], "baseline": ["telemetry"], "failure": "CANARY FAIL: task failed",
+        "revert": revert})
+    readiness.after = {"telemetry": "fail", "claude_direct": "pass" if publish == "merged" else "fail"}
+    host = ReadinessHost(repos.live, before={}, lands=["failure"] if publish == "blocked" else [])
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["revert"] == revert and "Aura is healthy again" in (
+        result["summary"])
+    assert result["revert_pr"]["status"] == publish and git(repos.live, "rev-parse", "main") == revert
+    assert [c for c in host.calls if c[0] in ("systemctl", "land", "checks")] == [
+        *switched("rmp-api", "rmp-worker"), ("land", f"aura/revert-{head[:12]}", "merge"),
+        ("checks", ("rmp-api", "rmp-worker"), ("telemetry",), *([("claude_direct",)] if publish == "blocked" else []))]

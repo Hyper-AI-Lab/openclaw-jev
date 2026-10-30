@@ -3519,3 +3519,153 @@ Every layout ended `verify: exit 0` (logs: `/root/.cache/wp09-b2-verify-ad16d4c/
 `git diff 200cb65 -- app/workflows requirements.txt` is empty, so no label is needed.
 
 **Next:** the docs mirror, the PR and the gated merge. This deploy is batch 1's host step, read from `runs/main/deploy-state.json`, `deploy.log` and the unit's journal.
+
+## 2026-10-29 22:40 UTC · WP-09 batch 2: PR opened, gated merge running
+
+**PR:** https://github.com/Hyper-AI-Lab/openclaw-jev/pull/50, head `57f34ad`. The commit after `ad16d4c` adds the docs mirror only.
+
+**Gated job `btwxxofyz`:** the same gate as for batch 1. After the merge it records the run's state and the unit's activity every 15 s in `/root/.cache/wp09-b2-deploy-timeline.txt`, as evidence for batch 1's host step:
+- `deploy-state.json`'s `queued_at`;
+- the launch time;
+- `deploy.log`'s first line.
+
+It then waits up to 2.5 h for the result.
+
+## 2026-10-29 22:55 UTC · WP-09 batch 2 deployed; batch 1's host step met
+
+**Merged:** PR #50, squash `fc70a93`, at 22:47:21Z. The gate passed: CLEAN, latest `test` run `success`, PR head = local `57f34ad`, base `200cb65`, one open PR.
+
+**Batch 1's host step, read live.** This is the first deploy through the batch 1 launcher:
+
+| Time (UTC) | Event |
+|---|---|
+| 22:53:16 | CI's `test` check on the merge commit completed (GitHub) |
+| 22:53:30 | Queued: `deploy-state.json` `queued_at`, at the next reconciler pass |
+| 22:53:32 | Launched, 2 s later in the same pass, so the gate was open and Aura idle |
+| 22:54:33 | Result recorded |
+
+- **One log:** `deploy.log` starts with `launch 1 of the deploy of fc70a9369085 (phase queued)`, launch 1 (truncate). The unit's `Result=success`.
+- **Verdict:** queued, launched within a minute of idle, with one log. **PASS.**
+
+**Deployed** by batch 1's code:
+- `result.json`: `deployed`, head `fc70a93`;
+- restarted `rmp-api` and `rmp-worker`;
+- health, readiness and the canary passed; `units: []`;
+- nondeterminism lines in the worker journal: 0.
+
+**Afterwards:**
+- the live checkout is at `fc70a93`, and both services are active;
+- no `deploy-state.json` exists;
+- `rmp-api`'s journal since 22:53Z has no deploy, launch or watch error, exception or traceback, so `report_ended_deploys` runs quietly;
+- `/health` returns ok.
+
+**Ledger** (WP-09 §6 and §7, after batch 2):
+- **closed:** `concurrency-idempotency-20` (CI-20), `WP09-b1-dead-unit-relaunch`, `WP09-b1-postpone-not-busy`;
+- **notes added:**
+  - `concurrency-idempotency-07`: deploy part delivered;
+  - `timeouts-external-08`: deploy part delivered (WP09-07);
+  - `debt-scalability-07`: restart residual delivered;
+  - `temporal-determinism-04`: progress.
+
+**Batch 2's own host step** ("the next deploy's log shows stop → move → start") is read on batch 3's deploy, which batch 2's code will run.
+
+**Next:** WP-09 batch 3, items 11-15. It also carries §9 amendment 4.3 (early results under the lock; a lost land response) and the ledgered `WP09-b2-queue-main-deactivating`.
+
+## 2026-10-29 22:55 UTC · WP-09 batch 3 started
+
+**Branch:** `aura/wp-09-3-checks` from `fc70a93`.
+
+**Items:**
+- WP09-11 to WP09-15: like-with-like readiness, checks that never raise, the rollback always publishing its revert, health after the publish, Kirill's note first and retried, and `deploy_checks.py` coverage;
+- §9 amendment 4.3: every result recorded under the lock; a land whose response was lost is found merged;
+- §9 amendment 4.5: `_queue_main` treats a deactivating unit as running;
+- WP09-33's lines for this batch.
+
+The Workflow tool worked this time: run `wf_61289f7a-fcd`, task `wrk03pw13`. It implements the batch, then runs the tiered review, the fixes and the re-review.
+
+**Host step:** this batch's own deploy, run by batch 2's code, is batch 2's host step. Its `deploy.log` must show stop → move → start.
+
+## 2026-10-30 03:10 UTC · WP-09 batch 3 resumed after the usage limit
+
+The implementer of run `wf_61289f7a-fcd` stopped at the session limit after about 2.3 h. It left 13 commits, `a043984` to `cf547d3`, and a clean tree, but no report. The commits appear to cover:
+- WP09-11 to WP09-15;
+- §9 amendments 4.3a, 4.3b and 4.5;
+- the ARCHITECTURE lines.
+
+**Backup:** `/root/.cache/wp09-b3-wip/`, as format-patch files.
+
+**Resumed** in the same run with a RESUME NOTE, as task `whf70fwg1`. The implementer is to:
+- review the 13 commits critically, item by item;
+- fix what is wrong and finish what is missing, including the proof that batch 2's code deploys this head, the probes and the four layouts;
+- report.
+
+The reviews follow in the same run.
+
+## 2026-10-30 08:12 UTC · WP-09 batch 3 implemented; round-1 reviews resumed after the usage limit
+
+**Implementer** (resumed): it reviewed the 13 earlier commits and kept them all, then added 7 commits (`aa6074f` to `c5186ab`). Head is `c5186ab`: 20 commits on `fc70a93`.
+
+**Fixes to the earlier commits:**
+- **`aa6074f`:** a Host that cannot be made is again a counted attempt. `62b6522` had made it a silent death.
+- **`5240091`:** a resumed rollback publishes again only after a publish that failed with an error.
+- **`93199d1`:** the reconciler records an undelivered note as `note_delivered: false`.
+- **New tests:**
+  - **`d5d1e02`:** `_wait_ok` tested with a fake `urlopen` and clock.
+  - **`7bf0269` and `4b64b96`:** a batch-2 `reverting` state is finished with one publish; a failed publish; a reply that cannot start.
+
+**Deviations, for the reviewers to judge:**
+1. **Amendment 4.3a.** A result reached under the lock is recorded without letting go of it (`Host.keeping`). Only early results take a fresh `LOCK_NB` hold. Releasing and re-taking the lock would leave a gap in which a restore could take it, and a `deployed` result would then go unrecorded.
+2. **WP09-13.** The publish is recorded in the state (`published`). A resumed rollback never repeats a publish that merged or was blocked. Otherwise a kill during the re-check would land the revert twice.
+3. **WP09-14.** One shared `deploy.send_note` serves both the unit and the reconciler. `note_delivered` is recorded only when a note was due.
+
+**Harness on `c5186ab`:** all four layouts, 1960 passed, 1 skipped; node 58/58; leftovers 0. An earlier default run under `nohup` failed 4 `test_backup_script` tests, because `nohup` makes SIGHUP ignored for the whole run (an artefact of how the test was launched). A clean re-run passed.
+
+**The correctness reviewer** hit the session limit. Resumed in the same run (task `wmjiqrscv`); the implementer replays from cache.
+
+## 2026-10-30 14:20 UTC · WP-09 batch 3: three review rounds, approved; my verify running
+
+**Run `wf_61289f7a-fcd`:** 9 agents, approved.
+- **Round 1:** both reviewers approve, with non-blocking points. The fixes:
+  - `e3e9fad`: the baseline type;
+  - `09d94f6`: a delivered note logged at INFO;
+  - `2f5bcc2`: a test for an attempt before the last while the lock is held.
+- **Round 2:** both approve. Fix `d50dfa2`: a test for a restarted gateway that becomes ready.
+- **Round 3:** both approve. Its wording nit, the ARCHITECTURE sentence on the lost-land retry, I fixed myself in `6a4d674` (docs only).
+
+**The fixer's harness on `2f5bcc2`:** all four layouts, node included in each, 1960 passed, 1 skipped.
+
+**Deviations accepted:**
+- 4.3a keeps the lock it reached a result under;
+- WP09-13 records `published`;
+- WP09-14 uses a shared `send_note`, which also retries on a raise;
+- WP09-12 keeps batch 2's inner readiness `try`.
+
+**Deferred, each with a reason and a home:**
+- **Spec §9 amendment 5 (batch 4):** a revert window that fails before the tree moved is resumed after publishing, as batch 2 did. Ledger `WP09-b3-revert-window-not-resumed`.
+- **WP-03:** `WP09-b3-ops-note-needs-postgres`. The note's dedup needs Postgres.
+- **WP-07:** `WP09-b3-reconciler-stop-during-note-pauses`.
+
+**Batch 2 ships this head.**
+- **Scratch execution:** `fc70a93`'s code deployed this head and ended `deployed`, with a log reading stop → move → start.
+- **Committed tests:** this code finishes batch 2's resumed and rollback runs.
+
+**PR body:** drafted in `/root/.cache/pr-wp09-b3.md`.
+
+**Now:** my four-layout verify on `6a4d674` (task `bn0m03y3v`).
+
+## 2026-10-30 15:38 UTC · WP-09 batch 3 verified by me
+
+**My harness run on `6a4d674`** (base `fc70a93`, unchanged as `origin/main`):
+
+| Layout | pytest | Time | node | Leftovers | Placeholder grep | Hidden new files |
+|---|---|---|---|---|---|---|
+| Default | 1960 passed, 1 skipped | 19:10 | 58/58 | 0 | clean | none |
+| coding-job | 1960 passed, 1 skipped | 18:54 | 58/58 | 0 | clean | none |
+| direct | 1960 passed, 1 skipped | 19:34 | 58/58 | 0 | clean | none |
+| live | 1960 passed, 1 skipped | 19:37 | 58/58 | 0 | clean | none |
+
+Every layout ended `verify: exit 0`, with node run in every layout (logs: `/root/.cache/wp09-b3-myverify-6a4d674/`).
+
+No label is needed: `app/workflows` and `requirements.txt` are untouched.
+
+**Next:** the docs mirror, the PR and the gated merge. The deploy is batch 2's host step: its log must show stop → move → start.

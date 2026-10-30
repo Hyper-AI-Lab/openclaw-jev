@@ -5,20 +5,23 @@ Started by the launcher (``app.coding.deploy.next_deploy``) with the spec of a q
 directory: a reviewed job's approved commit, queued by the coding workflow's deploy activity, or a commit of
 GitHub's main that CI passed, queued by RMP's watcher (``aura-deploy-main``). It runs
 ``app.coding.deploy.self_deploy``, which takes the code-reload lock within ``LOCK_WAIT_SEC`` once its slow work is
-done, and records the result; when the lock stays held or Aura is busy at the final check, it records nothing and
-the run stays queued. A run Aura still keeps busy two hours after it was queued is launched with ``--postpone`` and
-records ``postponed`` under the lock, taken at once or not at all. Each launch first prints which launch of the run
-it is, then checks in; the run's launches share one log, ``deploy.log``. An error or ``SIGTERM`` before the change is
-retried by the next launch, at most three times; one from ``applying`` on leaves the run to be resumed from its
-phase. After a result, a reviewed job gets a fresh run of its workflow, which sends Aura's judged reply on the new
-code; a deploy of GitHub's main sends Kirill a note with its pull requests' links when it did not go live (rolled
-back, blocked, failed, postponed) or when it changed files under ``ops/systemd/``, which it never installs.
+done, and records the result under that lock; when the lock stays held or Aura is busy at the final check, it records
+nothing and the run stays queued. A result reached before the lock (unchanged, blocked, failed) is recorded under the
+lock taken at once, or the run waits. A run Aura still keeps busy two hours after it was queued is launched with
+``--postpone`` and records ``postponed`` under the lock, taken at once or not at all. Each launch first prints which
+launch of the run it is, then checks in; the run's launches share one log, ``deploy.log``. An error or ``SIGTERM``
+before the change is retried by the next launch, at most three times; one from ``applying`` on leaves the run to be
+resumed from its phase. After a result, a reviewed job gets a fresh run of its workflow, which sends Aura's judged
+reply on the new code; a deploy of GitHub's main sends Kirill a note with its pull requests' links when it did not go
+live (rolled back, blocked, failed, postponed), when it changed files under ``ops/systemd/``, which it never installs,
+or when readiness checks it added or tightened fail on this host, which do not count against it.
 """
 import asyncio
 import fcntl
 import json
 import signal
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,7 +38,8 @@ from app.production.ops_notify import notify_ops_slack  # noqa: E402
 from app.temporal_control import connect_temporal  # noqa: E402
 
 TASK_QUEUE = "openclaw-tasks"
-# A deploy of GitHub's main that is live needs no note, unless it changed unit files; the Event records it.
+# A deploy of GitHub's main that is live needs no note, unless it changed unit files or new or tightened readiness
+# checks fail; the Event records it.
 QUIET = ("deployed", "unchanged")
 
 
@@ -44,29 +48,44 @@ def log(message: str) -> None:
 
 
 async def finish(spec: dict, result: dict) -> None:
-    """Record the result on the task, then start the run that replies, or tell Kirill when Aura's own deploy is not live
-    or changed unit files."""
-    task_id = spec["task_id"]
+    """Tell Kirill first, on its own and retried (``deploy.send_note``), when Aura's own deploy is not live, changed
+    unit files or found new or tightened readiness checks failing; then record the result on the task, with whether the
+    note was delivered; then, for a reviewed job, start the run that replies. Each step runs whatever the one before
+    did, and a failure is logged."""
+    task_id, github = spec["task_id"], spec.get("source") == "github"
+    recorded = result
+    if github and (result["status"] not in QUIET or result.get("units") or result.get("new_failing")):
+        noted = False
+        try:
+            note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
+        except Exception as exc:
+            log(f"writing the note to Kirill failed ({str(exc)[:300]})")
+        else:
+            noted = await deploy.send_note(note, f"deploy:{task_id}:{(result.get('head') or '')[:12]}",
+                                           notify_ops_slack, log)
+        recorded = {**result, "note_delivered": noted}
     try:
         async with AsyncSessionLocal() as db:
-            db.add(Event(correlation_id=task_id, entity_type="deploy" if spec.get("source") == "github" else "task",
-                         entity_id=task_id, event_type="coding.deploy", event_payload=result))
+            db.add(Event(correlation_id=task_id, entity_type="deploy" if github else "task", entity_id=task_id,
+                         event_type="coding.deploy", event_payload=recorded))
             task = await db.get(Task, task_id)
             if task is not None:
-                task.supplementary_context = {**(task.supplementary_context or {}), "coding_deploy": result}
+                task.supplementary_context = {**(task.supplementary_context or {}), "coding_deploy": recorded}
             await db.commit()
+    except Exception as exc:
+        log(f"recording the result on the task failed ({str(exc)[:300]})")
     finally:
         await engine.dispose()
-    if spec.get("source") == "github":
-        if result["status"] not in QUIET or result.get("units"):
-            note = deploy.deploy_note(result, get_coding_config()["repositories"]["rmp"]["remote"])
-            await notify_ops_slack(note, incident_id=f"deploy:{task_id}:{(result.get('head') or '')[:12]}")
-            log("told Kirill")
+    if github:
         return
-    client = await connect_temporal()
-    await client.start_workflow("CodingTaskWorkflow", {**spec["context"], "report": {**spec["report"], "shipped": result}},
-                                id=f"workflow-{task_id}", task_queue=TASK_QUEUE)
-    log(f"started the reply run workflow-{task_id}")
+    try:
+        client = await connect_temporal()
+        await client.start_workflow("CodingTaskWorkflow",
+                                    {**spec["context"], "report": {**spec["report"], "shipped": result}},
+                                    id=f"workflow-{task_id}", task_queue=TASK_QUEUE)
+        log(f"started the reply run workflow-{task_id}")
+    except Exception as exc:
+        log(f"starting the reply run workflow-{task_id} failed ({str(exc)[:300]})")
 
 
 def postponed(run: dict) -> dict:
@@ -129,41 +148,81 @@ def run_launch(spec_path: str, postpone: bool) -> int:
     return code
 
 
+@contextmanager
+def locked_now():
+    """The code-reload lock for the ``with`` block, taken at once (``LOCK_NB``) or not at all; whether it was taken."""
+    with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
 def checked_in(spec_path: str, spec: dict, run: dict, postpone: bool) -> int:
-    """The launch's work once it checked in, with ``run`` its state as the launch found it."""
-    task, state = spec["task_id"], deploy.state_file(spec["task_id"])
+    """The launch's work once it checked in, with ``run`` its state as the launch found it.
+
+    Every result is recorded, and ``finish`` runs, under the code-reload lock, so none is written while a restore or a
+    code reload holds it: a result reached under the lock without letting go of it (``Host.keeping``), any other under
+    a hold taken at once (``LOCK_NB``). When that lock is held, the launch waits and the run keeps its state; a last
+    attempt is then not counted, and the next launch tries again."""
     if postpone:
-        with open(deploy.CODE_RELOAD_LOCK, "w") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+        with locked_now() as held:
+            if not held:
                 log(f"waiting: {deploy.CODE_RELOAD_LOCK} is held; the run stays queued")
                 return 0
             return record(spec_path, spec, postponed(run))
     what = "GitHub's main" if spec.get("source") == "github" else f"{spec['head'][:12]} over {spec['old'][:12]}"
     log(f"deploying {what}")
     try:
-        result = deploy.self_deploy(spec, deploy.Host(), log=log)
+        host = deploy.Host()
     except (Exception, deploy.Interrupted) as exc:
-        now = deploy._read_json(state) or {}
-        if now.get("phase") in deploy.CHANGING:
-            # Counted, so a resume that fails the same way every time ends dead (deploy.end_dead_runs), and marked
-            # ended in the same write, so a kill right after cannot count it twice.
-            deploy.write_json(state, {**now, "escapes": now.get("escapes", 0) + 1,
-                                      "ended": now.get("started", now.get("launches", 0))})
-            log(f"interrupted in phase {now['phase']}; the next idle pass resumes it"
-                if isinstance(exc, deploy.Interrupted) else
-                f"stopped in phase {now['phase']} with an error ({str(exc)[:300]}); the next idle pass resumes it")
-            return 1
-        error = str(exc) or type(exc).__name__
+        return stopped(spec_path, spec, exc, locked_now)
+    with host.keeping(deploy.CODE_RELOAD_LOCK):
+        try:
+            result = deploy.self_deploy(spec, host, log=log)
+        except (Exception, deploy.Interrupted) as exc:
+            return stopped(spec_path, spec, exc, lambda: host.hold(deploy.CODE_RELOAD_LOCK, 0))
+        if result is None:
+            log("the run stays queued; the launcher's next pass tries again")
+            return 0
+        with host.hold(deploy.CODE_RELOAD_LOCK, 0) as held:
+            if not held:
+                log(f"waiting: {deploy.CODE_RELOAD_LOCK} is held, so the result ({result['status']}) is not recorded; "
+                    "the run keeps its state")
+                return 0
+            return record(spec_path, spec, result)
+
+
+def stopped(spec_path: str, spec: dict, exc: BaseException, hold) -> int:
+    """The end of a launch that an exception or ``SIGTERM`` stopped before it reached a result, from making the
+    deploy's host on. From ``applying`` on, the run keeps its state for the next idle pass to resume, and the escape is
+    counted. Before it, it is an attempt (``deploy.record_attempt``); the last attempt's ``failed`` is recorded under
+    the code-reload lock, which ``hold`` takes at once, and while another process holds that lock the attempt is not
+    counted and the launch waits."""
+    task, state = spec["task_id"], deploy.state_file(spec["task_id"])
+    now = deploy._read_json(state) or {}
+    if now.get("phase") in deploy.CHANGING:
+        # Counted, so a resume that fails the same way every time ends dead (deploy.end_dead_runs), and marked ended in
+        # the same write, so a kill right after cannot count it twice.
+        deploy.write_json(state, {**now, "escapes": now.get("escapes", 0) + 1,
+                                  "ended": now.get("started", now.get("launches", 0))})
+        log(f"interrupted in phase {now['phase']}; the next idle pass resumes it"
+            if isinstance(exc, deploy.Interrupted) else
+            f"stopped in phase {now['phase']} with an error ({str(exc)[:300]}); the next idle pass resumes it")
+        return 1
+    error = str(exc) or type(exc).__name__
+    with hold() as held:
+        if not held and now.get("attempt", 0) + 1 >= deploy.MAX_ATTEMPTS:
+            log(f"waiting: {deploy.CODE_RELOAD_LOCK} is held, so the last attempt ({error[:300]}) is not counted; the "
+                "launcher's next pass tries again")
+            return 0
         result = deploy.record_attempt(task, error)
         if result is None:
             log(f"stopped before the change ({error[:300]}); the launcher's next pass tries again")
             return 1
-    if result is None:
-        log("the run stays queued; the launcher's next pass tries again")
-        return 0
-    return record(spec_path, spec, result)
+        return record(spec_path, spec, result)
 
 
 if __name__ == "__main__":
