@@ -164,20 +164,26 @@ def test_a_status_is_the_answers_code_or_0_when_nothing_answered(monkeypatch, an
 
 @pytest.fixture
 def clock(monkeypatch):
-    """A monotonic clock that a sleep moves on, and the statuses the URL answers in turn (the last one again)."""
+    """A monotonic clock that a sleep moves on, and urlopen answering the statuses in ``statuses`` in turn (the last
+    one again): 200 an answer, another status an HTTP error, 0 nothing listening."""
     seen = {"now": 1000.0, "statuses": [], "asked": [], "slept": []}
 
     def sleep(seconds):
         seen["slept"].append(seconds)
         seen["now"] += seconds
 
-    def status(url):
+    def urlopen(url, timeout):
         seen["asked"].append(seen["now"])
-        return seen["statuses"].pop(0) if len(seen["statuses"]) > 1 else seen["statuses"][0]
+        status = seen["statuses"].pop(0) if len(seen["statuses"]) > 1 else seen["statuses"][0]
+        if status == 0:
+            raise ConnectionRefusedError(111, "Connection refused")
+        if status != 200:
+            raise deploy_checks.urllib.error.HTTPError(url, status, "Service Unavailable", {}, None)
+        return Response(status)
 
     monkeypatch.setattr(deploy_checks.time, "monotonic", lambda: seen["now"])
     monkeypatch.setattr(deploy_checks.time, "sleep", sleep)
-    monkeypatch.setattr(deploy_checks, "_status", status)
+    monkeypatch.setattr(deploy_checks.urllib.request, "urlopen", urlopen)
     return seen
 
 
