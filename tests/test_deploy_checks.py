@@ -240,6 +240,10 @@ def test_the_gateway_is_awaited_only_when_it_was_restarted(probes):
     assert deploy_checks.run(LIVE, ["openclaw-gateway"], {}) == {
         "failure": "the gateway was not ready within 5 minutes", "canary": None}
     assert probes["waits"][-1] == (deploy_checks.GATEWAY_READY, 300)
+    # Restarted and ready, the gateway lets the checks go on to readiness and the canary.
+    probes["ok"], probes["waits"] = {}, []
+    assert deploy_checks.run(LIVE, ["openclaw-gateway"], {}) == {"failure": None, "canary": "ok", "new_failing": []}
+    assert probes["waits"] == [("http://127.0.0.1:8000/health", 120), (deploy_checks.GATEWAY_READY, 300)]
 
 
 def test_a_readiness_report_that_fails_fails_the_checks(probes):
