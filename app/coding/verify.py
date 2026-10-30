@@ -3,12 +3,11 @@
 The exit codes systemd records are the test evidence, not Claude's report. Output files are root-owned;
 the counts parsed from them are informational, because the tests are code the job may change.
 
-The shared venv for a repository is built by root from the trusted source's requirements only. When
-a job changed its requirements, the job builds its own venv inside the sandbox instead.
+The shared venv for a repository is built by root from the trusted source's lock files only
+(``app.coding.venvs``). When a job changed its lock files, the job builds its own venv inside the sandbox instead.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import shutil
@@ -17,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.coding import venvs
 from app.coding.units import BASE_PATH, CODE_ROOT, CODER_HOME, CODER_USER, RUNS_DIR, systemd_run_argv, unit_properties
 from app.coding.workspace import Job
 
@@ -29,24 +29,10 @@ _PYTEST = re.compile(r"(\d+) (passed|failed|skipped|errors?|xfailed|xpassed|dese
 _NODE = re.compile(r"^ℹ (tests|pass|fail|cancelled|skipped|todo) (\d+)", re.M)
 
 
-def requirements_hash(path: Path) -> Optional[str]:
-    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-
-
 def ensure_shared_venv(repo: str, requirements: Path) -> Path:
-    """The read-only venv for ``repo``, rebuilt when the trusted requirements change."""
-    venv = VENVS_DIR / repo
-    stamp = venv / ".requirements.sha256"
-    wanted = requirements_hash(requirements)
-    if stamp.is_file() and stamp.read_text().strip() == wanted:
-        return venv
-    # Built in place: a venv's scripts record its path. Without the stamp, jobs build their own venv.
-    shutil.rmtree(venv, ignore_errors=True)
-    subprocess.run(["python3", "-m", "venv", str(venv)], check=True, capture_output=True, timeout=300)
-    subprocess.run([str(venv / "bin" / "pip"), "install", "-q", "--disable-pip-version-check", "-r", str(requirements)],
-                   check=True, capture_output=True, timeout=1800)
-    stamp.write_text(f"{wanted}\n")
-    return venv
+    """The read-only venv for ``repo``, built from the lock files next to the trusted ``requirements`` (the dev lock
+    once there is one) and rebuilt when they change. Without its stamp, jobs build their own venv."""
+    return venvs.build(VENVS_DIR / repo, requirements.parent)
 
 
 def seed_test_cache(owner: Optional[str] = CODER_USER, *, source: Path = Path("/tmp")) -> Path:
@@ -79,13 +65,9 @@ def commands_for(job: Job, cfg: Dict[str, Any]) -> List[List[str]]:
     setup = [list(argv) for argv in entry.get("setup") or []]
     venv = VENVS_DIR / job.repo
     uses_venv = any("{venv}" in arg for argv in entry["tests"] for arg in argv)
-    if uses_venv:
-        stamp = venv / ".requirements.sha256"
-        shared = stamp.is_file() and stamp.read_text().strip() == requirements_hash(checkout / "requirements.txt")
-        if not shared:
-            setup += [["python3", "-m", "venv", JOB_VENV],
-                      [f"{JOB_VENV}/bin/pip", "install", "-q", "--disable-pip-version-check", "-r", "requirements.txt"]]
-            venv = checkout / JOB_VENV
+    if uses_venv and venvs.stamp_of(venv) != venvs.lock_hash(checkout):
+        setup += [["python3", "-m", "venv", JOB_VENV], venvs.install_argv(f"{JOB_VENV}/bin/python", checkout)]
+        venv = checkout / JOB_VENV
     tests = [[arg.replace("{venv}", str(venv)) for arg in argv] for argv in entry["tests"]]
     # systemd refuses a relative executable path; a bare name is still looked up on PATH.
     return [[str(checkout / argv[0]) if "/" in argv[0] and not argv[0].startswith("/") else argv[0], *argv[1:]]
