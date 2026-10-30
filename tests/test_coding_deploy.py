@@ -2775,3 +2775,31 @@ def test_a_run_the_previous_deploy_code_left_compares_its_baseline_as_that_code_
         assert result["new_failing"] == [] and git(repos.live, "rev-parse", "main") == head
     else:
         assert result["error"] == "readiness checks failed: slack"
+
+
+@pytest.mark.parametrize("publish", ["merged", "blocked"])
+def test_a_rollback_the_previous_deploy_code_left_is_published_once_and_rechecked_as_that_code_compared(
+        repos, readiness, publish):
+    """A run the deploy code before this one was killed in while it reverted: the tree moved back to its recorded
+    revert, its baseline the list of the checks failing then, and no publish recorded. This code finishes the revert
+    window, publishes the revert once, then re-checks, counting every check missing from the list as passed then and
+    leaving ``claude_direct`` out while the revert waits on GitHub."""
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    git(repos.live, "merge", "-q", "--ff-only", head)
+    revert = git(repos.live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
+                 f"{repos.old}^{{tree}}", "-p", head, "-m", f"Revert {head[:12]}: the deploy's checks failed")
+    git(repos.live, "merge", "-q", "--ff-only", revert)
+    deploy.queue(main_spec(head))
+    deploy.write_json(deploy.state_file(deploy.MAIN), {
+        **batch_1_state(1, started=1, escapes=1), "phase": "reverting", "old": repos.old, "head": head,
+        "affected": ["rmp-api", "rmp-worker"], "baseline": ["telemetry"], "failure": "CANARY FAIL: task failed",
+        "revert": revert})
+    readiness.after = {"telemetry": "fail", "claude_direct": "pass" if publish == "merged" else "fail"}
+    host = ReadinessHost(repos.live, before={}, lands=["failure"] if publish == "blocked" else [])
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["revert"] == revert and "Aura is healthy again" in (
+        result["summary"])
+    assert result["revert_pr"]["status"] == publish and git(repos.live, "rev-parse", "main") == revert
+    assert [c for c in host.calls if c[0] in ("systemctl", "land", "checks")] == [
+        *switched("rmp-api", "rmp-worker"), ("land", f"aura/revert-{head[:12]}", "merge"),
+        ("checks", ("rmp-api", "rmp-worker"), ("telemetry",), *([("claude_direct",)] if publish == "blocked" else []))]
