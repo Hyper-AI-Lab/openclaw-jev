@@ -1,7 +1,8 @@
 """Shipping approved changes against hermetic repos: the live repo, its GitHub remote, the review repository, mirrors.
 
-git runs for real; the host's systemctl, pip, checks and the gate's probes are a recording fake, and so is the
-launcher's systemd-run.
+git runs for real; the host's systemctl, checks and the gate's probes are a recording fake, and so is the launcher's
+systemd-run. The live repo's venv is a real directory, as before the first switch; the venvs are built and switched on
+tmp_path, with the venv creation and pip a recording fake.
 """
 import asyncio
 import fcntl
@@ -21,7 +22,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.coding import deploy, verify, workspace
+from app.coding import deploy, venvs, verify, workspace
 from app.production import canary_sentinel
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,11 @@ def repos(tmp_path, monkeypatch):
     live, origin, review, scratch = tmp_path / "live", tmp_path / "origin.git", tmp_path / "review.git", tmp_path / "scratch"
     git(tmp_path, "init", "-q", "--bare", str(origin))
     git(tmp_path, "init", "-q", "-b", "main", str(live))
+    # The live checkout's venv: a real directory, untracked, as production's before the first switch.
+    (live / ".git" / "info").mkdir(exist_ok=True)
+    with open(live / ".git" / "info" / "exclude", "a") as exclude:
+        exclude.write("venv\nvenv.tmp\n")
+    write(live, {"venv/bin/python": "production's\n"})
     write(live, BASE)
     old = commit(live, "base")
     git(live, "remote", "add", "origin", str(origin))
@@ -70,6 +76,16 @@ def repos(tmp_path, monkeypatch):
     monkeypatch.setattr(deploy, "MIRRORS", tuple(mirrors))
     monkeypatch.setattr(deploy, "RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
+    monkeypatch.setattr(venvs, "VENVS_ROOT", tmp_path / "venvs")
+    venv_runs = []
+
+    def run(argv, *, cwd=None, timeout):
+        # The venv creation makes its python; the install and pip check do nothing.
+        venv_runs.append(argv)
+        if argv[:3] == ["python3", "-m", "venv"]:
+            write(Path(argv[3]), {"bin/python": "built\n"})
+
+    monkeypatch.setattr(venvs, "run", run)
 
     def change(files: dict, deletes=(), on=None) -> str:
         if scratch.exists():
@@ -85,7 +101,8 @@ def repos(tmp_path, monkeypatch):
     job = workspace.Job(task_id="t1", repo="rmp", branch="aura/t1-x", base=old, source=str(live), checkout=str(tmp_path / "job"),
                         review=str(review), created_at="2026-10-02T00:00:00+00:00")
     return SimpleNamespace(live=live, origin=origin, review=review, old=old, change=change, job=job,
-                           mirror=dict(mirrors), tmp=tmp_path)
+                           mirror=dict(mirrors), tmp=tmp_path, link=live / "venv", kinds=tmp_path / "venvs" / "rmp",
+                           venv_runs=venv_runs)
 
 
 class FakeHost(deploy.Host):
@@ -93,9 +110,11 @@ class FakeHost(deploy.Host):
 
     The gate's probes answer from ``units`` (the deploy units running), ``held`` (the code-reload lock) and ``busy``
     (the idle counts in turn, then 0; an exception in it is raised); each count is recorded. CI's check on a commit
-    answers from ``ci``, by commit, else "success". ``kill_at`` (a systemctl verb and n) kills the unit at its n-th
-    systemctl call of that verb: ``deploy.Interrupted`` is raised there, once, before the call is made. ``merged`` is
-    GitHub's record of the pull requests that merged, by branch, which a land adds to; hosts can share it."""
+    answers from ``ci``, by commit, else "success". ``kill_at`` (a systemctl verb, or "switch_venv", and n) kills the
+    unit at its n-th call of that kind: ``deploy.Interrupted`` is raised there, once, before the call is made.
+    ``merged`` is GitHub's record of the pull requests that merged, by branch, which a land adds to; hosts can share
+    it. The venv steps run ``venvs`` for real on tmp_path (``repos``) and are recorded: a build with the lock files
+    it was given, a switch with the live main it saw, a prune with what it keeps."""
 
     def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None, kill_at=None,
                  merged=None):
@@ -118,16 +137,29 @@ class FakeHost(deploy.Host):
     def reload_lock_held(self):
         return self.held
 
-    def systemctl(self, *args):
-        if self.kill_at and args[0] == self.kill_at[0]:
+    def die(self, kind, *args):
+        if self.kill_at and kind == self.kill_at[0]:
             self.kill_at[1] -= 1
             if self.kill_at[1] == 0:
                 self.kill_at = None
-                raise deploy.Interrupted(f"killed at systemctl {' '.join(args)}")
+                raise deploy.Interrupted(f"killed at {' '.join(map(str, args))}")
+
+    def systemctl(self, *args):
+        self.die(args[0], "systemctl", *args)
         self.calls.append(("systemctl", *args))
 
-    def pip_install(self):
-        self.calls.append(("pip",))
+    def build_venv(self, target, lock):
+        self.calls.append(("build_venv", str(target), sorted(path.name for path in lock.iterdir())))
+        return super().build_venv(target, lock)
+
+    def switch_venv(self, link, target, kind_root, adopt=None):
+        self.die("switch_venv", "switch_venv", target)
+        self.calls.append(("switch_venv", str(target), git(self.live, "rev-parse", "main")))
+        super().switch_venv(link, target, kind_root, adopt)
+
+    def prune(self, kind_root, keep):
+        self.calls.append(("prune", tuple(sorted(keep))))
+        return super().prune(kind_root, keep)
 
     def land(self, commit, branch, title, body, method):
         self.calls.append(("land", branch, method))
@@ -188,13 +220,24 @@ def test_a_reviewed_change_lands_through_a_pull_request_then_syncs_and_restarts_
     assert ("checks", services, ("telemetry",)) in host.calls
 
 
+def built_venv(task="t1") -> Path:
+    """The venv a run's lock files name: under the venvs root, the first 16 hex of their lock hash."""
+    return venvs.VENVS_ROOT / "rmp" / venvs.lock_hash(deploy.RUNS_DIR / task / "lock")[:16]
+
+
 def test_requirements_are_installed_before_the_restart_and_unit_files_are_not(repos):
     head = repos.change({"requirements.txt": "x==2\n", "ops/systemd/aura-x.service": "[Service]\nNice=5\n"})
     host = FakeHost(repos.live)
     assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
-    assert [c for c in host.calls if c[0] in ("systemctl", "pip")] == [
-        ("systemctl", "stop", "rmp-api"), ("systemctl", "stop", "rmp-worker"), ("pip",),
-        ("systemctl", "start", "rmp-api", "rmp-worker")]
+    # The head's requirements are built into a venv of their own before anything stops, and the live venv link is
+    # switched to it while the units are stopped.
+    target = built_venv()
+    assert [c[:2] for c in host.calls if c[0] in ("systemctl", "build_venv", "switch_venv")] == [
+        ("build_venv", str(target)), ("systemctl", "stop"), ("systemctl", "stop"), ("switch_venv", str(target)),
+        ("systemctl", "start")]
+    assert [c for c in host.calls if c[0] == "systemctl"] == switched("rmp-api", "rmp-worker")
+    assert os.readlink(repos.link) == str(target)
+    assert (deploy.RUNS_DIR / "t1" / "lock" / "requirements.txt").read_text() == "x==2\n"
 
 
 def test_a_unit_file_change_is_never_installed_or_restarted(repos, monkeypatch):
@@ -1222,11 +1265,11 @@ def test_the_units_stop_before_main_moves_and_start_after_the_switch(repos):
 
 
 class FailingHost(FakeHost):
-    """Raises at the systemctl call ``fail_at`` (its arguments), and at the first ``pip`` when ``pip_fails``; once."""
+    """Raises at the systemctl call ``fail_at`` (its arguments), once, after recording it."""
 
-    def __init__(self, live, *, fail_at=None, pip_fails=False, **kwargs):
+    def __init__(self, live, *, fail_at=None, **kwargs):
         super().__init__(live, **kwargs)
-        self.fail_at, self.pip_fails = fail_at, pip_fails
+        self.fail_at = fail_at
 
     def systemctl(self, *args):
         super().systemctl(*args)
@@ -1234,31 +1277,25 @@ class FailingHost(FakeHost):
             self.fail_at = None
             raise subprocess.CalledProcessError(1, ["systemctl", *args])
 
-    def pip_install(self):
-        super().pip_install()
-        if self.pip_fails:
-            self.pip_fails = False
-            raise subprocess.CalledProcessError(1, ["pip"])
-
 
 def test_a_failure_inside_the_window_still_starts_the_units(repos):
     head = repos.change({"app/a.py": "A = 2\n", "requirements.txt": "x==2\n"})
     host = FailingHost(repos.live, fail_at=("stop", "rmp-worker"))
     with pytest.raises(subprocess.CalledProcessError):
         deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
-    assert [c for c in host.calls if c[0] == "systemctl"] == [
+    assert [c for c in host.calls if c[0] in ("systemctl", "switch_venv")] == [
         ("systemctl", "stop", "rmp-api"), ("systemctl", "stop", "rmp-worker"),
         ("systemctl", "start", "rmp-api", "rmp-worker")]
-    assert git(repos.live, "rev-parse", "main") == repos.old
+    assert git(repos.live, "rev-parse", "main") == repos.old and not repos.link.is_symlink()
 
     # Once main moved, a failure is a rollback, and both windows start the units.
-    host = FailingHost(repos.live, pip_fails=True)
+    host = FailingHost(repos.live, fail_at=("start", "rmp-api", "rmp-worker"))
     result = deploy.self_deploy(spec(repos, head), host, log=lambda m: None)
     assert result["status"] == "rolled_back" and "applying the change failed" in result["summary"]
-    assert [c for c in host.calls if c[0] in ("systemctl", "pip")] == [
-        ("systemctl", "stop", "rmp-api"), ("systemctl", "stop", "rmp-worker"), ("pip",),
-        ("systemctl", "start", "rmp-api", "rmp-worker"),
-        ("systemctl", "stop", "rmp-api"), ("systemctl", "stop", "rmp-worker"), ("pip",),
+    assert [c for c in host.calls if c[0] == "systemctl"] == [
+        ("systemctl", "stop", "rmp-api"), ("systemctl", "stop", "rmp-worker"),
+        ("systemctl", "start", "rmp-api", "rmp-worker"), ("systemctl", "start", "rmp-api", "rmp-worker"),
+        ("systemctl", "stop", "rmp-api"), ("systemctl", "stop", "rmp-worker"),
         ("systemctl", "start", "rmp-api", "rmp-worker")]
 
 
@@ -1708,14 +1745,15 @@ async def test_a_dead_run_past_applying_keeps_its_state_and_stops_the_queue(repo
     git(repos.live, "merge", "-q", "--ff-only", head)
     deploy.queue(reviewed(repos, head=head))
     launched("t1", 3, phase="merged", old=repos.old, head=head, affected=["rmp-api", "rmp-worker"], baseline=[],
-             previous="/root/.openclaw/venvs/rmp/0123456789abcdef", **deaths)
+             venv={"target": str(repos.kinds / "fedcba9876543210"),
+                   "previous": "/root/.openclaw/venvs/rmp/0123456789abcdef", "adopt": None}, **deaths)
     deploy.queue(main_spec("c" * 40))
     assert deploy.next_deploy(FakeHost(repos.live)) is None
 
     await reporting.report()
     kept = state()
     assert kept["phase"] == "merged" and kept["dead_noted"] is True
-    assert kept["old"] == repos.old and kept["previous"] == "/root/.openclaw/venvs/rmp/0123456789abcdef"
+    assert kept["old"] == repos.old and kept["venv"]["previous"] == "/root/.openclaw/venvs/rmp/0123456789abcdef"
     [(note, incident)] = reporting.notes
     log = deploy.RUNS_DIR / "t1" / "deploy.log"
     assert note.startswith("Aura's deploy: stuck.") and (
@@ -2848,3 +2886,283 @@ def test_a_rollback_the_previous_deploy_code_left_is_published_once_and_rechecke
     assert [c for c in host.calls if c[0] in ("systemctl", "land", "checks")] == [
         *switched("rmp-api", "rmp-worker"), ("land", f"aura/revert-{head[:12]}", "merge"),
         ("checks", ("rmp-api", "rmp-worker"), ("telemetry",), *([("claude_direct",)] if publish == "blocked" else []))]
+
+
+# A head's hashed lock files, as from WP-09 batch 5.
+LOCKED = {"requirements.txt": "x==2 --hash=sha256:aa\n",
+          "requirements-dev.txt": "-r requirements.txt\ny==1 --hash=sha256:bb\n"}
+
+
+class VenvWatchingHost(FakeHost):
+    """Records, with each systemctl call, the live main and where the venv link points (``dir`` while it is the real
+    directory), and reads the run's state at the first stop."""
+
+    def __init__(self, live, **kwargs):
+        super().__init__(live, **kwargs)
+        self.at_first_stop = None
+
+    def systemctl(self, *args):
+        if args[0] == "stop" and self.at_first_stop is None and deploy.state_file("t1").exists():
+            self.at_first_stop = state()
+        super().systemctl(*args)
+        link = self.live / "venv"
+        self.calls[-1] = (*self.calls[-1], git(self.live, "rev-parse", "main"),
+                          os.readlink(link) if link.is_symlink() else "dir")
+
+
+def test_a_lock_change_builds_before_the_stop_and_switches_before_the_tree_moves(repos):
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    host = VenvWatchingHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    target, old = built_venv(), repos.old
+    assert [c for c in host.calls if c[0] in ("build_venv", "systemctl", "switch_venv")] == [
+        ("build_venv", str(target), ["requirements-dev.txt", "requirements.txt"]),
+        ("systemctl", "stop", "rmp-api", old, "dir"), ("systemctl", "stop", "rmp-worker", old, "dir"),
+        ("switch_venv", str(target), old),
+        ("systemctl", "start", "rmp-api", "rmp-worker", head, str(target))]
+    # Built from exactly the head's lock files, with their hashes required, and stamped.
+    lock = deploy.RUNS_DIR / "t1" / "lock"
+    assert {path.name: path.read_text() for path in lock.iterdir()} == LOCKED
+    python = str(target / "bin" / "python")
+    assert repos.venv_runs == [
+        ["python3", "-m", "venv", str(target)],
+        [python, "-m", "pip", "install", "-q", "--disable-pip-version-check", "--require-hashes", "-r",
+         "requirements-dev.txt"],
+        [python, "-m", "pip", "check"]]
+    assert venvs.stamp_of(target) == venvs.lock_hash(lock) and os.readlink(repos.link) == str(target)
+
+
+def test_a_rollback_moves_the_tree_then_switches_the_venv_back(repos):
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    host = VenvWatchingHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back"
+    target, revert, previous = built_venv(), result["revert"], state()["venv"]["previous"]
+    assert [c for c in host.calls if c[0] in ("systemctl", "switch_venv")][-4:] == [
+        ("systemctl", "stop", "rmp-api", head, str(target)), ("systemctl", "stop", "rmp-worker", head, str(target)),
+        ("switch_venv", previous, revert), ("systemctl", "start", "rmp-api", "rmp-worker", revert, previous)]
+    # Back on production's own venv, the directory the first switch moved, with nothing pruned.
+    assert os.readlink(repos.link) == previous and (Path(previous) / "bin" / "python").read_text() == "production's\n"
+    assert target.is_dir() and not [c for c in host.calls if c[0] == "prune"]
+
+
+def test_a_deploy_without_a_lock_change_builds_nothing(repos):
+    head = repos.change({"app/a.py": "A = 2\n", "requirements.in": "x==2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)["status"] == "deployed"
+    assert not [c for c in host.calls if c[0] in ("build_venv", "switch_venv", "prune")] and repos.venv_runs == []
+    assert repos.link.is_dir() and not repos.link.is_symlink() and state()["venv"] is None
+    assert not (deploy.RUNS_DIR / "t1" / "lock").exists() and not venvs.VENVS_ROOT.exists()
+
+
+def test_the_unit_runs_on_the_resolved_venv(repos, systemd_run):
+    deploy.queue(reviewed(repos))
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t1"
+    real = os.path.join(os.path.realpath(repos.link), "bin", "python")
+    assert systemd_run.argvs[-1][-3:] == [real, str(repos.live / "ops" / "coding_deploy.py"),
+                                          str(deploy.spec_file("t1"))]
+
+    resolved = repos.kinds / "0123456789abcdef"
+    (resolved / "bin").mkdir(parents=True)
+    shutil.rmtree(repos.link)
+    repos.link.symlink_to(resolved)
+    deploy.state_file("t1").unlink()
+    deploy.queue(reviewed(repos, "t2"))
+    assert deploy.next_deploy(FakeHost(repos.live)) == "aura-deploy-t2"
+    # The unit's own imports stay in the venv it started on, whatever the link points at later.
+    assert systemd_run.argvs[-1][-3] == os.path.join(os.path.realpath(resolved), "bin", "python")
+
+
+def test_a_venv_link_is_ignored(tmp_path):
+    repo = tmp_path / "repo"
+    git(tmp_path, "init", "-q", str(repo))
+    shutil.copy(ROOT / ".gitignore", repo / ".gitignore")
+    venv = tmp_path / "venvs" / "rmp" / "0123456789abcdef"
+    venv.mkdir(parents=True)
+    (repo / "venv").symlink_to(venv)
+    assert subprocess.run(["git", "check-ignore", "-q", "venv"], cwd=repo).returncode == 0
+    assert git(repo, "status", "--porcelain") == "?? .gitignore"
+
+
+def test_the_first_switch_records_the_moved_directory_as_previous(repos):
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    host = VenvWatchingHost(repos.live)
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)["status"] == "deployed"
+    # The lock files the real directory serves are old's: requirements.txt alone.
+    adopt = venvs.lock_hash(deploy.RUNS_DIR / "t1" / "lock-old")
+    assert sorted(path.name for path in (deploy.RUNS_DIR / "t1" / "lock-old").iterdir()) == ["requirements.txt"]
+    moved = repos.kinds / adopt[:16]
+    plan = {"target": str(built_venv()), "previous": str(moved), "adopt": adopt}
+    assert host.at_first_stop["phase"] == "applying" and host.at_first_stop["venv"] == plan
+    assert venvs.stamp_of(moved) == adopt and (moved / "bin" / "python").read_text() == "production's\n"
+    # Deployed: every venv but the target and the moved directory goes.
+    assert ("prune", tuple(sorted((plan["target"], plan["previous"])))) in host.calls
+    assert sorted(os.listdir(repos.kinds)) == sorted((adopt[:16], built_venv().name))
+
+
+def test_a_revert_of_the_first_lock_reuses_the_moved_venv_and_builds_nothing(repos):
+    # The first lock ships: production's directory moves under the lock hash of the requirements.txt it served.
+    locked = repos.change({**LOCKED})
+    deploy.queue(reviewed(repos, head=locked))
+    assert deploy.self_deploy(reviewed(repos, head=locked), FakeHost(repos.live), log=lambda m: None)["status"] == (
+        "deployed")
+    moved = Path(state()["venv"]["previous"])
+    assert venvs.stamp_of(moved) == state()["venv"]["adopt"] and repos.link.is_symlink()
+    builds = len(repos.venv_runs)
+
+    # Its revert restores the old requirements.txt and deletes requirements-dev.txt.
+    repos.old = locked
+    revert = repos.change({"requirements.txt": BASE["requirements.txt"]}, deletes=["requirements-dev.txt"], on=locked)
+    for path in (deploy.spec_file("t1"), deploy.state_file("t1")):
+        path.unlink()
+    deploy.queue(reviewed(repos, head=revert))
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(reviewed(repos, head=revert), host, log=lambda m: None)["status"] == "deployed"
+    assert sorted(path.name for path in (deploy.RUNS_DIR / "t1" / "lock").iterdir()) == ["requirements.txt"]
+    assert built_venv() == moved and len(repos.venv_runs) == builds
+    assert os.readlink(repos.link) == str(moved) and (moved / "bin" / "python").read_text() == "production's\n"
+
+
+def killed_at_the_fast_forward(monkeypatch, stop):
+    """``git merge --ff-only`` raises ``stop`` once, before it runs: the window was killed or failed between its venv
+    switch and its fast-forward."""
+    real_git, armed = deploy._git, [stop]
+
+    def git_stopping(repo, *args, env=None):
+        if armed and args[:2] == ("merge", "--ff-only"):
+            raise armed.pop()
+        return real_git(repo, *args, env=env)
+
+    monkeypatch.setattr(deploy, "_git", git_stopping)
+
+
+def test_a_run_killed_between_the_switch_and_the_fast_forward_stays_applying(repos, monkeypatch):
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    killed_at_the_fast_forward(monkeypatch, deploy.Interrupted("SIGTERM"))
+    host = FakeHost(repos.live)
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    run, target = state(), built_venv()
+    assert run["phase"] == "applying" and git(repos.live, "rev-parse", "main") == repos.old
+    assert os.readlink(repos.link) == str(target) and run["venv"]["target"] == str(target)
+    # The units start on the old tree and the new venv, as the unit's ExecStopPost= would.
+    assert [c for c in host.calls if c[0] == "systemctl"][-1] == ("systemctl", "start", "rmp-api", "rmp-worker")
+
+    # Resumed: the API's drain finds a task, and the run stays applying, since its venv moved.
+    host = FakeHost(repos.live, busy=[0, 1])
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None) is None
+    assert state()["phase"] == "applying" and state()["venv"] == run["venv"]
+    assert [c[:3] for c in host.calls if c[0] in ("systemctl", "count")] == [
+        ("systemctl", "start", "rmp-api"), ("count", 0), ("systemctl", "stop", "rmp-api"), ("count", 1),
+        ("systemctl", "start", "rmp-api")]
+
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert state()["venv"] == run["venv"] and os.readlink(repos.link) == str(target)
+    assert ("prune", tuple(sorted((run["venv"]["target"], run["venv"]["previous"])))) in host.calls
+
+
+def test_a_failure_between_the_switch_and_the_fast_forward_switches_the_venv_back(repos, monkeypatch):
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    killed_at_the_fast_forward(monkeypatch, RuntimeError("git merge failed: unable to write the index"))
+    host = FakeHost(repos.live)
+    with pytest.raises(RuntimeError, match="unable to write the index"):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    # An error before the change: the venv link is back at the recorded previous venv before the units start, and
+    # the run is back in its phase before applying.
+    previous = state()["venv"]["previous"]
+    assert state()["phase"] == "landed" and os.readlink(repos.link) == previous
+    assert [c[:2] for c in host.calls if c[0] in ("systemctl", "switch_venv")][-3:] == [
+        ("switch_venv", str(built_venv())), ("switch_venv", previous), ("systemctl", "start")]
+
+    result = deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live), log=lambda m: None)
+    assert result["status"] == "deployed" and os.readlink(repos.link) == str(built_venv())
+    assert state()["venv"]["previous"] == previous
+
+
+@pytest.mark.parametrize("waits_at", ["the reserve", "the final count", "the drain"])
+def test_a_resumed_run_whose_venv_moved_stays_applying_while_it_waits(repos, systemd_run, waits_at):
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    target = repos.kinds / "fedcba9876543210"
+    (target / "bin").mkdir(parents=True)
+    previous = repos.kinds / "0123456789abcdef"
+    previous.mkdir()
+    shutil.rmtree(repos.link)
+    repos.link.symlink_to(target)
+    pr = {"number": 7, "url": "https://github.com/Hyper-AI-Lab/openclaw-jev/pull/7"}
+    plan = {"target": str(target), "previous": str(previous), "adopt": None}
+    deploy.write_json(deploy.state_file("t1"), {**state(), "phase": "applying", "pr": pr, "merge": head,
+                                                "old": repos.old, "head": head, "affected": ["rmp-api", "rmp-worker"],
+                                                "baseline": [], "venv": plan})
+    host = FakeHost(repos.live, busy={"the reserve": [], "the final count": [1], "the drain": [0, 1]}[waits_at])
+    if waits_at == "the reserve":
+        host.elapsed = lambda: deploy.DEPLOY_UNIT_MAX_SEC
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None) is None
+    assert state()["phase"] == "applying" and state()["venv"] == plan and os.readlink(repos.link) == str(target)
+    assert git(repos.live, "rev-parse", "main") == repos.old
+    # Not before the change, so a hand abort keeps it.
+    assert "past the change, so its state is kept" in deploy.abort_run("t1")
+
+
+def test_a_run_killed_after_the_venv_switch_rolls_back_to_the_recorded_previous(repos):
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live, kill_at=("start", 1)), log=lambda m: None)
+    run, target = state(), built_venv()
+    assert run["phase"] == "merged" and os.readlink(repos.link) == str(target)
+
+    host = FakeHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back"
+    # The link was at target when the run resumed; the revert puts it at the recorded previous, not at target.
+    assert [c[:2] for c in host.calls if c[0] == "switch_venv"] == [("switch_venv", str(target)),
+                                                                      ("switch_venv", run["venv"]["previous"])]
+    assert os.readlink(repos.link) == run["venv"]["previous"] != str(target)
+
+
+def test_a_resumed_deploy_keeps_the_recorded_previous_venv(repos):
+    # Production's venv is a link already, to a venv an earlier lock built; a venv older than that one is left over.
+    previous, older = repos.kinds / "0123456789abcdef", repos.kinds / "00000000000000aa"
+    for venv in (previous, older):
+        (venv / "bin").mkdir(parents=True)
+    shutil.rmtree(repos.link)
+    repos.link.symlink_to(previous)
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live, kill_at=("start", 1)), log=lambda m: None)
+    target = built_venv()
+    assert state()["venv"] == {"target": str(target), "previous": str(previous), "adopt": None}
+
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)["status"] == "deployed"
+    assert ("prune", tuple(sorted((str(target), str(previous))))) in host.calls
+    assert sorted(os.listdir(repos.kinds)) == sorted((previous.name, target.name))
+
+
+def test_a_revert_killed_between_the_tree_and_the_venv_switches_back(repos):
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    host = FakeHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}],
+                    kill_at=("switch_venv", 2))
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    run, target = state(), built_venv()
+    assert run["phase"] == "reverting" and git(repos.live, "rev-parse", "main") == run["revert"]
+    assert os.readlink(repos.link) == str(target) and not [c for c in host.calls if c[0] == "land" and c[2] == "merge"]
+
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and os.readlink(repos.link) == run["venv"]["previous"]
+    assert [c[:2] for c in host.calls if c[0] == "switch_venv"] == [("switch_venv", run["venv"]["previous"])]
+    assert [c for c in host.calls if c[0] == "land"] == [("land", f"aura/revert-{head[:12]}", "merge")]

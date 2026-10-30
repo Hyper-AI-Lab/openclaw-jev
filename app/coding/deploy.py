@@ -8,15 +8,16 @@ the full suite on that exact commit as aura-coder, then hands off; the unit land
 A deploy waits queued on disk (``RUNS_DIR/<task>``). One launcher, ``next_deploy``, run by the reconciler's
 ``watch_main`` every minute and by the hand-off, starts the detached root unit (``ops/coding_deploy.py``) of the
 next queued run, only when no deploy unit runs, nothing holds the code-reload lock and no user task is active.
-The unit does its slow work first (a reviewed run's land and CI wait), then holds the code-reload lock, refuses
-mirrors edited by hand and, right after the strict idle count, stops the affected units, the API first with a
-second count; it fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in full and starts the units
-again, then checks health, readiness (like with like: only a check that passed before can fail it) and a canary.
+The unit does its slow work first (a reviewed run's land and CI wait, and the venv of the head's lock files when
+they changed), then holds the code-reload lock, refuses mirrors edited by hand and, right after the strict idle
+count, stops the affected units, the API first with a second count; it points the live venv link at the new venv,
+fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in full and starts the units again, then checks
+health, readiness (like with like: only a check that passed before can fail it) and a canary.
 It never installs a unit file; the result names the changed ones. On failure it reverts the live ``main`` the same
-way at once, lands the revert on GitHub as a pull request of its own whatever that window did, then checks health
-again. Each phase is written to the run's state as it happens, so a killed unit's run resumes from its phase. It
-records the result under the code-reload lock: Kirill's note for Aura's own first, retried, then the event; a
-reviewed job's workflow then replies on the new code.
+way at once, the tree first and the venv after, lands the revert on GitHub as a pull request of its own whatever
+that window did, then checks health again. Each phase is written to the run's state as it happens, so a killed
+unit's run resumes from its phase. It records the result under the code-reload lock: Kirill's note for Aura's own
+first, retried, then the event; a reviewed job's workflow then replies on the new code.
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
-from app.coding import github, verify, workspace
+from app.coding import github, venvs, verify, workspace
 from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
 from app.config import OPENCLAW_HOME
 
@@ -63,9 +64,12 @@ SERVICE_PATHS = (
     ("app/", ("rmp-api", "rmp-worker")),
     ("worker.py", ("rmp-api", "rmp-worker")),
     ("requirements.txt", ("rmp-api", "rmp-worker")),
+    ("requirements-dev.txt", ("rmp-api", "rmp-worker")),
     ("plugins/", ("openclaw-gateway",)),
     ("web-stack/", ("aura-web-backends",)),
 )
+# RMP's venvs, one per lock, under the venvs root (``venvs.VENVS_ROOT``); the live checkout's ``venv`` links to one.
+VENV_KIND = "rmp"
 # Repo directories with a live copy elsewhere on the host.
 PLUGINS_MIRROR = Path(OPENCLAW_HOME) / "plugins"
 WEB_STACK_MIRROR = Path(OPENCLAW_HOME) / "web-stack"
@@ -463,7 +467,8 @@ def launch(task: str, *, postpone: bool = False, live: Path) -> str:
     run keeps one log: the launcher empties it before the run's first launch, and every launch appends to it. The
     unit never empties it itself: systemd opens the unit's output again for its ``ExecStopPost=``, which would wipe
     the log at the unit's end. Whatever ends the unit, its ``ExecStopPost=`` starts the units its window left stopped
-    (``stop_post_command``).
+    (``stop_post_command``). The unit runs on the venv the live link resolves to now, so its own imports never follow
+    the link's switch.
     """
     path, state = spec_file(task), state_file(task)
     run = json.loads(state.read_text())
@@ -474,7 +479,8 @@ def launch(task: str, *, postpone: bool = False, live: Path) -> str:
              "EnvironmentFile=-/etc/openclaw/openclaw.env", f"ExecStopPost={stop_post_command(path.parent)}"]
     argv = ["systemd-run", f"--unit={unit}", f"--working-directory={live}", "--collect", "--quiet",
             *[f"--property={prop}" for prop in props], "--",
-            str(live / "venv" / "bin" / "python"), str(live / "ops" / "coding_deploy.py"), str(path),
+            os.path.join(os.path.realpath(live / "venv"), "bin", "python"), str(live / "ops" / "coding_deploy.py"),
+            str(path),
             *(["--postpone"] if postpone else [])]
     if not run.get("launches"):
         # A new run starts its log empty, 0600 even when an earlier run's unit created it (systemd makes it 0644).
@@ -848,9 +854,15 @@ class Host:
     def systemctl(self, *args: str) -> None:
         subprocess.run(["systemctl", *args], check=True, capture_output=True, timeout=300)
 
-    def pip_install(self) -> None:
-        subprocess.run([str(self.live / "venv" / "bin" / "pip"), "install", "-q", "-r", "requirements.txt"],
-                       cwd=self.live, check=True, capture_output=True, timeout=1800)
+    def build_venv(self, target: Path, lock: Path) -> Path:
+        """The venv of the lock files in ``lock`` at ``target``; one stamped for them already is kept as it is."""
+        return venvs.build(target, lock)
+
+    def switch_venv(self, link: Path, target: Path, kind_root: Path, adopt: Optional[str] = None) -> None:
+        venvs.switch(link, target, kind_root, adopt)
+
+    def prune(self, kind_root: Path, keep: Iterable[str]) -> List[str]:
+        return venvs.prune(kind_root, keep)
 
     def fetch_main(self) -> str:
         """GitHub's main, fetched into the live repo; its commit."""
@@ -943,21 +955,99 @@ def _before_applying(run: Dict[str, Any]) -> str:
     return "landed" if run.get("merge") else "queued"
 
 
+def _venv_root() -> Path:
+    return venvs.VENVS_ROOT / VENV_KIND
+
+
+def _lock_at(live: Path, commit: str, folder: Path) -> Path:
+    """The lock files present at ``commit``, written into ``folder``, emptied first; a file ``commit`` lacks is not
+    written."""
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True, mode=0o700)
+    for name in venvs.LOCK_NAMES:
+        try:
+            _git_bytes(live, "cat-file", "-e", f"{commit}:{name}")
+        except RuntimeError:
+            continue
+        (folder / name).write_bytes(_git_bytes(live, "show", f"{commit}:{name}"))
+    return folder
+
+
+def _build_venv(host: Host, task: str, head: str, changed: List[Tuple[str, str]],
+                log: Callable[[str], None]) -> Optional[Path]:
+    """Before the change, when the range added, changed or deleted a lock file: the venv of the head's lock files
+    (``RUNS_DIR/<task>/lock``), built under the venvs root unless one is stamped for them already, as the venv a
+    revert of the first lock finds; None when no lock file changed."""
+    if not any(path in venvs.LOCK_NAMES for _, path in changed):
+        return None
+    lock = _lock_at(host.live, head, RUNS_DIR / task / "lock")
+    target = _venv_root() / venvs.lock_hash(lock)[:16]
+    log(f"building the venv {target}")
+    host.build_venv(target, lock)
+    log(f"the venv {target} is ready")
+    return target
+
+
+def _venv_plan(host: Host, task: str, old: str, target: Path) -> Dict[str, Optional[str]]:
+    """The run's venv plan, recorded with ``applying``: the ``target`` the link goes to, and ``previous``, the venv it
+    serves now, which a revert switches back to: the link's target, or, while the link is still a real directory, the
+    path ``venvs.switch`` moves that directory to, named by ``adopt``, the lock hash of ``old``'s lock files
+    (``RUNS_DIR/<task>/lock-old``)."""
+    link = host.live / "venv"
+    if link.is_symlink():
+        return {"target": str(target), "previous": os.readlink(link), "adopt": None}
+    if not link.is_dir():
+        raise RuntimeError(f"{link} is neither a venv nor a link to one")
+    adopt = venvs.lock_hash(_lock_at(host.live, old, RUNS_DIR / task / "lock-old"))
+    return {"target": str(target), "previous": str(_venv_root() / adopt[:16]), "adopt": adopt}
+
+
+def _venv_moved(live: Path, run: Dict[str, Any]) -> bool:
+    """Whether the live venv link no longer points at the run's recorded previous venv: switched forward, or missing
+    after a kill inside the switch. The link is read, never compared with a recomputed path; a real directory, before
+    the first switch, is the recorded previous. A run without a venv plan never moves it."""
+    plan = run.get("venv")
+    if not plan:
+        return False
+    link = live / "venv"
+    if link.is_symlink():
+        return os.readlink(link) != plan["previous"]
+    return not link.is_dir()
+
+
+def _point_venv(host: Host, run: Dict[str, Any], which: str, log: Callable[[str], None]) -> None:
+    """Point the venv link at the run's recorded ``which`` venv ("previous" or "target") on the way out of a window
+    that failed or was killed. A switch that fails is logged, so the failure that brought the run here is the one
+    handled; the run then keeps its phase for its resume."""
+    path = run["venv"][which]
+    try:
+        host.switch_venv(host.live / "venv", Path(path), _venv_root())
+    except Exception as exc:
+        log(f"switching the venv to {path} failed: {exc}")
+        return
+    log(f"switched the venv to {path}")
+
+
 def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Callable[[str], None]) -> Optional[str]:
-    """The switch window: the tree, the mirrors and the requirements change only while the affected units are stopped.
+    """The switch window: the venv, the tree and the mirrors change only while the affected units are stopped.
 
     Forward, ``rmp-api`` stops first, so its graceful stop finishes the requests in flight against the running worker;
     while the tree is still at ``old``, the strict count is then taken again before the other units stop, and a task
     created while the API drained starts it again, puts the run back in its phase before ``applying`` and returns None
-    (waiting). Then the tree moves (``merged``): forward to ``head``, back to the recorded revert commit. The mirrors
-    are reconciled, the requirements installed and the units started in one call (``restarted``, forward). Back, both
-    counts are skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units
-    are started before the window is left; a failure while the live main, read again then, is still at ``old`` also
-    puts the run back in its phase before ``applying``. While units are stopped, ``stopped_file`` lists them, so the
-    unit's ``ExecStopPost=`` starts them after a kill that runs no Python. The commit the tree is at.
+    (waiting). Then, forward, the venv link goes to the run's planned venv before the tree moves to ``head``
+    (``merged``); back, the tree moves to the recorded revert commit before the link goes back to the recorded previous
+    venv. The mirrors are reconciled and the units started in one call (``restarted``, forward). Back, both counts are
+    skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units are started
+    before the window is left. While the live main, read again then, is still at ``old``, a failure first points the
+    venv link back at the recorded previous venv; a kill (``Interrupted``) leaves it where the switch got to, only
+    completing a link the first switch left missing. Either puts the run back in its phase before ``applying`` once
+    the link is at the recorded previous venv, so a run whose venv moved stays ``applying``, also when it waits, until
+    its window completes. While units are stopped, ``stopped_file`` lists them, so the unit's ``ExecStopPost=`` starts
+    them after a kill that runs no Python. The commit the tree is at.
     """
     live, units, forward = host.live, run["affected"], direction == "forward"
     target = run["head"] if forward else run["revert"]
+    plan = run.get("venv")
     try:
         before = _live_main(live)
         if units:
@@ -969,31 +1059,43 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
                 host.systemctl("start", "rmp-api")
                 log("started rmp-api again")
                 stopped_file(task).unlink(missing_ok=True)
-                _save(task, run, phase=_before_applying(run))
+                if not _venv_moved(live, run):
+                    _save(task, run, phase=_before_applying(run))
                 return None
         others = [unit for unit in units if unit != "rmp-api"]
         if others:
             host.systemctl("stop", *others)
             log(f"stopped {', '.join(others)}")
+        if forward and plan:
+            host.switch_venv(live / "venv", Path(plan["target"]), _venv_root(), plan["adopt"])
+            log(f"switched the venv to {plan['target']}")
         if before != target:
             _git(live, "merge", "--ff-only", "--quiet", target)
             log(f"main moved {before[:12]}..{target[:12]}")
         if forward:
             _save(task, run, phase="merged")
+        elif _venv_moved(live, run):
+            host.switch_venv(live / "venv", Path(plan["previous"]), _venv_root())
+            log(f"switched the venv back to {plan['previous']}")
         changed = changes(live, run["old"] if forward else run["head"], target)
         for prefix, mirror in MIRRORS:
             reconcile(live, target, changed, prefix, mirror)
-        if "requirements.txt" in [path for _, path in changed]:
-            host.pip_install()
         if units:
             host.systemctl("start", *units)
             log(f"started {', '.join(units)}")
             stopped_file(task).unlink(missing_ok=True)
         if forward:
             _save(task, run, phase="restarted")
-    except BaseException:
+    except BaseException as exc:
+        at_old = forward and _still_at_old(live, run)
+        if at_old and isinstance(exc, Exception) and _venv_moved(live, run):
+            _point_venv(host, run, "previous", log)
+        elif forward and plan and not os.path.lexists(live / "venv"):
+            # Killed inside the first switch, between the directory's move and the new link: the link it was making
+            # goes in, so the units start on a venv.
+            _point_venv(host, run, "target", log)
         _start_again(host, task, units, log)
-        if forward and _still_at_old(live, run):
+        if at_old and not _venv_moved(live, run):
             _save(task, run, phase=_before_applying(run))
         raise
     return target
@@ -1019,9 +1121,10 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
 
     ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
     approved ``head`` lands through a pull request first, the run's state records the merge commit (``landed``), and
-    exactly that commit is deployed once CI's test check passed on it. That slow work runs first, without the lock.
-    Then, holding the code-reload lock: the hand-edit check, the readiness baseline and, last before the units stop,
-    the strict idle count; then ``applying`` and the switch window (``_switch``), the checks, and on failure the revert
+    exactly that commit is deployed once CI's test check passed on it. That slow work runs first, without the lock, and
+    so does the build of the head's venv when the change moves the lock files (``_build_venv``). Then, holding the
+    code-reload lock: the hand-edit check, the readiness baseline and, last before the units stop, the strict idle
+    count; then ``applying`` with the venv plan, the switch window (``_switch``), the checks, and on failure the revert
     window. A run whose state is past ``landed`` was killed during or after its change: it resumes from its phase
     (``_resume``) and runs no step before the change.
     """
@@ -1070,31 +1173,37 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
             return {"status": "blocked", "pr": run["pr"], "summary": f"CI's test check on the merged commit "
                     f"{head[:12]} is {check}, so nothing was deployed here; main is unchanged. GitHub's main has the "
                     "change; it goes live with GitHub's main once CI passes on a later commit."}
+    changed = changes(live, old, head)
+    target = _build_venv(host, task, head, changed, log)
     with host.hold(CODE_RELOAD_LOCK, LOCK_WAIT_SEC) as held:
         if not held:
             log(f"waiting: {CODE_RELOAD_LOCK} stayed held for {LOCK_WAIT_SEC} s; the run keeps its phase")
             return None
         log(f"holding {CODE_RELOAD_LOCK}")
-        changed = changes(live, old, head)
         baseline = host.readiness_report()
         # After the baseline, which can take a minute and a half: a hand edit made meanwhile still blocks.
         blocked = _drift(live, old)
         if blocked:
             return blocked
-        run.update(old=old, head=head, affected=_affected(live, head, changed), baseline=baseline)
+        # The venv plan is made here, as the run first reaches applying from a phase before it, and is recorded with
+        # applying; the window, the revert, the prune and every resume read it from the state.
+        run.update(old=old, head=head, affected=_affected(live, head, changed), baseline=baseline,
+                   venv=_venv_plan(host, task, old, target) if target else None)
         return _apply_when_idle(host, task, run, log)
 
 
 def _apply_when_idle(host: Host, task: str, run: Dict[str, Any],
                      log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
     """From the time reserve on: the reserve, the final strict count, ``applying``, then the change. A resumed run
-    still at ``old`` that waits here goes back to its phase before ``applying``, like a run that never reached it."""
+    still at ``old`` that waits here goes back to its phase before ``applying``, like a run that never reached it,
+    unless its venv link no longer points at its recorded previous venv (killed between the switch and the
+    fast-forward): it then stays ``applying`` until its window completes."""
     reserved = host.elapsed() <= DEPLOY_UNIT_MAX_SEC - APPLY_RESERVE_SEC
     if not reserved:
         log(f"waiting: less than {APPLY_RESERVE_SEC // 60} min of the unit's {DEPLOY_UNIT_MAX_SEC // 3600} h are left "
             "for the change")
     if not reserved or not _idle(host, log):
-        if run.get("phase") == "applying":
+        if run.get("phase") == "applying" and not _venv_moved(host.live, run):
             _save(task, run, phase=_before_applying(run))
         return None
     _save(task, run, phase="applying")
@@ -1140,6 +1249,7 @@ def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
         _save(task, run, phase="reverting", failure=failure)
         return _rollback(host, task, run, log)
     old, head, restarted = run["old"], run["head"], run["affected"]
+    _prune_venvs(host, run, log)
     canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
     new_failing = checked.get("new_failing") or []
     tightened = (f" New or tightened readiness checks fail on this host: {', '.join(new_failing)}; they did not count "
@@ -1152,6 +1262,21 @@ def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
             "new_failing": new_failing,
             "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
             f"readiness passed and {canary}.{tightened}{installs}"}
+
+
+def _prune_venvs(host: Host, run: Dict[str, Any], log: Callable[[str], None]) -> None:
+    """Once a run whose venv moved is deployed: every RMP venv but its recorded target and previous is deleted. A
+    failure is logged; it never changes the result."""
+    plan = run.get("venv")
+    if not plan:
+        return
+    try:
+        gone = host.prune(_venv_root(), {plan["target"], plan["previous"]})
+    except Exception as exc:
+        log(f"deleting the venvs other than {plan['target']} and {plan['previous']} failed: {exc}")
+        return
+    if gone:
+        log(f"deleted the venvs {', '.join(gone)}")
 
 
 def _shipped(host: Host, run: Dict[str, Any]) -> Dict[str, Any]:
