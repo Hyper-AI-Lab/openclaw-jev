@@ -934,6 +934,8 @@ def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, 
     busy = FakeHost(repos.live, busy=[1] * 10)
 
     deploy.queue(reviewed(repos))
+    log = deploy.spec_file("t1").with_name("deploy.log")
+    log.write_text("an earlier run's log\n")
     queued_for("t1", deploy.IDLE_WAIT_SEC - 60)
     assert deploy.next_deploy(busy) is None and systemd_run.argvs == []
     queued_for("t1", 60)
@@ -941,8 +943,11 @@ def test_a_run_queued_for_two_hours_is_postponed(repos, github_ci, systemd_run, 
     busy.units = ["aura-deploy-t9.service"]
     assert deploy.next_deploy(busy) is None and systemd_run.argvs == []
     busy.units = []
+    assert log.read_text() == "an earlier run's log\n"
     assert deploy.next_deploy(busy) == "aura-deploy-t1"
     assert systemd_run.argvs[-1][-2:] == [str(deploy.spec_file("t1")), "--postpone"]
+    # A postponed first launch is the run's first launch too: it empties the log.
+    assert log.read_text() == "" and log.stat().st_mode & 0o777 == 0o600
     capsys.readouterr()
     with open(lock, "w") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
@@ -1679,15 +1684,27 @@ def launched(task, launches, started=None, **fields):
                                                 "started": launches if started is None else started, **fields})
 
 
-async def test_a_run_whose_units_die_before_they_start_ends_failed_once(repos, systemd_run, reporting):
+async def test_a_run_whose_units_die_before_they_start_ends_failed_once(repos, systemd_run, reporting, monkeypatch):
+    log, faked = deploy.RUNS_DIR / "main" / "deploy.log", deploy.subprocess.run
+
+    def run(argv, **kwargs):
+        # Each unit's output, appended to the run's log from the unit's start: the import error it dies of.
+        if argv[:1] == ["systemd-run"]:
+            with log.open("a") as out:
+                out.write(f"unit {len(systemd_run.argvs) + 1}: ModuleNotFoundError: No module named 'x'\n")
+        return faked(argv, **kwargs)
+
+    monkeypatch.setattr(deploy.subprocess, "run", run)
     deploy.queue(main_spec("c" * 40))
     host = FakeHost(repos.live)
     # Each launch's unit dies before it runs main: it never checks in.
     assert [deploy.next_deploy(host) for _ in range(4)] == ["aura-deploy-main"] * 3 + [None]
     assert len(systemd_run.argvs) == 3 and state(deploy.MAIN)["launches"] == 3 and state(deploy.MAIN)["started"] == 0
+    # The launches after the first keep the log, so the note's log holds every unit's error.
+    dying = [f"unit {n}: ModuleNotFoundError: No module named 'x'\n" for n in (1, 2, 3)]
+    assert log.read_text() == "".join(dying)
 
     await reporting.report()
-    log = deploy.RUNS_DIR / "main" / "deploy.log"
     result = {"status": "failed", "source": "github", "head": "c" * 40, "ci": "success",
               "summary": f"The deploy unit ended 3 times before it started (see {log}), so nothing was deployed; "
                          "main is unchanged."}
@@ -1703,6 +1720,7 @@ async def test_a_run_whose_units_die_before_they_start_ends_failed_once(repos, s
 
     await reporting.report()
     assert len(reporting.events) == 1 and len(reporting.notes) == 1
+    assert log.read_text() == "".join(dying)
 
 
 def test_a_run_whose_third_launch_is_starting_is_not_ended(repos):
