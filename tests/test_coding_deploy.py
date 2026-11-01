@@ -3427,3 +3427,68 @@ def test_a_revert_whose_venv_switch_back_fails_is_resumed(repos, web_venv, monke
         assert os.readlink(repos.link) == run["venv"]["previous"]
     else:
         assert sorted(os.listdir(web_venv.parent)) == [".venv", "w.py"]
+
+
+def test_a_web_stack_run_that_waited_is_relaunched_and_deploys(repos, web_venv):
+    head = repos.change({"web-stack/backends/requirements.txt": "fastapi==1\n"})
+    deploy.queue(reviewed(repos, head=head))
+    copy = web_venv.with_name(".venv.before-t1")
+
+    class CopyReadingHost(WebInstallingHost):
+        """Records, at the install, what the copy taken before the change holds."""
+
+        def install_web_stack(self):
+            self.copied = files_in(copy)
+            super().install_web_stack()
+
+    # The final count finds a task: the copy is taken, and the run waits before applying.
+    assert deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live, busy=[1]), log=lambda m: None) is None
+    assert state()["phase"] == "landed" and copy.is_dir() and "lib/later.py" not in files_in(copy)
+    # Meanwhile something is installed by hand: the relaunch drops the earlier copy and takes it again.
+    write(web_venv, {"lib/later.py": "installed by hand meanwhile\n"})
+    before = files_in(web_venv)
+    host = CopyReadingHost(repos.live)
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)["status"] == "deployed"
+    assert host.copied == before and [c[0] for c in host.calls].count("install_web_stack") == 1
+    assert not copy.exists() and files_in(web_venv) == {**before, "lib/installed.py": f"{head}\n"}
+
+
+@pytest.mark.parametrize("ending", ["blocked", "failed", "postponed", "an ended dead run", "an abort"])
+def test_the_web_venv_copy_is_removed_when_a_run_ends_before_the_change(repos, web_venv, monkeypatch, systemd_run,
+                                                                       ending):
+    unit, seen = deploy_unit(monkeypatch)
+    head = repos.change({"web-stack/backends/requirements.txt": "fastapi==1\n"})
+    deploy.queue(reviewed(repos, head=head))
+    copy, path, before = web_venv.with_name(".venv.before-t1"), deploy.spec_file("t1"), files_in(web_venv)
+    taken = []
+
+    class CopyWatchingHost(BlippingHost):
+        """Notes whether the copy was there when the readiness baseline was taken; a hand edit lands meanwhile."""
+
+        def readiness_report(self):
+            taken.append(copy.is_dir())
+            if ending == "blocked":
+                (repos.mirror[".cursor/rules/"] / "r.mdc").write_text("edited by hand while readiness ran\n")
+            return super().readiness_report()
+
+    if ending in ("blocked", "failed"):
+        # The launch takes the copy, then ends: a hand edit blocks it, or its last attempt fails.
+        monkeypatch.setattr(deploy, "Host", lambda: CopyWatchingHost(
+            repos.live, baselines=[RuntimeError("could not connect to server")] if ending == "failed" else []))
+        if ending == "failed":
+            deploy.write_json(deploy.state_file("t1"), {**state(), "attempt": 2})
+        unit.main(str(path))
+        assert taken == [True]
+    else:
+        # A copy an earlier launch took before it waited.
+        shutil.copytree(web_venv, copy, symlinks=True)
+        if ending == "postponed":
+            unit.main(str(path), postpone=True)
+        elif ending == "an ended dead run":
+            launched("t1", 3, started=0)
+            assert [task for task, _, _ in deploy.end_dead_runs(FakeHost(repos.live))] == ["t1"]
+        else:
+            assert deploy.abort_run("t1").startswith("Aborted the deploy of t1")
+    status = json.loads(path.with_name("result.json").read_text())["status"]
+    assert status == {"blocked": "blocked", "postponed": "postponed"}.get(ending, "failed")
+    assert not copy.exists() and files_in(web_venv) == before and not deploy.state_file("t1").exists()

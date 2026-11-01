@@ -587,6 +587,7 @@ def end_dead_runs(host: "Host") -> List[Tuple[str, Dict[str, Any], Dict[str, Any
                           "summary": summary}
                 write_json(spec_file(task).with_name("result.json"), result)
                 state_file(task).unlink()
+                drop_web_venv_copy(task)
             logger.error("The deploy run of %s is dead: %s", task, result["summary"])
             ended.append((task, spec, result))
         return ended
@@ -629,6 +630,7 @@ def abort_run(task_id: str) -> str:
         write_json(spec_file(task_id).with_name("result.json"),
                    {"status": "failed", "source": _source(task_id, spec), "head": spec.get("head"), "summary": summary})
         state_file(task_id).unlink()
+        drop_web_venv_copy(task_id)
         return f"Aborted the deploy of {task_id} in phase {phase}: it is recorded failed, and its state is removed."
     finally:
         os.close(fd)
@@ -1031,15 +1033,20 @@ def _web_venv_failed(task: str) -> Path:
     return WEB_VENV.with_name(f".venv.failed-{task}")
 
 
+def drop_web_venv_copy(task_id: str) -> None:
+    """Delete the copy of the web backends' venv a run took before its change (``.venv.before-<task>``), so none is
+    left behind: on every final result of the run, and when a launch starts its work before the change again, while
+    the venv itself is still the one copied. Never raises."""
+    shutil.rmtree(_web_venv_copy(task_id), ignore_errors=True)
+
+
 def _copy_web_venv(task: str, changed: List[Tuple[str, str]], log: Callable[[str], None]) -> None:
     """Before the change, when the web stack's requirements changed: an exact copy of the web backends' venv next to
     it, on the same filesystem, which a revert renames back. The venv holds what its requirements do not (the heavy
-    backends, installed by hand), so the copy, not a rebuild, is the way back. A copy an earlier launch left goes
-    first."""
+    backends, installed by hand), so the copy, not a rebuild, is the way back."""
     if WEB_REQUIREMENTS not in [path for _, path in changed]:
         return
     copy = _web_venv_copy(task)
-    shutil.rmtree(copy, ignore_errors=True)
     shutil.copytree(WEB_VENV, copy, symlinks=True)
     log(f"copied {WEB_VENV} to {copy}")
 
@@ -1184,6 +1191,8 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
             log(f"holding {CODE_RELOAD_LOCK}")
             return _resume(host, task, run, log)
     run = run or {}
+    # Before the change the web backends' venv is the one any earlier launch copied: its copy is taken again.
+    drop_web_venv_copy(task)
     old = _git(live, "rev-parse", "refs/heads/main").strip()
     if spec.get("source") == "github":
         host.fetch_main()
@@ -1297,7 +1306,7 @@ def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
         return _rollback(host, task, run, log)
     old, head, restarted = run["old"], run["head"], run["affected"]
     _prune_venvs(host, run, log)
-    shutil.rmtree(_web_venv_copy(task), ignore_errors=True)
+    drop_web_venv_copy(task)
     canary = "the canary passed" if checked["canary"] == "ok" else "the canary was skipped because Aura was busy"
     new_failing = checked.get("new_failing") or []
     tightened = (f" New or tightened readiness checks fail on this host: {', '.join(new_failing)}; they did not count "
@@ -1380,6 +1389,7 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     else:
         github_now = f"the revert is not on GitHub yet ({published['error']})"
     shutil.rmtree(_web_venv_failed(task), ignore_errors=True)
+    drop_web_venv_copy(task)
     return {"status": "rolled_back", **_shipped(host, run), "revert": revert, "revert_pr": published, "error": failure,
             "summary": f"Deploying {head[:12]} failed its checks ({failure}){reverted}; {health}; {github_now}."}
 
