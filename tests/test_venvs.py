@@ -1,7 +1,13 @@
 """The venv builder and the venv link, on tmp_path: the venv creation and pip are a recording fake."""
+import ctypes
+import errno
 import os
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -122,6 +128,90 @@ def test_switch_adopts_a_real_directory_under_its_lock_hash(tmp_path):
     assert sorted(os.listdir(link.parent)) == ["venv"]
 
 
+# Polls a path in a process of its own until a stop file appears; prints how often it looked and how often the path
+# was missing.
+READER = """
+import os, sys
+path, ready, stop = sys.argv[1:4]
+polls = missing = 0
+open(ready, "w").close()
+while not os.path.exists(stop):
+    polls += 1
+    if not os.path.exists(path):
+        missing += 1
+print(polls, missing)
+"""
+
+
+def test_the_live_venv_is_never_missing_during_the_first_switch(tmp_path):
+    link, kind_root = live_venv(tmp_path), tmp_path / "venvs" / "rmp"
+    target, adopt = kind_root / ("b" * 16), "a" * 64
+    (target / "bin").mkdir(parents=True)
+    (target / "bin" / "python").write_text("built\n")
+    previous, ready, stop = kind_root / adopt[:16], tmp_path / "ready", tmp_path / "stop"
+    reader = subprocess.Popen([sys.executable, "-c", READER, str(link / "bin" / "python"), str(ready), str(stop)],
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 30
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        for _ in range(2000):
+            venvs.switch(link, target, kind_root, adopt=adopt)
+            assert os.readlink(link) == str(target) and previous.is_dir() and not previous.is_symlink()
+            # Back to production's directory at the live path, in one exchange too, for the next first switch.
+            venvs.exchange(link, previous)
+            assert link.is_dir() and not link.is_symlink()
+    finally:
+        stop.touch()
+        out, _ = reader.communicate(timeout=60)
+    polls, missing = map(int, out.split())
+    assert polls > 1000 and missing == 0
+
+
+def test_the_first_switch_replaces_a_stale_placeholder_and_never_a_directory(tmp_path):
+    link, kind_root = live_venv(tmp_path), tmp_path / "venvs" / "rmp"
+    target = kind_root / ("b" * 16)
+    target.mkdir(parents=True)
+    # A directory where production's would go is never removed: the switch raises before anything moved.
+    (kind_root / ("a" * 16)).mkdir()
+    with pytest.raises(FileExistsError):
+        venvs.switch(link, target, kind_root, adopt="a" * 64)
+    assert link.is_dir() and not link.is_symlink() and os.listdir(kind_root / ("a" * 16)) == []
+    # The link an earlier try made there, before its exchange, is replaced.
+    (kind_root / ("a" * 16)).rmdir()
+    (kind_root / ("a" * 16)).symlink_to(kind_root / "elsewhere")
+    venvs.switch(link, target, kind_root, adopt="a" * 64)
+    assert os.readlink(link) == str(target) and (kind_root / ("a" * 16) / "bin" / "python").exists()
+
+
+def refusing(answer):
+    """A libc whose renameat2 is missing (``answer`` None) or fails with the errno ``answer``."""
+    if answer is None:
+        return SimpleNamespace()
+
+    def renameat2(*args):
+        ctypes.set_errno(answer)
+        return -1
+
+    return SimpleNamespace(renameat2=renameat2)
+
+
+@pytest.mark.parametrize("answer, error", [(None, AttributeError), (errno.EINVAL, OSError), (errno.ENOSYS, OSError),
+                                           (errno.EXDEV, OSError)], ids=["no symbol", "EINVAL", "ENOSYS", "EXDEV"])
+def test_a_first_switch_the_kernel_refuses_raises_before_anything_moved(tmp_path, monkeypatch, answer, error):
+    link, kind_root = live_venv(tmp_path), tmp_path / "venvs" / "rmp"
+    target = kind_root / ("b" * 16)
+    target.mkdir(parents=True)
+    monkeypatch.setattr(venvs, "_libc", lambda: refusing(answer))
+    with pytest.raises(error) as raised:
+        venvs.switch(link, target, kind_root, adopt="a" * 64)
+    if answer is not None:
+        assert raised.value.errno == answer and "renameat2 RENAME_EXCHANGE failed" in str(raised.value)
+    # No two-step fallback: production's directory is still the live venv.
+    assert link.is_dir() and not link.is_symlink() and (link / "bin" / "python").read_text() == "production's\n"
+    assert not (kind_root / ("a" * 16)).is_dir() or (kind_root / ("a" * 16)).is_symlink()
+
+
 def test_switch_swaps_links_atomically(tmp_path):
     kind_root = tmp_path / "venvs" / "rmp"
     first, second = kind_root / "1", kind_root / "2"
@@ -159,7 +249,7 @@ def test_switch_is_idempotent_and_repairs_a_missing_link(tmp_path):
     venvs.switch(link, target, kind_root, adopt="a" * 64)
     assert os.lstat(link).st_ino == before.st_ino and os.readlink(link) == str(target)
 
-    # Killed after the directory moved and before the new link took its place: no link, a stale new one.
+    # No link at all (removed by hand), and a stale new link a killed switch left: the link is made again.
     link.unlink()
     os.symlink(kind_root / "elsewhere", link.with_name("venv.tmp"))
     venvs.switch(link, target, kind_root)

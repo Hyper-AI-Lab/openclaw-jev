@@ -3176,32 +3176,48 @@ def test_a_failure_between_the_switch_and_the_fast_forward_switches_the_venv_bac
     assert state()["venv"]["previous"] == previous
 
 
-def test_a_kill_inside_the_first_switch_leaves_the_link_at_the_new_venv(repos, monkeypatch):
+@pytest.mark.parametrize("kill, then", [("after", "deployed"), ("after", "rolled_back"), ("before", "deployed")])
+def test_a_kill_inside_the_first_switch_leaves_the_link_at_the_new_venv(repos, monkeypatch, kill, then):
     head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
     deploy.queue(reviewed(repos, head=head))
-    real_replace, armed = os.replace, [True]
+    real_exchange, armed = venvs.exchange, [True]
 
-    def replace(src, dst):
-        # SIGTERM lands after production's directory moved and before the new link took its place.
-        if armed and Path(dst) == repos.link:
+    def exchange(first, second):
+        # SIGTERM lands at the first switch's one exchange: just after it, or just before it.
+        if armed:
             armed.clear()
+            if kill == "after":
+                real_exchange(first, second)
             raise deploy.Interrupted("SIGTERM")
-        real_replace(src, dst)
+        real_exchange(first, second)
 
-    monkeypatch.setattr(venvs.os, "replace", replace)
+    monkeypatch.setattr(venvs, "exchange", exchange)
     host = FakeHost(repos.live)
     with pytest.raises(deploy.Interrupted):
         deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
-    # The link it was making went in before the units started: they start on a venv, the old tree on the new one.
-    run = state()
-    assert os.readlink(repos.link) == str(built_venv()) and run["phase"] == "applying"
-    assert venvs.stamp_of(Path(run["venv"]["previous"])) == run["venv"]["adopt"]
-    assert [c[:2] for c in host.calls if c[0] in ("systemctl", "switch_venv")][-3:] == [
-        ("switch_venv", str(built_venv())), ("switch_venv", str(built_venv())), ("systemctl", "start")]
+    run, target = state(), built_venv()
+    previous = Path(run["venv"]["previous"])
+    # Either venv, never none: the units start on one of them, on the old tree.
+    assert [c for c in host.calls if c[0] == "systemctl"][-1] == ("systemctl", "start", "rmp-api", "rmp-worker")
     assert git(repos.live, "rev-parse", "main") == repos.old
+    if kill == "after":
+        # The link is at the new venv and production's directory at its recorded place: the run stays applying.
+        assert os.readlink(repos.link) == str(target) and run["phase"] == "applying"
+        assert previous.is_dir() and not previous.is_symlink() and venvs.stamp_of(previous) == run["venv"]["adopt"]
+    else:
+        # Nothing moved: production's directory is still the live venv, and the run is back before applying.
+        assert repos.link.is_dir() and not repos.link.is_symlink() and run["phase"] == "landed"
 
-    result = deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live), log=lambda m: None)
-    assert result["status"] == "deployed" and os.readlink(repos.link) == str(built_venv())
+    host = FakeHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}]
+                    if then == "rolled_back" else [])
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == then and state()["venv"] == run["venv"]
+    if then == "deployed":
+        assert os.readlink(repos.link) == str(target) and git(repos.live, "rev-parse", "main") == head
+    else:
+        # The revert puts the link at production's own directory, where the exchange put it.
+        assert os.readlink(repos.link) == str(previous) and git(repos.live, "rev-parse", "main") == result["revert"]
+    assert (previous / "bin" / "python").read_text() == "production's\n" and not previous.is_symlink()
 
 
 @pytest.mark.parametrize("waits_at", ["the reserve", "the final count", "the drain"])

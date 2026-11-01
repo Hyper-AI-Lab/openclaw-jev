@@ -7,6 +7,7 @@ marks it complete.
 """
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import os
 import shutil
@@ -21,6 +22,9 @@ VENVS_ROOT = Path(OPENCLAW_HOME) / "venvs"
 LOCK_NAMES = ("requirements.txt", "requirements-dev.txt")
 STAMP = ".rmp-lock.sha256"
 INSTALL_TIMEOUT_SEC = 1800
+# renameat2(2)'s "the current directory" descriptor and its flag that swaps two paths in one step.
+AT_FDCWD = -100
+RENAME_EXCHANGE = 2
 
 PathLike = Union[str, Path]
 
@@ -81,15 +85,33 @@ def build(target: Path, root: Path) -> Path:
     return target
 
 
+def _libc() -> ctypes.CDLL:
+    return ctypes.CDLL("libc.so.6", use_errno=True)
+
+
+def exchange(first: Path, second: Path) -> None:
+    """Swap the paths ``first`` and ``second`` in one call, ``renameat2(..., RENAME_EXCHANGE)`` through libc: there is
+    no instant at which either is missing. libc is resolved here, at the call; a libc without the call, or a kernel or
+    filesystem that refuses it (``EINVAL``, ``ENOSYS``, ``EXDEV``), raises before anything moved."""
+    renameat2 = _libc().renameat2
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    renameat2.restype = ctypes.c_int
+    if renameat2(AT_FDCWD, os.fsencode(first), AT_FDCWD, os.fsencode(second), RENAME_EXCHANGE) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, f"renameat2 RENAME_EXCHANGE failed: {os.strerror(code)}", str(first), None, str(second))
+
+
 def switch(link: Path, target: PathLike, kind_root: Path, adopt: Optional[str] = None) -> None:
-    """Point ``link`` at ``target``, atomically, through a new link ``<link>.tmp`` (a stale one removed first) renamed
-    over it; a resumed window runs it again.
+    """Point ``link`` at ``target`` atomically; a resumed window runs it again.
 
     The first switch finds ``link`` a real directory: ``adopt``, the lock hash of the files that directory serves, is
-    then required. The directory is stamped with it and moved to ``kind_root/<adopt[:16]>``, where ``build`` finds it
-    as the venv of those files, and the link takes its place. A missing link (a kill between that move and the link's
-    rename) and a link to another path are pointed at ``target``; a link at ``target`` already is left as it is."""
-    target, tmp = str(target), link.with_name(f"{link.name}.tmp")
+    then required. The directory is stamped with it, a link to ``target`` is made at ``kind_root/<adopt[:16]>`` (a
+    stale one an earlier try left removed first; a directory there is never removed), and one ``exchange`` swaps the
+    two: ``link`` becomes the link to ``target`` and the directory lands at ``kind_root/<adopt[:16]>``, where
+    ``build`` finds it as the venv of those files. ``link`` is never missing; a refused exchange raises before
+    anything moved, and there is no two-step fallback. A link to another path, or a missing link, is replaced by a new
+    link ``<link>.tmp`` (a stale one removed first) renamed over it; a link at ``target`` already is left as it is."""
+    target, tmp = os.path.abspath(target), link.with_name(f"{link.name}.tmp")
     if os.path.lexists(tmp):
         os.unlink(tmp)
     if link.is_symlink() and os.readlink(link) == target:
@@ -98,11 +120,14 @@ def switch(link: Path, target: PathLike, kind_root: Path, adopt: Optional[str] =
         if not adopt:
             raise ValueError(f"{link} is a directory; its lock hash is needed to move it")
         (link / STAMP).write_text(f"{adopt}\n")
-        os.symlink(target, tmp)
         kind_root.mkdir(parents=True, exist_ok=True)
-        os.rename(link, kind_root / adopt[:16])
-    else:
-        os.symlink(target, tmp)
+        placeholder = kind_root / adopt[:16]
+        if placeholder.is_symlink():
+            placeholder.unlink()
+        os.symlink(target, placeholder)
+        exchange(link, placeholder)
+        return
+    os.symlink(target, tmp)
     os.replace(tmp, link)
 
 

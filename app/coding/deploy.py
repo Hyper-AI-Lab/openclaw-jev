@@ -1057,17 +1057,17 @@ def _restore_web_venv(task: str, log: Callable[[str], None]) -> None:
     log(f"renamed {copy} back to {WEB_VENV}")
 
 
-def _point_venv(host: Host, run: Dict[str, Any], which: str, log: Callable[[str], None]) -> None:
-    """Point the venv link at the run's recorded ``which`` venv ("previous" or "target") on the way out of a window
-    that failed or was killed. A switch that fails is logged, so the failure that brought the run here is the one
-    handled; the run then keeps its phase for its resume."""
-    path = run["venv"][which]
+def _venv_back(host: Host, run: Dict[str, Any], log: Callable[[str], None]) -> None:
+    """Point the venv link back at the run's recorded previous venv on the way out of a window that failed before the
+    tree moved. A switch that fails is logged, so the failure that brought the run here is the one handled; the run
+    then keeps its phase for its resume."""
+    previous = run["venv"]["previous"]
     try:
-        host.switch_venv(host.live / "venv", Path(path), _venv_root())
+        host.switch_venv(host.live / "venv", Path(previous), _venv_root())
     except Exception as exc:
-        log(f"switching the venv to {path} failed: {exc}")
+        log(f"switching the venv back to {previous} failed: {exc}")
         return
-    log(f"switched the venv to {path}")
+    log(f"switched the venv back to {previous}")
 
 
 def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Callable[[str], None]) -> Optional[str]:
@@ -1083,10 +1083,10 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
     counts are skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units
     are started before the window is left. While the live main, read again then, is still at ``old``, a failure first
     points the venv link back at the recorded previous venv; a kill (``Interrupted``) leaves it where the switch got
-    to, only completing a link the first switch left missing. Either puts the run back in its phase before
-    ``applying`` once the link is at the recorded previous venv, so a run whose venv moved stays ``applying``, also
-    when it waits, until its window completes. While units are stopped, ``stopped_file`` lists them, so the unit's
-    ``ExecStopPost=`` starts them after a kill that runs no Python. The commit the tree is at.
+    to, which the switch's one exchange keeps at either venv, never at none. Either puts the run back in its phase
+    before ``applying`` once the link is at the recorded previous venv, so a run whose venv moved stays ``applying``,
+    also when it waits, until its window completes. While units are stopped, ``stopped_file`` lists them, so the
+    unit's ``ExecStopPost=`` starts them after a kill that runs no Python. The commit the tree is at.
     """
     live, units, forward = host.live, run["affected"], direction == "forward"
     target = run["head"] if forward else run["revert"]
@@ -1138,11 +1138,7 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
     except BaseException as exc:
         at_old = forward and _main_at(live, run["old"])
         if at_old and isinstance(exc, Exception) and _venv_moved(live, run):
-            _point_venv(host, run, "previous", log)
-        elif forward and plan and not os.path.lexists(live / "venv"):
-            # Killed inside the first switch, between the directory's move and the new link: the link it was making
-            # goes in, so the units start on a venv.
-            _point_venv(host, run, "target", log)
+            _venv_back(host, run, log)
         _start_again(host, task, units, log)
         if at_old and not _venv_moved(live, run):
             _save(task, run, phase=_before_applying(run))
