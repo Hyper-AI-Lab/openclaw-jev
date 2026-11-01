@@ -3379,3 +3379,51 @@ def test_a_restarted_web_backend_without_health_fails_the_deploy(repos, readines
     assert result["error"] == "the web backends did not answer /health within 60 s"
     assert ("http://127.0.0.1:8791/health", 60) in waits
     assert git(repos.live, "rev-parse", "main^{tree}") == git(repos.live, "rev-parse", f"{repos.old}^{{tree}}")
+
+
+@pytest.mark.parametrize("fails", ["the venv switch back", "the web venv restore"])
+def test_a_revert_whose_venv_switch_back_fails_is_resumed(repos, web_venv, monkeypatch, fails):
+    if fails == "the venv switch back":
+        head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    else:
+        head = repos.change({"web-stack/backends/requirements.txt": "fastapi==1\n"})
+    deploy.queue(reviewed(repos, head=head))
+    real_restore, armed = deploy._restore_web_venv, [True]
+
+    class FailingBackHost(FakeHost):
+        """The revert window's switch of the venv link back fails, once."""
+
+        def switch_venv(self, link, target, kind_root, adopt=None):
+            if armed and fails == "the venv switch back" and str(target) == state()["venv"]["previous"]:
+                armed.clear()
+                raise OSError(28, "No space left on device")
+            super().switch_venv(link, target, kind_root, adopt)
+
+    def restore(task, log):
+        if armed and fails == "the web venv restore":
+            armed.clear()
+            raise OSError(16, "Device or resource busy")
+        real_restore(task, log)
+
+    monkeypatch.setattr(deploy, "_restore_web_venv", restore)
+    host = FailingBackHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    with pytest.raises(OSError):
+        deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    run = state()
+    # The tree is back, and the revert published; the venv or the web venv is not, so the run keeps reverting.
+    assert run["phase"] == "reverting" and git(repos.live, "rev-parse", "main") == run["revert"]
+    assert run["published"]["status"] == "merged" and git(repos.origin, "rev-parse", "main") == run["revert"]
+    if fails == "the venv switch back":
+        assert os.readlink(repos.link) == run["venv"]["target"]
+    else:
+        assert web_venv.with_name(".venv.before-t1").is_dir()
+    assert not [c for c in host.calls if c[0] == "checks"][1:]
+
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["revert_pr"] == run["published"]
+    assert not [c for c in host.calls if c[0] == "land"]
+    if fails == "the venv switch back":
+        assert os.readlink(repos.link) == run["venv"]["previous"]
+    else:
+        assert sorted(os.listdir(web_venv.parent)) == [".venv", "w.py"]

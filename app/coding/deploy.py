@@ -1338,11 +1338,12 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     there, or finds the tree moved already. Once it exists, each step runs on its own: one that fails is named in the
     summary and the next still runs, so the revert always reaches GitHub. What the publish did is recorded, so a
     resumed rollback publishes no second time; only a publish that failed with an error is tried again. A revert
-    window that failed before the tree moved to the revert commit is not the end: once the revert is published, its
-    error is raised, so the run keeps ``reverting``, the escape is counted, and the next idle pass resumes the window
-    (three such escapes leave the run stuck, ``end_dead_runs``). The re-check leaves ``claude_direct`` out while the
-    revert waits on GitHub: its clause that GitHub's main contains the live main fails until the revert merges
-    there."""
+    window that raised before the host was back (``_reverted``: the tree at the revert commit, the venv link at the
+    recorded previous venv, the web backends' venv copy renamed back) is not the end: once the revert is published,
+    its error is raised, so the run keeps ``reverting``, the escape is counted, and the next idle pass resumes the
+    window (three such escapes leave the run stuck, ``end_dead_runs``). The re-check leaves ``claude_direct`` out
+    while the revert waits on GitHub: its clause that GitHub's main contains the live main fails until the revert
+    merges there."""
     live, head, failure, restarted = host.live, run["head"], run["failure"], run["affected"]
     if not run.get("revert"):
         revert = _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
@@ -1357,13 +1358,14 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     except Exception as exc:
         log(f"the revert window failed: {exc}")
         reverted = f"; reverting main to {revert[:12]} and restarting {units} failed ({str(exc)[:300]})"
-        unmoved = None if _main_at(live, revert) else exc
+        unmoved = None if _reverted(live, task, run) else exc
     published = run.get("published")
     if published is None or published["status"] == "failed":
         published = _publish_revert(host, revert, head, failure, log)
         _save(task, run, published=published)
     if unmoved is not None:
-        log("the live main is not at the revert yet; the run keeps reverting, and the next idle pass resumes it")
+        log("the revert is not in place yet (the live main, the venv link or the web backends' venv); the run keeps "
+            "reverting, and the next idle pass resumes it")
         raise unmoved
     try:
         still = host.checks(restarted, run["baseline"],
@@ -1380,6 +1382,13 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     shutil.rmtree(_web_venv_failed(task), ignore_errors=True)
     return {"status": "rolled_back", **_shipped(host, run), "revert": revert, "revert_pr": published, "error": failure,
             "summary": f"Deploying {head[:12]} failed its checks ({failure}){reverted}; {health}; {github_now}."}
+
+
+def _reverted(live: Path, task: str, run: Dict[str, Any]) -> bool:
+    """Whether a revert window that raised left the host where the revert puts it: the live main at the revert commit
+    (False when it cannot be read), the venv link at the recorded previous venv, and the web backends' venv copy from
+    before the change renamed back."""
+    return _main_at(live, run["revert"]) and not _venv_moved(live, run) and not _web_venv_copy(task).exists()
 
 
 def _drift(live: Path, old: str) -> Optional[Dict[str, Any]]:
