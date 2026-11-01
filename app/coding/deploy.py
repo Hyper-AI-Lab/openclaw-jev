@@ -1250,10 +1250,10 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
 
 def _apply_when_idle(host: Host, task: str, run: Dict[str, Any],
                      log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
-    """From the time reserve on: the reserve, the final strict count, ``applying``, then the change. A resumed run
-    still at ``old`` that waits here goes back to its phase before ``applying``, like a run that never reached it,
-    unless its venv link no longer points at its recorded previous venv (killed between the switch and the
-    fast-forward): it then stays ``applying`` until its window completes."""
+    """From the time reserve on: the reserve, the final strict count, ``applying`` (with the venv plan, which the log
+    names too), then the change. A resumed run still at ``old`` that waits here goes back to its phase before
+    ``applying``, like a run that never reached it, unless its venv link no longer points at its recorded previous
+    venv (killed between the switch and the fast-forward): it then stays ``applying`` until its window completes."""
     reserved = host.elapsed() <= DEPLOY_UNIT_MAX_SEC - APPLY_RESERVE_SEC
     if not reserved:
         log(f"waiting: less than {APPLY_RESERVE_SEC // 60} min of the unit's {DEPLOY_UNIT_MAX_SEC // 3600} h are left "
@@ -1263,6 +1263,11 @@ def _apply_when_idle(host: Host, task: str, run: Dict[str, Any],
             _save(task, run, phase=_before_applying(run))
         return None
     _save(task, run, phase="applying")
+    plan = run.get("venv")
+    if plan:
+        # In the log too, so a plan whose state is lost later is still on record.
+        log(f"venv plan: target {plan['target']}, previous {plan['previous']}"
+            + (f", adopt {plan['adopt']}" if plan["adopt"] else ""))
     return _change(host, task, run, log)
 
 

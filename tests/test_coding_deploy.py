@@ -3492,3 +3492,23 @@ def test_the_web_venv_copy_is_removed_when_a_run_ends_before_the_change(repos, w
     status = json.loads(path.with_name("result.json").read_text())["status"]
     assert status == {"blocked": "blocked", "postponed": "postponed"}.get(ending, "failed")
     assert not copy.exists() and files_in(web_venv) == before and not deploy.state_file("t1").exists()
+
+
+@pytest.mark.parametrize("live_venv", ["a real directory", "a link"])
+def test_the_deploy_log_names_the_venv_plan(repos, live_venv):
+    if live_venv == "a link":
+        previous = repos.kinds / "0123456789abcdef"
+        (previous / "bin").mkdir(parents=True)
+        shutil.rmtree(repos.link)
+        repos.link.symlink_to(previous)
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    lines = []
+    assert deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live), log=lines.append)["status"] == (
+        "deployed")
+    plan = state()["venv"]
+    line = f"venv plan: target {plan['target']}, previous {plan['previous']}"
+    if live_venv == "a real directory":
+        line += f", adopt {plan['adopt']}"
+    # Logged once applying is written, before anything stops.
+    assert line in lines and lines.index(line) < lines.index("stopped rmp-api")
