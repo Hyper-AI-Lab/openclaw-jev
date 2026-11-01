@@ -168,7 +168,7 @@ def test_the_live_venv_is_never_missing_during_the_first_switch(tmp_path):
     assert polls > 1000 and missing == 0
 
 
-def test_the_first_switch_replaces_a_stale_placeholder_and_never_a_directory(tmp_path):
+def test_the_first_switch_replaces_a_stale_new_link_and_never_a_directory(tmp_path):
     link, kind_root = live_venv(tmp_path), tmp_path / "venvs" / "rmp"
     target = kind_root / ("b" * 16)
     target.mkdir(parents=True)

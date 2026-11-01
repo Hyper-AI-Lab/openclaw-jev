@@ -121,11 +121,11 @@ def switch(link: Path, target: PathLike, kind_root: Path, adopt: Optional[str] =
             raise ValueError(f"{link} is a directory; its lock hash is needed to move it")
         (link / STAMP).write_text(f"{adopt}\n")
         kind_root.mkdir(parents=True, exist_ok=True)
-        placeholder = kind_root / adopt[:16]
-        if placeholder.is_symlink():
-            placeholder.unlink()
-        os.symlink(target, placeholder)
-        exchange(link, placeholder)
+        home = kind_root / adopt[:16]
+        if home.is_symlink():
+            home.unlink()
+        os.symlink(target, home)
+        exchange(link, home)
         return
     os.symlink(target, tmp)
     os.replace(tmp, link)
