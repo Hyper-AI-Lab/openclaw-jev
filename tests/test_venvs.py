@@ -128,21 +128,24 @@ def test_switch_adopts_a_real_directory_under_its_lock_hash(tmp_path):
     assert sorted(os.listdir(link.parent)) == ["venv"]
 
 
-# Polls a path in a process of its own until a stop file appears; prints how often it looked and how often the path
-# was missing. A look that fails counts as missing when a second look right after it fails too: a path walk through
-# ``venv/bin/python`` that races a rename of ``venv`` in another directory can fail once (measured on this host: 6 of
-# about 216,000 looks over 40,000 exchanges, every one found on the second look, and ``venv`` itself never missing),
-# while the path a two-step switch leaves missing is still missing then (about 10,000 of 11,000 failed looks).
+# Polls the live venv in a process of its own until a stop file appears; prints how often it looked, how often the
+# name itself was missing (``os.path.lexists(<venv>)``, one look) and how often ``<venv>/bin/python`` was. A look at
+# ``<venv>/bin/python`` counts as missing only when a second look right after it fails too: a full path walk that
+# races a rename across directories can fail once on this kernel (measured: 6 of about 216,000 looks over 40,000
+# exchanges, every one found on the second look, while the name was never missing), and the path a two-step switch
+# leaves missing is still missing then (about 10,000 of 11,000 failed looks).
 READER = """
 import os, sys
-path, ready, stop = sys.argv[1:4]
-polls = missing = 0
+name, path, ready, stop = sys.argv[1:5]
+polls = name_missing = missing = 0
 open(ready, "w").close()
 while not os.path.exists(stop):
     polls += 1
+    if not os.path.lexists(name):
+        name_missing += 1
     if not os.path.exists(path) and not os.path.exists(path):
         missing += 1
-print(polls, missing)
+print(polls, name_missing, missing)
 """
 
 
@@ -152,8 +155,8 @@ def test_the_live_venv_is_never_missing_during_the_first_switch(tmp_path):
     (target / "bin").mkdir(parents=True)
     (target / "bin" / "python").write_text("built\n")
     previous, ready, stop = kind_root / adopt[:16], tmp_path / "ready", tmp_path / "stop"
-    reader = subprocess.Popen([sys.executable, "-c", READER, str(link / "bin" / "python"), str(ready), str(stop)],
-                              stdout=subprocess.PIPE, text=True)
+    reader = subprocess.Popen([sys.executable, "-c", READER, str(link), str(link / "bin" / "python"), str(ready),
+                               str(stop)], stdout=subprocess.PIPE, text=True)
     try:
         deadline = time.monotonic() + 30
         while not ready.exists() and time.monotonic() < deadline:
@@ -168,8 +171,9 @@ def test_the_live_venv_is_never_missing_during_the_first_switch(tmp_path):
     finally:
         stop.touch()
         out, _ = reader.communicate(timeout=60)
-    polls, missing = map(int, out.split())
-    assert polls > 1000 and missing == 0, f"the live venv was missing at {missing} of {polls} looks"
+    polls, name_missing, missing = map(int, out.split())
+    assert polls > 1000 and name_missing == 0 and missing == 0, (
+        f"of {polls} looks, the live venv's name was missing at {name_missing} and its python at {missing}")
 
 
 def test_the_first_switch_replaces_a_stale_new_link_and_never_a_directory(tmp_path):
