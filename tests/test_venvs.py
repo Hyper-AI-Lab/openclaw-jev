@@ -273,7 +273,9 @@ def test_prune_keeps_what_it_is_told(tmp_path):
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     (kind_root / "linked").symlink_to(elsewhere)
-    assert venvs.prune(kind_root, {kind_root / "target", str(kind_root / "previous")}) == ["older", "oldest"]
+    # Kept paths count in their normalised form: a trailing slash or a ".." names the same directory.
+    kept = {f"{kind_root / 'target'}/", str(kind_root / "older" / ".." / "previous")}
+    assert venvs.prune(kind_root, kept) == ["older", "oldest"]
     assert sorted(os.listdir(kind_root)) == ["linked", "note.txt", "previous", "target"] and elsewhere.is_dir()
     assert venvs.prune(tmp_path / "none", ()) == []
 

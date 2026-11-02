@@ -998,30 +998,39 @@ def _build_venv(host: Host, task: str, head: str, changed: List[Tuple[str, str]]
     return target
 
 
+def _canonical(link: Path, path: Union[str, Path]) -> str:
+    """``path`` as the link ``link`` would name it, absolute and normalised: a relative path is joined to the link's
+    directory, then ``normpath`` drops ``.``, ``..`` and trailing slashes."""
+    return os.path.normpath(os.path.join(os.path.abspath(link.parent), path))
+
+
 def _venv_plan(host: Host, task: str, old: str, target: Path) -> Dict[str, Optional[str]]:
     """The run's venv plan, recorded with ``applying``: the ``target`` the link goes to, and ``previous``, the venv it
     serves now, which a revert switches back to: the link's target, or, while the link is still a real directory, the
     path ``venvs.switch`` moves that directory to, named by ``adopt``, the lock hash of ``old``'s lock files
-    (``RUNS_DIR/<task>/lock-old``)."""
+    (``RUNS_DIR/<task>/lock-old``). Both paths are stored in their canonical form (``_canonical``), so a link made by
+    hand, relative or with a trailing slash, is the same venv."""
     link = host.live / "venv"
     if link.is_symlink():
-        return {"target": str(target), "previous": os.readlink(link), "adopt": None}
+        return {"target": _canonical(link, target), "previous": _canonical(link, os.readlink(link)), "adopt": None}
     if not link.is_dir():
         raise RuntimeError(f"{link} is neither a venv nor a link to one")
     adopt = venvs.lock_hash(_lock_at(host.live, old, RUNS_DIR / task / "lock-old"))
-    return {"target": str(target), "previous": str(_venv_root() / adopt[:16]), "adopt": adopt}
+    return {"target": _canonical(link, target), "previous": _canonical(link, _venv_root() / adopt[:16]),
+            "adopt": adopt}
 
 
 def _venv_moved(live: Path, run: Dict[str, Any]) -> bool:
-    """Whether the live venv link no longer points at the run's recorded previous venv: switched forward, or missing
-    after a kill inside the switch. The link is read, never compared with a recomputed path; a real directory, before
-    the first switch, is the recorded previous. A run without a venv plan never moves it."""
+    """Whether the live venv link no longer points at the run's recorded previous venv: switched forward, or missing.
+    The link is read and compared with the recorded path, both in their canonical form (``_canonical``), never with a
+    recomputed path; a real directory, before the first switch, is the recorded previous. A run without a venv plan
+    never moves it."""
     plan = run.get("venv")
     if not plan:
         return False
     link = live / "venv"
     if link.is_symlink():
-        return os.readlink(link) != plan["previous"]
+        return _canonical(link, os.readlink(link)) != _canonical(link, plan["previous"])
     return not link.is_dir()
 
 

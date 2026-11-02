@@ -3556,3 +3556,31 @@ def test_a_result_after_applying_keeps_the_web_venv_copy(repos, web_venv, monkey
     assert files_in(copy) == before and not deploy.state_file("t1").exists()
     assert (f"The web backends' venv from before this deploy is kept at {copy}, to be renamed back to {web_venv} by "
             "hand if it is needed.") in result["summary"]
+
+
+@pytest.mark.parametrize("then", ["deployed", "rolled_back"])
+def test_a_relative_live_link_is_recorded_canonically_and_kept_by_prune(repos, then):
+    previous, older = repos.kinds / "0123456789abcdef", repos.kinds / "00000000000000aa"
+    for venv in (previous, older):
+        (venv / "bin").mkdir(parents=True)
+    # Production's link made by hand: relative, with a "." and a trailing slash.
+    shutil.rmtree(repos.link)
+    os.symlink("../venvs/rmp/./0123456789abcdef/", repos.link)
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    # The API's drain finds a task: the link, read canonically, is still at the recorded previous, so the run goes
+    # back before applying.
+    assert deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live, busy=[0, 1]), log=lambda m: None) is None
+    plan = state()["venv"]
+    assert plan == {"target": str(built_venv()), "previous": str(previous), "adopt": None}
+    assert state()["phase"] == "landed"
+
+    host = FakeHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}]
+                    if then == "rolled_back" else [])
+    assert deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)["status"] == then
+    if then == "deployed":
+        # The prune keeps the venv the relative link served and deletes only the older one.
+        assert ("prune", tuple(sorted((plan["target"], plan["previous"])))) in host.calls
+        assert sorted(os.listdir(repos.kinds)) == sorted((previous.name, built_venv().name))
+    else:
+        assert os.readlink(repos.link) == str(previous) and older.is_dir()

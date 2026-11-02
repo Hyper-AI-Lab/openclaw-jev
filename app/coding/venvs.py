@@ -132,13 +132,14 @@ def switch(link: Path, target: PathLike, kind_root: Path, adopt: Optional[str] =
 
 
 def prune(kind_root: Path, keep: Iterable[PathLike]) -> List[str]:
-    """Delete every directory under ``kind_root`` that is not in ``keep``; the names deleted."""
-    kept = {Path(path) for path in keep}
+    """Delete every directory under ``kind_root`` that is not in ``keep``, comparing absolute, normalised paths (a kept
+    path with ``..`` or a trailing slash is the same directory); the names deleted."""
+    kept = {os.path.normpath(os.path.abspath(path)) for path in keep}
     gone = []
     if not kind_root.is_dir():
         return gone
     for entry in sorted(kind_root.iterdir()):
-        if entry.is_dir() and not entry.is_symlink() and entry not in kept:
+        if entry.is_dir() and not entry.is_symlink() and os.path.normpath(os.path.abspath(entry)) not in kept:
             shutil.rmtree(entry)
             gone.append(entry.name)
     return gone
