@@ -1035,9 +1035,17 @@ def _web_venv_failed(task: str) -> Path:
 
 def drop_web_venv_copy(task_id: str) -> None:
     """Delete the copy of the web backends' venv a run took before its change (``.venv.before-<task>``), so none is
-    left behind: on every final result of the run, and when a launch starts its work before the change again, while
-    the venv itself is still the one copied. Never raises."""
+    left behind where it is no longer the way back (``end_web_venv_copy``), and when a launch starts its work before
+    the change again, while the venv itself is still the one copied. Never raises."""
     shutil.rmtree(_web_venv_copy(task_id), ignore_errors=True)
+
+
+def end_web_venv_copy(task_id: str, status: str, phase: Optional[str]) -> None:
+    """The copy of the web backends' venv at the run's final result, reached in ``phase``: dropped on ``deployed``,
+    ``rolled_back`` and every result reached before ``applying``; kept on any other result reached from ``applying``
+    on, where it may be the only way back, and that result's summary names it."""
+    if status in ("deployed", "rolled_back") or phase not in CHANGING:
+        drop_web_venv_copy(task_id)
 
 
 def _copy_web_venv(task: str, changed: List[Tuple[str, str]], log: Callable[[str], None]) -> None:
@@ -1287,8 +1295,11 @@ def _resume(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
     if phase == "reverting" and now in (run["head"], run.get("revert")):
         return _rollback(host, task, run, log)
     _start_again(host, task, run["affected"], log)
-    return {"status": "failed",
-            "summary": f"The live main is {now[:12]}, which this deploy did not make; please check it."}
+    summary = f"The live main is {now[:12]}, which this deploy did not make; please check it."
+    if _web_venv_copy(task).is_dir():
+        summary += (f" The web backends' venv from before this deploy is kept at {_web_venv_copy(task)}, to be renamed "
+                    f"back to {WEB_VENV} by hand if it is needed.")
+    return {"status": "failed", "summary": summary}
 
 
 def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], None]) -> Optional[Dict[str, Any]]:

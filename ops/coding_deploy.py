@@ -100,14 +100,16 @@ def postponed(run: dict) -> dict:
 
 
 def record(spec_path: str, spec: dict, result: dict) -> int:
-    """Record the run's result (atomically, on disk before the state goes), then remove its state and the copy of the
-    web backends' venv it may have taken, then ``finish``; the unit's exit status."""
+    """Record the run's result (atomically, on disk before the state goes), then remove its state and, unless it may
+    still be the way back (``deploy.end_web_venv_copy``), the copy of the web backends' venv it took, then
+    ``finish``; the unit's exit status."""
     result = {**result, "suite": spec.get("suite"), "source": spec.get("source") or "reviewed",
               "head": result.get("head") or spec.get("head"), "ci": spec.get("ci")}
     log(f"result: {json.dumps(result)}")
+    phase = (deploy._read_json(deploy.state_file(spec["task_id"])) or {}).get("phase")
     deploy.write_json(Path(spec_path).with_name("result.json"), result)
     deploy.state_file(spec["task_id"]).unlink(missing_ok=True)
-    deploy.drop_web_venv_copy(spec["task_id"])
+    deploy.end_web_venv_copy(spec["task_id"], result["status"], phase)
     asyncio.run(finish(spec, result))
     return 0 if result["status"] == "deployed" else 1
 

@@ -1256,9 +1256,10 @@ def test_a_task_created_while_the_api_drains_restarts_the_api_and_waits(repos):
 
 
 class MainWatchingHost(FakeHost):
-    """Records, with each systemctl call, the live main it saw."""
+    """Records, with each systemctl call, the live main it saw; ``kill_at`` kills it as it does ``FakeHost``."""
 
     def systemctl(self, *args):
+        self.die(args[0], "systemctl", *args)
         self.calls.append(("systemctl", *args, git(self.live, "rev-parse", "main")))
 
 
@@ -3512,3 +3513,46 @@ def test_the_deploy_log_names_the_venv_plan(repos, live_venv):
         line += f", adopt {plan['adopt']}"
     # Logged once applying is written, before anything stops.
     assert line in lines and lines.index(line) < lines.index("stopped rmp-api")
+
+
+def test_a_resumed_rollback_restores_the_installed_web_venv(repos, web_venv):
+    before = files_in(web_venv)
+    head = repos.change({"web-stack/backends/requirements.txt": "fastapi==1\n"})
+    deploy.queue(reviewed(repos, head=head))
+    copy = web_venv.with_name(".venv.before-t1")
+    # Killed at the start, after the change's install: the venv holds it, and the copy is the only way back.
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), WebInstallingHost(repos.live, kill_at=("start", 1)),
+                           log=lambda m: None)
+    assert state()["phase"] == "merged" and files_in(web_venv) == {**before, "lib/installed.py": f"{head}\n"}
+    assert files_in(copy) == before
+
+    host = WebInstallingHost(repos.live, checks=[{"failure": "the web backends did not answer /health within 60 s",
+                                                  "canary": None}])
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and git(repos.live, "rev-parse", "main") == result["revert"]
+    # The resumed rollback renamed the copy back: the venv is as it was before the change, and no copy is left.
+    assert files_in(web_venv) == before and (web_venv / "bin" / "python").is_symlink()
+    assert sorted(os.listdir(web_venv.parent)) == [".venv", "w.py"]
+
+
+def test_a_result_after_applying_keeps_the_web_venv_copy(repos, web_venv, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    before = files_in(web_venv)
+    head = repos.change({"web-stack/backends/requirements.txt": "fastapi==1\n"})
+    deploy.queue(reviewed(repos, head=head))
+    copy = web_venv.with_name(".venv.before-t1")
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), WebInstallingHost(repos.live, kill_at=("start", 1)),
+                           log=lambda m: None)
+    # The live main moves under the killed run: its resume ends failed, from merged, with the change installed.
+    write(repos.live, {"docs/d.md": "someone else's commit\n"})
+    commit(repos.live, "a commit no deploy made")
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live))
+    assert unit.main(str(deploy.spec_file("t1"))) == 1
+    result = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())
+    assert result["status"] == "failed" and "which this deploy did not make" in result["summary"]
+    # The copy is the only way back to the venv from before the change: it is kept, and the summary names it.
+    assert files_in(copy) == before and not deploy.state_file("t1").exists()
+    assert (f"The web backends' venv from before this deploy is kept at {copy}, to be renamed back to {web_venv} by "
+            "hand if it is needed.") in result["summary"]
