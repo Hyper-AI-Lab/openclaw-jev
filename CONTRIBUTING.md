@@ -13,7 +13,7 @@ Thanks for helping improve Aura.
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements-dev.txt
 pytest -q
 bash ops/verify_openclaw_patch.sh   # when OpenClaw dist patches change
 ```
