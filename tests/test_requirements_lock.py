@@ -1,5 +1,5 @@
 """The hashed lock, requirements.txt and requirements-dev.txt, which ops/lock_requirements.py generates from the .in
-files. Pure: it reads the repo's files."""
+files, and CI's install of it. Pure: it reads the repo's files."""
 import importlib
 import re
 from pathlib import Path
@@ -61,3 +61,9 @@ def test_the_langchain_embedder_dependency_imports():
     # providers use.
     importlib.import_module("langchain.embeddings.base")
 
+
+def test_ci_installs_the_dev_lock_with_hashes():
+    lines = [line.strip() for line in (ROOT / ".github" / "workflows" / "ci.yml").read_text().splitlines()]
+    install = lines.index("pip install --require-hashes -r requirements-dev.txt")
+    assert lines[install - 1] == "python -m pip install --upgrade pip"
+    assert not [line for line in lines if line.startswith("pip install") and "requirements.txt" in line]
