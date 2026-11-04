@@ -119,8 +119,8 @@ def resolve(source: str, constraint_files: List[Path], held: Dict[str, str], rep
 
 def release_hashes(name: str, version: str, chosen: str) -> List[str]:
     """The sha256 of every file of the release on PyPI, which must list the file pip chose."""
-    hashes = sorted({file["digests"]["sha256"] for file in fetch_json(PYPI_RELEASE.format(name=name,
-                                                                                          version=version))["urls"]})
+    release = fetch_json(PYPI_RELEASE.format(name=name, version=version))
+    hashes = sorted({file["digests"]["sha256"] for file in release["urls"]})
     if chosen not in hashes:
         raise Refused(f"PyPI lists no file of {name}=={version} with the sha256 pip chose ({chosen})")
     return hashes
