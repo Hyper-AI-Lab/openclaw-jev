@@ -218,9 +218,10 @@ def test_a_moved_pin_with_extras_leaves_the_constraints(script):
     assert written(script.repo) == lock_files({**RUNTIME, "fastapi": "0.136.0"}, DEV)
 
 
-@pytest.mark.parametrize("line", ["fastapi == 0.136.0", "fastapi [standard]==0.136.0"])
+@pytest.mark.parametrize("line", ["fastapi == 0.136.0", "fastapi [standard]==0.136.0",
+                                  "fastapi[standard] == 0.136.0"])
 def test_a_moved_pin_with_spaces_leaves_the_constraints(script, line):
-    # PEP 508 allows whitespace around the extras and the operator; pip reads both lines as fastapi==0.136.0.
+    # PEP 508 allows whitespace around the extras and the operator; pip reads each line as fastapi==0.136.0.
     first_lock(script)
     (script.repo / "requirements.in").write_text(f"{line}\n")
 
