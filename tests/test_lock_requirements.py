@@ -98,7 +98,7 @@ class FakePip:
                 pinned.update(self.requested(source.parent / line[3:]))
             elif "==" in line:
                 name, version = line.split("==")
-                pinned[name.split("[")[0]] = version
+                pinned[name.split("[")[0].strip()] = version.strip()
         return pinned
 
     def __call__(self, args):
@@ -210,6 +210,19 @@ def test_a_changed_in_pin_leaves_the_constraints(script):
 def test_a_moved_pin_with_extras_leaves_the_constraints(script):
     first_lock(script)
     (script.repo / "requirements.in").write_text("fastapi[standard]==0.136.0\n")
+
+    assert script.main([]) == 0
+
+    others = {name: version for name, version in {**RUNTIME, **DEV}.items() if name != "fastapi"}
+    assert script.pip.calls[0]["constraints"] == [others]
+    assert written(script.repo) == lock_files({**RUNTIME, "fastapi": "0.136.0"}, DEV)
+
+
+@pytest.mark.parametrize("line", ["fastapi == 0.136.0", "fastapi [standard]==0.136.0"])
+def test_a_moved_pin_with_spaces_leaves_the_constraints(script, line):
+    # PEP 508 allows whitespace around the extras and the operator; pip reads both lines as fastapi==0.136.0.
+    first_lock(script)
+    (script.repo / "requirements.in").write_text(f"{line}\n")
 
     assert script.main([]) == 0
 
