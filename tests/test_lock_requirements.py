@@ -243,6 +243,17 @@ def test_a_report_that_moves_a_constrained_pin_exits_1(script, monkeypatch, caps
     assert written(script.repo) == before
 
 
+def test_a_runtime_pin_missing_from_the_full_set_exits_1(script, capsys):
+    # Without its -r line, requirements-dev.in resolves to the test tools alone: the full set lacks every runtime pin.
+    (script.repo / "requirements-dev.in").write_text("pytest==9.0.3\n")
+
+    assert script.main(["--constraint", str(script.repo / "freeze.txt")]) == 1
+
+    assert capsys.readouterr().out == ("the dev resolution does not hold the runtime pins fastapi==0.135.1, "
+                                       "pydantic==2.12.5, pydantic-core==2.41.5, starlette==0.52.1\n")
+    assert not (script.repo / "requirements.txt").exists() and not (script.repo / "requirements-dev.txt").exists()
+
+
 def test_a_hash_missing_from_pypi_exits_1(script, capsys):
     script.missing.add(("starlette", "0.52.1"))
 
