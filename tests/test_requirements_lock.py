@@ -5,8 +5,9 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# A pin at the start of a requirement line, with the whitespace PEP 508 allows around its extras and the ==.
-PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([^\s;#]+)")
+# A pin at the start of a requirement line, with the whitespace PEP 508 allows around its extras and the ==. A version
+# begins with a letter or digit, so a missing version never swallows the --hash= option after it.
+PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9][^\s;#]*)")
 HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
 
 
