@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)==(\S+)")
+PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==(\S+)")
 HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
 
 

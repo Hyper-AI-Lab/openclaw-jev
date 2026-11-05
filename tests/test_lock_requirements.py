@@ -96,7 +96,7 @@ class FakePip:
                 pinned.update(self.requested(source.parent / line[3:]))
             elif "==" in line:
                 name, version = line.split("==")
-                pinned[name] = version
+                pinned[name.split("[")[0]] = version
         return pinned
 
     def __call__(self, args):
@@ -197,6 +197,17 @@ def test_adding_a_package_moves_no_existing_pin(script, capsys):
 def test_a_changed_in_pin_leaves_the_constraints(script):
     first_lock(script)
     (script.repo / "requirements.in").write_text("fastapi==0.136.0\n")
+
+    assert script.main([]) == 0
+
+    others = {name: version for name, version in {**RUNTIME, **DEV}.items() if name != "fastapi"}
+    assert script.pip.calls[0]["constraints"] == [others]
+    assert written(script.repo) == lock_files({**RUNTIME, "fastapi": "0.136.0"}, DEV)
+
+
+def test_a_moved_pin_with_extras_leaves_the_constraints(script):
+    first_lock(script)
+    (script.repo / "requirements.in").write_text("fastapi[standard]==0.136.0\n")
 
     assert script.main([]) == 0
 
