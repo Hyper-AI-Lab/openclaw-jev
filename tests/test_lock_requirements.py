@@ -27,14 +27,16 @@ NEWEST = {"fastapi": "0.136.0", "starlette": "1.10.0", "pydantic": "2.13.0", "py
           "mako": "1.3.10"}
 # pip writes a distribution's metadata name, which is not always the canonical one.
 METADATA_NAMES = {"pydantic-core": "pydantic_core"}
-# pip 24.0's report of a constraint it cannot keep (pip/_internal/resolution/resolvelib/factory.py).
+# pip 24.0's report of a constraint it cannot keep (pip/_internal/resolution/resolvelib/factory.py): a requirement of
+# the user's own is "The user requested <pin>", a constraint "The user requested (constraint) <pin>".
 CONFLICT = """\
 Collecting fastapi==0.136.0 (from -r requirements.in (line 1))
   Using cached fastapi-0.136.0-py3-none-any.whl.metadata (28 kB)
 INFO: pip is looking at multiple versions of fastapi to determine which version is compatible with other requirements. This could take a while.
-ERROR: Cannot install -r requirements.in (line 1) because these package versions have conflicting dependencies.
+ERROR: Cannot install -r requirements.in (line 1) and starlette==0.53.0 because these package versions have conflicting dependencies.
 
 The conflict is caused by:
+    The user requested starlette==0.53.0
     fastapi 0.136.0 depends on starlette<1.11 and >=0.53.0
     The user requested (constraint) starlette==0.52.1
 
@@ -227,6 +229,8 @@ def test_a_forced_move_exits_1_and_names_the_pin(script, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert out.startswith("would move: starlette==0.52.1\nchange that pin in requirements.in (or requirements-dev.in) "
                           "to move it\n")
+    # Only a constraint can be moved: the user's own pin, starlette==0.53.0, is never named on that line.
+    assert "starlette==0.53.0" not in out.splitlines()[0]
     assert "The conflict is caused by:" in out and "outside the lock" not in out
     assert written(script.repo) == before
 
