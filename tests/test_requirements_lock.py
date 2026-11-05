@@ -32,10 +32,10 @@ def test_every_requirement_is_pinned_with_its_hashes():
         if name == "requirements-dev.txt":
             lines = lines[1:]
         assert lines, name
+        # The script writes each pin as one word, name==version, followed by its hashes and nothing else.
         for line in lines:
-            match = PIN.match(line)
-            assert match, (name, line)
-            hashes = line[match.end():].split()
+            pin, *hashes = line.split()
+            assert PIN.fullmatch(pin), (name, line)
             assert hashes and all(HASH.fullmatch(word) for word in hashes), (name, line)
 
 
