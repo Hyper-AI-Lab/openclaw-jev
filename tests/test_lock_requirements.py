@@ -283,37 +283,38 @@ def test_a_runtime_pin_missing_from_the_full_set_exits_1(script, capsys):
     assert not (script.repo / "requirements.txt").exists() and not (script.repo / "requirements-dev.txt").exists()
 
 
-# The .in grammar's corpus: each line with the (canonical name, version) parse_in_line reads, None for a line that is
-# no pin, or REFUSED for a line outside the grammar.
+# The .in grammar's corpus: each line, the .in file it is read as part of, and the (canonical name, version)
+# parse_in_line reads, None for a line that is no pin, or REFUSED for a line outside the grammar.
 REFUSED = "refused"
+IN_RUNTIME, IN_DEV = "requirements.in", "requirements-dev.in"
 IN_LINES = [
-    ("fastapi==0.135.1", ("fastapi", "0.135.1")),
-    ("fastapi == 0.135.1", ("fastapi", "0.135.1")),
-    ("fastapi [standard] == 0.135.1", ("fastapi", "0.135.1")),
-    ("fastapi[a, b]==0.135.1", ("fastapi", "0.135.1")),
-    ('fastapi==0.135.1; python_version < "3.13"', ("fastapi", "0.135.1")),
-    ("fastapi==0.135.1  # the API", ("fastapi", "0.135.1")),
-    ("-r  requirements.in", None),
-    ("", None),
-    ("# the runtime pins", None),
-    ("fastapi===0.135.1", REFUSED),
-    ("fastapi>=0.135", REFUSED),
-    ("fastapi==", REFUSED),
-    ("fastapi== ", REFUSED),
-    ("fastapi==0.135.1#x", REFUSED),
-    ("fastapi @ https://example.org/f.whl", REFUSED),
-    ("--index-url https://example.org", REFUSED),
+    (IN_RUNTIME, "fastapi==0.135.1", ("fastapi", "0.135.1")),
+    (IN_RUNTIME, "fastapi == 0.135.1", ("fastapi", "0.135.1")),
+    (IN_RUNTIME, "fastapi [standard] == 0.135.1", ("fastapi", "0.135.1")),
+    (IN_RUNTIME, "fastapi[a, b]==0.135.1", ("fastapi", "0.135.1")),
+    (IN_RUNTIME, 'fastapi==0.135.1; python_version < "3.13"', ("fastapi", "0.135.1")),
+    (IN_RUNTIME, "fastapi==0.135.1  # the API", ("fastapi", "0.135.1")),
+    (IN_DEV, "-r  requirements.in", None),
+    (IN_RUNTIME, "", None),
+    (IN_RUNTIME, "# the runtime pins", None),
+    (IN_RUNTIME, "fastapi===0.135.1", REFUSED),
+    (IN_RUNTIME, "fastapi>=0.135", REFUSED),
+    (IN_RUNTIME, "fastapi==", REFUSED),
+    (IN_RUNTIME, "fastapi== ", REFUSED),
+    (IN_RUNTIME, "fastapi==0.135.1#x", REFUSED),
+    (IN_RUNTIME, "fastapi @ https://example.org/f.whl", REFUSED),
+    (IN_RUNTIME, "--index-url https://example.org", REFUSED),
 ]
 
 
-@pytest.mark.parametrize("line, expected", IN_LINES)
-def test_in_line_grammar(line, expected):
+@pytest.mark.parametrize("name, line, expected", IN_LINES)
+def test_in_line_grammar(name, line, expected):
     parse_in_line = load().parse_in_line
     if expected == REFUSED:
         with pytest.raises(ValueError, match=r"^not an exact pin \(name==version\): "):
-            parse_in_line(line)
+            parse_in_line(line, Path(name))
     else:
-        assert parse_in_line(line) == expected
+        assert parse_in_line(line, Path(name)) == expected
 
 
 @pytest.mark.parametrize("name, line", [("requirements.in", "fastapi===0.136.0"), ("requirements.in", "fastapi>=0.135"),

@@ -10,11 +10,11 @@ pip's own resolver does the work (``pip install --dry-run --ignore-installed --r
 every resolution is constrained. By default the constraints are the committed lock's pins, less each name whose line
 in requirements.in or requirements-dev.in names another version: a new package resolves around the existing pins, and
 a pin moves only through its .in line. ``--constraint FILE`` takes FILE's ``name==version`` lines instead: the first
-lock, against production's ``pip freeze``. Every line of a .in file is ``-r <file>`` or an exact ``==`` pin
-(``parse_in_line``); any other line stops the script before pip runs. A constrained version the resolution would move
-exits 1 and names it, and so does a pin whose chosen file PyPI does not list; none of these writes anything. Last it
-prints the constraints' names the lock leaves out: with --constraint, production's distributions no requirement
-reaches; without it, the dependencies the change dropped.
+lock, against production's ``pip freeze``. Every line of a .in file is an exact ``==`` pin, PEP 508 as ``packaging``
+parses it, or, in requirements-dev.in, ``-r requirements.in`` (``parse_in_line``); any other line stops the script
+before pip runs. A constrained version the resolution would move exits 1 and names it, and so does a pin whose chosen
+file PyPI does not list; none of these writes anything. Last it prints the constraints' names the lock leaves out: with
+--constraint, production's distributions no requirement reaches; without it, the dependencies the change dropped.
 """
 import argparse
 import json
@@ -26,6 +26,9 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.version import InvalidVersion, Version
+
 REPO = Path(__file__).resolve().parents[1]
 RUNTIME_IN, RUNTIME_LOCK = "requirements.in", "requirements.txt"
 DEV_IN, DEV_LOCK = "requirements-dev.in", "requirements-dev.txt"
@@ -35,12 +38,11 @@ PYPI_RELEASE = "https://pypi.org/pypi/{name}/{version}/json"
 # around the extras and the == (name [extra] == 1.0). A version begins with a letter or digit, so a line whose version
 # is missing is no pin, whatever follows it.
 PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9][^\s;#\\]*)")
-# The .in grammar (D-6): "-r <file>", or an exact pin: a name, optional [extras], ==, then a version that begins with a
-# letter or digit and ends at whitespace, ";" or "#", then an optional "; marker" and an optional " # comment", with the
-# whitespace PEP 508 allows around the extras and the ==. Any other line is refused, never skipped.
-IN_INCLUDE = re.compile(r"-r\s+\S+")
-IN_PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\]\s*)?==\s*([A-Za-z0-9][^\s;#]*)"
-                    r"\s*(?:;[^#]*?)?(?:\s+#.*)?\s*")
+# A comment in a requirements file starts at a "#" that begins the line or follows whitespace (pip's COMMENT_RE in
+# pip/_internal/req/req_file.py); a "#" glued to text is part of it.
+COMMENT = re.compile(r"(^|\s+)#.*$")
+# The one include a .in file may hold, and only requirements-dev.in: the runtime pins.
+INCLUDE = re.compile(r"-r\s+requirements\.in")
 # pip's conflict report names each constraint it could not keep, at INFO level (pip 24.0,
 # pip/_internal/resolution/resolvelib/factory.py), so pip runs without --quiet.
 CONSTRAINT_LINE = re.compile(r"The user requested \(constraint\) ([A-Za-z0-9][A-Za-z0-9._-]*)(\S+)")
@@ -72,17 +74,35 @@ def pins(path: Path) -> Dict[str, str]:
     return found
 
 
-def parse_in_line(line: str) -> Optional[Tuple[str, str]]:
-    """One line of a .in file: ``(canonical name, version)`` for an exact pin, None for a ``-r`` line, a blank line or
-    a comment. Any other line raises ``ValueError``: ``===``, ``>=`` and the other operators, a missing version,
-    something glued to the version, a URL or ``@`` reference, an option line."""
+def parse_in_line(line: str, path: Path) -> Optional[Tuple[str, str]]:
+    """One line of the .in file ``path``, read as pip reads it: ``(canonical name, version)`` for an exact pin, None for
+    a blank line, a comment or, in requirements-dev.in alone, ``-r requirements.in``. Any other line raises
+    ``ValueError``. A line ending in ``\\`` is refused, since pip would join the next line to it, and so is any other
+    option line. After its comment is removed, the pin is parsed by ``packaging`` (PEP 508: extras and a valid marker
+    are allowed) and must name no URL and hold exactly one specifier, ``==`` on a valid version without ``*``."""
     text = line.strip()
-    if not text or text.startswith("#") or IN_INCLUDE.fullmatch(text):
+    if not text or text.startswith("#"):
         return None
-    match = IN_PIN.fullmatch(text)
-    if not match:
-        raise ValueError(f"not an exact pin (name==version): {line}")
-    return canonical(match.group(1)), match.group(2)
+    refused = ValueError(f"not an exact pin (name==version): {line}")
+    if text.endswith("\\"):
+        raise refused
+    text = COMMENT.sub("", text)
+    if text.startswith("-"):
+        if path.name == DEV_IN and INCLUDE.fullmatch(text):
+            return None
+        raise refused
+    try:
+        requirement = Requirement(text)
+    except InvalidRequirement:
+        raise refused from None
+    specifiers = list(requirement.specifier)
+    if requirement.url or len(specifiers) != 1 or specifiers[0].operator != "==" or "*" in specifiers[0].version:
+        raise refused
+    try:
+        version = Version(specifiers[0].version)
+    except InvalidVersion:
+        raise refused from None
+    return canonical(requirement.name), str(version)
 
 
 def in_pins(path: Path) -> Dict[str, str]:
@@ -91,7 +111,7 @@ def in_pins(path: Path) -> Dict[str, str]:
     found = {}
     for number, line in enumerate(path.read_text().splitlines(), start=1):
         try:
-            pin = parse_in_line(line)
+            pin = parse_in_line(line, path)
         except ValueError as exc:
             raise Refused(f"{path.name}:{number}: {exc}") from None
         if pin:

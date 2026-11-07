@@ -39,7 +39,7 @@ def in_pins(name: str) -> dict:
     """``{canonical name: version}`` of a .in file, each line read by the lock script's ``parse_in_line``, which raises
     on a line outside the .in grammar."""
     parse = lock_script().parse_in_line
-    return dict(pin for line in (ROOT / name).read_text().splitlines() if (pin := parse(line)))
+    return dict(pin for line in (ROOT / name).read_text().splitlines() if (pin := parse(line, ROOT / name)))
 
 
 def test_every_requirement_is_pinned_with_its_hashes():
