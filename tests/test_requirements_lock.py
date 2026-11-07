@@ -1,11 +1,13 @@
 """The hashed lock, requirements.txt and requirements-dev.txt, which ops/lock_requirements.py generates from the .in
-files, and CI's install of it. Pure: it reads the repo's files."""
+files, and CI's install of it. Pure: it reads the repo's files. The .in files are read with the lock script's own
+parser, so the two can never disagree about a line."""
 import importlib
+import importlib.util
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# A pin at the start of a requirement line, with the whitespace PEP 508 allows around its extras and the ==. A version
+# A pin at the start of a lock line, with the whitespace PEP 508 allows around its extras and the ==. A version
 # begins with a letter or digit, so a missing version never swallows the --hash= option after it.
 PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9][^\s;#]*)")
 HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
@@ -22,8 +24,22 @@ def requirements(name: str) -> list:
 
 
 def pinned(name: str) -> dict:
-    """``{canonical name: version}`` of the file's pins, each read from its whole line; ``-r`` lines are not pins."""
+    """``{canonical name: version}`` of a lock file's pins, each read from its whole line; its ``-r`` line is no pin."""
     return {canonical(match.group(1)): match.group(2) for line in requirements(name) if (match := PIN.match(line))}
+
+
+def lock_script():
+    module_spec = importlib.util.spec_from_file_location("lock_requirements", ROOT / "ops" / "lock_requirements.py")
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return module
+
+
+def in_pins(name: str) -> dict:
+    """``{canonical name: version}`` of a .in file, each line read by the lock script's ``parse_in_line``, which raises
+    on a line outside the .in grammar."""
+    parse = lock_script().parse_in_line
+    return dict(pin for line in (ROOT / name).read_text().splitlines() if (pin := parse(line)))
 
 
 def test_every_requirement_is_pinned_with_its_hashes():
@@ -49,8 +65,8 @@ def test_the_dev_lock_includes_the_runtime_lock_and_repeats_none_of_it():
 def test_every_in_pin_is_in_its_lock_at_the_same_version():
     runtime = pinned("requirements.txt")
     full = {**runtime, **pinned("requirements-dev.txt")}
-    assert pinned("requirements.in") and pinned("requirements.in").items() <= runtime.items()
-    assert pinned("requirements-dev.in") and pinned("requirements-dev.in").items() <= full.items()
+    assert in_pins("requirements.in") and in_pins("requirements.in").items() <= runtime.items()
+    assert in_pins("requirements-dev.in") and in_pins("requirements-dev.in").items() <= full.items()
     assert requirements("requirements-dev.in")[0] == "-r requirements.in"
 
 
