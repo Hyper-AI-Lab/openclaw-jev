@@ -42,6 +42,20 @@ def in_pins(name: str) -> dict:
     return dict(pin for line in (ROOT / name).read_text().splitlines() if (pin := parse(line, ROOT / name)))
 
 
+def in_includes(name: str) -> list:
+    """The lines of a .in file that ``parse_in_line`` accepts there as an include: no pin there, and refused when read
+    as part of requirements.in, which may include nothing, unlike a blank line or a comment."""
+    parse, path = lock_script().parse_in_line, ROOT / name
+    found = []
+    for line in path.read_text().splitlines():
+        if parse(line, path) is None:
+            try:
+                parse(line, ROOT / "requirements.in")
+            except ValueError:
+                found.append(line)
+    return found
+
+
 def test_every_requirement_is_pinned_with_its_hashes():
     for name in ("requirements.txt", "requirements-dev.txt"):
         lines = requirements(name)
@@ -67,7 +81,8 @@ def test_every_in_pin_is_in_its_lock_at_the_same_version():
     full = {**runtime, **pinned("requirements-dev.txt")}
     assert in_pins("requirements.in") and in_pins("requirements.in").items() <= runtime.items()
     assert in_pins("requirements-dev.in") and in_pins("requirements-dev.in").items() <= full.items()
-    assert requirements("requirements-dev.in")[0] == "-r requirements.in"
+    # requirements-dev.in includes the runtime pins once, through the one include parse_in_line allows there.
+    assert len(in_includes("requirements-dev.in")) == 1
 
 
 def test_starlette_and_pydantic_core_are_pinned_in_the_runtime_lock():
