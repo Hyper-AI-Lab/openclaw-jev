@@ -294,9 +294,12 @@ IN_LINES = [
     (IN_RUNTIME, "fastapi[a, b]==0.135.1", ("fastapi", "0.135.1")),
     (IN_RUNTIME, 'fastapi==0.135.1; python_version < "3.13"', ("fastapi", "0.135.1")),
     (IN_RUNTIME, "fastapi==0.135.1  # the API", ("fastapi", "0.135.1")),
+    (IN_RUNTIME, 'fastapi==0.135.1;python_version>="3"', ("fastapi", "0.135.1")),
     (IN_DEV, "-r  requirements.in", None),
     (IN_RUNTIME, "", None),
     (IN_RUNTIME, "# the runtime pins", None),
+    # pip never joins a comment line to the next, whatever it ends in.
+    (IN_RUNTIME, "# the runtime pins \\", None),
     (IN_RUNTIME, "fastapi===0.135.1", REFUSED),
     (IN_RUNTIME, "fastapi>=0.135", REFUSED),
     (IN_RUNTIME, "fastapi==", REFUSED),
@@ -304,6 +307,17 @@ IN_LINES = [
     (IN_RUNTIME, "fastapi==0.135.1#x", REFUSED),
     (IN_RUNTIME, "fastapi @ https://example.org/f.whl", REFUSED),
     (IN_RUNTIME, "--index-url https://example.org", REFUSED),
+    (IN_RUNTIME, "fastapi==0.135.1;garbage", REFUSED),
+    (IN_RUNTIME, 'fastapi==0.135.1; sys_platform = "linux"', REFUSED),
+    # pip joins the next line to this one, inside its comment.
+    (IN_RUNTIME, "fastapi==0.135.1 # c \\", REFUSED),
+    (IN_RUNTIME, "fastapi==0.135.*", REFUSED),
+    (IN_RUNTIME, "fastapi==0.135.1,<1", REFUSED),
+    (IN_RUNTIME, "fastapi==${V}", REFUSED),
+    (IN_RUNTIME, "fastapi==0.${V}", REFUSED),
+    (IN_DEV, "-r other.in", REFUSED),
+    (IN_RUNTIME, "-r requirements.in", REFUSED),
+    (IN_RUNTIME, "-c constraints.txt", REFUSED),
 ]
 
 
@@ -317,10 +331,11 @@ def test_in_line_grammar(name, line, expected):
         assert parse_in_line(line, Path(name)) == expected
 
 
-@pytest.mark.parametrize("name, line", [("requirements.in", "fastapi===0.136.0"), ("requirements.in", "fastapi>=0.135"),
-                                        ("requirements.in", "fastapi==0.136.0#x"),
-                                        ("requirements-dev.in", "pytest===9.0.3")])
-def test_a_line_that_is_not_an_exact_pin_exits_1_before_pip(script, capsys, name, line):
+@pytest.mark.parametrize("name, line, argv", [
+    ("requirements.in", "fastapi===0.136.0", []), ("requirements.in", "fastapi>=0.135", []),
+    ("requirements.in", "fastapi==0.136.0#x", []), ("requirements-dev.in", "pytest===9.0.3", []),
+    ("requirements.in", "fastapi==0.135.1;garbage", ["--constraint", "freeze.txt"])])
+def test_a_line_that_is_not_an_exact_pin_exits_1_before_pip(script, capsys, name, line, argv):
     first_lock(script)
     before = written(script.repo)
     capsys.readouterr()
@@ -328,7 +343,7 @@ def test_a_line_that_is_not_an_exact_pin_exits_1_before_pip(script, capsys, name
     path.write_text(f"{path.read_text()}{line}\n")
     number = len(path.read_text().splitlines())
 
-    assert script.main([]) == 1
+    assert script.main([str(script.repo / arg) if arg == "freeze.txt" else arg for arg in argv]) == 1
 
     assert capsys.readouterr().out == f"{name}:{number}: not an exact pin (name==version): {line}\n"
     assert script.pip.calls == [] and written(script.repo) == before
