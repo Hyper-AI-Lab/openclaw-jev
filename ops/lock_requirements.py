@@ -10,10 +10,11 @@ pip's own resolver does the work (``pip install --dry-run --ignore-installed --r
 every resolution is constrained. By default the constraints are the committed lock's pins, less each name whose line
 in requirements.in or requirements-dev.in names another version: a new package resolves around the existing pins, and
 a pin moves only through its .in line. ``--constraint FILE`` takes FILE's ``name==version`` lines instead: the first
-lock, against production's ``pip freeze``. A constrained version the resolution would move exits 1 and names it, and
-so does a pin whose chosen file PyPI does not list; neither writes anything. Last it prints the constraints' names the
-lock leaves out: with --constraint, production's distributions no requirement reaches; without it, the dependencies
-the change dropped.
+lock, against production's ``pip freeze``. Every line of a .in file is ``-r <file>`` or an exact ``==`` pin
+(``parse_in_line``); any other line stops the script before pip runs. A constrained version the resolution would move
+exits 1 and names it, and so does a pin whose chosen file PyPI does not list; none of these writes anything. Last it
+prints the constraints' names the lock leaves out: with --constraint, production's distributions no requirement
+reaches; without it, the dependencies the change dropped.
 """
 import argparse
 import json
@@ -34,6 +35,12 @@ PYPI_RELEASE = "https://pypi.org/pypi/{name}/{version}/json"
 # around the extras and the == (name [extra] == 1.0). A version begins with a letter or digit, so a line whose version
 # is missing is no pin, whatever follows it.
 PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9][^\s;#\\]*)")
+# The .in grammar (D-6): "-r <file>", or an exact pin: a name, optional [extras], ==, then a version that begins with a
+# letter or digit and ends at whitespace, ";" or "#", then an optional "; marker" and an optional " # comment", with the
+# whitespace PEP 508 allows around the extras and the ==. Any other line is refused, never skipped.
+IN_INCLUDE = re.compile(r"-r\s+\S+")
+IN_PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\]\s*)?==\s*([A-Za-z0-9][^\s;#]*)"
+                    r"\s*(?:;[^#]*?)?(?:\s+#.*)?\s*")
 # pip's conflict report names each constraint it could not keep, at INFO level (pip 24.0,
 # pip/_internal/resolution/resolvelib/factory.py), so pip runs without --quiet.
 CONSTRAINT_LINE = re.compile(r"The user requested \(constraint\) ([A-Za-z0-9][A-Za-z0-9._-]*)(\S+)")
@@ -55,13 +62,40 @@ def canonical(name: str) -> str:
 
 
 def pins(path: Path) -> Dict[str, str]:
-    """``{canonical name: version}`` of a requirements, constraints or freeze file's ``name==version`` lines; its
-    ``-r``, ``--hash`` and comment lines are skipped."""
+    """``{canonical name: version}`` of a lock, constraints or freeze file's ``name==version`` lines; its ``-r``,
+    ``--hash`` and comment lines are skipped. The .in files are read by ``in_pins``."""
     found = {}
     for line in path.read_text().splitlines():
         match = PIN.match(line.strip())
         if match:
             found[canonical(match.group(1))] = match.group(2)
+    return found
+
+
+def parse_in_line(line: str) -> Optional[Tuple[str, str]]:
+    """One line of a .in file: ``(canonical name, version)`` for an exact pin, None for a ``-r`` line, a blank line or
+    a comment. Any other line raises ``ValueError``: ``===``, ``>=`` and the other operators, a missing version,
+    something glued to the version, a URL or ``@`` reference, an option line."""
+    text = line.strip()
+    if not text or text.startswith("#") or IN_INCLUDE.fullmatch(text):
+        return None
+    match = IN_PIN.fullmatch(text)
+    if not match:
+        raise ValueError(f"not an exact pin (name==version): {line}")
+    return canonical(match.group(1)), match.group(2)
+
+
+def in_pins(path: Path) -> Dict[str, str]:
+    """``{canonical name: version}`` of the .in file ``path``, each line read by ``parse_in_line``; a line outside the
+    grammar is refused, named by its file and line number."""
+    found = {}
+    for number, line in enumerate(path.read_text().splitlines(), start=1):
+        try:
+            pin = parse_in_line(line)
+        except ValueError as exc:
+            raise Refused(f"{path.name}:{number}: {exc}") from None
+        if pin:
+            found[pin[0]] = pin[1]
     return found
 
 
@@ -77,13 +111,12 @@ def fetch_json(url: str) -> dict:
         return json.load(answer)
 
 
-def constraints(constraint: Optional[Path]) -> Dict[str, str]:
+def constraints(constraint: Optional[Path], wanted: Dict[str, str]) -> Dict[str, str]:
     """The constraint set: ``constraint``'s pins when given; otherwise the committed lock's, less each name whose pin
-    in a .in file names another version, which is that pin's explicit move."""
+    in a .in file (``wanted``) names another version, which is that pin's explicit move."""
     if constraint is not None:
         return pins(constraint)
     locked = {**pins(REPO / RUNTIME_LOCK), **pins(REPO / DEV_LOCK)}
-    wanted = {**pins(REPO / RUNTIME_IN), **pins(REPO / DEV_IN)}
     return {name: version for name, version in locked.items() if wanted.get(name, version) == version}
 
 
@@ -138,8 +171,10 @@ def lock_text(source: str, entries: Dict[str, Tuple[str, List[str]]], include: s
 
 
 def lock(constraint: Optional[Path]) -> Tuple[Dict[str, str], Resolved, Resolved]:
-    """The constraint set and the two resolutions: the runtime set R, then the full set F, constrained by R too."""
-    held = constraints(constraint)
+    """The constraint set and the two resolutions: the runtime set R, then the full set F, constrained by R too. Both
+    .in files are read first, so a line outside their grammar stops the lock before pip runs."""
+    wanted = {**in_pins(REPO / RUNTIME_IN), **in_pins(REPO / DEV_IN)}
+    held = constraints(constraint, wanted)
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         held_file = write_pins(work / "constraints.txt", held)
