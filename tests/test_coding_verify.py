@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.coding import verify, workspace
+from app.coding import venvs, verify, workspace
 
 FAKES = Path(__file__).resolve().parent / "fakes" / "coding"
 TASK = "5d3c2a10-0000-4000-8000-00000000beef"
@@ -72,19 +72,49 @@ def test_a_failed_setup_stops_before_the_tests(env):
     assert not result["ok"] and [c["setup"] for c in result["commands"]] == [True]
 
 
+def venv_tests(env):
+    """The job's configuration with tests that run on the shared venv."""
+    return {**env.cfg, "repositories": {"demo": {**env.cfg["repositories"]["demo"],
+                                                  "tests": [["{venv}/bin/python", "-m", "pytest", "-q"]]}}}
+
+
 def test_the_shared_venv_serves_only_jobs_with_the_same_requirements(env):
-    cfg = {**env.cfg, "repositories": {"demo": {**env.cfg["repositories"]["demo"],
-                                                 "tests": [["{venv}/bin/python", "-m", "pytest", "-q"]]}}}
+    cfg = venv_tests(env)
     shared = verify.VENVS_DIR / "demo"
     shared.mkdir()
-    (shared / ".requirements.sha256").write_text(verify.requirements_hash(env.checkout / "requirements.txt") + "\n")
+    (shared / ".rmp-lock.sha256").write_text(venvs.lock_hash(env.checkout) + "\n")
     assert verify.commands_for(env.job, cfg) == [[f"{shared}/bin/python", "-m", "pytest", "-q"]]
     (env.checkout / "requirements.txt").write_text("requests\n")
     commands = verify.commands_for(env.job, cfg)
     local = env.checkout / verify.JOB_VENV
     assert commands[0] == ["python3", "-m", "venv", verify.JOB_VENV] and "requirements.txt" in commands[1]
-    assert commands[1][0] == f"{local}/bin/pip", "systemd refuses relative executables"
+    assert commands[1][:4] == [f"{local}/bin/python", "-m", "pip", "install"], "systemd refuses relative executables"
     assert commands[-1] == [f"{local}/bin/python", "-m", "pytest", "-q"]
+
+
+def test_a_job_with_a_dev_lock_installs_it_with_hashes(env):
+    (env.checkout / "requirements-dev.txt").write_text("-r requirements.txt\npytest==9.0.3 --hash=sha256:00\n")
+    local = env.checkout / verify.JOB_VENV
+    assert verify.commands_for(env.job, venv_tests(env)) == [
+        ["python3", "-m", "venv", verify.JOB_VENV],
+        [f"{local}/bin/python", "-m", "pip", "install", "-q", "--disable-pip-version-check", "--require-hashes", "-r",
+         "requirements-dev.txt"],
+        [f"{local}/bin/python", "-m", "pytest", "-q"]]
+
+
+def test_the_shared_venv_is_reused_only_for_the_same_lock(env):
+    cfg, shared = venv_tests(env), verify.VENVS_DIR / "demo"
+    (env.checkout / "requirements-dev.txt").write_text("-r requirements.txt\n")
+    shared.mkdir()
+    # Stamped for requirements.txt alone, as before the dev lock: a job whose checkout has the dev lock builds its own.
+    (shared / ".rmp-lock.sha256").write_text(venvs.lock_hash(env.tmp / "source") + "\n")
+    assert verify.commands_for(env.job, cfg)[0] == ["python3", "-m", "venv", verify.JOB_VENV]
+    (shared / ".rmp-lock.sha256").write_text(venvs.lock_hash(env.checkout) + "\n")
+    assert verify.commands_for(env.job, cfg) == [[f"{shared}/bin/python", "-m", "pytest", "-q"]]
+    # The stamp of the coding jobs' venv before this one never matches: the next job's venv is built anew.
+    (shared / ".rmp-lock.sha256").unlink()
+    (shared / ".requirements.sha256").write_text(venvs.lock_hash(env.checkout) + "\n")
+    assert verify.commands_for(env.job, cfg)[0] == ["python3", "-m", "venv", verify.JOB_VENV]
 
 
 def test_relative_executables_run_from_the_checkout_and_bare_names_from_path(env):
@@ -101,11 +131,12 @@ def test_the_shared_venv_is_rebuilt_only_when_the_trusted_requirements_change(en
     requirements.write_text("")
     venv = verify.ensure_shared_venv("demo", requirements)
     assert (venv / "bin" / "python").exists()
-    stamp = (venv / ".requirements.sha256").stat().st_mtime_ns
-    assert verify.ensure_shared_venv("demo", requirements) == venv and (venv / ".requirements.sha256").stat().st_mtime_ns == stamp
+    stamp = (venv / ".rmp-lock.sha256").stat().st_mtime_ns
+    assert verify.ensure_shared_venv("demo", requirements) == venv
+    assert (venv / ".rmp-lock.sha256").stat().st_mtime_ns == stamp
     requirements.write_text("# changed\n")
     verify.ensure_shared_venv("demo", requirements)
-    assert (venv / ".requirements.sha256").read_text().strip() == verify.requirements_hash(requirements)
+    assert (venv / ".rmp-lock.sha256").read_text().strip() == venvs.lock_hash(env.tmp)
 
 
 def test_the_temporal_test_server_is_seeded_into_the_test_tmpdir(env):

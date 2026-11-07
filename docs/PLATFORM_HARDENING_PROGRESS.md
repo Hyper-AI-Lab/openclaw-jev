@@ -3772,3 +3772,239 @@ They are ledgered as `WP09-b3a-log-test-gaps`, for batch 4, which edits the same
 Every layout ended `verify: exit 0` (logs: `/root/.cache/wp09-b3a-myverify-92334c7/`).
 
 **Next:** the docs mirror, the PR and the gated merge. While the unit runs, the job copies `deploy.log` every 2 s to read batch 2's host step.
+
+## 2026-10-30 18:48 UTC · WP-09 hotfix 3a: PR opened, gated merge running
+
+**PR:** https://github.com/Hyper-AI-Lab/openclaw-jev/pull/52, head `cd2e5a6`. The commit after `92334c7` adds the docs mirror only.
+
+**Gated job `balslea17`:** the same gate as before. After the merge it does three things:
+- **Log snapshots:** copies `deploy.log` to `/root/.cache/wp09-b3a-deploy-log-snapshot.txt` every 2 s, whenever the file has grown, because batch 3's code wipes it when the unit ends.
+- **Timeline:** records the run's state every 10 s.
+- **Result:** reports the result, and the log's size once the run ends.
+
+## 2026-10-30 19:06 UTC · WP-09 hotfix 3a deployed; batch 2's host step met
+
+**Merged:** PR #52, squash `2e41c5c`, at 18:54:58Z. The gate passed: CLEAN, `test` `success`, head = local `cd2e5a6`, base `039f0a1`, one open PR.
+
+**Deployed** by batch 3's code, at 19:05:18Z:
+- `result.json`: `deployed`, head `2e41c5c`;
+- restarted `rmp-api` and `rmp-worker`;
+- health, readiness and the canary passed; `units: []`; `new_failing: []`;
+- nondeterminism lines in the worker journal: 0.
+
+**Afterwards:** the live checkout is at `2e41c5c`; both services are active; there are no errors in `rmp-api`'s journal; `/health` returns ok.
+
+**Batch 2's host step: PASS.** The `deploy.log` snapshot, taken while the unit ran:
+
+```
+19:04:30Z launch 1 of the deploy of 2e41c5cedee8 (phase queued)
+19:04:30Z deploying GitHub's main
+19:04:31Z holding /run/rmp-code-reload.lock
+19:04:36Z stopped rmp-api
+19:04:36Z stopped rmp-worker
+19:04:36Z main moved 039f0a12b1f7..2e41c5cedee8
+19:04:38Z started rmp-api, rmp-worker
+```
+
+- **Order:** stop → move → start, with the units stopped for about 2 s.
+- **Phases:** the timeline shows `merged`, then `restarted`, written live.
+- **After the run:** as predicted, `deploy.log` is 0 bytes once the unit ended, because batch 3's code launched it with `truncate:`. The deploy after this one (batch 4) is the first launched with `append:`, and it must keep its whole log: that is this hotfix's host step.
+
+**Watcher latency:** CI's `test` check on the merge commit completed at 19:01:17Z. The run was queued at 19:04:29Z (3 min 12 s later) and launched at 19:04:30Z, 1 s after.
+- In earlier deploys the queue followed CI within 8 to 14 s.
+- The gap is the reconciler loop's pass time plus its 60 s sleep. `watch_main` runs inline after the other steps of the pass.
+- WP-07 already moves `watch_main` into its own task with a fetch timeout. Noted there; no new item.
+- Batch 1's rule, "launched within a minute of idle", held: 1 s.
+
+**Ledger:** `WP09-b2-first-launch-log-wiped` is closed by PR #52; batch 4's log is the remaining check.
+
+**Next:** WP-09 batch 4 (venvs, items WP09-16 to WP09-19), plus §9 amendment 5 (the revert window resumed) and the two log test gaps (`WP09-b3a-log-test-gaps`).
+
+## 2026-10-30 19:27 UTC · WP-09 batch 4 started
+
+**Branch:** `aura/wp-09-4-venvs` from `2e41c5c`.
+
+**Items:**
+- WP09-16: one venv builder;
+- WP09-17: RMP's venv, one per lock, switched while stopped, switched back by a revert;
+- WP09-18: coding jobs use the dev lock;
+- WP09-19: the web stack's requirements, and its health awaited;
+- §9 amendment 5: a revert window that fails before the tree moved is resumed;
+- amendment 4.4's batch-4 note: the venv-link exception;
+- the two log test gaps (`WP09-b3a-log-test-gaps`);
+- WP09-33's lines.
+
+**Pipeline:** the Workflow hook timed out twice, so this batch uses the manual pipeline (`/root/.cache/wp-batch-manual/wp09-b4/`).
+
+**Host step:** this batch's own deploy is hotfix 3a's host step: its `deploy.log` must keep the whole run. Until batch 5 there is no lock change, so this deploy must not switch the live venv. The implementer must say exactly what the deploy does to `/root/.openclaw/rmp/venv`.
+
+## 2026-11-01 10:53 UTC · WP-09 batch 4 implemented; round-1 reviews resumed after the usage limit
+
+**Implementer:** 9 commits, `73b5576` to `4e75d46`, on `2e41c5c`. It covers:
+- WP09-16: `app/coding/venvs.py`;
+- WP09-18: coding jobs build with it;
+- WP09-17: one venv per lock, built before the lock, the plan recorded with `applying`, the switch made while stopped, switched back by a revert, pruned after `deployed`, and the unit run on the resolved venv;
+- WP09-19: the web stack installed inside the window, with a venv copy restored on a revert and its health awaited;
+- §9 amendment 5;
+- the venv note of amendment 4.4;
+- the two log test gaps;
+- ARCHITECTURE.
+
+**Evidence:**
+- **Harness:** all four layouts on `4e75d46`, 1994 passed, 1 skipped; node 58/58.
+- **Mutation probes:** 29/29 caught.
+- **This batch's own deploy:** in a scratch run, `2e41c5c`'s code deployed this head and ended `deployed`, with no pip call, a stop/stop/start and a full log. **It leaves `/root/.openclaw/rmp/venv` untouched:** it stays a real directory and stays ignored, and `/root/.openclaw/venvs` is not created.
+
+**Deviations:**
+- An exception before the tree moved switches the venv back; a kill leaves the link at target, so the run stays `applying`.
+- A kill inside the first switch completes the link.
+- The plan is recomputed only before `applying`.
+- Robustness guards.
+
+**Residual risk:** a SIGKILL between the first switch's two syscalls leaves the live venv path missing. Batch 5 makes the first real switch on production.
+- **Candidate fix,** which I asked the reviewers to judge: `renameat2(RENAME_EXCHANGE)`, so the live path becomes the link atomically.
+
+**Both reviewers** were cut off by the session limit (reset 2026-10-31 23:40Z). Resumed now with their context.
+
+## 2026-11-01 11:26 UTC · WP-09 batch 4 round 1: closure requests changes (atomic first switch); correctness approves
+
+**Closure reviewer: request changes.**
+- **Blocking:** the first venv switch is not atomic. Its host probe: two-step, the live path was missing 28,802 times over 3000 switches; `RENAME_EXCHANGE`, 0 times.
+- **Its own scratch run:** `2e41c5c`'s code ships `4e75d46` and leaves `/root/.openclaw/rmp/venv` byte-for-byte untouched, with the same inodes; `/root/.openclaw/venvs` is not created.
+- **The rest:** all items are closed; all four deviations are justified.
+
+**Correctness reviewer: approve.** Its own scratch run and focused runs in all four layouts. It also recommends the exchange (0 misses over 60,000), but **before batch 5**, not as a blocker.
+
+**Decision:** batch 4 itself (round 2), because batch 5's first switch runs batch 4's code.
+- **Spec §9 amendment 7:** the closure reviewer's variant. A placeholder symlink `kind_root/<adopt16>` → target is exchanged with the real `venv` in one `renameat2(RENAME_EXCHANGE)` call, so the directory lands at its final home in the same instant. `renameat2` is resolved lazily. With no fallback, a failure is an attempt before anything moved.
+- **Spec §9 amendment 8:**
+  - a revert whose venv switch-back, or web restore, fails keeps `reverting`;
+  - the 1.3 GB web venv copy is deleted on every final result and re-taken cleanly on a relaunch;
+  - the venv plan is written to `deploy.log`;
+  - the `lock_hash` framing is listed as a deviation.
+
+**Fix round** sent to the implementer, which keeps its context.
+
+## 2026-11-02 02:03 UTC · WP-09 batch 4 fix round resumed after the usage limit
+
+The implementer stopped at the session limit (reset 2026-11-01 15:50Z), after 7 fix commits on `4e75d46`:
+
+| Commit | Change |
+|---|---|
+| `aad2c9c` | The first switch is one `renameat2` exchange (amendment 7) |
+| `46c9858` | Wording |
+| `b46aefc` | A revert keeps `reverting` while the venv link or the web venv is not back (8.1) |
+| `31f95c3` | The web copy is never left behind (8.2) |
+| `a7843c3` | The venv plan is logged (8.3) |
+| `f9fd9f7` | ARCHITECTURE.md |
+| `038d5a1` | The reader test counts a miss only when a second look fails too |
+
+**On `038d5a1`.** The implementer measured on this host:
+- with the exchange, 6 of about 216,000 looks at `venv/bin/python` failed once, while racing the exchange in another directory, and every one of them succeeded on the second look; `venv` itself was never missing;
+- with the two-step switch, about 10,000 of 11,000 failed looks were still missing on the second look.
+
+So the test still tells the two apart. It has been asked to confirm that the test fails on `4e75d46`, and to state why a one-off failed path walk does not matter: during the switch the affected units are stopped. The reviewers will judge it in round 2.
+
+Kirill's "Try again" came at 02:02Z. I sent the implementer a message to finish: check coverage, run the four layouts, and report.
+
+## 2026-11-02 02:05 UTC · WP-09 batch 4 fix round 1 done; round-2 re-reviews and my verify running
+
+**Implementer:** head `038d5a1`. All four layouts pass: 2012 passed, 1 skipped; node 58/58. 40 of 40 mutation probes caught.
+
+**Amendment 7 (atomic first switch):**
+- Case 1 is now a link at `<root>/<adopt16>` exchanged with the real venv in one `renameat2(RENAME_EXCHANGE)` call through ctypes. It is looked up lazily, has no fallback, and a refusal (a missing symbol, EINVAL, ENOSYS or EXDEV) raises before anything moved.
+- The live venv and the venvs root are on the same ext4 filesystem (dev 2049), so EXDEV cannot happen here.
+- The kill test is rewritten for the exchange: a kill before it or after it, followed by a resume, gives `deployed` or `rolled_back`.
+
+**`038d5a1` (the reader's second look):** the test still fails on `4e75d46`'s two-step switch, with 55,774 of 662,164 looks missing.
+- **Why a second look:** with the exchange, `lstat(venv)` never missed (0 of about 233,000 looks). A full walk through `venv/bin/python` failed once 6 times in about 216,000, and the immediate retry found it every time.
+- **Why that cannot hurt production:** the switch runs with `rmp-api` and `rmp-worker` stopped, under the lock, after a zero count, so nothing that needs the venv can start then. Only a timer oneshot exec'ing in that microsecond could fail once, and it runs again at its next tick.
+
+**Amendment 8:**
+- **8.1:** a revert keeps `reverting` until the venv link and the web venv are back.
+- **8.2:** the web copy is dropped on every final result and on a relaunch.
+- **8.3:** the venv plan is logged.
+- **8.4:** the `lock_hash` framing is listed as a deviation.
+
+**Batch 4's own deploy, re-checked:** `2e41c5c`'s code still deploys `038d5a1` without touching the live venv.
+
+**Now running:** both reviewers' round-2 re-reviews (focused runs) and my four-layout verify (`b81nmcpew`).
+
+## 2026-11-02 02:22 UTC · WP-09 batch 4 round 2: closure approves; correctness asks for one missing test; fix round 2
+
+**Closure reviewer: approve.** Its round-1 blocking issue is closed.
+- **Its reader probe:** the exchange gave 0 `lstat(venv)` failures in 3.2 million looks. A full walk through `venv/bin/python` failed 65 times in 2.95 million, and every one succeeded on the second look; a plain `os.replace` behaves the same. The two-step mutant was caught, with 82,674 misses.
+- **This batch's own deploy:** `038d5a1`'s deploy, run by `2e41c5c`'s code, was re-verified: the live venv is untouched.
+
+**Correctness reviewer: request changes, for one missing test.**
+- **The gap:** no test proves that a resumed rollback restores the installed web venv from its copy. A mutant that drops the copy before the resumed-run branch passes the suite.
+- **Minor:** `record()` also drops the copy on a resume's "foreign main" `failed` result, where the copy may be the only way back.
+- **Nits:**
+  - the reader test should assert that `lexists(venv)` is never missing, at a single look;
+  - `previous` is stored as raw `readlink` output.
+- **Judged sound:** the exchange code (the ctypes signature and errno handling, the lazy lookup), every kill state, and the second look.
+
+**Decision:** spec §9 amendment 9 takes all four:
+- the copy is kept for results reached from `applying` on, other than `deployed` and `rolled_back`, and the summary names it;
+- a resumed rollback restores the web venv, with a test;
+- the plan is stored canonically;
+- the `lexists` assertion is added.
+
+I stopped my verify of `038d5a1`, since the head will change. Fix round 2 is sent to the implementer.
+
+## 2026-11-04 16:03 UTC · WP-09 batch 4 fix round 2 resumed after the usage limit
+
+The implementer stopped at the session limit (reset 2026-11-03 07:00Z), after 4 commits on `038d5a1`:
+
+| Commit | Amendment | Change |
+|---|---|---|
+| `77c24a7` | 9.1 | The web copy is kept on a result reached from `applying` on, and the summary names it |
+| `0312619` | 9.2 | The venv plan is stored canonically |
+| `297788f` | 9.3 | The reader also checks `lexists(venv)` at a single look |
+| `b7817da` | — | ARCHITECTURE.md |
+
+It was about to run the four layouts. Kirill's "please, continue" came at 16:03Z. The implementer is resumed to confirm the coverage and the probes, run the layouts, and report.
+
+## 2026-11-04 16:04 UTC · WP-09 batch 4 fix round 2 done; round-3 check and my verify running
+
+**Implementer:** head `b7817da`.
+- **Harness:** all four layouts, 2016 passed, 1 skipped; node 58/58; finished after the last commit.
+- **Mutation probes:** 48 of 48 caught.
+
+**Amendment 9:**
+- **9.1:** `end_web_venv_copy(task, status, phase)` drops the copy on `deployed`, `rolled_back` and results before `applying`, and keeps it otherwise, naming it in the summary.
+  - `test_a_resumed_rollback_restores_the_installed_web_venv` fails on the reviewer's mutant (P1).
+- **9.2:** canonical paths in the plan, `_venv_moved` and `prune`.
+  - Tested with the relative live link `../venvs/rmp/./<hash>/`, for both `deployed` and `rolled_back`.
+- **9.3:** the reader asserts 0 single-look `lexists(venv)` misses.
+  - On `4e75d46`'s two-step switch: 25,779 misses of the name and 25,460 of `bin/python`, in 258,309 looks.
+
+**Batch 4's own deploy, re-checked on `b7817da`:** `2e41c5c`'s code deploys it with the live venv untouched.
+
+**Now running:** the correctness reviewer's round-3 check of `038d5a1..b7817da` (focused runs) and my four-layout verify (`bcvfe71hm`).
+
+## 2026-11-04 16:16 UTC · WP-09 batch 4 round 3: correctness approves; review complete
+
+**Verdict:** the correctness reviewer approves `038d5a1..b7817da`, with no issues.
+- It re-ran its round-2 mutant (the web-copy drop moved ahead of the resumed-run branch). The mutant now fails both new tests.
+- `record()` reads the phase before the state is removed, so it is current. Mutating that read is caught.
+- The canonical comparisons are correct; a mutant that compares raw paths is caught.
+- No regressions. Focused runs passed in the default and live layouts.
+
+**Batch 4 review is complete:** three rounds, and both reviewers approve. The PR body is drafted in `/root/.cache/pr-wp09-b4.md`. Waiting for my verify (`bcvfe71hm`).
+
+## 2026-11-04T17:37Z: WP-09 batch 4 verified by me
+My four-layout verify on `b7817da` (`bcvfe71hm`, logs in `/root/.cache/wp09-b4-myverify-b7817da/`):
+
+| Layout | pytest | node | Leftovers |
+|---|---|---|---|
+| Default | 2016 passed, 1 skipped | 58/58 | 0 |
+| go-live | 2016 passed, 1 skipped | 58/58 | 0 |
+| Coding job | 2016 passed, 1 skipped | 58/58 | 0 |
+| Direct session | 2016 passed, 1 skipped | 58/58 | 0 |
+
+- The placeholder grep is clean, and no new file is hidden by `.gitignore`.
+- `app/workflows` and `requirements.txt` are untouched.
+- `origin/main` is still `2e41c5c`, the base.
+
+**Next:** mirror this log, open the PR, and run the gated merge. The deploy is hotfix 3a's host step: its `deploy.log` must keep the whole run. `/root/.openclaw/rmp/venv` must stay a real directory.

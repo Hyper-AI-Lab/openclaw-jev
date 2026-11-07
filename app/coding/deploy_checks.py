@@ -1,4 +1,4 @@
-"""Checks after a self-deploy restarts services: RMP's health, the gateway, readiness and a canary."""
+"""Checks after a self-deploy restarts services: RMP's health, the gateway, the web backends, readiness and a canary."""
 from __future__ import annotations
 
 import json
@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Union
 
 RMP = "http://127.0.0.1:8000"
 GATEWAY_READY = "http://127.0.0.1:18789/readyz"
+WEB_HEALTH = "http://127.0.0.1:8791/health"
 CANARY_TRIES = 5
 CANARY_WAIT_SEC = 30
 CANARY_TIMEOUT_SEC = 600
@@ -78,6 +79,8 @@ def run(live: Path, restarted: Iterable[str], baseline: Union[Dict[str, str], Li
             return {"failure": "RMP's /health did not answer within 2 minutes", "canary": None}
         if "openclaw-gateway" in restarted and not _wait_ok(GATEWAY_READY, 300):
             return {"failure": "the gateway was not ready within 5 minutes", "canary": None}
+        if "aura-web-backends" in restarted and not _wait_ok(WEB_HEALTH, 60):
+            return {"failure": "the web backends did not answer /health within 60 s", "canary": None}
         try:
             now = readiness_report()
         except Exception as exc:

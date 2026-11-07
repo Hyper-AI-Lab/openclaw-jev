@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Everything used below is imported now: main moves under this process, and a later import would load the new code.
 import app.coding.deploy_checks  # noqa: E402,F401
+import app.coding.venvs  # noqa: E402,F401
 import app.production.canary_sentinel  # noqa: E402,F401
 from app.coding import deploy  # noqa: E402
 from app.config import get_coding_config  # noqa: E402
@@ -99,13 +100,16 @@ def postponed(run: dict) -> dict:
 
 
 def record(spec_path: str, spec: dict, result: dict) -> int:
-    """Record the run's result (atomically, on disk before the state goes), then remove its state, then ``finish``;
-    the unit's exit status."""
+    """Record the run's result (atomically, on disk before the state goes), then remove its state and, unless it may
+    still be the way back (``deploy.end_web_venv_copy``), the copy of the web backends' venv it took, then
+    ``finish``; the unit's exit status."""
     result = {**result, "suite": spec.get("suite"), "source": spec.get("source") or "reviewed",
               "head": result.get("head") or spec.get("head"), "ci": spec.get("ci")}
     log(f"result: {json.dumps(result)}")
+    phase = (deploy._read_json(deploy.state_file(spec["task_id"])) or {}).get("phase")
     deploy.write_json(Path(spec_path).with_name("result.json"), result)
     deploy.state_file(spec["task_id"]).unlink(missing_ok=True)
+    deploy.end_web_venv_copy(spec["task_id"], result["status"], phase)
     asyncio.run(finish(spec, result))
     return 0 if result["status"] == "deployed" else 1
 
