@@ -283,6 +283,56 @@ def test_a_runtime_pin_missing_from_the_full_set_exits_1(script, capsys):
     assert not (script.repo / "requirements.txt").exists() and not (script.repo / "requirements-dev.txt").exists()
 
 
+# The .in grammar's corpus: each line with the (canonical name, version) parse_in_line reads, None for a line that is
+# no pin, or REFUSED for a line outside the grammar.
+REFUSED = "refused"
+IN_LINES = [
+    ("fastapi==0.135.1", ("fastapi", "0.135.1")),
+    ("fastapi == 0.135.1", ("fastapi", "0.135.1")),
+    ("fastapi [standard] == 0.135.1", ("fastapi", "0.135.1")),
+    ("fastapi[a, b]==0.135.1", ("fastapi", "0.135.1")),
+    ('fastapi==0.135.1; python_version < "3.13"', ("fastapi", "0.135.1")),
+    ("fastapi==0.135.1  # the API", ("fastapi", "0.135.1")),
+    ("-r  requirements.in", None),
+    ("", None),
+    ("# the runtime pins", None),
+    ("fastapi===0.135.1", REFUSED),
+    ("fastapi>=0.135", REFUSED),
+    ("fastapi==", REFUSED),
+    ("fastapi== ", REFUSED),
+    ("fastapi==0.135.1#x", REFUSED),
+    ("fastapi @ https://example.org/f.whl", REFUSED),
+    ("--index-url https://example.org", REFUSED),
+]
+
+
+@pytest.mark.parametrize("line, expected", IN_LINES)
+def test_in_line_grammar(line, expected):
+    parse_in_line = load().parse_in_line
+    if expected == REFUSED:
+        with pytest.raises(ValueError, match=r"^not an exact pin \(name==version\): "):
+            parse_in_line(line)
+    else:
+        assert parse_in_line(line) == expected
+
+
+@pytest.mark.parametrize("name, line", [("requirements.in", "fastapi===0.136.0"), ("requirements.in", "fastapi>=0.135"),
+                                        ("requirements.in", "fastapi==0.136.0#x"),
+                                        ("requirements-dev.in", "pytest===9.0.3")])
+def test_a_line_that_is_not_an_exact_pin_exits_1_before_pip(script, capsys, name, line):
+    first_lock(script)
+    before = written(script.repo)
+    capsys.readouterr()
+    path = script.repo / name
+    path.write_text(f"{path.read_text()}{line}\n")
+    number = len(path.read_text().splitlines())
+
+    assert script.main([]) == 1
+
+    assert capsys.readouterr().out == f"{name}:{number}: not an exact pin (name==version): {line}\n"
+    assert script.pip.calls == [] and written(script.repo) == before
+
+
 def test_a_hash_missing_from_pypi_exits_1(script, capsys):
     script.missing.add(("starlette", "0.52.1"))
 
