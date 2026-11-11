@@ -86,15 +86,17 @@ def lock_files(runtime: dict, dev: dict) -> tuple:
 class FakePip:
     """``pip install --dry-run --report`` over the fake index: each requirement's own pin, else its constraint
     (unless ``ignore_constraints``), else its newest release; a pin that contradicts a constraint is pip's conflict.
-    Each call is recorded with its .in file and its constraint files as they were at the call."""
+    ``ignore_includes`` makes it skip ``-r`` lines. Each call is recorded with its .in file and its constraint files
+    as they were at the call."""
 
-    def __init__(self, repo: Path, *, ignore_constraints: bool = False):
-        self.repo, self.ignore_constraints, self.calls = repo, ignore_constraints, []
+    def __init__(self, repo: Path, *, ignore_constraints: bool = False, ignore_includes: bool = False):
+        self.repo, self.ignore_constraints, self.ignore_includes, self.calls = (repo, ignore_constraints,
+                                                                                ignore_includes, [])
 
     def requested(self, source: Path) -> dict:
         pinned = {}
         for line in source.read_text().splitlines():
-            if line.startswith("-r "):
+            if line.startswith("-r ") and not self.ignore_includes:
                 pinned.update(self.requested(source.parent / line[3:]))
             elif "==" in line:
                 name, version = line.split("==")
@@ -272,9 +274,11 @@ def test_a_report_that_moves_a_constrained_pin_exits_1(script, monkeypatch, caps
     assert written(script.repo) == before
 
 
-def test_a_runtime_pin_missing_from_the_full_set_exits_1(script, capsys):
-    # Without its -r line, requirements-dev.in resolves to the test tools alone: the full set lacks every runtime pin.
-    (script.repo / "requirements-dev.in").write_text("pytest==9.0.3\n")
+def test_a_runtime_pin_missing_from_the_full_set_exits_1(script, monkeypatch, capsys):
+    # A dev resolution that drops requirements-dev.in's include resolves the test tools alone: the full set lacks
+    # every runtime pin. The .in files themselves are valid.
+    pip = FakePip(script.repo, ignore_includes=True)
+    monkeypatch.setattr(script, "run_pip", pip)
 
     assert script.main(["--constraint", str(script.repo / "freeze.txt")]) == 1
 
