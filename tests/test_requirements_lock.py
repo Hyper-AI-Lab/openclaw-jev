@@ -1,6 +1,6 @@
 """The hashed lock, requirements.txt and requirements-dev.txt, which ops/lock_requirements.py generates from the .in
 files, and CI's install of it. Pure: it reads the repo's files. The .in files are read with the lock script's own
-parser, so the two can never disagree about a line."""
+reader, so the two can never disagree about them."""
 import importlib
 import importlib.util
 import re
@@ -36,24 +36,10 @@ def lock_script():
 
 
 def in_pins(name: str) -> dict:
-    """``{canonical name: version}`` of a .in file, each line read by the lock script's ``parse_in_line``, which raises
-    on a line outside the .in grammar."""
-    parse = lock_script().parse_in_line
-    return dict(pin for line in (ROOT / name).read_text().splitlines() if (pin := parse(line, ROOT / name)))
-
-
-def in_includes(name: str) -> list:
-    """The lines of a .in file that ``parse_in_line`` accepts there as an include: no pin there, and refused when read
-    as part of requirements.in, which may include nothing, unlike a blank line or a comment."""
-    parse, path = lock_script().parse_in_line, ROOT / name
-    found = []
-    for line in path.read_text().splitlines():
-        if parse(line, path) is None:
-            try:
-                parse(line, ROOT / "requirements.in")
-            except ValueError:
-                found.append(line)
-    return found
+    """``{canonical name: version}`` of a .in file, read by the lock script's ``parse_in_file``, which raises on a file
+    outside the .in files' one form: for requirements-dev.in, also unless it holds exactly one include of
+    requirements.in and repeats none of its names."""
+    return lock_script().parse_in_file(ROOT / name)
 
 
 def test_every_requirement_is_pinned_with_its_hashes():
@@ -81,8 +67,6 @@ def test_every_in_pin_is_in_its_lock_at_the_same_version():
     full = {**runtime, **pinned("requirements-dev.txt")}
     assert in_pins("requirements.in") and in_pins("requirements.in").items() <= runtime.items()
     assert in_pins("requirements-dev.in") and in_pins("requirements-dev.in").items() <= full.items()
-    # requirements-dev.in includes the runtime pins once, through the one include parse_in_line allows there.
-    assert len(in_includes("requirements-dev.in")) == 1
 
 
 def test_starlette_and_pydantic_core_are_pinned_in_the_runtime_lock():

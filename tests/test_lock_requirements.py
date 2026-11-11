@@ -100,7 +100,7 @@ class FakePip:
                 pinned.update(self.requested(source.parent / line[3:]))
             elif "==" in line:
                 name, version = line.split("==")
-                pinned[name.split("[")[0].strip()] = version.strip()
+                pinned[name] = version
         return pinned
 
     def __call__(self, args):
@@ -209,31 +209,6 @@ def test_a_changed_in_pin_leaves_the_constraints(script):
     assert written(script.repo) == lock_files({**RUNTIME, "fastapi": "0.136.0"}, DEV)
 
 
-def test_a_moved_pin_with_extras_leaves_the_constraints(script):
-    first_lock(script)
-    (script.repo / "requirements.in").write_text("fastapi[standard]==0.136.0\n")
-
-    assert script.main([]) == 0
-
-    others = {name: version for name, version in {**RUNTIME, **DEV}.items() if name != "fastapi"}
-    assert script.pip.calls[0]["constraints"] == [others]
-    assert written(script.repo) == lock_files({**RUNTIME, "fastapi": "0.136.0"}, DEV)
-
-
-@pytest.mark.parametrize("line", ["fastapi == 0.136.0", "fastapi [standard]==0.136.0",
-                                  "fastapi[standard] == 0.136.0"])
-def test_a_moved_pin_with_spaces_leaves_the_constraints(script, line):
-    # PEP 508 allows whitespace around the extras and the operator; pip reads each line as fastapi==0.136.0.
-    first_lock(script)
-    (script.repo / "requirements.in").write_text(f"{line}\n")
-
-    assert script.main([]) == 0
-
-    others = {name: version for name, version in {**RUNTIME, **DEV}.items() if name != "fastapi"}
-    assert script.pip.calls[0]["constraints"] == [others]
-    assert written(script.repo) == lock_files({**RUNTIME, "fastapi": "0.136.0"}, DEV)
-
-
 def test_a_forced_move_exits_1_and_names_the_pin(script, monkeypatch, capsys):
     first_lock(script)
     before = written(script.repo)
@@ -287,70 +262,135 @@ def test_a_runtime_pin_missing_from_the_full_set_exits_1(script, monkeypatch, ca
     assert not (script.repo / "requirements.txt").exists() and not (script.repo / "requirements-dev.txt").exists()
 
 
-# The .in grammar's corpus: each line, the .in file it is read as part of, and the (canonical name, version)
-# parse_in_line reads, None for a line that is no pin, or REFUSED for a line outside the grammar.
-REFUSED = "refused"
+# The .in files' one form (specs/WP-09.md §9 amendment 15). Each case: the bytes of requirements.in and of
+# requirements-dev.in (None keeps the fixture's), then either the pins parse_in_file reads from each, or the message
+# of its refusal, which the script prints before pip in both modes.
 IN_RUNTIME, IN_DEV = "requirements.in", "requirements-dev.in"
-IN_LINES = [
-    (IN_RUNTIME, "fastapi==0.135.1", ("fastapi", "0.135.1")),
-    (IN_RUNTIME, "fastapi == 0.135.1", ("fastapi", "0.135.1")),
-    (IN_RUNTIME, "fastapi [standard] == 0.135.1", ("fastapi", "0.135.1")),
-    (IN_RUNTIME, "fastapi[a, b]==0.135.1", ("fastapi", "0.135.1")),
-    (IN_RUNTIME, 'fastapi==0.135.1; python_version < "3.13"', ("fastapi", "0.135.1")),
-    (IN_RUNTIME, "fastapi==0.135.1  # the API", ("fastapi", "0.135.1")),
-    (IN_RUNTIME, 'fastapi==0.135.1;python_version>="3"', ("fastapi", "0.135.1")),
-    (IN_DEV, "-r  requirements.in", None),
-    (IN_RUNTIME, "", None),
-    (IN_RUNTIME, "# the runtime pins", None),
-    # pip never joins a comment line to the next, whatever it ends in.
-    (IN_RUNTIME, "# the runtime pins \\", None),
-    (IN_RUNTIME, "fastapi===0.135.1", REFUSED),
-    (IN_RUNTIME, "fastapi>=0.135", REFUSED),
-    (IN_RUNTIME, "fastapi==", REFUSED),
-    (IN_RUNTIME, "fastapi== ", REFUSED),
-    (IN_RUNTIME, "fastapi==0.135.1#x", REFUSED),
-    (IN_RUNTIME, "fastapi @ https://example.org/f.whl", REFUSED),
-    (IN_RUNTIME, "--index-url https://example.org", REFUSED),
-    (IN_RUNTIME, "fastapi==0.135.1;garbage", REFUSED),
-    (IN_RUNTIME, 'fastapi==0.135.1; sys_platform = "linux"', REFUSED),
-    # pip joins the next line to this one, inside its comment.
-    (IN_RUNTIME, "fastapi==0.135.1 # c \\", REFUSED),
-    (IN_RUNTIME, "fastapi==0.135.*", REFUSED),
-    (IN_RUNTIME, "fastapi==0.135.1,<1", REFUSED),
-    (IN_RUNTIME, "fastapi==${V}", REFUSED),
-    (IN_RUNTIME, "fastapi==0.${V}", REFUSED),
-    (IN_DEV, "-r other.in", REFUSED),
-    (IN_RUNTIME, "-r requirements.in", REFUSED),
-    (IN_RUNTIME, "-c constraints.txt", REFUSED),
+TODAY = ((ROOT / IN_RUNTIME).read_bytes(), (ROOT / IN_DEV).read_bytes())
+# Today's pins, read the plain way their canonical lines allow; their names need only lowering to be canonical.
+TODAY_PINS = ({name.lower(): version for name, version in
+               (line.split("==") for line in TODAY[0].decode().splitlines() if "==" in line)},
+              {"pytest": "9.0.3", "pytest-asyncio": "1.4.0"})
+FIXTURE_PINS = ({"fastapi": "0.135.1"}, {"pytest": "9.0.3"})
+
+
+def not_a_pin(text: str, number: int = 1, name: str = IN_RUNTIME) -> str:
+    return f"{name}:{number}: not a canonical pin (name==version): {text}"
+
+
+def bad_line(text: str, case: str):
+    """A requirements.in of the one line ``text``, refused as no canonical pin."""
+    return pytest.param(f"{text}\n".encode(), None, not_a_pin(text), id=case)
+
+
+BYTE = "{}: only tab, LF, CR and printable ASCII may appear (line {} holds byte 0x{})"
+ESCAPE = "{}: no \\ or $ may appear, which pip reads as a line continuation or a variable (line {})"
+CODING = "{}: no coding declaration may appear in the first two lines, since pip would decode the file by it (line {})"
+IN_FILES = [
+    pytest.param(*TODAY, TODAY_PINS, id="today's files"),
+    pytest.param(b"fastapi==0.135.1  # the API\n", None, FIXTURE_PINS, id="a pin with a trailing comment"),
+    pytest.param(None, b"-r\trequirements.in  # the runtime pins\npytest==9.0.3\n", FIXTURE_PINS,
+                 id="the include with a tab and a comment"),
+    pytest.param(b"# the API\r\nfastapi==0.135.1\r\n", b"-r requirements.in\r\npytest==9.0.3\r\n", FIXTURE_PINS,
+                 id="CRLF line ends"),
+    pytest.param(b"\n  # the API\nfastapi==0.135.1 \t\n\n", b"pytest==9.0.3\n-r requirements.in\n", FIXTURE_PINS,
+                 id="blank lines, an indented comment, trailing whitespace, the include last"),
+    pytest.param(b"PyYAML==6.0.3\npydantic_core==2.41.5\npython-dateutil==2.9.0.post0\nx.y==0.63b1\n"
+                 b"z==1!2.0rc1.post2.dev3\n", None,
+                 ({"pyyaml": "6.0.3", "pydantic-core": "2.41.5", "python-dateutil": "2.9.0.post0", "x-y": "0.63b1",
+                   "z": "1!2.0rc1.post2.dev3"}, {"pytest": "9.0.3"}), id="canonical names and versions"),
+    # Round 6: what pip 24.0 reads differently.
+    pytest.param(b"# coding: utf-7\nfastapi==0.135.1\n# +AAo-starlette==9.9.9\n", None, CODING.format(IN_RUNTIME, 1),
+                 id="a utf-7 declaration hiding a pin"),
+    pytest.param(b"# coding: unicode_escape\nfastapi==0.135.1\n# \\nstarlette==9.9.9\n", None,
+                 ESCAPE.format(IN_RUNTIME, 3), id="a unicode_escape declaration hiding a pin"),
+    pytest.param(b"fastapi==0.135.1\n# vim: set fileencoding=latin-1 :\n", None, CODING.format(IN_RUNTIME, 2),
+                 id="a latin-1 declaration on line 2"),
+    pytest.param("fastapi==0.135.1  # café\n".encode("latin-1"), None, BYTE.format(IN_RUNTIME, 1, "e9"),
+                 id="a latin-1 byte"),
+    pytest.param(b"\xef\xbb\xbffastapi==0.135.1\n", None, BYTE.format(IN_RUNTIME, 1, "ef"), id="a BOM"),
+    pytest.param("fastapi==0.135.1\n".encode("utf-16"), None, BYTE.format(IN_RUNTIME, 1, "ff"), id="UTF-16"),
+    bad_line("fastapi==0.135.1,", "a trailing comma"),
+    bad_line('fastapi==0.135.1; extra == "x"', "an extra marker"),
+    bad_line('fastapi==0.135.1; platform_release == "6.8 -generic"', "a marker string with a dash"),
+    bad_line("fastapi==0.135.1+local.zip", "a local label"),
+    pytest.param(None, "-r\u00a0requirements.in\npytest==9.0.3\n".encode(), BYTE.format(IN_DEV, 1, "c2"),
+                 id="an include with a non-ASCII space"),
+    pytest.param(b'fastapi==0.136.0; python_version < "3"\nfastapi==0.135.1\n', None,
+                 not_a_pin('fastapi==0.136.0; python_version < "3"'), id="a false marker"),
+    pytest.param(b"fastapi==0.135.1\nfastapi==0.136.0\n", None,
+                 f"{IN_RUNTIME}: fastapi is pinned twice (lines 1 and 2)", id="a name twice in a file"),
+    pytest.param(b"Jinja2==3.1.6\njinja2==3.1.6\n", None, f"{IN_RUNTIME}: jinja2 is pinned twice (lines 1 and 2)",
+                 id="a name twice in a file, spelt twice"),
+    pytest.param(None, b"-r requirements.in\npytest==9.0.3\nFastAPI==0.135.1\n",
+                 f"{IN_DEV}: fastapi pinned in {IN_RUNTIME} too", id="a name in both files"),
+    # Lines amendments 13 and 14 refused.
+    bad_line("fastapi===0.135.1", "==="),
+    bad_line("fastapi>=0.135", ">="),
+    bad_line("fastapi==", "no version"),
+    bad_line("fastapi== ", "no version and a space"),
+    bad_line("fastapi==0.135.1#x", "a glued #"),
+    bad_line("fastapi @ https://example.org/f.whl", "a URL"),
+    bad_line("--index-url https://example.org", "an option line"),
+    bad_line("fastapi==0.135.1;garbage", "an invalid marker"),
+    bad_line('fastapi==0.135.1; sys_platform = "linux"', "a marker with ="),
+    pytest.param(b"fastapi==0.135.1 # c \\\n", None, ESCAPE.format(IN_RUNTIME, 1), id="a continuation"),
+    bad_line("fastapi==0.135.*", "a wildcard"),
+    bad_line("fastapi==0.135.1,<1", "two specifiers"),
+    pytest.param(b"fastapi==${V}\n", None, ESCAPE.format(IN_RUNTIME, 1), id="a variable"),
+    pytest.param(b"fastapi==0.${V}\n", None, ESCAPE.format(IN_RUNTIME, 1), id="a variable after a digit"),
+    pytest.param(None, b"-r other.in\npytest==9.0.3\n", not_a_pin("-r other.in", 1, IN_DEV),
+                 id="another include"),
+    pytest.param(b"-r requirements.in\nfastapi==0.135.1\n", None, not_a_pin("-r requirements.in"),
+                 id="an include in requirements.in"),
+    bad_line("-c constraints.txt", "a constraints line"),
+    pytest.param(None, b"pytest==9.0.3\n", f"{IN_DEV}: needs exactly one -r requirements.in line, and has 0",
+                 id="no include"),
+    pytest.param(None, b"-r requirements.in\npytest==9.0.3\n-r requirements.in\n",
+                 f"{IN_DEV}: needs exactly one -r requirements.in line, and has 2", id="two includes"),
+    # The forms earlier rulings accepted (amendments 10.4, 11.2, 14), and other non-canonical pins.
+    bad_line("fastapi==v0.135.1", "a v before the version"),
+    bad_line('fastapi==0.135.1;python_version>="3"', "a glued marker"),
+    bad_line("fastapi[standard]==0.136.0", "extras"),
+    bad_line("fastapi == 0.136.0", "spaces around =="),
+    bad_line("fastapi [standard]==0.136.0", "a space before the extras"),
+    bad_line("fastapi[standard] == 0.136.0", "a space after the extras"),
+    bad_line("fastapi\t==\t0.136.0", "tabs around =="),
+    bad_line("fastapi (==0.136.0)", "a parenthesised version"),
+    bad_line("  fastapi==0.135.1", "an indented pin"),
+    bad_line("fastapi==01.0", "a non-canonical version"),
+    bad_line("fastapi==0!1.0", "a zero epoch"),
+    bad_line("fastapi==1.0-rc1", "a dashed pre-release"),
+    bad_line("fastapi-==0.135.1", "a name ending in a dash"),
+    bad_line("fastapi==0.135.1 junk", "text after the version"),
+    pytest.param(None, b" -r requirements.in\npytest==9.0.3\n", not_a_pin(" -r requirements.in", 1, IN_DEV),
+                 id="an indented include"),
 ]
 
 
-@pytest.mark.parametrize("name, line, expected", IN_LINES)
-def test_in_line_grammar(name, line, expected):
-    parse_in_line = load().parse_in_line
-    if expected == REFUSED:
-        with pytest.raises(ValueError, match=r"^not an exact pin \(name==version\): "):
-            parse_in_line(line, Path(name))
-    else:
-        assert parse_in_line(line, Path(name)) == expected
-
-
-@pytest.mark.parametrize("name, line, argv", [
-    ("requirements.in", "fastapi===0.136.0", []), ("requirements.in", "fastapi>=0.135", []),
-    ("requirements.in", "fastapi==0.136.0#x", []), ("requirements-dev.in", "pytest===9.0.3", []),
-    ("requirements.in", "fastapi==0.135.1;garbage", ["--constraint", "freeze.txt"])])
-def test_a_line_that_is_not_an_exact_pin_exits_1_before_pip(script, capsys, name, line, argv):
+@pytest.mark.parametrize("runtime, dev, expected", IN_FILES)
+def test_in_file_rules(script, capsys, runtime, dev, expected):
     first_lock(script)
     before = written(script.repo)
     capsys.readouterr()
-    path = script.repo / name
-    path.write_text(f"{path.read_text()}{line}\n")
-    number = len(path.read_text().splitlines())
+    for name, data in ((IN_RUNTIME, runtime), (IN_DEV, dev)):
+        if data is not None:
+            (script.repo / name).write_bytes(data)
 
-    assert script.main([str(script.repo / arg) if arg == "freeze.txt" else arg for arg in argv]) == 1
+    def read():
+        return tuple(script.parse_in_file(script.repo / name) for name in (IN_RUNTIME, IN_DEV))
 
-    assert capsys.readouterr().out == f"{name}:{number}: not an exact pin (name==version): {line}\n"
-    assert script.pip.calls == [] and written(script.repo) == before
+    if not isinstance(expected, str):
+        assert read() == expected
+        return
+    with pytest.raises(script.Refused) as refused:
+        read()
+    assert str(refused.value) == expected
+    # Refused before pip, in both modes, and nothing written.
+    for argv in ([], ["--constraint", str(script.repo / "freeze.txt")]):
+        assert script.main(argv) == 1
+        assert capsys.readouterr().out == f"{expected}\n"
+        assert script.pip.calls == [] and written(script.repo) == before
 
 
 def test_a_hash_missing_from_pypi_exits_1(script, capsys):

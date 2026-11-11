@@ -10,10 +10,11 @@ pip's own resolver does the work (``pip install --dry-run --ignore-installed --r
 every resolution is constrained. By default the constraints are the committed lock's pins, less each name whose line
 in requirements.in or requirements-dev.in names another version: a new package resolves around the existing pins, and
 a pin moves only through its .in line. ``--constraint FILE`` takes FILE's ``name==version`` lines instead: the first
-lock, against production's ``pip freeze``. Every line of a .in file is an exact ``==`` pin, PEP 508 as ``packaging``
-parses it, or, in requirements-dev.in, ``-r requirements.in`` (``parse_in_line``); any other line stops the script
-before pip runs. A constrained version the resolution would move exits 1 and names it, and so does a pin whose chosen
-file PyPI does not list; none of these writes anything. Last it prints the constraints' names the lock leaves out: with
+lock, against production's ``pip freeze``. The .in files take one canonical form, which every pip reads the same way
+(``parse_in_file``): printable ASCII, one ``name==version`` pin per line with a canonical version and an optional
+`` # comment``, and in requirements-dev.in one ``-r requirements.in``; anything else stops the script before pip runs.
+A constrained version the resolution would move exits 1 and names it, and so does a pin whose chosen file PyPI does
+not list; none of these writes anything. Last it prints the constraints' names the lock leaves out: with
 --constraint, production's distributions no requirement reaches; without it, the dependencies the change dropped.
 """
 import argparse
@@ -26,8 +27,7 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from packaging.requirements import InvalidRequirement, Requirement
-from packaging.version import InvalidVersion, Version
+from packaging.version import Version
 
 REPO = Path(__file__).resolve().parents[1]
 RUNTIME_IN, RUNTIME_LOCK = "requirements.in", "requirements.txt"
@@ -38,11 +38,18 @@ PYPI_RELEASE = "https://pypi.org/pypi/{name}/{version}/json"
 # around the extras and the == (name [extra] == 1.0). A version begins with a letter or digit, so a line whose version
 # is missing is no pin, whatever follows it.
 PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9][^\s;#\\]*)")
-# A comment in a requirements file starts at a "#" that begins the line or follows whitespace (pip's COMMENT_RE in
-# pip/_internal/req/req_file.py); a "#" glued to text is part of it.
-COMMENT = re.compile(r"(^|\s+)#.*$")
-# The one include a .in file may hold, and only requirements-dev.in: the runtime pins.
-INCLUDE = re.compile(r"-r\s+requirements\.in")
+# The .in files' one form (D-6), which every pip reads the same way. Whole file: only tab, LF, CR and printable ASCII;
+# no "\" (pip joins the next line) and no "$" (pip expands ${VAR}); no coding declaration, pip's own pattern
+# (pip/_internal/utils/encoding.py) found anywhere in the first two lines, since pip would decode the file by it. Each
+# line, its trailing spaces and tabs ignored: blank, a comment, the include (requirements-dev.in only, exactly once)
+# or a canonical pin, each with an optional trailing comment after a space or tab.
+IN_BYTES = frozenset(b"\t\n\r" + bytes(range(0x20, 0x7F)))
+IN_CODING = re.compile(rb"coding[:=]\s*([-\w.]+)")
+IN_COMMENT = re.compile(r"[ \t]*#.*")
+IN_INCLUDE = re.compile(r"-r[ \t]+requirements\.in(?:[ \t]+#.*)?")
+IN_PIN = re.compile(r"([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
+                    r"==((?:[0-9]+!)?[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?(?:\.post[0-9]+)?(?:\.dev[0-9]+)?)"
+                    r"(?:[ \t]+#.*)?")
 # pip's conflict report names each constraint it could not keep, at INFO level (pip 24.0,
 # pip/_internal/resolution/resolvelib/factory.py), so pip runs without --quiet.
 CONSTRAINT_LINE = re.compile(r"The user requested \(constraint\) ([A-Za-z0-9][A-Za-z0-9._-]*)(\S+)")
@@ -65,7 +72,7 @@ def canonical(name: str) -> str:
 
 def pins(path: Path) -> Dict[str, str]:
     """``{canonical name: version}`` of a lock, constraints or freeze file's ``name==version`` lines; its ``-r``,
-    ``--hash`` and comment lines are skipped. The .in files are read by ``in_pins``."""
+    ``--hash`` and comment lines are skipped. The .in files are read by ``parse_in_file``."""
     found = {}
     for line in path.read_text().splitlines():
         match = PIN.match(line.strip())
@@ -74,49 +81,52 @@ def pins(path: Path) -> Dict[str, str]:
     return found
 
 
-def parse_in_line(line: str, path: Path) -> Optional[Tuple[str, str]]:
-    """One line of the .in file ``path``, read as pip reads it: ``(canonical name, version)`` for an exact pin, None for
-    a blank line, a comment or, in requirements-dev.in alone, ``-r requirements.in``. Any other line raises
-    ``ValueError``. A line ending in ``\\`` is refused, since pip would join the next line to it, and so is any other
-    option line. After its comment is removed, the pin is parsed by ``packaging`` (PEP 508: extras and a valid marker
-    are allowed) and must name no URL and hold exactly one specifier, ``==`` on a valid version without ``*``."""
-    text = line.strip()
-    if not text or text.startswith("#"):
-        return None
-    refused = ValueError(f"not an exact pin (name==version): {line}")
-    if text.endswith("\\"):
-        raise refused
-    text = COMMENT.sub("", text)
-    if text.startswith("-"):
-        if path.name == DEV_IN and INCLUDE.fullmatch(text):
-            return None
-        raise refused
-    try:
-        requirement = Requirement(text)
-    except InvalidRequirement:
-        raise refused from None
-    specifiers = list(requirement.specifier)
-    if requirement.url or len(specifiers) != 1 or specifiers[0].operator != "==" or "*" in specifiers[0].version:
-        raise refused
-    try:
-        version = Version(specifiers[0].version)
-    except InvalidVersion:
-        raise refused from None
-    return canonical(requirement.name), str(version)
+def _line_at(data: bytes, offset: int) -> int:
+    """The number of the line holding byte ``offset``, counting LF, CR and CRLF as line ends."""
+    return len(re.split(rb"\r\n|\r|\n", data[:offset]))
 
 
-def in_pins(path: Path) -> Dict[str, str]:
-    """``{canonical name: version}`` of the .in file ``path``, each line read by ``parse_in_line``; a line outside the
-    grammar is refused, named by its file and line number."""
-    found = {}
-    for number, line in enumerate(path.read_text().splitlines(), start=1):
-        try:
-            pin = parse_in_line(line, path)
-        except ValueError as exc:
-            raise Refused(f"{path.name}:{number}: {exc}") from None
-        if pin:
-            found[pin[0]] = pin[1]
-    return found
+def parse_in_file(path: Path) -> Dict[str, str]:
+    """``{canonical name: version}`` of the .in file ``path``, which must take the one canonical form (``IN_*`` above):
+    first the whole-file rules on its bytes, then each line, then no name pinned twice in it, nor, for
+    requirements-dev.in, in requirements.in too. Anything else raises ``Refused``: ``<file>:<line>: not a canonical
+    pin (name==version): <line>`` for a line, ``<file>: <rule>`` for a rule of the whole file."""
+    data, name = path.read_bytes(), path.name
+    odd = next((offset for offset, byte in enumerate(data) if byte not in IN_BYTES), None)
+    if odd is not None:
+        raise Refused(f"{name}: only tab, LF, CR and printable ASCII may appear (line {_line_at(data, odd)} holds "
+                      f"byte 0x{data[odd]:02x})")
+    odd = next((offset for offset, byte in enumerate(data) if byte in b"\\$"), None)
+    if odd is not None:
+        raise Refused(f"{name}: no \\ or $ may appear, which pip reads as a line continuation or a variable (line "
+                      f"{_line_at(data, odd)})")
+    for number, line in [*enumerate(data.split(b"\n")[:2], start=1), *enumerate(data.splitlines()[:2], start=1)]:
+        if IN_CODING.search(line):
+            raise Refused(f"{name}: no coding declaration may appear in the first two lines, since pip would decode "
+                          f"the file by it (line {number})")
+    found: Dict[str, Tuple[str, int]] = {}
+    includes = []
+    for number, line in enumerate(data.decode("ascii").splitlines(), start=1):
+        text = line.rstrip(" \t")
+        if not text or IN_COMMENT.fullmatch(text):
+            continue
+        if name == DEV_IN and IN_INCLUDE.fullmatch(text):
+            includes.append(number)
+            continue
+        match = IN_PIN.fullmatch(text)
+        if not match or str(Version(match.group(2))) != match.group(2):
+            raise Refused(f"{name}:{number}: not a canonical pin (name==version): {line}")
+        pinned = canonical(match.group(1))
+        if pinned in found:
+            raise Refused(f"{name}: {pinned} is pinned twice (lines {found[pinned][1]} and {number})")
+        found[pinned] = (match.group(2), number)
+    if name == DEV_IN:
+        if len(includes) != 1:
+            raise Refused(f"{name}: needs exactly one -r requirements.in line, and has {len(includes)}")
+        both = sorted(set(found) & set(parse_in_file(path.with_name(RUNTIME_IN))))
+        if both:
+            raise Refused(f"{name}: {', '.join(both)} pinned in {RUNTIME_IN} too")
+    return {pinned: version for pinned, (version, _) in found.items()}
 
 
 def run_pip(args: List[str]) -> Tuple[int, str]:
@@ -192,8 +202,8 @@ def lock_text(source: str, entries: Dict[str, Tuple[str, List[str]]], include: s
 
 def lock(constraint: Optional[Path]) -> Tuple[Dict[str, str], Resolved, Resolved]:
     """The constraint set and the two resolutions: the runtime set R, then the full set F, constrained by R too. Both
-    .in files are read first, so a line outside their grammar stops the lock before pip runs."""
-    wanted = {**in_pins(REPO / RUNTIME_IN), **in_pins(REPO / DEV_IN)}
+    .in files are read first, so a file outside their one form stops the lock before pip runs."""
+    wanted = {**parse_in_file(REPO / RUNTIME_IN), **parse_in_file(REPO / DEV_IN)}
     held = constraints(constraint, wanted)
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
