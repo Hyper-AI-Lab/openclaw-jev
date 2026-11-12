@@ -7,9 +7,9 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# A pin at the start of a lock line, with the whitespace PEP 508 allows around its extras and the ==. A version
-# begins with a letter or digit, so a missing version never swallows the --hash= option after it.
-PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9][^\s;#]*)")
+# A pin in a lock line: its first word, name==version, with no extras and no whitespace. A version begins with a letter
+# or digit, so a versionless entry is no pin.
+PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][^\s;#\\]*)")
 HASH = re.compile(r"--hash=sha256:[0-9a-f]{64}")
 
 
@@ -24,8 +24,10 @@ def requirements(name: str) -> list:
 
 
 def pinned(name: str) -> dict:
-    """``{canonical name: version}`` of a lock file's pins, each read from its whole line; its ``-r`` line is no pin."""
-    return {canonical(match.group(1)): match.group(2) for line in requirements(name) if (match := PIN.match(line))}
+    """``{canonical name: version}`` of a lock file's pins, each read from its line's first word; its ``-r`` line is no
+    pin."""
+    return {canonical(match.group(1)): match.group(2)
+            for line in requirements(name) if (match := PIN.fullmatch(line.split()[0]))}
 
 
 def lock_script():
