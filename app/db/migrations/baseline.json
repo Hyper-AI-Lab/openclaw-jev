@@ -1,0 +1,3134 @@
+{
+  "columns": [
+    {
+      "column": "checksum",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "artifacts",
+      "type": "character varying"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "artifacts",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "filename",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "artifacts",
+      "type": "character varying"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "artifacts",
+      "type": "character varying"
+    },
+    {
+      "column": "kind",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "artifacts",
+      "type": "character varying"
+    },
+    {
+      "column": "mime_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "artifacts",
+      "type": "character varying"
+    },
+    {
+      "column": "process_run_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "artifacts",
+      "type": "character varying"
+    },
+    {
+      "column": "size_bytes",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "artifacts",
+      "type": "integer"
+    },
+    {
+      "column": "storage_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "artifacts",
+      "type": "character varying"
+    },
+    {
+      "column": "uri",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "artifacts",
+      "type": "character varying"
+    },
+    {
+      "column": "char_count",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "integer"
+    },
+    {
+      "column": "context_header",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "text"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "document_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_chunks",
+      "type": "character varying"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_chunks",
+      "type": "character varying"
+    },
+    {
+      "column": "message_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "character varying"
+    },
+    {
+      "column": "meta",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "json"
+    },
+    {
+      "column": "ordinal",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_chunks",
+      "type": "integer"
+    },
+    {
+      "column": "process_run_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "character varying"
+    },
+    {
+      "column": "role",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "character varying"
+    },
+    {
+      "column": "section_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "character varying"
+    },
+    {
+      "column": "session_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "character varying"
+    },
+    {
+      "column": "source_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "task_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "character varying"
+    },
+    {
+      "column": "text",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_chunks",
+      "type": "text"
+    },
+    {
+      "column": "valid_to",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_chunks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "brief",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "text"
+    },
+    {
+      "column": "candidate_ids",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "json"
+    },
+    {
+      "column": "completed_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "consumed_by",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "character varying"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_context_reports",
+      "type": "character varying"
+    },
+    {
+      "column": "latency_ms",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "integer"
+    },
+    {
+      "column": "novelty",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "json"
+    },
+    {
+      "column": "queries",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "json"
+    },
+    {
+      "column": "report",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "json"
+    },
+    {
+      "column": "status",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "character varying"
+    },
+    {
+      "column": "task_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_context_reports",
+      "type": "character varying"
+    },
+    {
+      "column": "trigger",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "character varying"
+    },
+    {
+      "column": "usage",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_context_reports",
+      "type": "json"
+    },
+    {
+      "column": "content_hash",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "character varying"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "enriched_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_documents",
+      "type": "character varying"
+    },
+    {
+      "column": "kind",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_documents",
+      "type": "character varying"
+    },
+    {
+      "column": "meta",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "json"
+    },
+    {
+      "column": "process_run_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "character varying"
+    },
+    {
+      "column": "session_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "character varying"
+    },
+    {
+      "column": "source_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "source_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_documents",
+      "type": "character varying"
+    },
+    {
+      "column": "source_ref",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "json"
+    },
+    {
+      "column": "status",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "character varying"
+    },
+    {
+      "column": "summary",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "text"
+    },
+    {
+      "column": "task_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "character varying"
+    },
+    {
+      "column": "title",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "text"
+    },
+    {
+      "column": "toc",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "json"
+    },
+    {
+      "column": "updated_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "valid_to",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_documents",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "attempts",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_ingest_queue",
+      "type": "integer"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_ingest_queue",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "done_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_ingest_queue",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_ingest_queue",
+      "type": "character varying"
+    },
+    {
+      "column": "kind",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_ingest_queue",
+      "type": "character varying"
+    },
+    {
+      "column": "last_error",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_ingest_queue",
+      "type": "text"
+    },
+    {
+      "column": "next_attempt_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_ingest_queue",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "priority",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_ingest_queue",
+      "type": "integer"
+    },
+    {
+      "column": "ref_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_ingest_queue",
+      "type": "character varying"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_links",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_links",
+      "type": "character varying"
+    },
+    {
+      "column": "meta",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_links",
+      "type": "json"
+    },
+    {
+      "column": "relation",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_links",
+      "type": "character varying"
+    },
+    {
+      "column": "source_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_links",
+      "type": "character varying"
+    },
+    {
+      "column": "source_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_links",
+      "type": "character varying"
+    },
+    {
+      "column": "target_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_links",
+      "type": "character varying"
+    },
+    {
+      "column": "target_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_links",
+      "type": "character varying"
+    },
+    {
+      "column": "chunk_count",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_sections",
+      "type": "integer"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_sections",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "document_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_sections",
+      "type": "character varying"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_sections",
+      "type": "character varying"
+    },
+    {
+      "column": "level",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_sections",
+      "type": "integer"
+    },
+    {
+      "column": "ordinal",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "dm_sections",
+      "type": "integer"
+    },
+    {
+      "column": "path",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_sections",
+      "type": "text"
+    },
+    {
+      "column": "summary",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_sections",
+      "type": "text"
+    },
+    {
+      "column": "title",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_sections",
+      "type": "text"
+    },
+    {
+      "column": "updated_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "dm_sections",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "correlation_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "events",
+      "type": "character varying"
+    },
+    {
+      "column": "entity_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "events",
+      "type": "character varying"
+    },
+    {
+      "column": "entity_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "events",
+      "type": "character varying"
+    },
+    {
+      "column": "event_payload",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "events",
+      "type": "json"
+    },
+    {
+      "column": "event_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "events",
+      "type": "character varying"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "events",
+      "type": "character varying"
+    },
+    {
+      "column": "occurred_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "events",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "confidence",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "integer"
+    },
+    {
+      "column": "content",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "text"
+    },
+    {
+      "column": "content_ref",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "json"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "memory_items",
+      "type": "character varying"
+    },
+    {
+      "column": "memory_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "character varying"
+    },
+    {
+      "column": "provenance_ref",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "json"
+    },
+    {
+      "column": "scope_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "character varying"
+    },
+    {
+      "column": "scope_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "character varying"
+    },
+    {
+      "column": "supersedes_memory_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "character varying"
+    },
+    {
+      "column": "valid_from",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "valid_to",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_items",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_links",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "memory_links",
+      "type": "character varying"
+    },
+    {
+      "column": "relation",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_links",
+      "type": "character varying"
+    },
+    {
+      "column": "source_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_links",
+      "type": "character varying"
+    },
+    {
+      "column": "target_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "memory_links",
+      "type": "character varying"
+    },
+    {
+      "column": "confidence",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "observations",
+      "type": "integer"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "observations",
+      "type": "character varying"
+    },
+    {
+      "column": "observation_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "observations",
+      "type": "character varying"
+    },
+    {
+      "column": "observed_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "observations",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "payload_hash",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "observations",
+      "type": "character varying"
+    },
+    {
+      "column": "payload_ref",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "observations",
+      "type": "json"
+    },
+    {
+      "column": "process_run_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "observations",
+      "type": "character varying"
+    },
+    {
+      "column": "source",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "observations",
+      "type": "character varying"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "display_name",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "character varying"
+    },
+    {
+      "column": "last_log_mtime",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "last_seen_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "last_started_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "log_path",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "character varying"
+    },
+    {
+      "column": "pid",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "integer"
+    },
+    {
+      "column": "process_run_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "character varying"
+    },
+    {
+      "column": "run_count",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "integer"
+    },
+    {
+      "column": "scanner_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "os_process_tracks",
+      "type": "character varying"
+    },
+    {
+      "column": "script_basename",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "character varying"
+    },
+    {
+      "column": "script_path",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "character varying"
+    },
+    {
+      "column": "status",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "character varying"
+    },
+    {
+      "column": "task_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "character varying"
+    },
+    {
+      "column": "updated_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "os_process_tracks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "current_state",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "character varying"
+    },
+    {
+      "column": "ended_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "failure_criteria",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "json"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "process_runs",
+      "type": "character varying"
+    },
+    {
+      "column": "lease_owner",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "character varying"
+    },
+    {
+      "column": "next_check_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "parent_process_run_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "character varying"
+    },
+    {
+      "column": "plan_json",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "json"
+    },
+    {
+      "column": "plan_version",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "character varying"
+    },
+    {
+      "column": "process_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "character varying"
+    },
+    {
+      "column": "started_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "success_criteria",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "json"
+    },
+    {
+      "column": "task_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "process_runs",
+      "type": "character varying"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "side_effect_receipts",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "effect_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "side_effect_receipts",
+      "type": "character varying"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "side_effect_receipts",
+      "type": "character varying"
+    },
+    {
+      "column": "idempotency_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "side_effect_receipts",
+      "type": "character varying"
+    },
+    {
+      "column": "metadata_ref",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "side_effect_receipts",
+      "type": "json"
+    },
+    {
+      "column": "attempt_no",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "steps",
+      "type": "integer"
+    },
+    {
+      "column": "ended_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "steps",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "steps",
+      "type": "character varying"
+    },
+    {
+      "column": "idempotency_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "steps",
+      "type": "character varying"
+    },
+    {
+      "column": "input_ref",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "steps",
+      "type": "json"
+    },
+    {
+      "column": "output_ref",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "steps",
+      "type": "json"
+    },
+    {
+      "column": "process_run_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "steps",
+      "type": "character varying"
+    },
+    {
+      "column": "started_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "steps",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "status",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "steps",
+      "type": "character varying"
+    },
+    {
+      "column": "step_kind",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "steps",
+      "type": "character varying"
+    },
+    {
+      "column": "step_name",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "steps",
+      "type": "character varying"
+    },
+    {
+      "column": "confidence",
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "integer"
+    },
+    {
+      "column": "created_at",
+      "default": "now()",
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "decision",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "character varying"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "task_intake_decisions",
+      "type": "character varying"
+    },
+    {
+      "column": "intake_mode",
+      "default": "'shadow'::character varying",
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "character varying"
+    },
+    {
+      "column": "intent_snippet",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "character varying"
+    },
+    {
+      "column": "llm_raw",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "json"
+    },
+    {
+      "column": "policy_overrides",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "json"
+    },
+    {
+      "column": "rationale",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "text"
+    },
+    {
+      "column": "request_hash",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "character varying"
+    },
+    {
+      "column": "session_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "character varying"
+    },
+    {
+      "column": "similar_task_ids",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_intake_decisions",
+      "type": "json"
+    },
+    {
+      "column": "content",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "task_messages",
+      "type": "text"
+    },
+    {
+      "column": "created_at",
+      "default": "now()",
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_messages",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "task_messages",
+      "type": "character varying"
+    },
+    {
+      "column": "kind",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_messages",
+      "type": "character varying"
+    },
+    {
+      "column": "meta",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_messages",
+      "type": "json"
+    },
+    {
+      "column": "role",
+      "default": "'user'::character varying",
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_messages",
+      "type": "character varying"
+    },
+    {
+      "column": "session_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_messages",
+      "type": "character varying"
+    },
+    {
+      "column": "slack_ts",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_messages",
+      "type": "character varying"
+    },
+    {
+      "column": "source",
+      "default": "'api'::character varying",
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_messages",
+      "type": "character varying"
+    },
+    {
+      "column": "task_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "task_messages",
+      "type": "character varying"
+    },
+    {
+      "column": "artifact_refs",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "json"
+    },
+    {
+      "column": "duration_sec",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "integer"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "task_registry_entries",
+      "type": "character varying"
+    },
+    {
+      "column": "indexed_at",
+      "default": "now()",
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "intent_snippet",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "text"
+    },
+    {
+      "column": "outcome_summary",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "text"
+    },
+    {
+      "column": "process_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "character varying"
+    },
+    {
+      "column": "recurrence_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "character varying"
+    },
+    {
+      "column": "session_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "character varying"
+    },
+    {
+      "column": "task_created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "task_ended_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "task_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "task_registry_entries",
+      "type": "character varying"
+    },
+    {
+      "column": "task_kind",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "character varying"
+    },
+    {
+      "column": "terminal_status",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "character varying"
+    },
+    {
+      "column": "vector_point_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "task_registry_entries",
+      "type": "character varying"
+    },
+    {
+      "column": "correlation_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "goal",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "idempotency_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "intake_decision_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "next_check_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "openclaw_session_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "parent_task_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "priority",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "integer"
+    },
+    {
+      "column": "recurrence_key",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "requester",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "status",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "supplementary_context",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "json"
+    },
+    {
+      "column": "task_kind",
+      "default": "'one_shot'::character varying",
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "task_type",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "updated_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "user_request_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "tasks",
+      "type": "character varying"
+    },
+    {
+      "column": "attempts",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "vector_outbox",
+      "type": "integer"
+    },
+    {
+      "column": "created_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "vector_outbox",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "done_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "vector_outbox",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "vector_outbox",
+      "type": "character varying"
+    },
+    {
+      "column": "kind",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "vector_outbox",
+      "type": "character varying"
+    },
+    {
+      "column": "last_error",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "vector_outbox",
+      "type": "text"
+    },
+    {
+      "column": "next_attempt_at",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": false,
+      "table": "vector_outbox",
+      "type": "timestamp without time zone"
+    },
+    {
+      "column": "ref_id",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "not_null": true,
+      "table": "vector_outbox",
+      "type": "character varying"
+    }
+  ],
+  "constraints": [
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "artifacts_pkey",
+      "table": "artifacts",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (process_run_id) REFERENCES process_runs(id)",
+      "name": "artifacts_process_run_id_fkey",
+      "table": "artifacts",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (document_id) REFERENCES dm_documents(id)",
+      "name": "dm_chunks_document_id_fkey",
+      "table": "dm_chunks",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "dm_chunks_pkey",
+      "table": "dm_chunks",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (section_id) REFERENCES dm_sections(id)",
+      "name": "dm_chunks_section_id_fkey",
+      "table": "dm_chunks",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "dm_context_reports_pkey",
+      "table": "dm_context_reports",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (task_id) REFERENCES tasks(id)",
+      "name": "dm_context_reports_task_id_fkey",
+      "table": "dm_context_reports",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "dm_documents_pkey",
+      "table": "dm_documents",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "UNIQUE (source_key)",
+      "name": "dm_documents_source_key_key",
+      "table": "dm_documents",
+      "type": "u",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (task_id) REFERENCES tasks(id)",
+      "name": "dm_documents_task_id_fkey",
+      "table": "dm_documents",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "dm_ingest_queue_pkey",
+      "table": "dm_ingest_queue",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "dm_links_pkey",
+      "table": "dm_links",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (document_id) REFERENCES dm_documents(id)",
+      "name": "dm_sections_document_id_fkey",
+      "table": "dm_sections",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "dm_sections_pkey",
+      "table": "dm_sections",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "events_pkey",
+      "table": "events",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "memory_items_pkey",
+      "table": "memory_items",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "memory_links_pkey",
+      "table": "memory_links",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (source_id) REFERENCES memory_items(id)",
+      "name": "memory_links_source_id_fkey",
+      "table": "memory_links",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (target_id) REFERENCES memory_items(id)",
+      "name": "memory_links_target_id_fkey",
+      "table": "memory_links",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "observations_pkey",
+      "table": "observations",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (process_run_id) REFERENCES process_runs(id)",
+      "name": "observations_process_run_id_fkey",
+      "table": "observations",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (scanner_id)",
+      "name": "os_process_tracks_pkey",
+      "table": "os_process_tracks",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (process_run_id) REFERENCES process_runs(id)",
+      "name": "os_process_tracks_process_run_id_fkey",
+      "table": "os_process_tracks",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (task_id) REFERENCES tasks(id)",
+      "name": "os_process_tracks_task_id_fkey",
+      "table": "os_process_tracks",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "process_runs_pkey",
+      "table": "process_runs",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (task_id) REFERENCES tasks(id)",
+      "name": "process_runs_task_id_fkey",
+      "table": "process_runs",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "side_effect_receipts_pkey",
+      "table": "side_effect_receipts",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "steps_pkey",
+      "table": "steps",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (process_run_id) REFERENCES process_runs(id)",
+      "name": "steps_process_run_id_fkey",
+      "table": "steps",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "task_intake_decisions_pkey",
+      "table": "task_intake_decisions",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "task_messages_pkey",
+      "table": "task_messages",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (task_id) REFERENCES tasks(id)",
+      "name": "task_messages_task_id_fkey",
+      "table": "task_messages",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "task_registry_entries_pkey",
+      "table": "task_registry_entries",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "FOREIGN KEY (task_id) REFERENCES tasks(id)",
+      "name": "task_registry_entries_task_id_fkey",
+      "table": "task_registry_entries",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "definition": "UNIQUE (task_id)",
+      "name": "task_registry_entries_task_id_key",
+      "table": "task_registry_entries",
+      "type": "u",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "tasks_pkey",
+      "table": "tasks",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "definition": "PRIMARY KEY (id)",
+      "name": "vector_outbox_pkey",
+      "table": "vector_outbox",
+      "type": "p",
+      "validated": true
+    }
+  ],
+  "extensions": [
+    {
+      "name": "plpgsql",
+      "version": "1.0"
+    }
+  ],
+  "indexes": [
+    {
+      "definition": "CREATE UNIQUE INDEX artifacts_pkey ON public.artifacts USING btree (id)",
+      "name": "artifacts_pkey",
+      "table": "artifacts",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX dm_chunks_pkey ON public.dm_chunks USING btree (id)",
+      "name": "dm_chunks_pkey",
+      "table": "dm_chunks",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX dm_context_reports_pkey ON public.dm_context_reports USING btree (id)",
+      "name": "dm_context_reports_pkey",
+      "table": "dm_context_reports",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX dm_documents_pkey ON public.dm_documents USING btree (id)",
+      "name": "dm_documents_pkey",
+      "table": "dm_documents",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX dm_documents_source_key_key ON public.dm_documents USING btree (source_key)",
+      "name": "dm_documents_source_key_key",
+      "table": "dm_documents",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX dm_ingest_queue_pkey ON public.dm_ingest_queue USING btree (id)",
+      "name": "dm_ingest_queue_pkey",
+      "table": "dm_ingest_queue",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX dm_links_pkey ON public.dm_links USING btree (id)",
+      "name": "dm_links_pkey",
+      "table": "dm_links",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX dm_sections_pkey ON public.dm_sections USING btree (id)",
+      "name": "dm_sections_pkey",
+      "table": "dm_sections",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX events_pkey ON public.events USING btree (id)",
+      "name": "events_pkey",
+      "table": "events",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_artifacts_checksum ON public.artifacts USING btree (checksum)",
+      "name": "ix_artifacts_checksum",
+      "table": "artifacts",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_artifacts_kind ON public.artifacts USING btree (kind)",
+      "name": "ix_artifacts_kind",
+      "table": "artifacts",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_artifacts_process_run_id ON public.artifacts USING btree (process_run_id)",
+      "name": "ix_artifacts_process_run_id",
+      "table": "artifacts",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_chunks_document_id ON public.dm_chunks USING btree (document_id)",
+      "name": "ix_dm_chunks_document_id",
+      "table": "dm_chunks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_chunks_document_ordinal ON public.dm_chunks USING btree (document_id, ordinal)",
+      "name": "ix_dm_chunks_document_ordinal",
+      "table": "dm_chunks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_chunks_fts ON public.dm_chunks USING gin (to_tsvector('english'::regconfig, ((COALESCE(context_header, ''::text) || ' '::text) || COALESCE(text, ''::text))))",
+      "name": "ix_dm_chunks_fts",
+      "table": "dm_chunks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_chunks_message_id ON public.dm_chunks USING btree (message_id)",
+      "name": "ix_dm_chunks_message_id",
+      "table": "dm_chunks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_chunks_section_id ON public.dm_chunks USING btree (section_id)",
+      "name": "ix_dm_chunks_section_id",
+      "table": "dm_chunks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_chunks_session_key ON public.dm_chunks USING btree (session_key)",
+      "name": "ix_dm_chunks_session_key",
+      "table": "dm_chunks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_chunks_source_at ON public.dm_chunks USING btree (source_at)",
+      "name": "ix_dm_chunks_source_at",
+      "table": "dm_chunks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_chunks_task_id ON public.dm_chunks USING btree (task_id)",
+      "name": "ix_dm_chunks_task_id",
+      "table": "dm_chunks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_context_reports_status ON public.dm_context_reports USING btree (status)",
+      "name": "ix_dm_context_reports_status",
+      "table": "dm_context_reports",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_context_reports_task_id ON public.dm_context_reports USING btree (task_id)",
+      "name": "ix_dm_context_reports_task_id",
+      "table": "dm_context_reports",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_documents_fts ON public.dm_documents USING gin (to_tsvector('english'::regconfig, ((COALESCE(title, ''::text) || ' '::text) || COALESCE(summary, ''::text))))",
+      "name": "ix_dm_documents_fts",
+      "table": "dm_documents",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_documents_kind ON public.dm_documents USING btree (kind)",
+      "name": "ix_dm_documents_kind",
+      "table": "dm_documents",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_documents_process_run_id ON public.dm_documents USING btree (process_run_id)",
+      "name": "ix_dm_documents_process_run_id",
+      "table": "dm_documents",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_documents_session_key ON public.dm_documents USING btree (session_key)",
+      "name": "ix_dm_documents_session_key",
+      "table": "dm_documents",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_documents_source_at ON public.dm_documents USING btree (source_at)",
+      "name": "ix_dm_documents_source_at",
+      "table": "dm_documents",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_documents_status ON public.dm_documents USING btree (status)",
+      "name": "ix_dm_documents_status",
+      "table": "dm_documents",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_documents_task_id ON public.dm_documents USING btree (task_id)",
+      "name": "ix_dm_documents_task_id",
+      "table": "dm_documents",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_ingest_due ON public.dm_ingest_queue USING btree (priority, next_attempt_at) WHERE (done_at IS NULL)",
+      "name": "ix_dm_ingest_due",
+      "table": "dm_ingest_queue",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_ingest_queue_done_at ON public.dm_ingest_queue USING btree (done_at)",
+      "name": "ix_dm_ingest_queue_done_at",
+      "table": "dm_ingest_queue",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_ingest_queue_ref_id ON public.dm_ingest_queue USING btree (ref_id)",
+      "name": "ix_dm_ingest_queue_ref_id",
+      "table": "dm_ingest_queue",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_links_relation ON public.dm_links USING btree (relation)",
+      "name": "ix_dm_links_relation",
+      "table": "dm_links",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_links_source_id ON public.dm_links USING btree (source_id)",
+      "name": "ix_dm_links_source_id",
+      "table": "dm_links",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_links_target_id ON public.dm_links USING btree (target_id)",
+      "name": "ix_dm_links_target_id",
+      "table": "dm_links",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_sections_document_id ON public.dm_sections USING btree (document_id)",
+      "name": "ix_dm_sections_document_id",
+      "table": "dm_sections",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_dm_sections_fts ON public.dm_sections USING gin (to_tsvector('english'::regconfig, ((COALESCE(title, ''::text) || ' '::text) || COALESCE(summary, ''::text))))",
+      "name": "ix_dm_sections_fts",
+      "table": "dm_sections",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_events_correlation_id ON public.events USING btree (correlation_id)",
+      "name": "ix_events_correlation_id",
+      "table": "events",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_events_entity_id ON public.events USING btree (entity_id)",
+      "name": "ix_events_entity_id",
+      "table": "events",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_events_type_time ON public.events USING btree (event_type, occurred_at)",
+      "name": "ix_events_type_time",
+      "table": "events",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_memory_items_content_fts ON public.memory_items USING gin (to_tsvector('simple'::regconfig, COALESCE(content, ''::text)))",
+      "name": "ix_memory_items_content_fts",
+      "table": "memory_items",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_memory_items_scope_id ON public.memory_items USING btree (scope_id)",
+      "name": "ix_memory_items_scope_id",
+      "table": "memory_items",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_memory_items_scope_type ON public.memory_items USING btree (scope_type)",
+      "name": "ix_memory_items_scope_type",
+      "table": "memory_items",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_memory_link_pair ON public.memory_links USING btree (source_id, target_id, relation)",
+      "name": "ix_memory_link_pair",
+      "table": "memory_links",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_memory_links_relation ON public.memory_links USING btree (relation)",
+      "name": "ix_memory_links_relation",
+      "table": "memory_links",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_memory_links_source ON public.memory_links USING btree (source_id)",
+      "name": "ix_memory_links_source",
+      "table": "memory_links",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_memory_links_source_id ON public.memory_links USING btree (source_id)",
+      "name": "ix_memory_links_source_id",
+      "table": "memory_links",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_memory_links_target ON public.memory_links USING btree (target_id)",
+      "name": "ix_memory_links_target",
+      "table": "memory_links",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_memory_links_target_id ON public.memory_links USING btree (target_id)",
+      "name": "ix_memory_links_target_id",
+      "table": "memory_links",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_memory_scope ON public.memory_items USING btree (scope_type, scope_id, memory_type)",
+      "name": "ix_memory_scope",
+      "table": "memory_items",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_observations_process_run_id ON public.observations USING btree (process_run_id)",
+      "name": "ix_observations_process_run_id",
+      "table": "observations",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_os_process_tracks_process_run_id ON public.os_process_tracks USING btree (process_run_id)",
+      "name": "ix_os_process_tracks_process_run_id",
+      "table": "os_process_tracks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_os_process_tracks_status ON public.os_process_tracks USING btree (status)",
+      "name": "ix_os_process_tracks_status",
+      "table": "os_process_tracks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_os_process_tracks_task_id ON public.os_process_tracks USING btree (task_id)",
+      "name": "ix_os_process_tracks_task_id",
+      "table": "os_process_tracks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_process_runs_parent_process_run_id ON public.process_runs USING btree (parent_process_run_id)",
+      "name": "ix_process_runs_parent_process_run_id",
+      "table": "process_runs",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_process_runs_task_id ON public.process_runs USING btree (task_id)",
+      "name": "ix_process_runs_task_id",
+      "table": "process_runs",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ix_side_effect_idempotency ON public.side_effect_receipts USING btree (idempotency_key)",
+      "name": "ix_side_effect_idempotency",
+      "table": "side_effect_receipts",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_side_effect_receipts_effect_type ON public.side_effect_receipts USING btree (effect_type)",
+      "name": "ix_side_effect_receipts_effect_type",
+      "table": "side_effect_receipts",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ix_side_effect_receipts_idempotency_key ON public.side_effect_receipts USING btree (idempotency_key)",
+      "name": "ix_side_effect_receipts_idempotency_key",
+      "table": "side_effect_receipts",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_steps_process_run_id ON public.steps USING btree (process_run_id)",
+      "name": "ix_steps_process_run_id",
+      "table": "steps",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_intake_decisions_decision ON public.task_intake_decisions USING btree (decision)",
+      "name": "ix_task_intake_decisions_decision",
+      "table": "task_intake_decisions",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_intake_decisions_request_hash ON public.task_intake_decisions USING btree (request_hash)",
+      "name": "ix_task_intake_decisions_request_hash",
+      "table": "task_intake_decisions",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_messages_fts ON public.task_messages USING gin (to_tsvector('english'::regconfig, COALESCE(content, ''::text)))",
+      "name": "ix_task_messages_fts",
+      "table": "task_messages",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_messages_kind ON public.task_messages USING btree (kind)",
+      "name": "ix_task_messages_kind",
+      "table": "task_messages",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_messages_session_key ON public.task_messages USING btree (session_key)",
+      "name": "ix_task_messages_session_key",
+      "table": "task_messages",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_messages_slack_ts ON public.task_messages USING btree (slack_ts)",
+      "name": "ix_task_messages_slack_ts",
+      "table": "task_messages",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_messages_task_created ON public.task_messages USING btree (task_id, created_at)",
+      "name": "ix_task_messages_task_created",
+      "table": "task_messages",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_messages_task_id ON public.task_messages USING btree (task_id)",
+      "name": "ix_task_messages_task_id",
+      "table": "task_messages",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_registry_entries_process_type ON public.task_registry_entries USING btree (process_type)",
+      "name": "ix_task_registry_entries_process_type",
+      "table": "task_registry_entries",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_registry_entries_recurrence_key ON public.task_registry_entries USING btree (recurrence_key)",
+      "name": "ix_task_registry_entries_recurrence_key",
+      "table": "task_registry_entries",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_registry_entries_session_key ON public.task_registry_entries USING btree (session_key)",
+      "name": "ix_task_registry_entries_session_key",
+      "table": "task_registry_entries",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_registry_entries_task_id ON public.task_registry_entries USING btree (task_id)",
+      "name": "ix_task_registry_entries_task_id",
+      "table": "task_registry_entries",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_registry_entries_terminal_status ON public.task_registry_entries USING btree (terminal_status)",
+      "name": "ix_task_registry_entries_terminal_status",
+      "table": "task_registry_entries",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_registry_fts ON public.task_registry_entries USING gin (to_tsvector('english'::regconfig, ((COALESCE(intent_snippet, ''::text) || ' '::text) || COALESCE(outcome_summary, ''::text))))",
+      "name": "ix_task_registry_fts",
+      "table": "task_registry_entries",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_task_registry_recurrence ON public.task_registry_entries USING btree (recurrence_key, terminal_status)",
+      "name": "ix_task_registry_recurrence",
+      "table": "task_registry_entries",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_correlation_id ON public.tasks USING btree (correlation_id)",
+      "name": "ix_tasks_correlation_id",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_goal_fts ON public.tasks USING gin (to_tsvector('english'::regconfig, (COALESCE(goal, ''::character varying))::text))",
+      "name": "ix_tasks_goal_fts",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ix_tasks_idempotency_key ON public.tasks USING btree (idempotency_key)",
+      "name": "ix_tasks_idempotency_key",
+      "table": "tasks",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_intake_decision_id ON public.tasks USING btree (intake_decision_id)",
+      "name": "ix_tasks_intake_decision_id",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_openclaw_session_key ON public.tasks USING btree (openclaw_session_key)",
+      "name": "ix_tasks_openclaw_session_key",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_parent_task_id ON public.tasks USING btree (parent_task_id)",
+      "name": "ix_tasks_parent_task_id",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_recurrence_key ON public.tasks USING btree (recurrence_key)",
+      "name": "ix_tasks_recurrence_key",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_session ON public.tasks USING btree (openclaw_session_key)",
+      "name": "ix_tasks_session",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_status ON public.tasks USING btree (status)",
+      "name": "ix_tasks_status",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_task_kind ON public.tasks USING btree (task_kind)",
+      "name": "ix_tasks_task_kind",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_task_type ON public.tasks USING btree (task_type)",
+      "name": "ix_tasks_task_type",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_tasks_user_request_id ON public.tasks USING btree (user_request_id)",
+      "name": "ix_tasks_user_request_id",
+      "table": "tasks",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_vector_outbox_done_at ON public.vector_outbox USING btree (done_at)",
+      "name": "ix_vector_outbox_done_at",
+      "table": "vector_outbox",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_vector_outbox_next_attempt_at ON public.vector_outbox USING btree (next_attempt_at)",
+      "name": "ix_vector_outbox_next_attempt_at",
+      "table": "vector_outbox",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_vector_outbox_pending ON public.vector_outbox USING btree (next_attempt_at) WHERE (done_at IS NULL)",
+      "name": "ix_vector_outbox_pending",
+      "table": "vector_outbox",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ix_vector_outbox_ref_id ON public.vector_outbox USING btree (ref_id)",
+      "name": "ix_vector_outbox_ref_id",
+      "table": "vector_outbox",
+      "unique": false,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX memory_items_pkey ON public.memory_items USING btree (id)",
+      "name": "memory_items_pkey",
+      "table": "memory_items",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX memory_links_pkey ON public.memory_links USING btree (id)",
+      "name": "memory_links_pkey",
+      "table": "memory_links",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX observations_pkey ON public.observations USING btree (id)",
+      "name": "observations_pkey",
+      "table": "observations",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX os_process_tracks_pkey ON public.os_process_tracks USING btree (scanner_id)",
+      "name": "os_process_tracks_pkey",
+      "table": "os_process_tracks",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX process_runs_pkey ON public.process_runs USING btree (id)",
+      "name": "process_runs_pkey",
+      "table": "process_runs",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX side_effect_receipts_pkey ON public.side_effect_receipts USING btree (id)",
+      "name": "side_effect_receipts_pkey",
+      "table": "side_effect_receipts",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX steps_pkey ON public.steps USING btree (id)",
+      "name": "steps_pkey",
+      "table": "steps",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX task_intake_decisions_pkey ON public.task_intake_decisions USING btree (id)",
+      "name": "task_intake_decisions_pkey",
+      "table": "task_intake_decisions",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX task_messages_pkey ON public.task_messages USING btree (id)",
+      "name": "task_messages_pkey",
+      "table": "task_messages",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX task_registry_entries_pkey ON public.task_registry_entries USING btree (id)",
+      "name": "task_registry_entries_pkey",
+      "table": "task_registry_entries",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX task_registry_entries_task_id_key ON public.task_registry_entries USING btree (task_id)",
+      "name": "task_registry_entries_task_id_key",
+      "table": "task_registry_entries",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX tasks_pkey ON public.tasks USING btree (id)",
+      "name": "tasks_pkey",
+      "table": "tasks",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ux_dm_ingest_pending ON public.dm_ingest_queue USING btree (kind, ref_id) WHERE (done_at IS NULL)",
+      "name": "ux_dm_ingest_pending",
+      "table": "dm_ingest_queue",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ux_dm_links_edge ON public.dm_links USING btree (source_id, target_id, relation)",
+      "name": "ux_dm_links_edge",
+      "table": "dm_links",
+      "unique": true,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX vector_outbox_pkey ON public.vector_outbox USING btree (id)",
+      "name": "vector_outbox_pkey",
+      "table": "vector_outbox",
+      "unique": true,
+      "valid": true
+    }
+  ],
+  "other_objects": [],
+  "tables": [
+    {
+      "kind": "r",
+      "name": "artifacts",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "dm_chunks",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "dm_context_reports",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "dm_documents",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "dm_ingest_queue",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "dm_links",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "dm_sections",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "events",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "memory_items",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "memory_links",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "observations",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "os_process_tracks",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "process_runs",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "side_effect_receipts",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "steps",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "task_intake_decisions",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "task_messages",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "task_registry_entries",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "tasks",
+      "persistence": "p"
+    },
+    {
+      "kind": "r",
+      "name": "vector_outbox",
+      "persistence": "p"
+    }
+  ]
+}
