@@ -8,22 +8,26 @@ the full suite on that exact commit as aura-coder, then hands off; the unit land
 A deploy waits queued on disk (``RUNS_DIR/<task>``). One launcher, ``next_deploy``, run by the reconciler's
 ``watch_main`` every minute and by the hand-off, starts the detached root unit (``ops/coding_deploy.py``) of the
 next queued run, only when no deploy unit runs, nothing holds the code-reload lock and no user task is active.
-The unit does its slow work first (a reviewed run's land and CI wait, and the venv of the head's lock files when
-they changed), then holds the code-reload lock, refuses mirrors edited by hand and, right after the strict idle
-count, stops the affected units, the API first with a second count; it points the live venv link at the new venv,
-fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in full and starts the units again, then checks
-health, readiness (like with like: only a check that passed before can fail it) and a canary.
+The unit first blocks a change whose readiness-hashed host files or Claude Code pin are not installed on the host,
+then does its slow work (a reviewed run's land and CI wait, the venv of the head's lock files when they changed, and
+a copy of OpenClaw's dist when its patches changed), then holds the code-reload lock, replays the running workflows
+on the head's code, refuses mirrors edited by hand and, right after the strict idle count, stops the affected units,
+the API first with a second count; it points the live venv link at the new venv, fast-forwards the live ``main`` to
+GitHub's, reconciles the mirrors in full, applies OpenClaw's model policy and dist patches when they changed and
+starts the units again, then checks health, readiness (like with like: only a check that passed before can fail it)
+and a canary.
 It never installs a unit file; the result names the changed ones. On failure it reverts the live ``main`` the same
-way at once, the tree first and the venv after, lands the revert on GitHub as a pull request of its own whatever
-that window did, then checks health again. Each phase is written to the run's state as it happens, so a killed
-unit's run resumes from its phase. It records the result under the code-reload lock: Kirill's note for Aura's own
-first, retried, then the event; a reviewed job's workflow then replies on the new code.
+way at once, the tree first and the venv after, then OpenClaw's dist and policy, lands the revert on GitHub as a pull
+request of its own whatever that window did, then checks health again. Each phase is written to the run's state as
+it happens, so a killed unit's run resumes from its phase. It records the result under the code-reload lock: Kirill's
+note for Aura's own first, retried, then the event; a reviewed job's workflow then replies on the new code.
 """
 from __future__ import annotations
 
 import ast
 import asyncio
 import fcntl
+import filecmp
 import hashlib
 import io
 import json
@@ -73,6 +77,8 @@ SERVICE_PATHS = (
     ("requirements.txt", ("rmp-api", "rmp-worker")),
     ("requirements-dev.txt", ("rmp-api", "rmp-worker")),
     ("plugins/", ("openclaw-gateway",)),
+    ("patch_openclaw.sh", ("openclaw-gateway",)),
+    ("ops/openclaw_patch_audit.py", ("openclaw-gateway",)),
     ("web-stack/", ("aura-web-backends",)),
 )
 # RMP's venvs, one per lock, under the venvs root (``venvs.VENVS_ROOT``); the live checkout's ``venv`` links to one.
@@ -84,6 +90,17 @@ CURSOR_RULES_MIRROR = Path("/root/.cursor/rules")
 # The web backends' venv, untracked in their mirror, and the requirements installed into it in place when they change.
 WEB_VENV = WEB_STACK_MIRROR / "backends" / ".venv"
 WEB_REQUIREMENTS = "web-stack/backends/requirements.txt"
+# OpenClaw's side of a change, run in the window once the tree moved, and again (or undone) by a revert: the model
+# policy, which the gateway reads from openclaw.json live, and the patches of OpenClaw's dist, which the gateway loads at
+# its start. The dist is the one patch_openclaw.sh patches; a run copies it first, and its revert restores that copy.
+POLICY_SOURCE = "app/llm/model_policy.py"
+POLICY_COMMAND = ("import json; from app.llm.model_policy import apply_openclaw_policy; "
+                  "print(json.dumps(apply_openclaw_policy()['changed']))")
+POLICY_TIMEOUT_SEC = 300
+PATCH_SOURCES = ("patch_openclaw.sh", "ops/openclaw_patch_audit.py")
+OPENCLAW_DIST = Path(os.environ.get("OPENCLAW_DIST_DIR", "/usr/lib/node_modules/openclaw/dist"))
+PATCH_TIMEOUT_SEC = 900
+AUDIT_TIMEOUT_SEC = 300
 MIRRORS = (
     ("plugins/", PLUGINS_MIRROR),
     ("web-stack/", WEB_STACK_MIRROR),
@@ -648,6 +665,7 @@ def end_dead_runs(host: "Host") -> List[Tuple[str, Dict[str, Any], Dict[str, Any
                 write_json(spec_file(task).with_name("result.json"), result)
                 state_file(task).unlink()
                 drop_web_venv_copy(task)
+                drop_dist_copy(task)
             logger.error("The deploy run of %s is dead: %s", task, result["summary"])
             ended.append((task, spec, result))
         return ended
@@ -691,6 +709,7 @@ def abort_run(task_id: str) -> str:
                    {"status": "failed", "source": _source(task_id, spec), "head": spec.get("head"), "summary": summary})
         state_file(task_id).unlink()
         drop_web_venv_copy(task_id)
+        drop_dist_copy(task_id)
         return f"Aborted the deploy of {task_id} in phase {phase}: it is recorded failed, and its state is removed."
     finally:
         os.close(fd)
@@ -978,6 +997,29 @@ class Host:
             return {"error": result.get("error") or f"exit {run.returncode}"}
         return result
 
+    def _openclaw_step(self, argv: List[str], timeout: float, failure: str) -> str:
+        """Run one of OpenClaw's steps from the live tree, which is the change's (or the revert's) by now: its output,
+        or ``failure`` with the end of what it printed when it exits non-zero."""
+        run = subprocess.run(argv, cwd=self.live, capture_output=True, text=True, timeout=timeout,
+                             env={**os.environ, "PYTHONPATH": str(self.live), "OPENCLAW_DIST_DIR": str(OPENCLAW_DIST)})
+        if run.returncode != 0:
+            raise RuntimeError(f"{failure}: {(run.stdout + run.stderr).strip()[-300:]}")
+        return run.stdout
+
+    def apply_openclaw_policy(self) -> str:
+        """OpenClaw's model policy as the live tree writes it into openclaw.json, in a process of its own on the live
+        venv: this unit's modules are from before the change. The keys it changed, as JSON."""
+        python = str(self.live / "venv" / "bin" / "python")
+        return self._openclaw_step([python, "-c", POLICY_COMMAND], POLICY_TIMEOUT_SEC,
+                                   "applying OpenClaw's model policy failed").strip()
+
+    def patch_openclaw(self) -> None:
+        """The live tree's patches of OpenClaw's dist, then its audit of them, while the gateway is stopped."""
+        python = str(self.live / "venv" / "bin" / "python")
+        self._openclaw_step(["bash", str(self.live / "patch_openclaw.sh")], PATCH_TIMEOUT_SEC, "patching OpenClaw failed")
+        self._openclaw_step([python, str(self.live / "ops" / "openclaw_patch_audit.py"), str(OPENCLAW_DIST)],
+                            AUDIT_TIMEOUT_SEC, "patching OpenClaw failed")
+
     def installed_sha256(self, path: Path) -> Optional[str]:
         """The sha256 of the host file ``path`` as installed, or None when it is not a file."""
         return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
@@ -1214,6 +1256,95 @@ def _restore_web_venv(task: str, log: Callable[[str], None]) -> None:
     log(f"renamed {copy} back to {WEB_VENV}")
 
 
+def _dist_copy(task: str) -> Path:
+    return RUNS_DIR / task / "openclaw-dist.before"
+
+
+def drop_dist_copy(task_id: str) -> None:
+    """Delete the copy of OpenClaw's dist a run took before its change, once the run has its result. Never raises."""
+    shutil.rmtree(_dist_copy(task_id), ignore_errors=True)
+
+
+def _copy_dist(task: str, changed: List[Tuple[str, str]], log: Callable[[str], None]) -> None:
+    """Before the change, when OpenClaw's patches or their audit changed: a copy of OpenClaw's dist in the run's
+    directory, which a revert restores. Patches are edits in place that nothing else undoes. A copy an earlier launch
+    took before it waited is replaced: the dist is still the one it copied."""
+    if not any(path in PATCH_SOURCES for _, path in changed):
+        return
+    copy = _dist_copy(task)
+    shutil.rmtree(copy, ignore_errors=True)
+    shutil.copytree(OPENCLAW_DIST, copy, symlinks=True)
+    log(f"copied {OPENCLAW_DIST} to {copy}")
+
+
+def _same_entry(one: Path, other: Path) -> bool:
+    """Whether two paths hold the same: links with the same target, or regular files with the same bytes."""
+    if one.is_symlink() or other.is_symlink():
+        return one.is_symlink() and other.is_symlink() and os.readlink(one) == os.readlink(other)
+    return one.is_file() and other.is_file() and filecmp.cmp(one, other, shallow=False)
+
+
+def _is_tree(path: Path) -> bool:
+    return path.is_dir() and not path.is_symlink()
+
+
+def restore_tree(copy: Path, target: Path) -> List[str]:
+    """Put ``target`` back as ``copy`` holds it: every file or link the copy lacks is removed (a directory it lacks
+    with everything in it), and every one whose content differs from the copy's, or that is missing, is copied back,
+    each through a temporary file renamed over it. What is already as in the copy is left alone, so a resumed revert can
+    run it again. The paths removed or restored, relative to ``target``."""
+    done = []
+    for root, dirs, files in os.walk(target):
+        for name in [*dirs, *files]:
+            path = Path(root) / name
+            kept = copy / path.relative_to(target)
+            if os.path.lexists(kept) and _is_tree(kept) == _is_tree(path):
+                continue
+            if _is_tree(path):
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            if name in dirs:
+                dirs.remove(name)
+            done.append(str(path.relative_to(target)))
+    for root, dirs, files in os.walk(copy):
+        for name in [*dirs, *files]:
+            kept = Path(root) / name
+            path = target / kept.relative_to(copy)
+            if _is_tree(kept):
+                path.mkdir(exist_ok=True)
+                continue
+            if os.path.lexists(path) and _same_entry(kept, path):
+                continue
+            tmp = path.with_name(f".{path.name}.aura-restore")
+            tmp.unlink(missing_ok=True)
+            if kept.is_symlink():
+                os.symlink(os.readlink(kept), tmp)
+            else:
+                shutil.copy2(kept, tmp)
+            os.replace(tmp, path)
+            done.append(str(path.relative_to(target)))
+    return done
+
+
+def _openclaw_steps(host: Host, task: str, paths: List[str], forward: bool, log: Callable[[str], None]) -> None:
+    """OpenClaw's side of the window, after the tree and the mirrors: forward, the model policy of the new tree, then
+    the patches of the dist and their audit; back, the dist restored from the copy taken before the change, then the
+    policy of the reverted tree. Each runs only when the change touched its files; a failure raises, so forward it is
+    the deploy's failure."""
+    patches, policy = any(path in PATCH_SOURCES for path in paths), POLICY_SOURCE in paths
+    if forward and policy:
+        log(f"applied OpenClaw's model policy (changed {host.apply_openclaw_policy()})")
+    if forward and patches:
+        host.patch_openclaw()
+        log(f"patched and audited {OPENCLAW_DIST}")
+    if not forward and patches and _dist_copy(task).is_dir():
+        restored = restore_tree(_dist_copy(task), OPENCLAW_DIST)
+        log(f"restored {OPENCLAW_DIST} from {_dist_copy(task)} ({len(restored)} path(s))")
+    if not forward and policy:
+        log(f"applied OpenClaw's model policy again (changed {host.apply_openclaw_policy()})")
+
+
 def _venv_back(host: Host, run: Dict[str, Any], log: Callable[[str], None]) -> None:
     """Point the venv link back at the run's recorded previous venv on the way out of a window that failed before the
     tree moved. A switch that fails is logged, so the failure that brought the run here is the one handled; the run
@@ -1236,9 +1367,10 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
     (waiting). Then, forward, the venv link goes to the run's planned venv before the tree moves to ``head``
     (``merged``); back, the tree moves to the recorded revert commit before the link goes back to the recorded previous
     venv. The web stack's changed requirements are installed into its venv (back: its copy from before the change is
-    renamed back), the mirrors are reconciled and the units started in one call (``restarted``, forward). Back, both
-    counts are skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units
-    are started before the window is left. While the live main, read again then, is still at ``old``, a failure first
+    renamed back), the mirrors are reconciled, OpenClaw's side is applied (back: undone, ``_openclaw_steps``) and the
+    units started in one call (``restarted``, forward). Back, both counts are skipped. Every step finds itself done
+    when a resumed run repeats it. Whatever raises inside, the units are started before the window is left. While the
+    live main, read again then, is still at ``old``, a failure first
     points the venv link back at the recorded previous venv; a kill (``Interrupted``) leaves it where the switch got
     to, which the switch's one exchange keeps at either venv, never at none. Either puts the run back in its phase
     before ``applying`` once the link is at the recorded previous venv, so a run whose venv moved stays ``applying``,
@@ -1286,6 +1418,7 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
                 _restore_web_venv(task, log)
         for prefix, mirror in MIRRORS:
             reconcile(live, target, changed, prefix, mirror)
+        _openclaw_steps(host, task, [path for _, path in changed], forward, log)
         if units:
             host.systemctl("start", *units)
             log(f"started {', '.join(units)}")
@@ -1392,6 +1525,7 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     changed = changes(live, old, head)
     target = _build_venv(host, task, head, changed, log)
     _copy_web_venv(task, changed, log)
+    _copy_dist(task, changed, log)
     with host.hold(CODE_RELOAD_LOCK, LOCK_WAIT_SEC) as held:
         if not held:
             log(f"waiting: {CODE_RELOAD_LOCK} stayed held for {LOCK_WAIT_SEC} s; the run keeps its phase")

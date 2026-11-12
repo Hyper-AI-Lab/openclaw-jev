@@ -77,6 +77,8 @@ def repos(tmp_path, monkeypatch):
     monkeypatch.setattr(deploy, "RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
     monkeypatch.setattr(venvs, "VENVS_ROOT", tmp_path / "venvs")
+    # OpenClaw's dist, which a change of its patches copies, patches and restores (absent until a test makes it).
+    monkeypatch.setattr(deploy, "OPENCLAW_DIST", tmp_path / "openclaw" / "dist")
     # The host files the deploy compares with their repo copies, installed on tmp_path (none installed yet).
     monkeypatch.setattr(deploy, "HOST_INSTALLED", tuple(
         (source, tmp_path / "host" / str(installed).lstrip("/")) for source, installed in deploy.HOST_INSTALLED))
@@ -121,16 +123,19 @@ class FakeHost(deploy.Host):
     for real on tmp_path (``repos``) and recorded; the installed Claude Code is ``claude``, (version, sha256), and
     settings.json's own ``coding`` is ``settings``. The replay of the running workflows answers from ``replays``, a
     result for each call in turn (the head's tree, then the live one), then nothing running; each call is recorded
-    with its venv and the tree's ``app/a.py``."""
+    with its venv and the tree's ``app/a.py``. OpenClaw's policy step and its patch step are recorded with the live
+    main they saw; the patch step edits ``deploy.OPENCLAW_DIST`` (``patch``, a function of the dist), then raises
+    ``patch_failure`` when one is given."""
 
     def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None, kill_at=None,
-                 merged=None, claude=(None, None), settings=None, replays=()):
+                 merged=None, claude=(None, None), settings=None, replays=(), patch=None, patch_failure=None):
         super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
         self.calls, self.busy, self.results, self.lands = [], list(busy), list(checks), list(lands)
         self.units, self.held, self.ci = list(units), held, dict(ci or {})
         self.kill_at = list(kill_at) if kill_at else None
         self.merged = {} if merged is None else merged
         self.claude, self.settings, self.replays = claude, dict(settings or {}), list(replays)
+        self.patch, self.patch_failure = patch, patch_failure
 
     def active_user_tasks(self):
         count = self.busy.pop(0) if self.busy else 0
@@ -210,6 +215,17 @@ class FakeHost(deploy.Host):
     def installed_claude(self):
         self.calls.append(("installed_claude",))
         return self.claude
+
+    def apply_openclaw_policy(self):
+        self.calls.append(("apply_policy", git(self.live, "rev-parse", "main")))
+        return '["agents.defaults.model.primary"]'
+
+    def patch_openclaw(self):
+        self.calls.append(("patch_openclaw", git(self.live, "rev-parse", "main")))
+        if self.patch:
+            self.patch(deploy.OPENCLAW_DIST)
+        if self.patch_failure:
+            raise self.patch_failure
 
     def replay(self, tree, *, venv):
         which = "live" if tree == self.live else "head"
@@ -3804,3 +3820,179 @@ def test_the_hosts_replay_runs_the_tool_on_the_trees_python_and_reads_its_line(t
     monkeypatch.setattr(deploy, "REPLAY_TIMEOUT_SEC", 0.5)
     monkeypatch.setenv("SLOW", "1")
     assert replay(0, "") == {"error": "it did not finish within 0.5 s"}
+
+
+def test_a_model_policy_change_applies_the_policy_inside_the_window(repos):
+    head = repos.change({"app/llm/model_policy.py": "PRIMARY_MODEL = 'openai/gpt-6-luna'\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = MainWatchingHost(repos.live)
+    lines = []
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lines.append)
+    # On the new tree, while the units are stopped; the gateway reads openclaw.json live, so no unit is added.
+    assert result["status"] == "deployed" and result["restarted"] == ["rmp-api", "rmp-worker"]
+    assert [c for c in host.calls if c[0] in ("systemctl", "apply_policy")] == [
+        ("systemctl", "stop", "rmp-api", repos.old), ("systemctl", "stop", "rmp-worker", repos.old),
+        ("apply_policy", head), ("systemctl", "start", "rmp-api", "rmp-worker", head)]
+    assert "applied OpenClaw's model policy (changed [\"agents.defaults.model.primary\"])" in lines
+
+    # A rollback runs it again on the reverted tree; a change that leaves the policy alone runs it not at all.
+    repos.old = head
+    head = repos.change({"app/llm/model_policy.py": "PRIMARY_MODEL = 'openai/gpt-6'\n"}, on=head)
+    for path in (deploy.spec_file("t1"), deploy.state_file("t1")):
+        path.unlink(missing_ok=True)
+    deploy.queue(reviewed(repos, head=head))
+    host = MainWatchingHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back"
+    assert [c for c in host.calls if c[0] == "apply_policy"] == [("apply_policy", head),
+                                                                 ("apply_policy", result["revert"])]
+    repos.old = result["revert"]
+    head = repos.change({"app/a.py": "A = 3\n"}, on=result["revert"])
+    for path in (deploy.spec_file("t1"), deploy.state_file("t1")):
+        path.unlink()
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
+    assert not [c for c in host.calls if c[0] in ("apply_policy", "patch_openclaw")]
+
+
+@pytest.fixture
+def dist(repos):
+    """OpenClaw's dist on tmp_path, as installed."""
+    write(deploy.OPENCLAW_DIST, {"index.js": "unpatched\n", "chunks/a.mjs": "export const a = 1;\n",
+                                 "chunks/b.mjs": "export const b = 2;\n"})
+    (deploy.OPENCLAW_DIST / "chunks" / "latest.mjs").symlink_to("a.mjs")
+    return deploy.OPENCLAW_DIST
+
+
+def patching(dist):
+    """What patch_openclaw.sh does to the dist, and more: edits in place, a file added, one deleted, a link moved."""
+    write(dist, {"index.js": "patched RMP_HOOK_PERSISTENCE\n", "chunks/new.mjs": "added\n", "extra/x.js": "added\n"})
+    (dist / "chunks" / "b.mjs").unlink()
+    (dist / "chunks" / "latest.mjs").unlink()
+    (dist / "chunks" / "latest.mjs").symlink_to("new.mjs")
+
+
+def test_a_patch_change_copies_the_dist_patches_audits_and_restarts_the_gateway(repos, dist, monkeypatch):
+    assert deploy.restarts_for(["patch_openclaw.sh"]) == deploy.restarts_for(["ops/openclaw_patch_audit.py"]) == [
+        "openclaw-gateway"]
+    unit, seen = deploy_unit(monkeypatch)
+    before, copy = files_in(dist), deploy.RUNS_DIR / "t1" / "openclaw-dist.before"
+
+    class CopyWatchingHost(MainWatchingHost):
+        """Records, at each stop, what the copy of the dist holds."""
+
+        def systemctl(self, *args):
+            if args[0] == "stop":
+                self.calls.append(("copy at stop", files_in(copy) if copy.is_dir() else None))
+            super().systemctl(*args)
+
+    host = CopyWatchingHost(repos.live, patch=patching)
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    head = repos.change({"patch_openclaw.sh": "#!/bin/bash\necho patched\n"})
+    deploy.queue(reviewed(repos, head=head))
+    assert unit.main(str(deploy.spec_file("t1"))) == 0
+    result = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())
+    assert result["status"] == "deployed" and result["restarted"] == ["openclaw-gateway"]
+    # Copied before the gateway stopped; patched and audited while it was stopped and the tree at the head.
+    assert [c for c in host.calls if c[0] in ("copy at stop", "systemctl", "patch_openclaw")] == [
+        ("copy at stop", before), ("systemctl", "stop", "openclaw-gateway", repos.old), ("patch_openclaw", head),
+        ("systemctl", "start", "openclaw-gateway", head)]
+    assert files_in(dist)["index.js"] == "patched RMP_HOOK_PERSISTENCE\n"
+    # The copy goes with the result.
+    assert not copy.exists() and not deploy.state_file("t1").exists()
+
+
+def test_a_failing_audit_rolls_back_and_restores_the_dist(repos, dist):
+    before = files_in(dist)
+    head = repos.change({"ops/openclaw_patch_audit.py": "REQUIRED = ('hook-persistence',)\n"})
+    deploy.queue(reviewed(repos, head=head))
+    failure = RuntimeError("patching OpenClaw failed: ERROR: required patch missing after apply: hook-persistence")
+    host = MainWatchingHost(repos.live, patch=patching, patch_failure=failure)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["error"] == f"applying the change failed ({failure})"
+    # The window started the gateway after the failure; the revert window restored the dist from its copy while the
+    # gateway was stopped again, and published the revert.
+    revert = result["revert"]
+    assert [c for c in host.calls if c[0] in ("systemctl", "patch_openclaw", "land")] == [
+        ("land", "aura/t1-x", "squash"), ("systemctl", "stop", "openclaw-gateway", repos.old), ("patch_openclaw", head),
+        ("systemctl", "start", "openclaw-gateway", head), ("systemctl", "stop", "openclaw-gateway", head),
+        ("systemctl", "start", "openclaw-gateway", revert), ("land", f"aura/revert-{head[:12]}", "merge")]
+    assert files_in(dist) == before and (dist / "chunks" / "latest.mjs").is_symlink()
+    assert git(repos.live, "rev-parse", "main") == revert
+
+
+def test_restore_tree_puts_back_changed_and_removes_added_files(tmp_path):
+    copy, target = tmp_path / "copy", tmp_path / "target"
+    write(copy, {"a.js": "a\n", "sub/b.js": "b\n", "sub/deep/c.js": "c\n", "run.sh": "#!/bin/sh\n"})
+    (copy / "run.sh").chmod(0o755)
+    (copy / "sub" / "link.js").symlink_to("b.js")
+    shutil.copytree(copy, target, symlinks=True)
+    write(target, {"a.js": "patched\n", "sub/new.js": "added\n", "added/x.js": "added\n", "run.sh": "#!/bin/sh\nx\n"})
+    (target / "sub" / "deep" / "c.js").unlink()
+    (target / "sub" / "link.js").unlink()
+    (target / "sub" / "link.js").symlink_to("new.js")
+    (target / "sub" / "b.js").unlink()
+    (target / "sub" / "b.js").mkdir()
+
+    done = deploy.restore_tree(copy, target)
+    assert files_in(target) == files_in(copy) and (target / "sub" / "link.js").is_symlink()
+    assert sorted(os.listdir(target)) == ["a.js", "run.sh", "sub"]
+    assert oct((target / "run.sh").stat().st_mode & 0o777) == oct(0o755)
+    assert sorted(done) == ["a.js", "added", "run.sh", "sub/b.js", "sub/b.js", "sub/deep/c.js", "sub/link.js",
+                            "sub/new.js"]
+    # Again: nothing left to do.
+    assert deploy.restore_tree(copy, target) == []
+
+
+def test_the_hosts_policy_step_runs_the_live_trees_writer_on_the_live_venv(tmp_path, monkeypatch):
+    live = tmp_path / "live"
+    python = live / "venv" / "bin" / "python"
+    # A fake interpreter: it records how it was run, prints the changed keys and an error, and exits CODE.
+    write(live, {"venv/bin/python": '#!/bin/sh\nprintf "%s\\n" "$PYTHONPATH" "$PWD" "$1" "$2" "$OPENCLAW_DIST_DIR" '
+                                    '> "$CALLS"\necho \'["agents.defaults.model.primary"]\'\n'
+                                    'echo "Traceback: openclaw.json is not JSON" >&2\nexit "$CODE"\n'})
+    python.chmod(0o755)
+    calls = tmp_path / "calls"
+    monkeypatch.setenv("CALLS", str(calls))
+    monkeypatch.setenv("CODE", "0")
+    host = deploy.Host(live, repo="Hyper-AI-Lab/openclaw-jev")
+    assert host.apply_openclaw_policy() == '["agents.defaults.model.primary"]'
+    assert calls.read_text().splitlines() == [str(live), str(live), "-c", deploy.POLICY_COMMAND,
+                                              str(deploy.OPENCLAW_DIST)]
+    monkeypatch.setenv("CODE", "1")
+    with pytest.raises(RuntimeError, match=r"(?s)^applying OpenClaw's model policy failed: .*Traceback: openclaw.json "
+                                           "is not JSON$"):
+        host.apply_openclaw_policy()
+
+
+@pytest.mark.parametrize("ending", ["blocked", "an ended dead run", "an abort"])
+def test_the_dist_copy_goes_with_the_runs_result(repos, dist, monkeypatch, systemd_run, ending):
+    unit, seen = deploy_unit(monkeypatch)
+    before, copy = files_in(dist), deploy.RUNS_DIR / "t1" / "openclaw-dist.before"
+    head = repos.change({"patch_openclaw.sh": "#!/bin/bash\necho patched\n"})
+    deploy.queue(reviewed(repos, head=head))
+    if ending == "blocked":
+        copied = []
+
+        class CopyReplayingHost(FakeHost):
+            """Notes whether the copy was taken by the time of the replay, which blocks the run."""
+
+            def replay(self, tree, *, venv):
+                copied.append(files_in(copy) if copy.is_dir() else None)
+                return super().replay(tree, venv=venv)
+
+        monkeypatch.setattr(deploy, "Host", lambda: CopyReplayingHost(repos.live, replays=[
+            {"replayed": [], "failed": {"workflow-b": NONDETERMINISM}}, {"replayed": ["workflow-b"], "failed": {}}]))
+        assert unit.main(str(deploy.spec_file("t1"))) == 1
+        assert copied == [before, before]
+    else:
+        # A copy an earlier launch took before it waited.
+        shutil.copytree(dist, copy, symlinks=True)
+        if ending == "an ended dead run":
+            launched("t1", 3, started=0)
+            assert [task for task, _, _ in deploy.end_dead_runs(FakeHost(repos.live))] == ["t1"]
+        else:
+            assert deploy.abort_run("t1").startswith("Aborted the deploy of t1")
+    status = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())["status"]
+    assert status == ("blocked" if ending == "blocked" else "failed")
+    assert not copy.exists() and files_in(dist) == before and not deploy.state_file("t1").exists()
