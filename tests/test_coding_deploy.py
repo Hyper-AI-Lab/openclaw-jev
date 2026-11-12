@@ -119,16 +119,18 @@ class FakeHost(deploy.Host):
     it. The venv steps run ``venvs`` for real on tmp_path (``repos``) and are recorded: a build with the lock files
     it was given, a switch with the live main it saw, a prune with what it keeps. The installed host files are read
     for real on tmp_path (``repos``) and recorded; the installed Claude Code is ``claude``, (version, sha256), and
-    settings.json's own ``coding`` is ``settings``."""
+    settings.json's own ``coding`` is ``settings``. The replay of the running workflows answers from ``replays``, a
+    result for each call in turn (the head's tree, then the live one), then nothing running; each call is recorded
+    with its venv and the tree's ``app/a.py``."""
 
     def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None, kill_at=None,
-                 merged=None, claude=(None, None), settings=None):
+                 merged=None, claude=(None, None), settings=None, replays=()):
         super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
         self.calls, self.busy, self.results, self.lands = [], list(busy), list(checks), list(lands)
         self.units, self.held, self.ci = list(units), held, dict(ci or {})
         self.kill_at = list(kill_at) if kill_at else None
         self.merged = {} if merged is None else merged
-        self.claude, self.settings = claude, dict(settings or {})
+        self.claude, self.settings, self.replays = claude, dict(settings or {}), list(replays)
 
     def active_user_tasks(self):
         count = self.busy.pop(0) if self.busy else 0
@@ -208,6 +210,11 @@ class FakeHost(deploy.Host):
     def installed_claude(self):
         self.calls.append(("installed_claude",))
         return self.claude
+
+    def replay(self, tree, *, venv):
+        which = "live" if tree == self.live else "head"
+        self.calls.append(("replay", which, str(venv), (tree / "app" / "a.py").read_text()))
+        return self.replays.pop(0) if self.replays else {"replayed": [], "failed": {}}
 
 
 def spec(repos, head):
@@ -3713,3 +3720,87 @@ def test_a_merge_commit_that_carries_an_uninstalled_host_file_is_blocked_before_
                                       "installed.") and result["pr"]["number"] == 7
     assert not [c for c in host.calls if c[0] in ("wait_check", "systemctl")]
     assert git(repos.live, "rev-parse", "main") == repos.old
+
+
+NONDETERMINISM = ("Nondeterminism error: Activity type of scheduled event 'run_openclaw_turn' does not match activity "
+                  "type of activity command 'run_turn'")
+
+
+def test_a_change_that_breaks_a_running_workflow_is_blocked(repos):
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM}},
+                                         {"replayed": ["workflow-a", "workflow-b"], "failed": {}}])
+    lines = []
+    result = deploy.self_deploy(main_spec(head), host, log=lines.append)
+    assert result == {"status": "blocked", "summary": f"The new code cannot replay running workflow(s) workflow-b "
+                      f"({NONDETERMINISM}), so nothing was deployed; main is unchanged. A workflow change needs "
+                      "workflow.patched."}
+    # Under the lock, after the baseline: the head's tree on the live venv (the lock did not change), then the live
+    # tree; the head's tree is gone after.
+    assert [c for c in host.calls if c[0] == "replay"] == [("replay", "head", str(repos.link), "A = 2\n"),
+                                                           ("replay", "live", str(repos.link), "A = 1\n")]
+    counts = ("live-history replay: the head's code replayed 1 running workflow(s) and failed 1; the live code "
+              "replayed 2 and failed 0")
+    assert lines.index(f"holding {deploy.CODE_RELOAD_LOCK}") < lines.index(counts)
+    assert not (deploy.RUNS_DIR / deploy.MAIN / "tree").exists()
+    assert git(repos.live, "rev-parse", "main") == repos.old and not [c for c in host.calls if c[0] == "systemctl"]
+
+
+def test_a_workflow_broken_before_the_deploy_does_not_block_it(repos):
+    # A lock change: the head's code replays on the venv built for it.
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM}},
+                                         {"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM}}])
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert "replay" not in result["summary"]
+    assert [c[:3] for c in host.calls if c[0] in ("build_venv", "replay")] == [
+        ("build_venv", str(built_venv()), ["requirements-dev.txt", "requirements.txt"]),
+        ("replay", "head", str(built_venv())), ("replay", "live", str(repos.link))]
+
+
+@pytest.mark.parametrize("new, old, reason", [
+    ({"error": "listing or fetching the running workflows failed: Failed client connect"}, {"replayed": [], "failed": {}},
+     "listing or fetching the running workflows failed: Failed client connect"),
+    ({"replayed": [], "failed": {}}, {"error": "it did not finish within 300 s"}, "it did not finish within 300 s"),
+    ({"replayed": [], "failed": {"workflow-b": NONDETERMINISM}}, {"error": "/root/.openclaw/rmp has no "
+                                                                           "ops/replay_live.py"},
+     "/root/.openclaw/rmp has no ops/replay_live.py")])
+def test_a_replay_that_cannot_run_is_reported_not_blocking(repos, new, old, reason):
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    lines = []
+    result = deploy.self_deploy(main_spec(head), FakeHost(repos.live, replays=[new, old]), log=lines.append)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert result["summary"].endswith(f"The live-history replay could not run ({reason}).")
+    assert f"the live-history replay could not run: {reason}" in lines
+
+
+def test_the_hosts_replay_runs_the_tool_on_the_trees_python_and_reads_its_line(tmp_path, monkeypatch):
+    tree, venv = tmp_path / "tree", tmp_path / "venv"
+    write(tree, {"ops/replay_live.py": "# the tool\n"})
+    python = venv / "bin" / "python"
+    # A fake interpreter: it records how it was run, prints what OUT holds after a line of noise and exits CODE.
+    write(venv, {"bin/python": '#!/bin/sh\necho "$PYTHONPATH $PWD $1" > "$CALLS"\necho noise\ncat "$OUT"\n'
+                               'echo "Traceback: it broke" >&2\n[ -n "$SLOW" ] && exec sleep 5\nexit "$CODE"\n'})
+    python.chmod(0o755)
+    calls, out = tmp_path / "calls", tmp_path / "out"
+    monkeypatch.setenv("CALLS", str(calls))
+    monkeypatch.setenv("OUT", str(out))
+    host = deploy.Host(tmp_path, repo="Hyper-AI-Lab/openclaw-jev")
+
+    def replay(code, printed):
+        monkeypatch.setenv("CODE", str(code))
+        out.write_text(printed)
+        return host.replay(tree, venv=venv)
+
+    found = {"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM}}
+    assert replay(0, json.dumps(found) + "\n") == found
+    assert calls.read_text() == f"{tree} {tree} {tree / 'ops' / 'replay_live.py'}\n"
+    assert replay(2, json.dumps({"error": "listing failed"}) + "\n") == {"error": "listing failed"}
+    assert replay(1, "") == {"error": "exit 1: Traceback: it broke"}
+    assert host.replay(tmp_path / "old-tree", venv=venv) == {"error": f"{tmp_path / 'old-tree'} has no "
+                                                                      "ops/replay_live.py"}
+    monkeypatch.setattr(deploy, "REPLAY_TIMEOUT_SEC", 0.5)
+    monkeypatch.setenv("SLOW", "1")
+    assert replay(0, "") == {"error": "it did not finish within 0.5 s"}

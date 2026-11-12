@@ -25,6 +25,7 @@ import ast
 import asyncio
 import fcntl
 import hashlib
+import io
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
 import time
 from contextlib import contextmanager
@@ -62,6 +64,8 @@ APPLY_RESERVE_SEC = 90 * 60
 CHANGING = ("applying", "merged", "restarted", "reverting")
 # Errors before the change a run survives: the last of them ends it ``failed``.
 MAX_ATTEMPTS = 3
+# The replay of the running workflows on the head's code, then on the live code, each at most this long.
+REPLAY_TIMEOUT_SEC = 300
 # (path or directory prefix, services restarted when it changes); docs, tests and ops restart nothing.
 SERVICE_PATHS = (
     ("app/", ("rmp-api", "rmp-worker")),
@@ -950,6 +954,30 @@ class Host:
         """CI's test check on ``sha`` once it finished, or its state when the wait ran out."""
         return github.wait_check(sha, self.repo)
 
+    def replay(self, tree: Path, *, venv: Path) -> Dict[str, Any]:
+        """The running workflows replayed on ``tree``'s code, by its ``ops/replay_live.py`` on ``venv``'s python:
+        ``{"replayed": [ids], "failed": {id: error}}``, or ``{"error": why the replay could not run}``."""
+        tool = tree / "ops" / "replay_live.py"
+        if not tool.is_file():
+            return {"error": f"{tree} has no ops/replay_live.py"}
+        try:
+            run = subprocess.run([str(venv / "bin" / "python"), str(tool)], cwd=tree, capture_output=True, text=True,
+                                 env={**os.environ, "PYTHONPATH": str(tree)}, timeout=REPLAY_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            return {"error": f"it did not finish within {REPLAY_TIMEOUT_SEC} s"}
+        except OSError as exc:
+            return {"error": str(exc)[:300]}
+        lines = run.stdout.strip().splitlines()
+        try:
+            result = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            result = None
+        if not isinstance(result, dict):
+            return {"error": f"exit {run.returncode}: {run.stderr.strip()[-300:]}"}
+        if run.returncode != 0 or "error" in result:
+            return {"error": result.get("error") or f"exit {run.returncode}"}
+        return result
+
     def installed_sha256(self, path: Path) -> Optional[str]:
         """The sha256 of the host file ``path`` as installed, or None when it is not a file."""
         return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
@@ -1066,6 +1094,41 @@ def _build_venv(host: Host, task: str, head: str, changed: List[Tuple[str, str]]
     host.build_venv(target, lock)
     log(f"the venv {target} is ready")
     return target
+
+
+def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: Optional[Path],
+                 log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
+    """Before the change, under the lock: the running workflows replayed on the head's code (its tree from
+    ``git archive`` in ``RUNS_DIR/<task>/tree``, on the head's venv: the one built for it, else the live one), then on
+    the live code. A workflow that replays on the live code and fails on the head's would wedge on the new code: the
+    blocked result. One that fails on both was broken already and blocks nothing. A replay that could not run is noted
+    in the run (``replay``, for the result's summary) and blocks nothing either, so an outage of the replay never stops
+    every deploy, the fix included. The tree is deleted after; the log names the counts."""
+    tree = RUNS_DIR / task / "tree"
+    shutil.rmtree(tree, ignore_errors=True)
+    tree.mkdir(parents=True, mode=0o700)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(_git_bytes(host.live, "archive", "--format=tar", head))) as archive:
+            archive.extractall(tree, filter="data")
+        new = host.replay(tree, venv=target or host.live / "venv")
+        old = host.replay(host.live, venv=host.live / "venv")
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
+    failure = new.get("error") or old.get("error")
+    run["replay"] = f"The live-history replay could not run ({failure})." if failure else None
+    if failure:
+        log(f"the live-history replay could not run: {failure}")
+        return None
+    log(f"live-history replay: the head's code replayed {len(new['replayed'])} running workflow(s) and failed "
+        f"{len(new['failed'])}; the live code replayed {len(old['replayed'])} and failed {len(old['failed'])}")
+    broken = [workflow for workflow in new["failed"] if workflow in old["replayed"]]
+    if not broken:
+        return None
+    summary = (f"The new code cannot replay running workflow(s) {', '.join(broken)} ({new['failed'][broken[0]]}), so "
+               "nothing was deployed; main is unchanged. A workflow change needs workflow.patched.")
+    if run.get("merge"):
+        summary += " GitHub's main has the change; it goes live with GitHub's main."
+    return {"status": "blocked", **({"pr": run["pr"]} if run.get("pr") else {}), "summary": summary}
 
 
 def _canonical(link: Path, path: Union[str, Path]) -> str:
@@ -1265,7 +1328,8 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     reviewed run before the land, and again for its merge commit). That slow work runs first, without the lock, and
     so does the build of the head's venv when the change moves the lock files (``_build_venv``), and the copy of the
     web backends' venv when their requirements change (``_copy_web_venv``). Then, holding the
-    code-reload lock: the hand-edit check, the readiness baseline and, last before the units stop, the strict idle
+    code-reload lock: the readiness baseline, the replay of the running workflows on the head's code and the live code
+    (``_replay_live``), the hand-edit check and, last before the units stop, the strict idle
     count; then ``applying`` with the venv plan, the switch window (``_switch``), the checks, and on failure the revert
     window. A run whose state is past ``landed`` was killed during or after its change: it resumes from its phase
     (``_resume``) and runs no step before the change.
@@ -1334,8 +1398,8 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
             return None
         log(f"holding {CODE_RELOAD_LOCK}")
         baseline = host.readiness_report()
-        # After the baseline, which can take a minute and a half: a hand edit made meanwhile still blocks.
-        blocked = _drift(live, old)
+        # After the baseline and the replay, which can take minutes: a hand edit made meanwhile still blocks.
+        blocked = _replay_live(host, task, run, head, target, log) or _drift(live, old)
         if blocked:
             return blocked
         # The venv plan is made here, as the run first reaches applying from a phase before it, and is recorded with
@@ -1423,7 +1487,12 @@ def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
     return {"status": "deployed", **_shipped(host, run), "canary": checked["canary"], "units": units,
             "new_failing": new_failing,
             "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
-            f"readiness passed and {canary}.{tightened}{installs}"}
+            f"readiness passed and {canary}.{tightened}{_replay_note(run)}{installs}"}
+
+
+def _replay_note(run: Dict[str, Any]) -> str:
+    """The result summary's sentence when the run's replay of the running workflows could not run (``_replay_live``)."""
+    return f" {run['replay']}" if run.get("replay") else ""
 
 
 def _prune_venvs(host: Host, run: Dict[str, Any], log: Callable[[str], None]) -> None:
@@ -1496,7 +1565,8 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     shutil.rmtree(_web_venv_failed(task), ignore_errors=True)
     drop_web_venv_copy(task)
     return {"status": "rolled_back", **_shipped(host, run), "revert": revert, "revert_pr": published, "error": failure,
-            "summary": f"Deploying {head[:12]} failed its checks ({failure}){reverted}; {health}; {github_now}."}
+            "summary": f"Deploying {head[:12]} failed its checks ({failure}){reverted}; {health}; {github_now}."
+            f"{_replay_note(run)}"}
 
 
 def _reverted(live: Path, task: str, run: Dict[str, Any]) -> bool:
