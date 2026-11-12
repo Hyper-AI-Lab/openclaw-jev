@@ -318,9 +318,9 @@ def claude_pin(live: Path, commit: str, own: Dict[str, Any]) -> Tuple[Any, ...]:
 def install_gaps(live: Path, old: str, head: str, changed: List[Tuple[str, str]], host: "Host") -> List[str]:
     """What must be installed on this host before ``head`` deploys over ``old`` (rule 18), by name; empty when nothing.
 
-    A readiness-hashed host file whose repo copy the range ``changed`` must be installed with the head's bytes (a copy
-    the head deletes has nothing to install), and when the range moves the effective Claude Code pin, the installed
-    binary must be the head's version with the head's sha256. The deploy installs none of them."""
+    A readiness-hashed host file whose repo copy the range changes (``changed``) must be installed with the head's
+    bytes (a copy the head deletes has nothing to install), and when the range moves the effective Claude Code pin, the
+    installed binary must be the head's version with the head's sha256. The deploy installs none of them."""
     paths = {path for status, path in changed if status != "D"}
     gaps = []
     for source, installed in HOST_INSTALLED:
