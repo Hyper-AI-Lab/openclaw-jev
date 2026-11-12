@@ -39,10 +39,11 @@ PYPI_RELEASE = "https://pypi.org/pypi/{name}/{version}/json"
 # is missing is no pin, whatever follows it.
 PIN = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9][^\s;#\\]*)")
 # The .in files' one form (D-6), which every pip reads the same way. Whole file: only tab, LF, CR and printable ASCII;
-# no "\" (pip joins the next line) and no "$" (pip expands ${VAR}); no coding declaration, pip's own pattern
-# (pip/_internal/utils/encoding.py) found anywhere in the first two lines, since pip would decode the file by it. Each
-# line, its trailing spaces and tabs ignored: blank, a comment, the include (requirements-dev.in only, exactly once)
-# or a canonical pin, each with an optional trailing comment after a space or tab.
+# no "\" (pip joins the next line) and no "$" (pip expands ${VAR}); no coding declaration, pip's own pattern found
+# anywhere in the first two lines as pip splits them, at LF only (pip/_internal/utils/encoding.py), since pip would
+# decode the file by it. Each line, its trailing spaces and tabs ignored: blank, a comment, the include
+# (requirements-dev.in only, exactly once) or a canonical pin, each with an optional trailing comment after a space or
+# tab.
 IN_BYTES = frozenset(b"\t\n\r" + bytes(range(0x20, 0x7F)))
 IN_CODING = re.compile(rb"coding[:=]\s*([-\w.]+)")
 IN_COMMENT = re.compile(r"[ \t]*#.*")
@@ -100,7 +101,7 @@ def parse_in_file(path: Path) -> Dict[str, str]:
     if odd is not None:
         raise Refused(f"{name}: no \\ or $ may appear, which pip reads as a line continuation or a variable (line "
                       f"{_line_at(data, odd)})")
-    for number, line in [*enumerate(data.split(b"\n")[:2], start=1), *enumerate(data.splitlines()[:2], start=1)]:
+    for number, line in enumerate(data.split(b"\n")[:2], start=1):
         if IN_CODING.search(line):
             raise Refused(f"{name}: no coding declaration may appear in the first two lines, since pip would decode "
                           f"the file by it (line {number})")
