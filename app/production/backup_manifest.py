@@ -240,6 +240,20 @@ def problems(dest: Path, *, hashes: bool, qdrant_mode: Optional[str] = None) -> 
     return found
 
 
+def default_root() -> Path:
+    """Where ops/backup.sh writes its backups, by its own chain: ``RMP_BACKUP_ROOT``, else ``<RMP_DATA_DIR>/backups``,
+    else ``<RMP_ROOT>/data/backups``, else ``<OPENCLAW_HOME or /root/.openclaw>/rmp/data/backups``. Never relative to
+    the working directory: the deploy runs the migration wrapper from a run directory of its own."""
+    environ = os.environ
+    if environ.get("RMP_BACKUP_ROOT"):
+        return Path(environ["RMP_BACKUP_ROOT"])
+    if environ.get("RMP_DATA_DIR"):
+        return Path(environ["RMP_DATA_DIR"]) / "backups"
+    if environ.get("RMP_ROOT"):
+        return Path(environ["RMP_ROOT"]) / "data" / "backups"
+    return Path(environ.get("OPENCLAW_HOME") or "/root/.openclaw") / "rmp" / "data" / "backups"
+
+
 def newest(root: Path) -> Optional[Path]:
     """The newest backup under ``root``: the newest directory named like a stamp that holds a manifest.json. A run in
     progress has none yet, and a killed run never writes one. Other directories there, such as openclaw-state/ and an
