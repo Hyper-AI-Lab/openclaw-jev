@@ -7,6 +7,7 @@ repo is tmp_path.
 import hashlib
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -267,10 +268,21 @@ def test_a_runtime_pin_missing_from_the_full_set_exits_1(script, monkeypatch, ca
 # of its refusal, which the script prints before pip in both modes.
 IN_RUNTIME, IN_DEV = "requirements.in", "requirements-dev.in"
 TODAY = ((ROOT / IN_RUNTIME).read_bytes(), (ROOT / IN_DEV).read_bytes())
-# Today's pins, read the plain way their canonical lines allow; their names need only lowering to be canonical.
-TODAY_PINS = ({name.lower(): version for name, version in
-               (line.split("==") for line in TODAY[0].decode().splitlines() if "==" in line)},
-              {"pytest": "9.0.3", "pytest-asyncio": "1.4.0"})
+
+
+def plain_in_pins(data: bytes) -> dict:
+    """A .in file's pins, read the plain way the one form allows: each line's text before any "#" that holds ==, split
+    at it, the name in its canonical form (PEP 503)."""
+    pinned = {}
+    for line in data.decode("ascii").splitlines():
+        text = line.split("#", 1)[0].strip()
+        if "==" in text:
+            name, version = text.split("==")
+            pinned[re.sub(r"[-_.]+", "-", name).lower()] = version
+    return pinned
+
+
+TODAY_PINS = (plain_in_pins(TODAY[0]), plain_in_pins(TODAY[1]))
 FIXTURE_PINS = ({"fastapi": "0.135.1"}, {"pytest": "9.0.3"})
 
 
