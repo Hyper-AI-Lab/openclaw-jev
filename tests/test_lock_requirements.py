@@ -375,6 +375,8 @@ IN_FILES = [
     bad_line("fastapi==1.0-rc1", "a dashed pre-release"),
     bad_line("fastapi-==0.135.1", "a name ending in a dash"),
     bad_line("fastapi==0.135.1 junk", "text after the version"),
+    # A release part longer than Python's integer-digit limit: Version() raises ValueError.
+    bad_line(f"fastapi=={'1' * 5000}", "a version Version() cannot read"),
     pytest.param(None, b" -r requirements.in\npytest==9.0.3\n", not_a_pin(" -r requirements.in", 1, IN_DEV),
                  id="an indented include"),
 ]

@@ -87,6 +87,15 @@ def _line_at(data: bytes, offset: int) -> int:
     return len(re.split(rb"\r\n|\r|\n", data[:offset]))
 
 
+def _canonical_version(version: str) -> bool:
+    """Whether ``version`` is its own normalised form. One ``Version`` cannot read is not: a release part longer than
+    Python's integer-digit limit raises ``ValueError``."""
+    try:
+        return str(Version(version)) == version
+    except ValueError:
+        return False
+
+
 def parse_in_file(path: Path) -> Dict[str, str]:
     """``{canonical name: version}`` of the .in file ``path``, which must take the one canonical form (``IN_*`` above):
     first the whole-file rules on its bytes, then each line, then no name pinned twice in it, nor, for
@@ -115,7 +124,7 @@ def parse_in_file(path: Path) -> Dict[str, str]:
             includes.append(number)
             continue
         match = IN_PIN.fullmatch(text)
-        if not match or str(Version(match.group(2))) != match.group(2):
+        if not match or not _canonical_version(match.group(2)):
             raise Refused(f"{name}:{number}: not a canonical pin (name==version): {line}")
         pinned = canonical(match.group(1))
         if pinned in found:
