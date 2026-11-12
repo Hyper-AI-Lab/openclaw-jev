@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.coding import deploy, venvs, verify, workspace
+from app.coding import deploy, units, venvs, verify, workspace
 from app.production import canary_sentinel
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -3667,7 +3667,7 @@ def test_a_claude_pin_change_blocks_until_the_binary_matches(repos):
     write(repos.live, {"app/config.py": CONFIG.format(*old_pin)})
     repos.old = commit(repos.live, "the pin as installed")
     head = merged_on_github(repos, {"app/config.py": CONFIG.format(*new_pin)})
-    gap = f"Claude Code 2.1.300 (sha256 {'b' * 64}) as {deploy.CLAUDE_BIN}"
+    gap = f"Claude Code 2.1.300 (sha256 {'b' * 64}) as {units.CLAUDE_BIN}"
     # The old binary, then the new version with another binary: blocked, with nothing deployed.
     for claude in (old_pin, ("2.1.300", "c" * 64)):
         host = FakeHost(repos.live, claude=claude)
