@@ -108,7 +108,7 @@ Each consumer runs `off`, `shadow` (record Jev's proposal, act on the existing p
 git clone https://github.com/Hyper-AI-Lab/openclaw-jev.git
 cd openclaw-jev
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements-dev.txt
 
 cp settings.example.json settings.json
 # Set api_key, production.slack_owner_user_id, vector_memory, task_registry and jev.

@@ -471,7 +471,9 @@ def launch(task: str, *, postpone: bool = False, live: Path) -> str:
     unit never empties it itself: systemd opens the unit's output again for its ``ExecStopPost=``, which would wipe
     the log at the unit's end. Whatever ends the unit, its ``ExecStopPost=`` starts the units its window left stopped
     (``stop_post_command``). The unit runs on the venv the live link resolves to now, so its own imports never follow
-    the link's switch.
+    the link's switch, with one exception: at the first switch the resolved path is production's real venv directory
+    itself, which the exchange renames, so the unit's later lazy imports come from the new venv. That is harmless,
+    because the first lock pins production's own versions.
     """
     path, state = spec_file(task), state_file(task)
     run = json.loads(state.read_text())

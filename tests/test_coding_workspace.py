@@ -85,6 +85,19 @@ def test_the_work_is_collected_from_the_review_repository(ws):
     assert ".aura" not in sh_git("ls-tree", "-r", "--name-only", "HEAD", cwd=checkout)
 
 
+def test_a_change_to_the_dev_lock_and_its_in_file_is_a_dependency_change(ws):
+    # The approval card and the review prompt list these; the deploy builds production's venv from the dev lock.
+    job = workspace.prepare(TASK, "demo", "bump pytest", ws.cfg, owner=None)
+    checkout = Path(job.checkout)
+    (checkout / "requirements.in").write_text("pytest\n")
+    (checkout / "requirements-dev.in").write_text("-r requirements.in\npytest==9.0.3\n")
+    (checkout / "requirements-dev.txt").write_text("-r requirements.txt\npytest==9.0.3 --hash=sha256:00\n")
+    result = workspace.collect(job, "Bump pytest", ws.cfg)
+    dependency_files = ["requirements-dev.in", "requirements-dev.txt", "requirements.in"]
+    assert [c["path"] for c in result["changed"]] == dependency_files
+    assert result["dependencies_changed"] == dependency_files
+
+
 def test_a_planted_git_config_cannot_fake_the_diff_or_run_commands(ws):
     job = workspace.prepare(TASK, "demo", "planted", ws.cfg, owner=None)
     checkout = Path(job.checkout)

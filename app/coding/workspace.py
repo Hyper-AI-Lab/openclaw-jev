@@ -31,7 +31,8 @@ GIT_NAME, GIT_EMAIL = "Aura (Claude Code)", "aura-coder@aura.local"
 EXCLUDES = (".aura/", ".venv/", "node_modules/", "__pycache__/", ".pytest_cache/")
 MAX_BUNDLE_BYTES = 200 * 1024 * 1024
 TEST_PATH = re.compile(r"(^|/)(tests?/|test_[^/]*\.py$|[^/]*_test\.py$|[^/]*\.test\.[cm]?[jt]s$)")
-DEPENDENCY_FILES = {"requirements.txt", "pyproject.toml", "package.json", "package-lock.json", "setup.py", "setup.cfg"}
+DEPENDENCY_FILES = {"requirements.txt", "requirements-dev.txt", "requirements.in", "requirements-dev.in",
+                    "pyproject.toml", "package.json", "package-lock.json", "setup.py", "setup.cfg"}
 
 COLLECT_SCRIPT = r"""
 set -e
