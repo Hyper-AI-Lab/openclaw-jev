@@ -4008,3 +4008,608 @@ My four-layout verify on `b7817da` (`bcvfe71hm`, logs in `/root/.cache/wp09-b4-m
 - `origin/main` is still `2e41c5c`, the base.
 
 **Next:** mirror this log, open the PR, and run the gated merge. The deploy is hotfix 3a's host step: its `deploy.log` must keep the whole run. `/root/.openclaw/rmp/venv` must stay a real directory.
+
+## 2026-11-04 17:40 UTC · WP-09 batch 4 blocked: GitHub refuses the token
+- `aura-github push aura/wp-09-4-venvs` failed with "Invalid username or token". `gh pr create` and `gh api rate_limit` both return HTTP 401 "Bad credentials".
+- `/root/.config/github_pat` is unchanged since 2026-08-10, and its length means a fine-grained token. It last worked for PR #52's merge on 2026-10-31, so it most likely expired. I read only the file's metadata, never the token.
+- **Impact:** every GitHub write on the host uses this file. That covers `aura-github` and RMP's coding jobs (push, `open_pull_request`, `github.merged_pull`). No coding run or journal line has hit it yet, but Aura's next coding job would fail at push. Read-only `git fetch` still works.
+- **Ledger:** new item `OPS-2026-11-04-github-token-401` (high, WP-16). WP-16 adds a readiness check on the token and its expiry.
+- **Kirill's action:** renew the token and write it into the file himself.
+- **State:** the branch is committed locally at `a2c0ef8`, the docs mirror included. It is not pushed and there is no PR yet. `origin/main` is still `2e41c5c`.
+- **Meanwhile:** batch 5 is specified and built on a local branch stacked on batch 4. It is rebased onto the squash once batch 4 is deployed.
+
+## 2026-11-04 17:43 UTC · WP09-22: the harness runs a clone on its lock's venv; WP-09 batch 5 started
+This is the programme's own pre-batch-5 step (spec §7, "Before batch 5"). Nothing on the host changes outside `/root/rmp-intelligence` and `/root/.cache`.
+
+**Harness changes:**
+- **`program/bin/verify.sh`:** reads `VENV`, defaulting to `/root/.openclaw/rmp/venv`. The default is kept unresolved, so a default run is unchanged. VENV is the pytest interpreter and `LAYOUT=live`'s read-only bind of the copy's `venv`. A missing venv exits 2 and names it. The run prints `verify: venv <path>`. Backup: `/root/.cache/verify.sh.bak-wp09-22`.
+- **New `program/bin/build-verify-venv.sh <clone>`:**
+  - builds `/root/.cache/rmp-verify-venvs/<sha256 over both lock files' names and digests>` with the system `python3` (3.12.3, production's interpreter);
+  - installs `requirements-dev.txt` with `--require-hashes`, runs `pip check`, writes the stamp last, then prints the directory;
+  - on a clone without `requirements-dev.txt`, exits 2.
+
+**Checked:**
+- `tests/test_venvs.py` on batch 4's head: 16 passed in the default layout and in `LAYOUT=live`, both on the default venv.
+- `VENV=/nonexistent` gives "verify: no venv at /nonexistent".
+- The builder refuses batch 4's clone, which has no lock yet.
+
+**Rollback:** copy the backup over `verify.sh` and delete the builder.
+
+**Batch 5:**
+- Branch `aura/wp-09-5-lock`, stacked on batch 4's `a2c0ef8`. Batch 4 cannot merge until the GitHub token is renewed.
+- The implementer runs WP09-20's "before the PR" host step, which is read-only: production's `pip freeze`, then `lock_requirements.py --constraint`.
+- The verify runs in all four layouts on the lock's venv, plus one default run on production's venv.
+- The prompts are in `/root/.cache/wp-batch-manual/wp09-b5/`. I adjusted the template for this batch: the stacked base, requirements changing here, five harness runs, and the host-step exception.
+- Once batch 4 is squash-merged, this branch is rebased onto the squash: `git rebase --onto origin/main a2c0ef8`.
+
+## 2026-11-04 18:18 UTC · WP-26 spec started while GitHub is blocked
+- **Why now:** WP-26 starts once WP-09 batch 5 is deployed (rules 3, 4, 43). Its spec is read-only work, so it runs while batch 4 waits on the token and batch 5 is being built.
+- **Run:** workflow `wp26-spec`, run `wf_2a29a979-9ab`. It reads the read-only worktree `/root/work/spec-ro`, moved to `a2c0ef8` (batch 4 plus its docs mirror).
+- **Research, in parallel, three briefs:**
+  - `research/alembic-existing-schema.md`;
+  - `research/temporal-schema-and-ci-services.md`;
+  - `research/wp26-schema-survey.md`. This one re-checks the drift list D1-D12 against `rmp_db` with read-only SQL.
+- **Spec:** one writer produces `specs/WP-26.md`. It must settle ten named tensions in the decisions table, among them UC-32's `DROP EXTENSION` against "additive only", the §3 `deploy.py` row, where the migration runs in WP-09's window, and Postgres tests in the sandbox.
+- **Critique:** three critics in parallel (coverage, production safety, technical correctness), then a revision. Up to three rounds, until all three approve.
+
+## 2026-11-04 21:01 UTC · Resumed after the usage limit
+**GitHub token:** still refused (HTTP 401). The file is unchanged since 2026-08-10, so batch 4 is still unpushed.
+
+**WP-09 batch 5:**
+- The implementer stopped at the limit, with seven commits on `aura/wp-09-5-lock`:
+  - `2a2fcad`: `lock_requirements.py` and `make lock`;
+  - `536c3bc`: the hashed lock with `langchain`, plus the dev split;
+  - `8fd4f1c`: `CLAUDE.md` and `README.md`;
+  - `9215c30`: `CONTRIBUTING.md`;
+  - `40e3572`: CI installs with hashes;
+  - `9c06d5c`: `ARCHITECTURE.md`;
+  - `31701d5`: a readability change.
+- The same agent was resumed to finish the harness runs and the scratch proofs.
+
+**WP-26 spec:**
+- Two of the three research briefs finished before the limit: `research/alembic-existing-schema.md`, and the Temporal and CI brief.
+- The schema survey failed at the limit. The run was resumed with `resumeFromRunId`, so the two finished briefs replay from cache.
+- **Early facts from the Alembic brief:**
+  - the plan's baseline (`create_all` plus `_MIGRATIONS`) and the work package's (the live schema) differ in D1-D3, D7-D10 and D12. The spec must pick one, or ask Kirill;
+  - `make lock` would add only `alembic` 1.20.1 and `Mako` 1.4.3 and move no pin;
+  - Temporal's schemas are at 1.18 (`temporal`) and 1.13 (`temporal_visibility`), on server 1.30.1;
+  - the stale auto-setup line is now `tests/test_readiness.py:311`.
+
+## 2026-11-04 21:06 UTC · WP-09 batch 5 implemented; Tier-1 review and my verify running
+**Implementer's report** (`/root/.cache/wp-batch-manual/wp09-b5/impl-report.txt`):
+- **Head:** `31701d5`, seven commits on `a2c0ef8`. Nothing pushed, and the tree is clean.
+- **WP09-20, WP09-21 and this batch's WP09-33 part:** done.
+- **Deviations:**
+  - `CONTRIBUTING.md:16` installs the dev lock, because its local-check block would fail without pytest.
+  - `requirements-dev.txt`'s header names its own `.in` file.
+  - pip is called with `--disable-pip-version-check`, and the script prints "wrote" and "moved pins" lines.
+- **Host step "before the PR":** `PYTHONDONTWRITEBYTECODE=1 /root/.openclaw/rmp/venv/bin/python ops/lock_requirements.py --constraint /root/.cache/wp09-lock/production.txt` (freeze: 100 lines). It exited 0 and printed:
+  - `wrote requirements.txt (79 pins) and requirements-dev.txt (5 more)`
+  - `moved pins: none (84 of the 100 constraints are in the lock, each at its version)`
+  - `outside the lock: attrs, cloudpickle, decompyle3, diskcache, genson, jsonpath-ng, jsonschema, jsonschema-specifications, outlines, outlines-core, pillow, referencing, rpds-py, spark-parser, uncompyle6, xdis`
+
+  These 16 are exactly outlines' tree of 12 plus the four decompilers. The spec's grep found 0 imports of them in `app`, `ops`, `worker.py` and `tests`.
+- **Scratch run of batch 4's deploy code on this head:**
+  - It built the venv before the window and took the code-reload lock only at 73.5 s.
+  - One `RENAME_EXCHANGE` made the venv a link to `venvs/rmp/fcb513c80bb3a8ce`. The real directory moved to `venvs/rmp/d53843e2612ab7e1`, stamped with the pre-lock hash and holding 101 distributions.
+  - The result was `deployed`.
+  - **Revert:** no build and no exchange; the link went back to `d53843e2612ab7e1`.
+  - The coding jobs' shared venv was rebuilt once from the dev lock: starlette 0.52.1, pytest 9.0.3, pytest-asyncio 1.4.0, langchain 1.2.12.
+- **Harness, five runs, each verify exit 0:** 2029 passed, 1 skipped, node 58/58, 0 leftovers. Four layouts on the lock's venv, plus default on production's venv.
+- **Rollback target after deploy:** `/root/.openclaw/venvs/rmp/d53843e2612ab7e1`. It holds only if the merged lock files are byte-identical to the branch's.
+
+**Review:** workflow `wp09-b5-review`, run `wf_67e6692b-20b`. Four lenses:
+- correctness;
+- closure;
+- first-switch production safety, which includes anything on the host that runs on the RMP venv and imports a removed distribution;
+- lock integrity, with every hash checked independently against PyPI.
+
+Two skeptics try to refute each blocking issue.
+
+**My verify:** five runs, background `bh6bks0gi`, logs in `/root/.cache/wp09-b5-myverify-31701d5/`.
+
+## 2026-11-05 02:12 UTC · WP-09 batch 5: my verify passes; round 1 has three approvals; amendment 10
+**My verify of `31701d5`** (`bh6bks0gi`, logs in `/root/.cache/wp09-b5-myverify-31701d5/`). Every run exited 0 with 0 leftovers, a clean placeholder grep and no ignored new file.
+
+| Run | pytest | node |
+|---|---|---|
+| default, on the lock's venv | 2029 passed, 1 skipped | 58/58 |
+| coding-job, on the lock's venv | 2029 passed, 1 skipped | 58/58 |
+| direct, on the lock's venv | 2029 passed, 1 skipped | 58/58 |
+| live, on the lock's venv | 2029 passed, 1 skipped | 58/58 |
+| default, on production's venv | 2029 passed, 1 skipped | 58/58 |
+
+**Review** (`wf_67e6692b-20b`):
+- **Approved:** correctness, closure and first-switch safety, with no blocking issue.
+  - Two reviewers re-ran the lock script with pip 24.0, and the committed files are byte-identical to its output. `make lock` without `--constraint` changes nothing.
+  - A real-pip probe adding `starlette>=1.0` exits 1 with `would move: starlette==0.52.1`. A probe adding alembic adds only alembic and Mako.
+  - A CI simulation on pip 26.3 resolves all 84 wheels with hashes.
+  - No unit, cron entry, skill or script on the host imports any of the 16 removed distributions.
+- **Lock-integrity lens:** stopped at the usage limit. The run was resumed (`wc9q3i39o`), and the three finished lenses replay from cache.
+- **Non-blocking points.** Three of the four lenses found the same one independently: `app/coding/workspace.py:34` `DEPENDENCY_FILES` does not know `requirements-dev.txt` or the `.in` files. A coding job changing only the dev lock would show "Dependency changes: none" on Kirill's approval card, while the deploy would still switch production's venv. Because batch 5 creates those files, the fix belongs in batch 5. Others:
+  - the `ARCHITECTURE.md` Resume sentence is wrong at the first switch;
+  - no test covers lock step 4;
+  - the PyPI fetch has no retry;
+  - the PR body lacks "merge only after batch 4 is deployed" and the build-failure handling.
+- **Spec `§9 amendment 10`:**
+  1. `DEPENDENCY_FILES` gains `requirements-dev.txt`, `requirements.in` and `requirements-dev.in`, with a test.
+  2. The Resume bullet gains D-8's exception.
+  3. A test for lock step 4.
+
+  It also adds two lines to the PR body. The fetch retry is considered and not taken. Backup: `/root/.cache/WP-09.md.bak-amend10`.
+- **Next:** once the lock-integrity lens and its verification finish, one fix round with the implementer covers amendment 10 and any confirmed blocking issue.
+
+**WP-26 spec:** the spec writer stopped at the limit. The run was resumed (`wrrb3n041`), and its three research briefs replay from cache.
+
+**GitHub token:** still refused.
+
+## 2026-11-05 02:35 UTC · WP-09 batch 5 round 1 complete: four approvals; fix round 1 (amendment 10) running
+**Lock-integrity lens: approved.**
+- **Hashes:** checked independently against PyPI's JSON for every pin. All 84 match PyPI's digest set exactly. None is yanked, none is sdist-only, and every version equals production's.
+- **Re-freeze:** a read-only re-freeze of production is byte-identical to `/root/.cache/wp09-lock/production.txt`.
+- **Installs:** a hashed dry run with pip 24.0 and with pip 26.3 resolves 84 packages each. A real scratch install then passes `pip check`.
+- **Reproducibility:** the script's default mode run twice, and its `--constraint` mode once, both reproduce the committed files byte for byte.
+- **Mutation probes:** 19 of 21 were caught. The two that survived, step 4's check and a widened `CONSTRAINT_LINE`, become amendment 10, points 3 and 5.
+
+**Verification:** no blocking issue was raised, so no skeptic ran. All four lenses also flagged `DEPENDENCY_FILES` (amendment 10, point 1).
+
+**Amendment 10 is extended:**
+- **Point 4:** `PIN` accepts extras. With real pip 24.0, a moved `.in` pin written with extras was refused with wrong advice. It fails closed, and no `.in` line has extras today.
+- **Point 5:** the fake conflict block gains pip's direct-request line.
+- **PR body:** the coding-jobs bullet adds pygments, python-dateutil and six.
+
+**Fix round 1:** sent to the same implementer. It covers points 1-5, each with fail-before proof. The lock files must stay byte-identical. Five harness runs follow.
+
+**Attribution:** from now on, commits and PR bodies carry no attribution lines.
+- The `wp-batch.workflow.js` template no longer asks for the trailer. Backup: `/root/.cache/wp-batch.workflow.js.bak-noattr`.
+- The batch 4 PR body draft lost its last line.
+- Earlier local commits are left as they are.
+- Squash merges get an explicit subject and body, so the squash message carries no trailer.
+
+## 2026-11-05 07:12 UTC · Resumed after the usage limit: batch 5's fix round done, my verify running; WP-26 critique resumed
+**GitHub token:** still refused.
+
+**WP-09 batch 5, fix round 1:** five commits on `31701d5`, one per point of amendment 10:
+- `1bfe2a6` (1): `DEPENDENCY_FILES` gains the new lock files.
+- `c894f0d` (2): the Resume bullet.
+- `e9c970f` (3): a test for lock step 4.
+- `0e0d12f` (4): pins with extras.
+- `d50f87e` (5): pip's direct-request line.
+
+The implementer's five runs on `d50f87e` all exited 0 (2032 passed, 1 skipped, 0 leftovers). The agent was resumed to finish its report.
+
+**My verify:** five runs on a snapshot copy, `/root/.cache/wp09-b5-src-d50f87e`, so the clone can change without affecting it. Background `bqopttqce`, logs in `/root/.cache/wp09-b5-myverify-d50f87e/`. The round-2 review follows the implementer's report.
+
+**WP-26 spec:**
+- `specs/WP-26.md` is written (115 kB, at 03:51).
+- Round-1 critique: the coverage and safety critics finished before the limit. The technical critic and everything after it failed.
+- Resumed as `w2cnlkljl`: the finished critics replay from cache, and the technical critic, the revision and the later rounds run live.
+
+## 2026-11-05 07:15 UTC · WP-09 batch 5 fix round 1 reported; round-2 review running
+**Implementer's report:** head `d50f87e`, clean tree. Lock files and `app/workflows`: `git diff 31701d5 -- requirements*.txt requirements*.in` and `git diff a2c0ef8 -- app/workflows` are both empty.
+
+**Fail-before evidence for each new test:**
+- **Point 1:** `test_a_change_to_the_dev_lock_and_its_in_file_is_a_dependency_change` fails on `31701d5`'s `workspace.py` with `assert [] == [...]`.
+- **Point 3:** with step 4 disabled, 1 fails.
+- **Point 4:** `31701d5`'s script exits 1 on the extras move.
+- **Point 5:** a widened `CONSTRAINT_LINE` now fails, where it used to pass 7 of 7. The conflict format was checked against real pip 24.0 with a dry run.
+
+**Other checks:**
+- `make lock` in its default mode, in a scratch copy, reproduces both lock files byte for byte.
+- Five harness runs, all exit 0: 2032 passed, 1 skipped, node 58/58, 0 leftovers.
+- The PR-body draft gains the merge-order and failed-build subsection, plus pygments, python-dateutil and six.
+
+**Housekeeping:** I removed `/root/.cache/wp-scratch.49vros`. It was 410 MB, a round-1 reviewer's scratch copy at `31701d5` plus two venvs, with no process using it.
+
+**Round-2 review:** workflow `wp09-b5-review-r2`, run `wf_c7d0a44e-75c`. Two lenses, with two skeptics on each blocking issue:
+- adversarial closure of amendment 10, reproducing each fail-before independently;
+- correctness and regressions of `31701d5..d50f87e`.
+
+**My verify (`bqopttqce`):** running on the `d50f87e` snapshot.
+
+## 2026-11-05 07:23 UTC · WP-09 batch 5 round 2: both lenses approve; amendment 11; fix round 2
+**Round 2** (`wf_c7d0a44e-75c`): closure and regression both approve, and each point of amendment 10 is closed. Each lens reproduced the failures before the fix independently in scratch copies:
+- with `31701d5`'s `workspace.py`, `assert [] == [...]`;
+- with step 4 disabled, `KeyError: 'fastapi'`;
+- with the old `PIN`, `assert 1 == 0`;
+- with a widened `CONSTRAINT_LINE`, `would move: starlette==0.53.0, starlette==0.52.1`.
+
+There was no blocking issue, so no skeptic ran.
+
+**Non-blocking points, taken as amendment 11.** Backup: `/root/.cache/WP-09.md.bak-amend11`.
+1. No test asserts `requirements.in`'s entry in `DEPENDENCY_FILES`.
+2. `PIN` misses PEP 508 whitespace forms. This is the same fail-closed class as amendment 10's point 4.
+3. `deploy.py:472`'s `launch()` docstring still makes the claim that `ARCHITECTURE.md` corrected.
+
+The reviewers also flagged the missing `Co-Authored-By` trailer. That is the programme's new rule (no attribution), so it is recorded in amendment 11 and is not a defect.
+
+**My verify:** I stopped `bqopttqce`, which was on `d50f87e`, because the head will change. Nothing was left behind: no verify or pytest processes, no `rmp-verify` scopes and no temporary directories.
+
+**Fix round 2:** sent to the implementer. One commit per point, with fail-before proof for points 1 and 2. It runs focused tests in the coding-job and direct layouts plus one full default run; I then run all five layouts on the final head.
+
+## 2026-11-05 07:51 UTC · WP-09 batch 5 fix round 2 done; round 3 and my five-run verify running
+**Fix round 2:** head `2a4ea6a`, clean tree.
+- `523cadc`: the dependency-change case also writes `requirements.in`. With `requirements.in` removed from the set it fails, where `d50f87e`'s test passed 9 of 9.
+- `cb264c7`: `PIN` reads PEP 508 whitespace. The test helper matches whole lines, and `test_a_moved_pin_with_spaces_leaves_the_constraints` covers both forms. It fails with `assert 1 == 0` on `d50f87e`'s script.
+- `2a4ea6a`: `launch()`'s docstring gains D-8's exception.
+
+**Lock files:** still byte-identical to `31701d5`'s, checked by `git diff --quiet` and by `make lock`'s default mode in a scratch copy.
+
+**Implementer's runs, all exit 0:**
+- the touched files under coding-job and direct: 26 passed each;
+- one full default run on the lock's venv: 2034 passed, 1 skipped, node 58/58, 0 leftovers.
+
+**Round 3:** workflow `wp09-b5-review-r3`, run `wf_c60f2a6d-151`. Two lenses: closure of amendment 11, with more PEP 508 forms tried against real pip 24.0, and regressions, comparing the rewritten test helpers line by line. Two skeptics on each blocking issue.
+
+**My verify:** five runs (four layouts on the lock's venv, plus default on production's venv) on the snapshot `/root/.cache/wp09-b5-src-2a4ea6a`. Background `bpvc8t9lr`, logs in `/root/.cache/wp09-b5-myverify-2a4ea6a/`.
+
+## 2026-11-05 12:12 UTC · Resumed: batch 5 round 3 finds a weakened test (amendment 12); WP-26 critique resumed
+**GitHub token:** still refused.
+
+**My verify of `2a4ea6a`** (`bpvc8t9lr`): all five runs exited 0, with 2034 passed, 1 skipped, node 58/58, 0 leftovers, a clean grep and no ignored new file. This verifies `2a4ea6a` only; the head changes again below.
+
+**Round 3** (`wf_c60f2a6d-151`):
+- **Regression lens:** "changes", with one **blocking** issue that both skeptics confirmed.
+  - The round-2 helper in `tests/test_requirements_lock.py` lets the version start with `-`. A versionless lock entry (`annotated-doc== \` plus its hashes) now passes `test_every_requirement_is_pinned_with_its_hashes`, which failed on `d50f87e`. That is a weakened test.
+  - There is no production risk, because pip refuses such a file under `--require-hashes`.
+- **Also from the regression lens (non-blocking):** the whitespace between the extras and `==` is not pinned by any test.
+- **Amendment 11:** points 1 and 3 are closed; point 2 is not.
+- **Closure lens:** stopped at the usage limit. Its scratch directory `/root/.cache/wp-scratch.x2mNDB` (56 MB, at `2a4ea6a`, no process) is removed.
+
+**Spec `§9 amendment 12`** (backup `/root/.cache/WP-09.md.bak-amend12`):
+1. Both `PIN` version groups start with an alphanumeric character. The fail-before probe is `annotated-doc==`.
+2. A third whitespace case, `fastapi[standard] == 0.136.0`.
+
+**Fix round 3:** sent to the implementer. It also asks for a check, helper by helper, that every rewritten helper rejects whatever `d50f87e`'s helper rejected. Then a fresh review round on the final head covers amendments 11 and 12, followed by my five-run verify.
+
+**WP-26:** round 1's critics and revision are done. Round 2 failed at the limit and was resumed (`woafsqc6z`).
+
+## 2026-11-05 12:48 UTC · WP-09 batch 5 fix round 3 done; round 4 and my verify running
+**Fix round 3:** head `67f7be4`, clean tree. The lock files are byte-identical, `app/workflows` is untouched, and no scratch copy is left.
+- `2613f56`: both `PIN` versions start with an alphanumeric character. A versionless `annotated-doc==` now fails `test_every_requirement_is_pinned_with_its_hashes`; it passed at `2a4ea6a` and failed at `d50f87e`. The `.in` files still read 21 and 2 pins, and `make lock`'s default mode is byte-identical.
+- `2f89796`: the third whitespace case. Removing the allowance between the extras and `==` makes it fail.
+- `67f7be4`: a deviation, recorded as amendment 12 point 3. The re-check matrix (12 malformed inputs × `d50f87e`/`2a4ea6a`/final, in `wp09-b5/r3/`) found a second weakening: a spaced lock pin passed. The lock-format test again reads `name==version` as one word. The final head rejects every input `d50f87e` rejected.
+
+**Implementer's runs, all exit 0:** the touched files under coding-job and direct (18 passed each), and one full default run (2035 passed, 1 skipped, node 58/58, 0 leftovers).
+
+**Round 4:** workflow `wp09-b5-review-r4`, run `wf_a7a9cf40-ab0`. Closure of amendments 11 and 12, all six points, with further PEP 508 forms tried against real pip 24.0. The regression lens builds its own matrix of every assertion `d50f87e` made. Two skeptics on each blocking issue.
+
+**My verify:** five runs on the snapshot `/root/.cache/wp09-b5-src-67f7be4`, background `b5bvfuv18`.
+
+## 2026-11-07 01:53 UTC · Resumed: batch 5 round 4 finds a "===" gap; amendment 13 states the .in grammar; WP-26 resumed
+**GitHub token:** still refused. It has now been down since 2026-11-04.
+
+**My verify of `67f7be4`** (`b5bvfuv18`): all five runs exited 0, with 2035 passed, 1 skipped each. This verifies `67f7be4` only; the head changes below.
+
+**Round 4** (`wf_a7a9cf40-ab0`):
+- **Regression lens:** "changes". All six points of amendments 11 and 12 are closed, but its own matrix of 56 inputs found one more silent change. An `.in` pin written with PEP 440's `===` is no longer read: `langchain===9.9.9` against the lock's 1.2.12 passes every test on head and failed on `d50f87e`. The script also refuses a `===` move with wrong advice. Both were reproduced with real pip 24.0 and local wheels.
+- **Not verified by skeptics:** the two skeptics and the closure lens stopped at the usage limit. I judged the evidence direct and reproduced.
+- **Non-blocking:** forms glued after the version, a script rule that no test covers, and `-r  requirements.in` with two spaces.
+- **Scratch:** `wp-scratch.ybpd3h` (40 MB, no process) is removed.
+
+**Decision, spec `§9 amendment 13`** (backup `/root/.cache/WP-09.md.bak-amend13`):
+- **Why:** rounds 2-4 each found a new edge in two hand-kept regular expressions, because the `.in` grammar was never stated and lines outside it were skipped silently.
+- **The grammar:** an `.in` line is `-r <file>` or an exact `==` pin, with PEP 508 whitespace, optional extras, a version starting with a letter or digit, and an optional marker or comment.
+- **Anything else** (`===`, `>=`, `~=`, `!=`, no version, glued text, a URL, an option line) makes the script exit 1 before pip runs, naming the file and line.
+- **One parser:** `parse_in_line` is shared by the script and the format test. The lock-line check stays strict.
+- **Proof:** a parametrised corpus test plus a "fails before pip" test, and a no-weakening matrix against `d50f87e`.
+
+**Fix round 4:** sent to the implementer.
+
+**WP-26:**
+- Round 2's three critics finished.
+- The round-2 revision and round 3 failed at the limit, and were resumed (`whic8r5am`).
+
+## 2026-11-07 02:01 UTC · GitHub token renewed; WP-09 batch 4 PR opened
+**Token:** Kirill regenerated it and saved it into `/root/.config/github_pat` (file time 2026-11-07 01:59:55Z, mode 600; I read only its metadata).
+- `gh api rate_limit` answers `limit=5000`, and the repository API answers HTTP 200.
+- The `Github-Authentication-Token-Expiration` header reads **2027-02-05 01:58:23 UTC**.
+- The outage ran from 2026-11-04 17:37Z at the latest to 2026-11-07 about 02:00Z.
+- `OPS-2026-11-04-github-token-401` gets a note and stays open for WP-16's readiness check on expiry.
+
+**Batch 4:**
+- Before opening the PR: `origin/main` is `2e41c5c`, no PR is open, the live checkout is `deployed` at `2e41c5c`, and `/root/.openclaw/rmp/venv` is a real directory.
+- `aura-github push aura/wp-09-4-venvs` pushed head `a2c0ef8`.
+- PR [#53](https://github.com/Hyper-AI-Lab/openclaw-jev/pull/53) is opened with `/root/.cache/pr-wp09-b4.md`, which carries no attribution line, and is bound in the app.
+- **Merge plan:** wait for CI's event, run the gate once (CLEAN, `test` success, PR head equals `a2c0ef8`, main equals `2e41c5c`, exactly one open PR), then squash with an explicit subject and body that carry no attribution.
+- **After the merge:** watch the deploy. This is hotfix 3a's host step: `deploy.log` must keep the whole run. `/root/.openclaw/rmp/venv` must stay a real directory.
+
+## 2026-11-07 02:34 UTC · PR #53 merged on a green gate; deploy watch running. Batch 5 fix round 4 done
+**PR #53:** CI `test` passed, and the app reported it MERGEABLE and CLEAN. I read that from its PR status cache, without polling.
+- **Gate, run once:** `state=CLEAN test=success head=a2c0ef8 local=a2c0ef8 main=2e41c5c open=1`, so GATE-OK.
+- **Merged** with squash, with an explicit subject (`… (#53)`) and a one-sentence body carrying no attribution.
+- **Deploy watch:** background `bkxvbbzax`. It records the timeline every 10 s, the largest `deploy.log` snapshot, the result, whether the venv is still a real directory, and nondeterminism in the worker journal.
+
+**Batch 5, fix round 4** (amendment 13): head `7af3a6d`, clean tree. The lock files are unchanged since `31701d5`, and no scratch copy is left.
+- `0b639bf`: `parse_in_line`, plus the refusal before pip runs.
+- `c831e7a`: the tests use the same parser.
+- `7af3a6d`: the corpus and before-pip tests.
+
+**Fail-before on `67f7be4`:** 11 failures with its line reading plugged in. The `.in` files still parse to 21 and 2 pins, and `make lock` is byte-identical.
+
+**Matrix:** 28 inputs × `d50f87e`/`67f7be4`/head. Every `===` input, including A42 and A55, is rejected again.
+
+**Implementer's runs:** the touched files under coding-job and direct passed 38 each. The full default run: 2055 passed, 1 skipped, node 58/58, 0 leftovers.
+
+**Point it raised, and my ruling:** `fastapi==0.135.1;python_version>="3"` (lock at 0.135.1) was rejected at `d50f87e` and passes at head. I confirm the head:
+- it is a valid PEP 508 pin with a marker, which pip installs as fastapi 0.135.1, and amendment 13's grammar accepts it;
+- `d50f87e` rejected it only by accident, by reading `0.135.1;python_version>="3"` as the version, which was a false positive and not a check;
+- the same line at another version still fails.
+
+## 2026-11-07 13:01 UTC · WP-09 batch 4 deployed (PR #53, 40528e9); hotfix 3a's host step met; ledger closures
+**Merge:** at 02:34:38Z, squash `40528e9`. The message carries no attribution.
+
+**Deploy:**
+- Queued at 02:41:08Z and launched at 02:41:09Z. The result `deployed` was written at 02:41:54Z.
+- `restarted`: `rmp-api` and `rmp-worker`; canary `ok`; `new_failing` empty; `ci` `success`.
+- The stop window: stopped `rmp-api` and `rmp-worker` at 02:41:21, main moved at 02:41:21, started both at 02:41:24. That is about 3 s down.
+- `/root/.openclaw/rmp/venv` stayed a real directory, and `/root/.openclaw/venvs` was not created, as the PR said: no lock change, so no switch.
+- Live head `40528e9`. 0 nondeterminism in the worker journal.
+
+**Hotfix 3a's host step is met.** `deploy.log` kept the whole run, 866 bytes, from `launch 1 of the deploy of 40528e95fe55 (phase queued)` through `result: {"status": "deployed", …}`. It equals the largest snapshot taken while the unit ran.
+
+**Watcher latency:** 6 min 30 s from merge to queue (02:34:38 to 02:41:08). The previous deploy took 3 min 12 s. Noted for WP-07, which gives `watch_main` its own task.
+
+**Ledger** (spec §7, "after batch 4"):
+- Closed: `B4b-01` with `web-stack-R5`, `WP09-b3-revert-window-not-resumed`, `WP09-b3a-log-test-gaps`.
+- `wp_states["WP-09"]` is updated.
+
+## 2026-11-07 13:02 UTC · Correction to the watcher latency above
+The 6 min 30 s I logged is measured from the merge. Most of it is CI running on main's squash: the `test` check on `40528e9` ran from 02:34:42Z to 02:40:55Z, and the run was queued at 02:41:08Z.
+
+The watcher's own latency was therefore **13 s after CI passed**, against 3 min 12 s on 2026-10-30. Nothing new for WP-07.
+
+## 2026-11-07 13:02 UTC · Batch 5 rebased onto the deployed squash; round 5, my verify and WP-26's last critic running
+**Rebase:**
+- `git rebase --onto origin/main a2c0ef8 aura/wp-09-5-lock`: 21 commits, new head `a6c1b5d`.
+- `40528e9`'s tree equals `a2c0ef8`'s.
+- `a6c1b5d`'s tree is identical to `7af3a6d`'s, so every review and run on `7af3a6d` stands for it.
+
+**Round 5** (`wf_aaae8a2a-616`, resumed as `wtpdvub2u`): both lenses stopped at the limit before reporting. They run again on `7af3a6d`'s tree.
+
+**My verify:** five runs on the snapshot `/root/.cache/wp09-b5-src-a6c1b5d`, background `b4mzvqr79`, logs in `/root/.cache/wp09-b5-myverify-a6c1b5d/`. The placeholder grep now runs against `origin/main` `40528e9`, so it covers batch 5's diff only.
+
+**WP-26:** 14 of 15 agents are done. The round-3 technical critic stopped at the limit and was resumed (`wy4eeffej`).
+
+## 2026-11-07 13:27 UTC · WP-26 spec: three critique rounds done; a finishing round runs; Q2 put to Kirill
+**Result of `wf_2a29a979-9ab`:** all 15 agents done. `specs/WP-26.md` has 30 items in 8 batches (212 kB).
+- **Round 1:** all three lenses asked for revision (3, 7 and 4 blocking or major gaps).
+- **Round 2:** safety and coverage approved; one lens still asked for revision over D-5's 6-hour backup rule.
+- **Round 3:** coverage and technical approved. Safety still found **one major gap**: the pre-lock data-revision check of WP26-15 reads deleted revision files with `git show`. A revert PR of a deployed revision PR would fail three launches and wedge the WP-09 pipeline for every later head until a manual ship. Coverage and technical noted the same defect as minor. There are 17 minor points besides.
+
+**Finishing round:** `wp26-spec-finish`, run `wf_bd6e7db8-da1`. It revises against the 18 gaps in `/root/.cache/wp26-spec-gaps-r3.json`, fixing the deleted-file defect at its root with `test_a_revert_that_deletes_revision_files_deploys`. Then three lenses re-critique, for at most two rounds.
+- A first launch, `w5h9jp7ss`, was stopped within seconds: I had passed a placeholder instead of the gap list. `WP-26.md` was unchanged (mtime 03:15).
+
+**Open questions in the spec:**
+- **Q1:** the token's Workflows write permission. This is now a check: WP-09 batch 5's push proves it, because that batch edits `ci.yml`.
+- **Q2:** may batch 8 drop D4-D6 and D8's five redundant indexes and D10's eight unused server defaults? Rule 17 says migrations only add. Each removal comes with four proofs and a recorded undo. Q2 blocks batch 8 only, and no other WP. It is put to Kirill now.
+
+## 2026-11-07 13:41 UTC · WP-09 batch 5 round 5: amendment 13 approved by closure; regression finds two parser gaps; amendment 14 delegates to packaging
+**Round 5** (`wf_aaae8a2a-616`):
+- **Closure: approved.** It ran 73 inputs against pip 24.0's own parser and the script end to end, then a 6000-line fuzz. The script never skipped a line that pip reads. The fail-before was reproduced: 20 failures against `67f7be4`'s script.
+- **Regression: "changes", two blocking issues.**
+  1. The marker group accepts any text after `;`. The skeptics split 1-1 (the refuting one: `d50f87e` never checked markers).
+  2. Physical-line parsing against pip's continuation joining. Both skeptics confirmed it.
+- **Non-blocking:** `-r` may name any file; versions like `.*`, `,<1` and `${V}` pass; no `--constraint` before-pip test; the `-r` line is read by exact string.
+
+**Decision, spec `§9 amendment 14`** (backup `/root/.cache/WP-09.md.bak-amend14`): `parse_in_line(line, path)` delegates to `packaging.requirements.Requirement`, version 26.0, which is in the lock and in production's venv. D-6's checks sit on top:
+- a trailing `\` is refused;
+- the only include is `-r requirements.in`, and only in the dev `.in` file;
+- other option lines are refused;
+- a comment counts only after whitespace;
+- there must be exactly one `==` specifier, with a valid version and no `*`;
+- markers are validated.
+
+The corpus grows, and the no-weakening matrix is extended. This is the fifth round to find a new edge in a hand-written regex, and this decision removes the regex.
+
+**Fix round 5:** sent to the implementer, on the rebased `a6c1b5d`.
+
+**My verify of `a6c1b5d`:** stopped after its first run, which passed (2055 passed, 1 skipped, node 58/58, 0 leftovers), because the head changes. Nothing was left behind: no processes, scopes or temp directories.
+
+## 2026-11-09 23:01 UTC · Resumed after the usage limit: batch 5 fix round 5 and the WP-26 finishing round
+**WP-09 batch 5, fix round 5** (amendment 14): three commits on `a6c1b5d`, made before the limit stopped the agent:
+- `18dc3bc`: `parse_in_line` on packaging's PEP 508 parser, plus D-6's checks;
+- `137bdf0`: the `-r` include is read through `parse_in_line`;
+- `0b94e1e`: the corpus and the `--constraint` before-pip test.
+
+The agent was resumed to finish the proofs, the matrix and the runs.
+
+**WP-26 finishing round** (`wf_bd6e7db8-da1`):
+- The round-3 revision finished before the limit. It addressed all 18 gaps, among them:
+  - the deleted-revision-file defect, fixed at its root: only A and M entries are read, the check runs before the venv build, and a new `test_a_revert_that_deletes_revision_files_deploys` covers it;
+  - one KIND reader;
+  - the schema position on every ending;
+  - two-table lock exceptions;
+  - a Postgres test comparing the models with head.
+- Q1 is updated: WP-09 batch 5's push answers whether the token can change workflow files. Q2 is unchanged, and I recommend yes.
+- The round-4 critics stopped at the limit. The round was resumed as `wsw4l3i2h`, and the revision replays from cache.
+
+## 2026-11-09 23:15 UTC · Kirill answers WP-26's Q2: yes (K-39)
+Kirill: "Yes to Q2, drop the leftover indexes and defaults."
+
+**Recorded as follows:**
+- **`decisions.md`, K-39 (Q40):** WP-26 batch 8 may ship WP26-24 and WP26-25.
+  - WP26-24 drops five redundant indexes `CONCURRENTLY`: `ix_side_effect_idempotency`, `ix_memory_links_source`, `ix_memory_links_target`, `ix_tasks_session` and `ix_task_registry_entries_task_id`.
+  - WP26-25 drops D10's eight unused server defaults, one table per revision.
+  - Each removal carries D-8's four proofs and a recorded undo, and `REMOVALS` lists exactly them.
+- **`ordering.md` rule 17** gains the spec's §1a note, dated 2026-11-10.
+- Backups: `/root/.cache/decisions.md.bak-k39` and `/root/.cache/ordering.md.bak-k39`.
+
+**Still to do:** `specs/WP-26.md` §1a will record Q2 as answered once its finishing critique round (`wsw4l3i2h`) ends, so that no edit lands while the critics are reading the file.
+
+## 2026-11-09 23:43 UTC · WP-09 batch 5 fix round 5 done; ruling on non-normalised versions; round 6 and my verify running
+**Fix round 5:** head `0b94e1e`, clean tree.
+- The `IN_PIN` and `IN_INCLUDE` regexes are gone, and `parse_in_line` runs on packaging.
+- The lock files are unchanged since `31701d5`, and `app/workflows` is untouched.
+- **Fail-before on `a6c1b5d`:** 9 failures, covering `;garbage`, the invalid marker, the continuation, `.*`, `,<1`, `0.${V}`, the two kinds of foreign `-r`, and the `--constraint` before-pip case.
+- The `.in` files read 21 and 2 pins, equal to `d50f87e`'s reading. `make lock` reproduces both lock files byte for byte.
+- **No-weakening matrix:** 41 inputs. Every input `d50f87e` rejected is rejected, except two classes pip reads as the lock's own version.
+- **Runs:** the touched files under coding-job and direct passed 51 each. The full default run: 2068 passed, 1 skipped, node 58/58, 0 leftovers.
+
+**Ruling (mine):** `fastapi==v0.135.1` with the lock at 0.135.1 is correctly accepted. PEP 440 normalises `v0.135.1` to `0.135.1`, and pip installs exactly the lock's version. `d50f87e` rejected it only by comparing raw text. This is the same class as the glued-marker ruling of 2026-11-07.
+
+**Round 6:** the Workflow tool's PreToolUse hook timed out twice; the second call was an accidental probe with a placeholder argument, and it never ran. So the manual fallback runs instead: two background reviewers, closure of amendment 14 against pip 24.0 and packaging, and no weakening since `d50f87e`. The prompts are in `/root/.cache/wp-batch-manual/wp09-b5/r6-review/`. Skeptics will be spawned for any blocking issue.
+
+**My verify:** five runs on the snapshot `/root/.cache/wp09-b5-src-0b94e1e`, background `b2kq83o1d`.
+
+## 2026-11-11 03:15 UTC · Resumed after the usage limit: my verify of batch 5 passes; round 6 and WP-26 round 4 resumed
+**My verify of `0b94e1e`** (`b2kq83o1d`): all five runs exited 0, with 2068 passed, 1 skipped each. They covered the four layouts on the lock's venv plus default on production's venv. This is the batch's final head unless round 6 finds something.
+
+**Round 6:** both reviewers stopped at the limit before reporting. Both were resumed with their context.
+
+**WP-26:** the round-4 critics finished; the round-4 revision failed at the limit. The run was resumed (`w1udybasb`). Q2's answer (K-39) goes into `specs/WP-26.md` §1a after this run, so the file does not change under the critics.
+
+`origin/main` is still `40528e9`, and no PR is open.
+
+## 2026-11-11 03:30 UTC · WP-09 batch 5 round 6: the regression lens approves
+**Regression lens: approve,** with no blocking issue. A14-1 to A14-6 are closed. The result and evidence are in `wp09-b5/r6-review/regression-result.json` and `regression-matrix/`.
+- **Matrix:** 101 malformed inputs, built from every assertion `d50f87e` makes, run through the harness at `d50f87e` and at head.
+  - Every input `d50f87e` rejected is still rejected, apart from three classes.
+  - Two of those are the ruled ones: non-normalised PEP 440 spellings (`v0.135.1`, `0.135.01`, `0!0.135.1`, `0.63beta1`) and valid glued markers. Each relocks byte for byte.
+  - Seven inputs are rejected only at head.
+- **Mutants:** in all 16 script mutants, the head's tests kill a superset of what `d50f87e`'s kill.
+- **Other checks:** `IN_PIN` and `IN_INCLUDE` have no reader left. The readers return equal results on production's freeze (100 pins) and in both constraint modes (100 and 84). The four requirements files are byte-identical to `31701d5`'s, and `make lock` is byte-identical. `app/workflows` is untouched. The touched tests pass under coding-job and direct.
+
+**Non-blocking point, ruled:** `d50f87e` asserted that `requirements-dev.in`'s include is its first line, written exactly. Head asserts exactly one include. The include moved to another line, or given a trailing `# comment`, now passes. pip reads all three forms identically and `make lock` reproduces both lock files byte for byte. I rule this a false positive, in the same class as the earlier rulings, and add no fix.
+
+**Waiting:** the closure lens.
+
+## 2026-11-11 03:38 UTC · WP-09 batch 5 round 6: closure finds three more pip/script differences; amendment 15 narrows the .in form
+**Closure lens: "changes",** with three blocking issues. The result is in `wp09-b5/r6-review/closure-result.json`.
+1. **Encoding declarations.** A `# coding: unicode_escape`, utf-7 or latin-1 declaration hides a pin, option or include in what the script reads as a comment. End to end, a hidden `evilpkg==1.0` reached the lock with exit 0. This existed before `d50f87e`.
+2. **packaging 26.0 against pip's 21.3.** packaging 26.0 accepts lines that pip 24.0's vendored packaging 21.3 refuses: a trailing comma (newly accepted at `0b94e1e`), `extras` markers, ` -` in a marker string, archive-suffix local labels, and `-r` followed by non-ASCII whitespace.
+3. **False markers.** A false marker, combined with "last line wins" for a repeated name, hides the pin pip installs.
+
+**The lens also confirmed:**
+- the fail-before (10 on `a6c1b5d`), 21 and 2 pins, and `make lock` byte-identical;
+- a 283-input corpus and 2×40,000 fuzzed lines: every disagreement falls in these classes.
+
+**Decision, spec `§9 amendment 15`** (backup `/root/.cache/WP-09.md.bak-amend15`):
+- **Why:** six rounds each found a new pip/script difference, because the wider language (extras, whitespace, markers, non-normalised versions) has no single reading across pip versions.
+- **The form:** the `.in` files now take one strict canonical form.
+  - The whole file is printable ASCII plus tab, LF and CR, with no `\` or `$` and no coding declaration.
+  - Each line is blank, a comment, the dev file's single `-r requirements.in`, or a canonical `name==version` with an optional trailing comment.
+  - No name may be repeated in one file or across both files.
+  - Everything else is refused before pip runs.
+- **Today's files:** checked on 2026-11-11, both already conform.
+- **Superseded:** the line grammar of amendments 13-14, the allowances of 10.4 and 11.2, and my two rulings accepting glued markers and non-normalised versions. Those forms are now refused, which is stricter.
+- **Proof:** includes agreement with pip 24.0's own `parse_requirements` on every accepted file.
+
+**Fix round 6:** sent to the implementer.
+
+**Note:** `/root/.cache/wp-scratch.U11ece` was reported deleted by the closure reviewer.
+
+## 2026-11-11 04:02 UTC · WP-26 spec complete: all three lenses approve revision 5
+**Finishing run** (`wf_bd6e7db8-da1`): 8 agents, all done.
+- **Round 4:** coverage and safety approved. The technical lens found one major gap: the backup guards also applied to an empty database built with `--allow-empty`. Revision 5 fixed it.
+- **Round 5:** coverage, safety and technical all **approve**, with no blocking or major gap. Thirteen minor points remain.
+
+**Revision 5 also:**
+- keeps the root fix for deleted revision files, now with a 31 h backup case;
+- makes the 30 h guard wait before the lock instead of failing;
+- blocks Aura's approved coding jobs from landing a revision, under rule 44;
+- adds rule 46, against reverting batch 4 after batch 6;
+- defines one form for hand-run DDL;
+- makes `_fold` never raise;
+- puts a schema note on every ending other than `deployed` and `rolled_back`;
+- records K-39 everywhere.
+
+**`specs/WP-26.md`:** 30 items, 8 batches, 2,300 lines.
+- A new §10 lists the 13 minor points, each binding on the batch that implements its item. The full text is in `research/wp26-spec-gaps-r5.json`.
+- Backup before §10: `/root/.cache/WP-26.md.bak-final`.
+
+**Open questions:** Q2 is closed (K-39). Q1, whether the token can write workflows, is answered by WP-09 batch 5's push.
+
+**Ledger:** `wp_states["WP-26"]` is set.
+
+**Next:** §7's "before batch 1" bookkeeping (the work-packages rows, rules 3, 25, 43, 44, 45 and 46, the cross-WP notes, and the WP-09 and WP-04 spec notes) is the programme's step once WP-09 batch 5 is deployed, before WP-26 batch 1 starts.
+
+## 2026-11-12 06:43 UTC · Resumed after the usage limit: batch 5 fix round 6
+**Before the limit,** the implementer committed two changes on `0b94e1e`:
+- `3888a87`: the step-4 test's `.in` files stay valid under the new form.
+- `2bb4c90`: `parse_in_file` and the canonical form of amendment 15.
+
+**Resumed** to finish the proofs and runs. No harness run was in progress, and no scratch copy was left.
+
+## 2026-11-12 06:45 UTC · WP-09 batch 5 fix round 6 done; one docs point added (amendment 15.7)
+**Fix round 6:** head `2bb4c90` on `0b94e1e`, clean tree.
+- `parse_in_file` enforces amendment 15's canonical form. `parse_in_line` and `packaging.requirements` are gone.
+- The lock files are unchanged since `31701d5`, and `app/workflows` is untouched.
+- `test_in_file_rules` covers 55 cases: 6 accepted and 49 refused, each refused case checked in both modes.
+
+**Fail-before on `0b94e1e`:**
+- 27 refused cases were accepted there, often with the lock written.
+- 2 crashed with `UnicodeDecodeError`.
+- 20 were already refused under amendment 13's message. They are kept so they stay refused. This corrects amendment 15's "each refused case is accepted or crashes", which holds for 29 of 49.
+
+**Unchanged:** both `.in` files read 21 and 2 pins. Four readers agree: head's `parse_in_file`, head's test reader, and `d50f87e`'s script and test. `make lock` is byte-identical.
+
+**Agreement with pip:** pip 24.0's and pip 26.3's own `parse_requirements` return exactly `parse_in_file`'s pins for all 6 accepted files.
+
+**Runs:** the touched files under coding-job and direct passed 69 each. The full default run: 2086 passed, 1 skipped, node 58/58, 0 leftovers.
+
+**Amendment 15 point 7:** `CLAUDE.md:25` and `ARCHITECTURE.md:598` will state the `.in` form, so Aura's coding jobs meet it before `make lock` refuses them. This came from the implementer's suggestion. It is one docs commit, sent to the implementer. Round 7 and my verify follow on the new head.
+
+## 2026-11-12 06:46 UTC · WP-09 batch 5 head 88a9e66 (docs point 7); round 7 and my verify running
+**`88a9e66`:** one docs-only commit on `2bb4c90`. `CLAUDE.md:25` gains amendment 15.7's sentence word for word, and `ARCHITECTURE.md:598` gains the short form. Clean tree. The lock files are unchanged since `31701d5`, and `app/workflows` is untouched. Snapshot: `/root/.cache/wp09-b5-src-88a9e66`.
+
+**Round 7:** workflow `wp09-b5-review-r7`, run `wf_5941b468-e1c`; the Workflow tool's hook answered this time. Two lenses, with two skeptics on each blocking issue:
+- adversarial closure of amendment 15, with its own byte-level corpus and fuzz against pip 24.0 and the latest pip;
+- a whole-batch final read of `40528e9..88a9e66` against WP09-20, -21 and -33 and amendments 10-15, plus its own no-weakening list against `d50f87e`.
+
+**My verify:** five runs, background `bx9ziz4mc`.
+
+## 2026-11-12 07:20 UTC · WP-09 batch 5 round 7: whole-batch approves; closure finds one weakened check (line numbers); amendment 16
+**Round 7** (`wf_5941b468-e1c`):
+- **Whole-batch final read: approve.**
+  - WP09-20, WP09-21, WP09-33's part and amendments 10-15 are all closed.
+  - A 95-input no-weakening matrix against `d50f87e` found nothing caught there and accepted at head, apart from include placements amendment 15 allows.
+  - All 28 `d50f87e` mutants are caught. The lock files are byte-identical, `make lock` reproduces them, and `--constraint` gives the same 16 names.
+- **Closure:**
+  - Amendment 15 is confirmed against six pip versions (23.3.2 to 26.3): 15,469 accepted file pairs and 60 end-to-end dry-run installs, with 0 differences. All 3,799 refusals came before pip, in both modes.
+  - **One blocking issue,** confirmed by both skeptics: every corpus refusal is on line 1, so line numbers are not checked past 1. `0b94e1e`'s test checked line 2 or 3, so this is a weakened test.
+
+**Spec `§9 amendment 16`** (backup `/root/.cache/WP-09.md.bak-amend16`):
+1. Refusals placed on later lines.
+2. Tests for control characters, a glued include comment and a CR-separated coding declaration. The coding check is reduced to pip's own view.
+3. A `ValueError` from `Version()` becomes a `Refused`.
+4. The generated-file `PIN` is narrowed to one word, which removes the last of the superseded allowances.
+5. A robust expected value for the today's-files case.
+6. An exact docs sentence.
+
+**Fix round 7:** sent. My verify on `88a9e66` (`bx9ziz4mc`) was stopped during its first run, because the head will change; nothing was left behind.
+
+## 2026-11-12 07:39 UTC · WP-09 batch 5 fix round 7 done; round 8 and my verify running
+**Fix round 7** (amendment 16): head `e7ca336`, six commits on `88a9e66`. Clean tree. The lock files are unchanged since `31701d5`, and `app/workflows` is untouched.
+- `6f51705`: line numbers checked past line 1. A hard-coded line 1 now fails 2 cases.
+- `5672523`: the coding check uses only pip's own LF view. New tests for a CR-separated declaration, `\x0b` and a glued include comment.
+- `a947f8e`: an unreadable version gets the per-line refusal. It crashed on `88a9e66`.
+- `aa2a97d`: the generated-file `PIN` is one word. The freeze still reads 100 pins and the locks 79 and 5, and every lock malformation is still refused.
+- `4c0eda3`: the today's-files expectation is read robustly.
+- `e7ca336`: the docs' exact sentence.
+
+**Checks:** `make lock` is byte-identical. The touched files under coding-job and direct passed 75 each. The full default run: 2092 passed, 1 skipped, node 58/58, 0 leftovers.
+
+**Round 8:** workflow `wf_f89c4aea-d95`. Closure of amendment 16, with fail-before reproduced on `88a9e66`, plus no weakening since `88a9e66` and `d50f87e`.
+
+**My verify:** five runs on the snapshot `/root/.cache/wp09-b5-src-e7ca336`, background `b73i6ae8j`.
+
+## 2026-11-12 08:02 UTC · WP-09 batch 5 round 8: both lenses approve; review complete
+**Round 8** (`wf_f89c4aea-d95`): closure and regression both **approve**, with no blocking issue. A16-1 to A16-6 are closed, each fail-before was reproduced on `88a9e66` independently, and nothing was weakened since `88a9e66` or `d50f87e`.
+- **Coding check:** compared with pip 24.0 and 26.3 over 3.26 million generated files. Every file pip decodes by a declaration is refused, on the right line.
+- **One-word `PIN`:** reads production's freeze (100), the locks (79 and 5) and a constraint file exactly as pip 24.0 and 26.3 do. `make lock` and the `--constraint` run are byte-identical, with the same 16 names.
+
+**Non-blocking points, accepted without change:**
+- The docs sentence does not list every refusal: coding comments, control characters and local labels. It is the spec's wording, and the refusals happen anyway.
+- The coding check also refuses the pattern on lines that do not start with `#`. That is amendment 15.1's over-refusal by design.
+- `plain_in_pins` decodes at import, so a non-ASCII byte in an `.in` file stops test collection loudly instead of failing one case. It fails closed, and `make lock` refuses such a file first.
+- A non-canonical duplicate in the dev lock is now caught by the lock-format test instead of the overlap test.
+
+**Batch 5 review is complete:** eight rounds and amendments 10-16. The PR body is drafted in `/root/.cache/pr-wp09-b5.md`, with a VERIFY_TABLE still to fill and no attribution line. Waiting for my verify (`b73i6ae8j`).
+
+## 2026-11-12 08:34 UTC · WP-09 batch 5 verified by me
+My five-run verify of `e7ca336` (`b73i6ae8j`, logs in `/root/.cache/wp09-b5-myverify-e7ca336/`): every run exited 0, with 2092 passed and 1 skipped, node 58/58, 0 leftovers, a clean placeholder grep and no ignored new file. The runs were the default, coding-job, direct and live layouts on the lock's venv, plus default on production's current venv.
+
+`origin/main` is `40528e9`, and no PR is open.
+
+**Next:** mirror this log, push (this answers WP-26's Q1: whether the token can change workflow files, since this PR edits `ci.yml`), open the PR, and run the gated merge. The deploy is production's first venv switch, and the read-only host checks follow it.
