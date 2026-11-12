@@ -21,8 +21,10 @@ first, retried, then the event; a reviewed job's workflow then replies on the ne
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -39,8 +41,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 from app.coding import github, venvs, verify, workspace
-from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
-from app.config import OPENCLAW_HOME
+from app.coding.units import CLAUDE_BIN, CODE_ROOT, CODER_USER, JOBS_DIR, MANAGED_SETTINGS, RUNS_DIR
+from app.config import OPENCLAW_HOME, _read_settings_file
+from app.production import coding_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,16 @@ RMP_UNIT_PREFIXES = ("rmp-", "aura-", "openclaw-", "temporal.", "temporal-")
 # or no directory.
 MISSING = " (missing)"
 NOT_REGULAR = " (not a regular file)"
+# The readiness-hashed host files, as (repo copy, installed copy). Rule 18 installs a changed one before its merge; a
+# deploy whose head changes one waits, blocked, until the installed copy holds the head's bytes.
+HOST_INSTALLED = (
+    ("ops/claude_host/managed-settings.json", coding_readiness.HOST_POLICY),
+    ("ops/aura_github.sh", coding_readiness.GITHUB_WRAPPER),
+    ("ops/aura_coder/managed-settings.json", MANAGED_SETTINGS),
+)
+# Where the Claude Code pin is set: these keys of DEFAULT_CODING, unless settings.json's own ``coding`` sets them.
+CLAUDE_PIN_SOURCE = "app/config.py"
+CLAUDE_PIN_KEYS = ("claude_version", "claude_sha256")
 
 
 class Interrupted(BaseException):
@@ -258,6 +271,47 @@ def host_file_drift(repo: Path, commit: str = "HEAD") -> Dict[str, List[str]]:
     drift["mirrors"] = [path for prefix, target in MIRRORS
                         for _, _, path, _ in _out_of_date(repo, commit, prefix, target)]
     return drift
+
+
+def _default_pin(live: Path, commit: str) -> Dict[str, Any]:
+    """The Claude Code pin in ``commit``'s ``DEFAULT_CODING`` (``CLAUDE_PIN_KEYS``), read from its ``app/config.py``
+    with ``ast``: the commit's code is never imported."""
+    module = ast.parse(_git_bytes(live, "show", f"{commit}:{CLAUDE_PIN_SOURCE}"))
+    for node in module.body:
+        targets = (node.targets if isinstance(node, ast.Assign) else
+                   [node.target] if isinstance(node, ast.AnnAssign) else [])
+        if any(isinstance(target, ast.Name) and target.id == "DEFAULT_CODING" for target in targets) and isinstance(
+                node.value, ast.Dict):
+            return {key.value: ast.literal_eval(value) for key, value in zip(node.value.keys, node.value.values)
+                    if isinstance(key, ast.Constant) and key.value in CLAUDE_PIN_KEYS}
+    return {}
+
+
+def claude_pin(live: Path, commit: str, own: Dict[str, Any]) -> Tuple[Any, ...]:
+    """The effective Claude Code pin at ``commit``, (version, sha256): each key settings.json's own ``coding`` (``own``)
+    sets, else ``commit``'s ``DEFAULT_CODING``, as ``app.config.load_settings`` merges them."""
+    default = _default_pin(live, commit)
+    return tuple(own[key] if key in own else default.get(key) for key in CLAUDE_PIN_KEYS)
+
+
+def install_gaps(live: Path, old: str, head: str, changed: List[Tuple[str, str]], host: "Host") -> List[str]:
+    """What must be installed on this host before ``head`` deploys over ``old`` (rule 18), by name; empty when nothing.
+
+    A readiness-hashed host file whose repo copy the range ``changed`` must be installed with the head's bytes (a copy
+    the head deletes has nothing to install), and when the range moves the effective Claude Code pin, the installed
+    binary must be the head's version with the head's sha256. The deploy installs none of them."""
+    paths = {path for status, path in changed if status != "D"}
+    gaps = []
+    for source, installed in HOST_INSTALLED:
+        if source in paths and host.installed_sha256(installed) != hashlib.sha256(
+                _git_bytes(live, "show", f"{head}:{source}")).hexdigest():
+            gaps.append(f"{source} as {installed}")
+    if CLAUDE_PIN_SOURCE in paths:
+        own = host.coding_settings()
+        pin = claude_pin(live, head, own)
+        if pin != claude_pin(live, old, own) and tuple(host.installed_claude()) != pin:
+            gaps.append(f"Claude Code {pin[0]} (sha256 {pin[1]}) as {CLAUDE_BIN}")
+    return gaps
 
 
 def fetch_approved(job: workspace.Job, head: str, *, live: Path = LIVE_REPO) -> Dict[str, Any]:
@@ -659,7 +713,8 @@ def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
 
 
 MAIN = "main"
-# A head whose deploy ended this way waits for a later commit instead of being tried again.
+# A head whose deploy ended this way waits for a later commit instead of being tried again; one blocked until host
+# files are installed (``needs_install``) is queued again once they are.
 NOT_RETRIED = ("blocked", "failed", "rolled_back")
 # Kirill's note is tried at once and again after each of these pauses while it is not delivered: about 2.5 minutes.
 NOTE_RETRY_SEC = (30, 120)
@@ -693,7 +748,8 @@ def _queue_main(host: "Host") -> None:
         return
     last = _read_json(spec_file(MAIN).with_name("result.json"))
     if last and last.get("head") == head and last.get("status") in NOT_RETRIED:
-        return
+        if not last.get("needs_install") or install_gaps(host.live, old, head, changes(host.live, old, head), host):
+            return
     if github.check(head, host.repo) != "success":
         return
     queue({"task_id": MAIN, "source": "github", "head": head, "ci": "success"})
@@ -893,6 +949,18 @@ class Host:
     def wait_check(self, sha: str) -> str:
         """CI's test check on ``sha`` once it finished, or its state when the wait ran out."""
         return github.wait_check(sha, self.repo)
+
+    def installed_sha256(self, path: Path) -> Optional[str]:
+        """The sha256 of the host file ``path`` as installed, or None when it is not a file."""
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+    def coding_settings(self) -> Dict[str, Any]:
+        """settings.json's own ``coding`` section, without the defaults of the code running here."""
+        return _read_settings_file().get("coding") or {}
+
+    def installed_claude(self) -> Tuple[Optional[str], Optional[str]]:
+        """The installed Claude Code: its version and the sha256 of its binary, as readiness reads them."""
+        return coding_readiness.installed_version(), coding_readiness.binary_sha256(CLAUDE_BIN)
 
     def readiness_report(self) -> Dict[str, str]:
         from app.coding import deploy_checks
@@ -1192,7 +1260,9 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
 
     ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
     approved ``head`` lands through a pull request first, the run's state records the merge commit (``landed``), and
-    exactly that commit is deployed once CI's test check passed on it. That slow work runs first, without the lock, and
+    exactly that commit is deployed once CI's test check passed on it. First of all, a change to a readiness-hashed host
+    file or to the Claude Code pin that is not installed on the host blocks the run (``_install_blocked``; for a
+    reviewed run before the land, and again for its merge commit). That slow work runs first, without the lock, and
     so does the build of the head's venv when the change moves the lock files (``_build_venv``), and the copy of the
     web backends' venv when their requirements change (``_copy_web_venv``). Then, holding the
     code-reload lock: the hand-edit check, the readiness baseline and, last before the units stop, the strict idle
@@ -1222,10 +1292,14 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         if not _is_ancestor(live, old, head):
             return {"status": "blocked", "summary": f"The live main ({old[:12]}) has commits GitHub's main lacks, so nothing "
                     "was deployed; main is unchanged."}
+        blocked = _install_blocked(host, old, head, run)
+        if blocked:
+            return blocked
     else:
         if old != spec["old"]:
             return {"status": "failed", "summary": "main moved while the deploy waited, so nothing was deployed. Ask me again."}
-        blocked = _drift(live, old)
+        # Before the land, so a change whose host files are not installed never reaches GitHub's main.
+        blocked = _install_blocked(host, old, spec["head"], run) or _drift(live, old)
         if blocked:
             return blocked
         if run.get("phase") != "landed":
@@ -1242,6 +1316,10 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         head = run["merge"]
         log(f"landed {run['pr']['url']} as {head[:12]}")
         host.fetch_main()
+        # The merge commit is what ships, and it also carries what GitHub's main held beyond the live main.
+        blocked = _install_blocked(host, old, head, run)
+        if blocked:
+            return blocked
         check = host.wait_check(head)
         if check != "success":
             return {"status": "blocked", "pr": run["pr"], "summary": f"CI's test check on the merged commit "
@@ -1426,6 +1504,21 @@ def _reverted(live: Path, task: str, run: Dict[str, Any]) -> bool:
     (False when it cannot be read), the venv link at the recorded previous venv, and the web backends' venv copy from
     before the change renamed back."""
     return _main_at(live, run["revert"]) and not _venv_moved(live, run) and not _web_venv_copy(task).exists()
+
+
+def _install_blocked(host: Host, old: str, head: str, run: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """A blocked result naming what must be installed on the host before ``head`` deploys over ``old``
+    (``install_gaps``, in ``needs_install``), or None when nothing must. The watcher queues a head of GitHub's main
+    blocked this way again once it is installed."""
+    gaps = install_gaps(host.live, old, head, changes(host.live, old, head), host)
+    if not gaps:
+        return None
+    summary = (f"{', '.join(gaps)} must be installed on the host before this deploy (rule 18), so nothing was "
+               "deployed; main is unchanged.")
+    if run.get("merge"):
+        summary += " GitHub's main has the change; it goes live with GitHub's main once that is installed."
+    return {"status": "blocked", **({"pr": run["pr"]} if run.get("pr") else {}), "needs_install": gaps,
+            "summary": summary}
 
 
 def _drift(live: Path, old: str) -> Optional[Dict[str, Any]]:

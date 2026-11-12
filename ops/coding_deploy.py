@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app.coding.deploy_checks  # noqa: E402,F401
 import app.coding.venvs  # noqa: E402,F401
 import app.production.canary_sentinel  # noqa: E402,F401
+import app.production.coding_readiness  # noqa: E402,F401
 from app.coding import deploy  # noqa: E402
 from app.config import get_coding_config  # noqa: E402
 from app.db.database import AsyncSessionLocal, engine  # noqa: E402

@@ -77,6 +77,9 @@ def repos(tmp_path, monkeypatch):
     monkeypatch.setattr(deploy, "RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
     monkeypatch.setattr(venvs, "VENVS_ROOT", tmp_path / "venvs")
+    # The host files the deploy compares with their repo copies, installed on tmp_path (none installed yet).
+    monkeypatch.setattr(deploy, "HOST_INSTALLED", tuple(
+        (source, tmp_path / "host" / str(installed).lstrip("/")) for source, installed in deploy.HOST_INSTALLED))
     venv_runs = []
 
     def run(argv, *, cwd=None, timeout):
@@ -114,15 +117,18 @@ class FakeHost(deploy.Host):
     unit at its n-th call of that kind: ``deploy.Interrupted`` is raised there, once, before the call is made.
     ``merged`` is GitHub's record of the pull requests that merged, by branch, which a land adds to; hosts can share
     it. The venv steps run ``venvs`` for real on tmp_path (``repos``) and are recorded: a build with the lock files
-    it was given, a switch with the live main it saw, a prune with what it keeps."""
+    it was given, a switch with the live main it saw, a prune with what it keeps. The installed host files are read
+    for real on tmp_path (``repos``) and recorded; the installed Claude Code is ``claude``, (version, sha256), and
+    settings.json's own ``coding`` is ``settings``."""
 
     def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None, kill_at=None,
-                 merged=None):
+                 merged=None, claude=(None, None), settings=None):
         super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
         self.calls, self.busy, self.results, self.lands = [], list(busy), list(checks), list(lands)
         self.units, self.held, self.ci = list(units), held, dict(ci or {})
         self.kill_at = list(kill_at) if kill_at else None
         self.merged = {} if merged is None else merged
+        self.claude, self.settings = claude, dict(settings or {})
 
     def active_user_tasks(self):
         count = self.busy.pop(0) if self.busy else 0
@@ -191,6 +197,17 @@ class FakeHost(deploy.Host):
     def checks(self, restarted, baseline, *, ignore=()):
         self.calls.append(("checks", tuple(restarted), tuple(baseline), *([tuple(ignore)] if ignore else [])))
         return self.results.pop(0) if self.results else {"failure": None, "canary": "ok"}
+
+    def installed_sha256(self, path):
+        self.calls.append(("installed", str(path)))
+        return super().installed_sha256(path)
+
+    def coding_settings(self):
+        return dict(self.settings)
+
+    def installed_claude(self):
+        self.calls.append(("installed_claude",))
+        return self.claude
 
 
 def spec(repos, head):
@@ -3584,3 +3601,115 @@ def test_a_relative_live_link_is_recorded_canonically_and_kept_by_prune(repos, t
         assert sorted(os.listdir(repos.kinds)) == sorted((previous.name, built_venv().name))
     else:
         assert os.readlink(repos.link) == str(previous) and older.is_dir()
+
+
+def installed(source):
+    """The installed copy of the readiness-hashed host file ``source``, on tmp_path (``repos``)."""
+    path = dict(deploy.HOST_INSTALLED)[source]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_a_github_wrapper_change_blocks_until_installed(repos):
+    write(repos.live, {"ops/aura_github.sh": "#!/bin/sh\necho v1\n"})
+    repos.old = commit(repos.live, "the wrapper as installed")
+    wrapper = installed("ops/aura_github.sh")
+    wrapper.write_text("#!/bin/sh\necho v1\n")
+    head = repos.change({"ops/aura_github.sh": "#!/bin/sh\necho v2\n", "app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    # Installed with the old bytes: blocked before the land, with what to install.
+    assert result["status"] == "blocked" and result["needs_install"] == [f"ops/aura_github.sh as {wrapper}"]
+    assert result["summary"] == (f"ops/aura_github.sh as {wrapper} must be installed on the host before this deploy "
+                                 "(rule 18), so nothing was deployed; main is unchanged.")
+    assert ("installed", str(wrapper)) in host.calls
+    assert not [c for c in host.calls if c[0] in ("land", "systemctl", "build_venv")]
+    assert git(repos.live, "rev-parse", "main") == repos.old and git(repos.origin, "rev-parse", "main") != head
+
+    # Installed with the head's bytes: deployed.
+    wrapper.write_text("#!/bin/sh\necho v2\n")
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert ("land", "aura/t1-x", "squash") in host.calls
+
+
+# app/config.py's DEFAULT_CODING with a Claude Code pin.
+CONFIG = 'DEFAULT_CODING = {{\n    "enabled": True,\n    "claude_version": "{}",\n    "claude_sha256": "{}",\n}}\n'
+
+
+def test_a_claude_pin_change_blocks_until_the_binary_matches(repos):
+    old_pin, new_pin = ("2.1.288", "a" * 64), ("2.1.300", "b" * 64)
+    write(repos.live, {"app/config.py": CONFIG.format(*old_pin)})
+    repos.old = commit(repos.live, "the pin as installed")
+    head = merged_on_github(repos, {"app/config.py": CONFIG.format(*new_pin)})
+    gap = f"Claude Code 2.1.300 (sha256 {'b' * 64}) as {deploy.CLAUDE_BIN}"
+    # The old binary, then the new version with another binary: blocked, with nothing deployed.
+    for claude in (old_pin, ("2.1.300", "c" * 64)):
+        host = FakeHost(repos.live, claude=claude)
+        result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+        assert result["status"] == "blocked" and result["needs_install"] == [gap]
+        assert git(repos.live, "rev-parse", "main") == repos.old and not [c for c in host.calls if c[0] == "systemctl"]
+    # settings.json's own coding pins Claude Code itself: the effective pin did not move, so nothing is compared.
+    host = FakeHost(repos.live, claude=old_pin, settings={"claude_version": "2.1.288", "claude_sha256": "a" * 64})
+    changed = deploy.changes(repos.live, repos.old, head)
+    assert deploy.install_gaps(repos.live, repos.old, head, changed, host) == []
+    assert ("installed_claude",) not in host.calls
+    # The binary matches the head's pin: deployed.
+    host = FakeHost(repos.live, claude=new_pin)
+    assert deploy.self_deploy(main_spec(head), host, log=lambda m: None)["status"] == "deployed"
+    assert git(repos.live, "rev-parse", "main") == head
+
+
+def test_the_watcher_retries_a_head_once_its_files_are_installed(repos, watching):
+    head = merged_on_github(repos, {"ops/aura_coder/managed-settings.json": "{\"v\": 2}\n"})
+    policy = installed("ops/aura_coder/managed-settings.json")
+    result = deploy.spec_file(deploy.MAIN).with_name("result.json")
+    result.parent.mkdir(parents=True)
+    result.write_text(json.dumps({"head": head, "status": "blocked",
+                                  "needs_install": [f"ops/aura_coder/managed-settings.json as {policy}"]}))
+    # Not installed yet: the head waits, as any blocked head does.
+    assert deploy.watch_main(FakeHost(repos.live)) is None and watching.started == []
+    policy.write_text("{\"v\": 1}\n")
+    assert deploy.watch_main(FakeHost(repos.live)) is None and watching.started == []
+    # Installed: queued again, without a new commit.
+    policy.write_text("{\"v\": 2}\n")
+    assert deploy.watch_main(FakeHost(repos.live)) == "aura-deploy-main"
+    assert watching.started == [main_spec(head)]
+    # A head blocked for another reason is still not retried.
+    deploy.state_file(deploy.MAIN).unlink()
+    result.write_text(json.dumps({"head": head, "status": "blocked"}))
+    watching.started.clear()
+    assert deploy.watch_main(FakeHost(repos.live)) is None and watching.started == []
+
+
+def test_a_merge_commit_that_carries_an_uninstalled_host_file_is_blocked_before_ci_is_awaited(repos):
+    # GitHub's main holds a commit beyond the live main that changes the host's policy; the reviewed change itself
+    # does not touch it, but its squash merge carries that commit.
+    head = repos.change({"app/a.py": "A = 2\n"})
+    github = repos.tmp / "github"
+    git(repos.tmp, "clone", "-q", "-b", "main", str(repos.origin), str(github))
+    write(github, {"ops/claude_host/managed-settings.json": "{\"v\": 2}\n"})
+    commit(github, "Another pull request")
+    git(github, "push", "-q", "origin", "HEAD:refs/heads/main")
+    write(github, {"app/a.py": "A = 2\n"})
+    merge = commit(github, "The approved change (#7)")
+    git(github, "push", "-q", str(repos.live), f"{merge}:refs/aura/squash")
+    deploy.queue(reviewed(repos, head=head))
+
+    class SquashingHost(FakeHost):
+        def land(self, commit, branch, title, body, method):
+            self.calls.append(("land", branch, method))
+            git(self.live, "push", "-q", "origin", f"{merge}:refs/heads/main")
+            return {"status": "merged", "pr": {"number": 7, "url": "https://github.com/x/y/pull/7"}, "merge": merge}
+
+    host = SquashingHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    policy = dict(deploy.HOST_INSTALLED)["ops/claude_host/managed-settings.json"]
+    assert result["status"] == "blocked" and result["needs_install"] == [
+        f"ops/claude_host/managed-settings.json as {policy}"]
+    assert result["summary"].endswith("GitHub's main has the change; it goes live with GitHub's main once that is "
+                                      "installed.") and result["pr"]["number"] == 7
+    assert not [c for c in host.calls if c[0] in ("wait_check", "systemctl")]
+    assert git(repos.live, "rev-parse", "main") == repos.old
