@@ -3657,6 +3657,12 @@ def test_a_github_wrapper_change_blocks_until_installed(repos):
     assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
     assert ("land", "aura/t1-x", "squash") in host.calls
 
+    # A change that deletes the repo copy has nothing to install.
+    gone = repos.change({}, deletes=["ops/aura_github.sh"], on=head)
+    host = FakeHost(repos.live)
+    assert deploy.install_gaps(repos.live, head, gone, deploy.changes(repos.live, head, gone), host) == []
+    assert not [c for c in host.calls if c[0] == "installed"]
+
 
 # app/config.py's DEFAULT_CODING with a Claude Code pin.
 CONFIG = 'DEFAULT_CODING = {{\n    "enabled": True,\n    "claude_version": "{}",\n    "claude_sha256": "{}",\n}}\n'
@@ -3742,15 +3748,27 @@ NONDETERMINISM = ("Nondeterminism error: Activity type of scheduled event 'run_o
                   "type of activity command 'run_turn'")
 
 
-def test_a_change_that_breaks_a_running_workflow_is_blocked(repos):
-    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+@pytest.mark.parametrize("source", ["github", "reviewed"])
+def test_a_change_that_breaks_a_running_workflow_is_blocked(repos, source):
+    if source == "github":
+        head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+        task, the_spec = deploy.MAIN, main_spec(head)
+    else:
+        head = repos.change({"app/a.py": "A = 2\n"})
+        task, the_spec = "t1", reviewed(repos, head=head)
+        deploy.queue(the_spec)
     host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM}},
                                          {"replayed": ["workflow-a", "workflow-b"], "failed": {}}])
     lines = []
-    result = deploy.self_deploy(main_spec(head), host, log=lines.append)
-    assert result == {"status": "blocked", "summary": f"The new code cannot replay running workflow(s) workflow-b "
-                      f"({NONDETERMINISM}), so nothing was deployed; main is unchanged. A workflow change needs "
-                      "workflow.patched."}
+    result = deploy.self_deploy(the_spec, host, log=lines.append)
+    summary = (f"The new code cannot replay running workflow(s) workflow-b ({NONDETERMINISM}), so nothing was "
+               "deployed; main is unchanged. A workflow change needs workflow.patched.")
+    if source == "github":
+        assert result == {"status": "blocked", "summary": summary}
+    else:
+        # The reviewed change landed before the replay: GitHub's main has it.
+        assert result == {"status": "blocked", "pr": state()["pr"], "summary": f"{summary} GitHub's main has the "
+                          "change; it goes live with GitHub's main."}
     # Under the lock, after the baseline: the head's tree on the live venv (the lock did not change), then the live
     # tree; the head's tree is gone after.
     assert [c for c in host.calls if c[0] == "replay"] == [("replay", "head", str(repos.link), "A = 2\n"),
@@ -3758,7 +3776,7 @@ def test_a_change_that_breaks_a_running_workflow_is_blocked(repos):
     counts = ("live-history replay: the head's code replayed 1 running workflow(s) and failed 1; the live code "
               "replayed 2 and failed 0")
     assert lines.index(f"holding {deploy.CODE_RELOAD_LOCK}") < lines.index(counts)
-    assert not (deploy.RUNS_DIR / deploy.MAIN / "tree").exists()
+    assert not (deploy.RUNS_DIR / task / "tree").exists()
     assert git(repos.live, "rev-parse", "main") == repos.old and not [c for c in host.calls if c[0] == "systemctl"]
 
 
@@ -3777,8 +3795,8 @@ def test_a_workflow_broken_before_the_deploy_does_not_block_it(repos):
 
 
 @pytest.mark.parametrize("new, old, reason", [
-    ({"error": "listing or fetching the running workflows failed: Failed client connect"}, {"replayed": [], "failed": {}},
-     "listing or fetching the running workflows failed: Failed client connect"),
+    ({"error": "listing or fetching the running workflows failed: Failed client connect"},
+     {"replayed": [], "failed": {}}, "listing or fetching the running workflows failed: Failed client connect"),
     ({"replayed": [], "failed": {}}, {"error": "it did not finish within 300 s"}, "it did not finish within 300 s"),
     ({"replayed": [], "failed": {"workflow-b": NONDETERMINISM}}, {"error": "/root/.openclaw/rmp has no "
                                                                            "ops/replay_live.py"},

@@ -64,7 +64,8 @@ async def test_replay_live_fetches_the_running_workflows_of_the_workers_types(mo
     class Client:
         async def list_workflows(self, query):
             queries.append(query)
-            for workflow_id, workflow_type in (("workflow-1", "GenericTaskWorkflow"), ("cron-x", "SomeoneElsesWorkflow"),
+            for workflow_id, workflow_type in (("workflow-1", "GenericTaskWorkflow"),
+                                               ("cron-x", "SomeoneElsesWorkflow"),
                                                ("workflow-2-recall", "DeepRecallWorkflow")):
                 yield SimpleNamespace(id=workflow_id, run_id=f"run-{workflow_id}", workflow_type=workflow_type)
 
