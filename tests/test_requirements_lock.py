@@ -82,6 +82,23 @@ def test_the_langchain_embedder_dependency_imports():
     importlib.import_module("langchain.embeddings.base")
 
 
+def test_alembic_and_mako_are_locked():
+    # Schema migrations (app/db/migrate.py, specs/WP-26.md WP26-01): Alembic is pinned in requirements.in, and the
+    # lock holds it and Mako, which it imports at run time, each with its hashes.
+    assert in_pins("requirements.in")["alembic"] == "1.20.1"
+    assert {name: pinned("requirements.txt")[name] for name in ("alembic", "mako")} == {
+        "alembic": "1.20.1", "mako": "1.4.3"}
+    hashes = {canonical(PIN.fullmatch(pin).group(1)): [word for word in rest if HASH.fullmatch(word)]
+              for pin, *rest in (line.split() for line in requirements("requirements.txt"))}
+    assert hashes["alembic"] and hashes["mako"]
+
+
+def test_alembic_imports():
+    alembic = importlib.import_module("alembic")
+    importlib.import_module("mako")
+    assert alembic.__version__ == "1.20.1"
+
+
 def test_ci_installs_the_dev_lock_with_hashes():
     lines = [line.strip() for line in (ROOT / ".github" / "workflows" / "ci.yml").read_text().splitlines()]
     install = lines.index("pip install --require-hashes -r requirements-dev.txt")
