@@ -324,6 +324,11 @@ IN_FILES = [
                  id="a name twice in a file, spelt twice"),
     pytest.param(None, b"-r requirements.in\npytest==9.0.3\nFastAPI==0.135.1\n",
                  f"{IN_DEV}: fastapi pinned in {IN_RUNTIME} too", id="a name in both files"),
+    # A refused line after others, in each file: its own line number is named (amendment 16).
+    pytest.param(b"fastapi==0.135.1\n\n# the API\r\nstarlette>=1\n", None, not_a_pin("starlette>=1", 4),
+                 id="a bad line 4 in requirements.in"),
+    pytest.param(None, b"-r requirements.in\npytest==9.0.3\npytest===9.0.3\n", not_a_pin("pytest===9.0.3", 3, IN_DEV),
+                 id="a bad line 3 in requirements-dev.in"),
     # Lines amendments 13 and 14 refused.
     bad_line("fastapi===0.135.1", "==="),
     bad_line("fastapi>=0.135", ">="),
