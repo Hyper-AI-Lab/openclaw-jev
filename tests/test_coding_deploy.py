@@ -230,7 +230,7 @@ class FakeHost(deploy.Host):
     def replay(self, tree, *, venv):
         which = "live" if tree == self.live else "head"
         self.calls.append(("replay", which, str(venv), (tree / "app" / "a.py").read_text()))
-        return self.replays.pop(0) if self.replays else {"replayed": [], "failed": {}}
+        return self.replays.pop(0) if self.replays else {"replayed": [], "failed": {}, "unregistered": {}}
 
 
 def spec(repos, head):
@@ -3757,7 +3757,8 @@ def test_a_change_that_breaks_a_running_workflow_is_blocked(repos, source):
         head = repos.change({"app/a.py": "A = 2\n"})
         task, the_spec = "t1", reviewed(repos, head=head)
         deploy.queue(the_spec)
-    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM}},
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM},
+                                          "unregistered": {}},
                                          {"replayed": ["workflow-a", "workflow-b"], "failed": {}}])
     lines = []
     result = deploy.self_deploy(the_spec, host, log=lines.append)
@@ -3784,7 +3785,8 @@ def test_a_workflow_broken_before_the_deploy_does_not_block_it(repos):
     # A lock change: the head's code replays on the venv built for it.
     head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
     deploy.queue(reviewed(repos, head=head))
-    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM}},
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM},
+                                          "unregistered": {}},
                                          {"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM}}])
     result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
     assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
@@ -3797,10 +3799,10 @@ def test_a_workflow_broken_before_the_deploy_does_not_block_it(repos):
 @pytest.mark.parametrize("new, old, reason", [
     ({"error": "listing or fetching the running workflows failed: Failed client connect"},
      {"replayed": [], "failed": {}}, "listing or fetching the running workflows failed: Failed client connect"),
-    ({"replayed": [], "failed": {}}, {"error": "it did not finish within 300 s"}, "it did not finish within 300 s"),
-    ({"replayed": [], "failed": {"workflow-b": NONDETERMINISM}}, {"error": "/root/.openclaw/rmp has no "
-                                                                           "ops/replay_live.py"},
-     "/root/.openclaw/rmp has no ops/replay_live.py")])
+    ({"replayed": [], "failed": {}, "unregistered": {}}, {"error": "it did not finish within 300 s"},
+     "it did not finish within 300 s"),
+    ({"replayed": [], "failed": {"workflow-b": NONDETERMINISM}, "unregistered": {}},
+     {"error": "/root/.openclaw/rmp has no ops/replay_live.py"}, "/root/.openclaw/rmp has no ops/replay_live.py")])
 def test_a_replay_that_cannot_run_is_reported_not_blocking(repos, new, old, reason):
     head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
     lines = []
@@ -3808,6 +3810,24 @@ def test_a_replay_that_cannot_run_is_reported_not_blocking(repos, new, old, reas
     assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
     assert result["summary"].endswith(f"The live-history replay could not run ({reason}).")
     assert f"the live-history replay could not run: {reason}" in lines
+
+
+def test_a_running_workflow_whose_type_the_head_no_longer_registers_is_blocked(repos):
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    # The head removed the class of workflow-c, which runs: the head's listing names it as a type it does not register.
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {},
+                                          "unregistered": {"workflow-c": "OldWorkflow", "cron-x": "SomeoneElses"}},
+                                         {"replayed": ["workflow-a", "workflow-c"], "failed": {}}])
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result == {"status": "blocked", "summary": "The new code cannot replay running workflow(s) workflow-c (type "
+                      "not registered at head), so nothing was deployed; main is unchanged. A workflow change needs "
+                      "workflow.patched."}
+    assert git(repos.live, "rev-parse", "main") == repos.old and not [c for c in host.calls if c[0] == "systemctl"]
+
+    # A workflow that started after the head's listing is in neither of its lists: it blocks nothing.
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {}, "unregistered": {}},
+                                         {"replayed": ["workflow-a", "workflow-new"], "failed": {}}])
+    assert deploy.self_deploy(main_spec(head), host, log=lambda m: None)["status"] == "deployed"
 
 
 def merged_with_a_link(repos, target):
@@ -3853,13 +3873,14 @@ def test_a_replay_answer_without_its_keys_is_reported_not_blocking(repos, tmp_pa
         def replay(self, tree, *, venv=None):
             return deploy.Host.replay(self, tree, venv=tmp_path / "printing-venv")
 
-    nothing = {"replayed": [], "failed": {}}
+    nothing = {"replayed": [], "failed": {}, "unregistered": {}}
     host = (PrintingHost(repos.live) if answers == "a tool printing {}" else
             FakeHost(repos.live, replays=[{}, nothing] if answers == "the head's {}" else [nothing, {}]))
     result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
     assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
-    assert result["summary"].endswith("The live-history replay could not run (the replay's answer lacks replayed or "
-                                      "failed ({})).")
+    lacks = "replayed, failed" if answers == "the live {}" else "replayed, failed, unregistered"
+    assert result["summary"].endswith(f"The live-history replay could not run (the replay's answer lacks one of "
+                                      f"{lacks} ({{}})).")
 
 
 def test_the_hosts_replay_runs_the_tool_on_the_trees_python_and_reads_its_line(tmp_path, monkeypatch):
@@ -4052,7 +4073,8 @@ def test_the_dist_copy_goes_with_the_runs_result(repos, dist, monkeypatch, syste
                 return super().replay(tree, venv=venv)
 
         monkeypatch.setattr(deploy, "Host", lambda: CopyReplayingHost(repos.live, replays=[
-            {"replayed": [], "failed": {"workflow-b": NONDETERMINISM}}, {"replayed": ["workflow-b"], "failed": {}}]))
+            {"replayed": [], "failed": {"workflow-b": NONDETERMINISM}, "unregistered": {}},
+            {"replayed": ["workflow-b"], "failed": {}}]))
         assert unit.main(str(deploy.spec_file("t1"))) == 1
         assert copied == [before, before]
     else:

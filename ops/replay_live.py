@@ -3,11 +3,12 @@
 
 Run as ``<venv>/bin/python ops/replay_live.py`` with the tree as its working directory and ``PYTHONPATH``. The deploy
 runs it before it changes anything, on the head's tree and on the live one: a workflow that replays on the live code and
-not on the head's would wedge on the new code, so the deploy is blocked. It lists the running workflows of the types
-``worker.WORKFLOWS`` registers, fetches each history and replays them with ``Replayer(workflows=WORKFLOWS)``, the
-worker's own runner. It prints one JSON line, ``{"replayed": [ids], "failed": {id: the error's first line}}``, and
-exits 0; when it cannot list or fetch, ``{"error": ...}`` and exit 2. Histories hold Kirill's messages, so they stay
-in memory: only ids and one line of each error are printed.
+not on the head's, or whose type the head no longer registers, would wedge on the new code, so the deploy is blocked.
+It lists the running workflows, fetches the history of each whose type ``worker.WORKFLOWS`` registers and replays them
+with ``Replayer(workflows=WORKFLOWS)``, the worker's own runner. It prints one JSON line, ``{"replayed": [ids],
+"failed": {id: the error's first line}, "unregistered": {id: type}}``, the last naming the running workflows of types
+this tree does not register, and exits 0; when it cannot list or fetch, ``{"error": ...}`` and exit 2. Histories hold
+Kirill's messages, so they stay in memory: only ids, types and one line of each error are printed.
 """
 from __future__ import annotations
 
@@ -60,25 +61,28 @@ async def replay(histories: Iterable[WorkflowHistory], workflows: Sequence[type]
     return {"replayed": replayed, "failed": failed}
 
 
-async def running(workflows: Sequence[type] = WORKFLOWS) -> List[WorkflowHistory]:
-    """The histories of the running workflows whose types ``workflows`` holds."""
+async def running(workflows: Sequence[type] = WORKFLOWS) -> Tuple[List[WorkflowHistory], Dict[str, str]]:
+    """The histories of the running workflows whose types ``workflows`` holds, and the other running workflows by id,
+    with their types."""
     names = {workflow.__name__ for workflow in workflows}
     client = await connect_temporal()
-    histories = []
+    histories, unregistered = [], {}
     async for execution in client.list_workflows(RUNNING):
         if execution.workflow_type in names:
             handle = client.get_workflow_handle(execution.id, run_id=execution.run_id)
             histories.append(await handle.fetch_history())
-    return histories
+        else:
+            unregistered[execution.id] = execution.workflow_type
+    return histories, unregistered
 
 
-async def run() -> Tuple[Dict[str, Any], int]:
+async def run(workflows: Sequence[type] = WORKFLOWS) -> Tuple[Dict[str, Any], int]:
     """The result to print and the exit status."""
     try:
-        histories = await running()
+        histories, unregistered = await running(workflows)
     except Exception as exc:
         return {"error": f"listing or fetching the running workflows failed: {first_line(exc)}"}, 2
-    return await replay(histories), 0
+    return {**await replay(histories, workflows), "unregistered": unregistered}, 0
 
 
 def main() -> int:

@@ -70,6 +70,8 @@ CHANGING = ("applying", "merged", "restarted", "reverting")
 MAX_ATTEMPTS = 3
 # The replay of the running workflows on the head's code, then on the live code, each at most this long.
 REPLAY_TIMEOUT_SEC = 300
+# The replay's error for a running workflow whose type the head no longer registers.
+UNREGISTERED = "type not registered at head"
 # (path or directory prefix, services restarted when it changes); docs, tests and ops restart nothing.
 SERVICE_PATHS = (
     ("app/", ("rmp-api", "rmp-worker")),
@@ -1138,22 +1140,27 @@ def _build_venv(host: Host, task: str, head: str, changed: List[Tuple[str, str]]
     return target
 
 
-def _replay_answer(answer: Any) -> Dict[str, Any]:
+def _replay_answer(answer: Any, mappings: Tuple[str, ...] = ("failed",)) -> Dict[str, Any]:
     """A replay's answer as ``_replay_live`` reads it: ``{"error": ...}`` as it is, else ``replayed``, a list of ids,
-    and ``failed``, ids with their errors. Any other answer could not come from a replay that ran: it is an error."""
+    and ``mappings``, each a dict: ``failed``, ids with their errors, and from the head's tree ``unregistered``, the
+    running workflows of types it does not register. Any other answer could not come from a replay that ran: it is an
+    error."""
     if isinstance(answer, dict) and "error" in answer:
         return answer
-    if isinstance(answer, dict) and isinstance(answer.get("replayed"), list) and isinstance(answer.get("failed"), dict):
+    if isinstance(answer, dict) and isinstance(answer.get("replayed"), list) and all(
+            isinstance(answer.get(key), dict) for key in mappings):
         return answer
-    return {"error": f"the replay's answer lacks replayed or failed ({str(answer)[:100]})"}
+    return {"error": f"the replay's answer lacks one of {', '.join(('replayed', *mappings))} ({str(answer)[:100]})"}
 
 
 def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: Optional[Path],
                  log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
     """Before the change, under the lock: the running workflows replayed on the head's code (its tree from
     ``git archive`` in ``RUNS_DIR/<task>/tree``, on the head's venv: the one built for it, else the live one), then on
-    the live code. A workflow that replays on the live code and fails on the head's would wedge on the new code: the
-    blocked result. One that fails on both was broken already and blocks nothing. A replay that could not run is noted
+    the live code. A workflow that replays on the live code and fails on the head's, or whose type the head's listing
+    names as one it no longer registers, would wedge on the new code: the blocked result. One that fails on both was
+    broken already and blocks nothing; one that started after the head's listing is in neither of its lists, and
+    blocks nothing either. A replay that could not run is noted
     in the run (``replay``, for the result's summary) and blocks nothing either, so an outage of the replay never stops
     every deploy, the fix included: a head whose tree cannot be built (``git archive``, or an extraction the ``data``
     filter refuses, such as an absolute or escaping symlink) and an answer without the expected keys count as such.
@@ -1168,7 +1175,7 @@ def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: 
         except Exception as exc:
             new: Dict[str, Any] = {"error": f"the head's tree could not be built ({str(exc)[:300]})"}
         else:
-            new = _replay_answer(host.replay(tree, venv=target or host.live / "venv"))
+            new = _replay_answer(host.replay(tree, venv=target or host.live / "venv"), ("failed", "unregistered"))
         old = _replay_answer(host.replay(host.live, venv=host.live / "venv"))
     finally:
         shutil.rmtree(tree, ignore_errors=True)
@@ -1179,11 +1186,12 @@ def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: 
         return None
     log(f"live-history replay: the head's code replayed {len(new['replayed'])} running workflow(s) and failed "
         f"{len(new['failed'])}; the live code replayed {len(old['replayed'])} and failed {len(old['failed'])}")
-    broken = [workflow for workflow in new["failed"] if workflow in old["replayed"]]
+    broken = {workflow: error for workflow, error in new["failed"].items() if workflow in old["replayed"]}
+    broken.update((workflow, UNREGISTERED) for workflow in new["unregistered"] if workflow in old["replayed"])
     if not broken:
         return None
-    summary = (f"The new code cannot replay running workflow(s) {', '.join(broken)} ({new['failed'][broken[0]]}), so "
-               "nothing was deployed; main is unchanged. A workflow change needs workflow.patched.")
+    summary = (f"The new code cannot replay running workflow(s) {', '.join(broken)} ({next(iter(broken.values()))}), "
+               "so nothing was deployed; main is unchanged. A workflow change needs workflow.patched.")
     if run.get("merge"):
         summary += " GitHub's main has the change; it goes live with GitHub's main."
     return {"status": "blocked", **({"pr": run["pr"]} if run.get("pr") else {}), "summary": summary}

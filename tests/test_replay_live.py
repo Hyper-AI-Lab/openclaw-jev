@@ -92,24 +92,22 @@ async def test_replay_live_passes_the_recorded_fixtures_and_names_a_broken_one(t
     assert submodules_are_their_packages_attributes()
 
 
-async def test_replay_live_fetches_the_running_workflows_of_the_workers_types(monkeypatch):
-    replay_live = load()
-    fetched, queries = [], []
+def faked_temporal(replay_live, monkeypatch, executions):
+    """Temporal with the running workflows ``executions``, (id, type); what was asked and fetched."""
+    seen = SimpleNamespace(fetched=[], queries=[])
 
     class Handle:
         def __init__(self, workflow_id, run_id):
             self.workflow_id, self.run_id = workflow_id, run_id
 
         async def fetch_history(self):
-            fetched.append((self.workflow_id, self.run_id))
+            seen.fetched.append((self.workflow_id, self.run_id))
             return WorkflowHistory(self.workflow_id, [])
 
     class Client:
         async def list_workflows(self, query):
-            queries.append(query)
-            for workflow_id, workflow_type in (("workflow-1", "GenericTaskWorkflow"),
-                                               ("cron-x", "SomeoneElsesWorkflow"),
-                                               ("workflow-2-recall", "DeepRecallWorkflow")):
+            seen.queries.append(query)
+            for workflow_id, workflow_type in executions:
                 yield SimpleNamespace(id=workflow_id, run_id=f"run-{workflow_id}", workflow_type=workflow_type)
 
         def get_workflow_handle(self, workflow_id, *, run_id):
@@ -119,10 +117,29 @@ async def test_replay_live_fetches_the_running_workflows_of_the_workers_types(mo
         return Client()
 
     monkeypatch.setattr(replay_live, "connect_temporal", connect_temporal)
-    histories = await replay_live.running()
-    assert queries == ['ExecutionStatus="Running"'] and replay_live.WORKFLOWS is worker.WORKFLOWS
-    assert fetched == [("workflow-1", "run-workflow-1"), ("workflow-2-recall", "run-workflow-2-recall")]
+    return seen
+
+
+async def test_replay_live_fetches_the_running_workflows_of_the_workers_types(monkeypatch):
+    replay_live = load()
+    seen = faked_temporal(replay_live, monkeypatch, [("workflow-1", "GenericTaskWorkflow"),
+                                                     ("cron-x", "SomeoneElsesWorkflow"),
+                                                     ("workflow-2-recall", "DeepRecallWorkflow")])
+    histories, unregistered = await replay_live.running()
+    assert seen.queries == ['ExecutionStatus="Running"'] and replay_live.WORKFLOWS is worker.WORKFLOWS
+    assert seen.fetched == [("workflow-1", "run-workflow-1"), ("workflow-2-recall", "run-workflow-2-recall")]
     assert [history.workflow_id for history in histories] == ["workflow-1", "workflow-2-recall"]
+    assert unregistered == {"cron-x": "SomeoneElsesWorkflow"}
+
+
+async def test_replay_live_names_a_running_workflow_whose_type_the_tree_no_longer_registers(monkeypatch):
+    replay_live = load()
+    # The tree removed DeepRecallWorkflow, and one instance of it runs.
+    without = [workflow for workflow in worker.WORKFLOWS if workflow.__name__ != "DeepRecallWorkflow"]
+    seen = faked_temporal(replay_live, monkeypatch, [("workflow-2-recall", "DeepRecallWorkflow")])
+    assert await replay_live.run(without) == (
+        {"replayed": [], "failed": {}, "unregistered": {"workflow-2-recall": "DeepRecallWorkflow"}}, 0)
+    assert seen.fetched == []
 
 
 def test_replay_live_that_cannot_list_exits_2_with_the_error(monkeypatch, capsys):
