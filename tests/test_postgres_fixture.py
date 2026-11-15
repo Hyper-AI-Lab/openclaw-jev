@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.pool import NullPool
 
-pytest_plugins = ["tests.postgres_fixture"]
+pytest_plugins = ["tests.postgres_fixture", "pytester"]
 
 TESTS = Path(__file__).resolve().parent
 FIXTURES = {"pg_server", "pg_database", "pg_live_shaped"}
@@ -115,6 +115,54 @@ def test_a_local_server_that_cannot_start_skips_with_its_reason_unless_required(
         monkeypatch.setenv("RMP_PG_IT_REQUIRED", "1")
         with pytest.raises(pytest.fail.Exception, match="initdb exited 1: initdb: the fake data directory"):
             plugin.unavailable(str(failed.value))
+    finally:
+        Path(fakes, "initdb").unlink(missing_ok=True)
+        os.rmdir(fakes)
+
+
+# A test module that needs a database, run by an inner pytest session through the fixture itself.
+USES_A_DATABASE = """
+pytest_plugins = ["tests.postgres_fixture"]
+
+
+def test_needs_a_database(pg_database):
+    assert pg_database.name
+"""
+
+
+@pytest.mark.parametrize("required", [False, True], ids=["optional", "required"])
+@pytest.mark.parametrize("server", ["initdb fails", "no binaries"])
+def test_a_test_using_the_fixture_skips_without_a_server_or_errors_when_one_is_required(pytester, monkeypatch, server,
+                                                                                       required):
+    # The fake initdb lives where the cluster's own user can run it: nobody when the tests run as root.
+    fakes = tempfile.mkdtemp(prefix="rmp-fake-pg-bin-")
+    try:
+        os.chmod(fakes, 0o755)
+        if server == "initdb fails":
+            bin_dir = fakes
+            Path(fakes, "initdb").write_text("#!/bin/sh\necho 'initdb: the fake data directory is not empty'\nexit 1\n")
+            Path(fakes, "initdb").chmod(0o755)
+            reason = "initdb exited 1: initdb: the fake data directory is not empty"
+        else:
+            bin_dir = os.path.join(fakes, "missing")
+            reason = f"RMP_PG_IT_URL is not set and {bin_dir} has no initdb"
+        monkeypatch.delenv("RMP_PG_IT_URL", raising=False)
+        monkeypatch.setenv("RMP_PG_BIN", bin_dir)
+        if required:
+            monkeypatch.setenv("RMP_PG_IT_REQUIRED", "1")
+        else:
+            monkeypatch.delenv("RMP_PG_IT_REQUIRED", raising=False)
+        clusters = {p.name for p in Path(tempfile.gettempdir()).iterdir() if p.name.startswith("rmp-pg-")}
+        pytester.makepyfile(test_inner=USES_A_DATABASE)
+        # The inner session has no ini file, so pytest-asyncio, which it does not need, would warn about its settings.
+        result = pytester.runpytest_inprocess("-rs", "-p", "no:cacheprovider", "-p", "no:asyncio")
+        if required:
+            result.assert_outcomes(errors=1)
+            assert f"RMP_PG_IT_REQUIRED=1 and no Postgres server: {reason}" in result.stdout.str()
+        else:
+            result.assert_outcomes(skipped=1)
+            assert f"no Postgres server: {reason}" in result.stdout.str()
+        assert {p.name for p in Path(tempfile.gettempdir()).iterdir() if p.name.startswith("rmp-pg-")} == clusters
     finally:
         Path(fakes, "initdb").unlink(missing_ok=True)
         os.rmdir(fakes)
