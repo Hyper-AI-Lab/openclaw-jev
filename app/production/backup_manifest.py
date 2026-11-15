@@ -241,9 +241,12 @@ def problems(dest: Path, *, hashes: bool, qdrant_mode: Optional[str] = None) -> 
 
 
 def default_root() -> Path:
-    """Where ops/backup.sh writes its backups, by its own chain: ``RMP_BACKUP_ROOT``, else ``<RMP_DATA_DIR>/backups``,
-    else ``<RMP_ROOT>/data/backups``, else ``<OPENCLAW_HOME or /root/.openclaw>/rmp/data/backups``. Never relative to
-    the working directory: the deploy runs the migration wrapper from a run directory of its own."""
+    """The backup root the migration wrapper, the deploy's check and the rehearsal read (specs/WP-26.md WP26-05):
+    ``RMP_BACKUP_ROOT``, else ``<RMP_DATA_DIR>/backups``, else ``<RMP_ROOT>/data/backups``, else ``<OPENCLAW_HOME or
+    /root/.openclaw>/rmp/data/backups``. ops/backup.sh follows the same chain but ignores ``OPENCLAW_HOME`` (its
+    ``RMP_ROOT`` defaults to /root/.openclaw/rmp); production sets neither, so both name
+    /root/.openclaw/rmp/data/backups, and every wrapper run prints the root it resolved. Never relative to the working
+    directory: the deploy runs the wrapper from a run directory of its own."""
     environ = os.environ
     if environ.get("RMP_BACKUP_ROOT"):
         return Path(environ["RMP_BACKUP_ROOT"])
