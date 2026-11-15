@@ -8,7 +8,8 @@ the full suite on that exact commit as aura-coder, then hands off; the unit land
 A deploy waits queued on disk (``RUNS_DIR/<task>``). One launcher, ``next_deploy``, run by the reconciler's
 ``watch_main`` every minute and by the hand-off, starts the detached root unit (``ops/coding_deploy.py``) of the
 next queued run, only when no deploy unit runs, nothing holds the code-reload lock and no user task is active.
-The unit first blocks a change whose readiness-hashed host files or Claude Code pin are not installed on the host,
+The unit first checks that the run still applies (GitHub's main is not live yet, or a reviewed job's base is still the
+live main), then blocks a change whose readiness-hashed host files or Claude Code pin are not installed on the host,
 then does its slow work (a reviewed run's land and CI wait, the venv of the head's lock files when they changed, and
 a copy of OpenClaw's dist when its patches changed), then holds the code-reload lock, replays the running workflows
 on the head's code, refuses mirrors edited by hand and, right after the strict idle count, stops the affected units,
@@ -1194,11 +1195,11 @@ def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: 
     the live code. A workflow that replays on the live code and fails on the head's, or whose type the head's listing
     names as one it no longer registers, would wedge on the new code: the blocked result. One that fails on both was
     broken already and blocks nothing; one that started after the head's listing is in neither of its lists, and
-    blocks nothing either. A replay that could not run is noted
-    in the run (``replay``, for the result's summary) and blocks nothing either, so an outage of the replay never stops
-    every deploy, the fix included: a head whose tree cannot be built (``git archive``, or an extraction the ``data``
-    filter refuses, such as an absolute or escaping symlink) and an answer without the expected keys count as such.
-    The tree is deleted after; the log gives both trees' counts and ids first (``_replay_line``)."""
+    blocks nothing either. A replay that could not run is noted in the run (``replay``, for the result's summary) and
+    blocks nothing either, so an outage of the replay never stops every deploy, the fix included: a head whose tree
+    cannot be built (``git archive``, or an extraction the ``data`` filter refuses, such as an absolute or escaping
+    symlink) and an answer without the expected keys count as such. The tree is deleted after; the log gives both
+    trees' counts and ids first (``_replay_line``)."""
     tree = RUNS_DIR / task / "tree"
     try:
         try:
@@ -1531,18 +1532,20 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     held, less than ``APPLY_RESERVE_SEC`` of the unit's time is left, or a user task was active (or the idle count
     failed) at the final check; the run then keeps its state, and the launcher's next pass tries again.
 
-    ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
-    approved ``head`` lands through a pull request first, the run's state records the merge commit (``landed``), and
-    exactly that commit is deployed once CI's test check passed on it. First of all, a change to a readiness-hashed host
-    file or to the Claude Code pin that is not installed on the host blocks the run (``_install_blocked``; for a
-    reviewed run before the land, and again for its merge commit). That slow work runs first, without the lock, and
-    so does the build of the head's venv when the change moves the lock files (``_build_venv``), and the copy of the
-    web backends' venv when their requirements change (``_copy_web_venv``). Then, holding the
-    code-reload lock: the readiness baseline, the replay of the running workflows on the head's code and the live code
-    (``_replay_live``), the hand-edit check and, last before the units stop, the strict idle
-    count; then ``applying`` with the venv plan, the switch window (``_switch``), the checks, and on failure the revert
-    window. A run whose state is past ``landed`` was killed during or after its change: it resumes from its phase
-    (``_resume``) and runs no step before the change.
+    ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed: one the live main already
+    contains is ``unchanged``, and a live main with commits GitHub's main lacks is ``blocked``. Otherwise the spec's
+    approved ``head``, over a live main still at its ``old``, lands through a pull request, the run's state records the
+    merge commit (``landed``), and exactly that commit is deployed once CI's test check passed on it. A change to a
+    readiness-hashed host file or to the Claude Code pin that is not installed on the host blocks the run
+    (``_install_blocked``): for GitHub's main right after those first checks; for a reviewed run before its hand-edit
+    check and its land, and again for its merge commit before the CI wait. The slow work, the land and the CI wait,
+    runs without the lock, and so do the build of the head's venv when the change moves the lock files
+    (``_build_venv``), the copy of the web backends' venv when their requirements change (``_copy_web_venv``) and the
+    copy of OpenClaw's dist when its patches change (``_copy_dist``). Then, holding the code-reload lock: the readiness
+    baseline, the replay of the running workflows on the head's code and the live code (``_replay_live``), the
+    hand-edit check and, last before the units stop, the strict idle count; then ``applying`` with the venv plan, the
+    switch window (``_switch``), the checks, and on failure the revert window. A run whose state is past ``landed``
+    was killed during or after its change: it resumes from its phase (``_resume``) and runs no step before the change.
     """
     task, live = spec["task_id"], host.live
     run = _read_json(state_file(task))
