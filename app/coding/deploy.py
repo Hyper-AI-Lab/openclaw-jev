@@ -1170,6 +1170,23 @@ def _replay_answer(answer: Any, mappings: Tuple[str, ...] = ("failed",)) -> Dict
     return {"error": f"the replay's answer lacks one of {', '.join(('replayed', *mappings))} ({str(answer)[:100]})"}
 
 
+def _replay_line(code: str, answer: Dict[str, Any]) -> str:
+    """The deploy log's line for the replay on ``code``: why it could not run, or its counts with their ids (each
+    failure with its error, each workflow of a type the tree does not register with its type)."""
+    if "error" in answer:
+        return f"live-history replay on {code}: could not run ({answer['error']})"
+
+    def counted(what: str, ids: List[str]) -> str:
+        return f"{what} {len(ids)}" + (f" ({'; '.join(ids)})" if ids else "")
+
+    parts = [counted("replayed", answer["replayed"]),
+             counted("failed", [f"{workflow}: {error}" for workflow, error in answer["failed"].items()])]
+    if "unregistered" in answer:
+        parts.append(counted("not registered",
+                             [f"{workflow}: {kind}" for workflow, kind in answer["unregistered"].items()]))
+    return f"live-history replay on {code}: {', '.join(parts)}"
+
+
 def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: Optional[Path],
                  log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
     """Before the change, under the lock: the running workflows replayed on the head's code (its tree from
@@ -1181,7 +1198,7 @@ def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: 
     in the run (``replay``, for the result's summary) and blocks nothing either, so an outage of the replay never stops
     every deploy, the fix included: a head whose tree cannot be built (``git archive``, or an extraction the ``data``
     filter refuses, such as an absolute or escaping symlink) and an answer without the expected keys count as such.
-    The tree is deleted after; the log names the counts."""
+    The tree is deleted after; the log gives both trees' counts and ids first (``_replay_line``)."""
     tree = RUNS_DIR / task / "tree"
     try:
         try:
@@ -1196,13 +1213,14 @@ def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: 
         old = _replay_answer(host.replay(host.live, venv=host.live / "venv"))
     finally:
         shutil.rmtree(tree, ignore_errors=True)
+    # Both trees' answers go to the log first, so the head's failures are on record also when the live one failed.
+    log(_replay_line("the head's code", new))
+    log(_replay_line("the live code", old))
     failure = new.get("error") or old.get("error")
     run["replay"] = f"The live-history replay could not run ({failure})." if failure else None
     if failure:
         log(f"the live-history replay could not run: {failure}")
         return None
-    log(f"live-history replay: the head's code replayed {len(new['replayed'])} running workflow(s) and failed "
-        f"{len(new['failed'])}; the live code replayed {len(old['replayed'])} and failed {len(old['failed'])}")
     broken = {workflow: error for workflow, error in new["failed"].items() if workflow in old["replayed"]}
     broken.update((workflow, UNREGISTERED) for workflow in new["unregistered"] if workflow in old["replayed"])
     if not broken:

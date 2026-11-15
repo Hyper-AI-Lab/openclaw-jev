@@ -3774,9 +3774,10 @@ def test_a_change_that_breaks_a_running_workflow_is_blocked(repos, source):
     # tree; the head's tree is gone after.
     assert [c for c in host.calls if c[0] == "replay"] == [("replay", "head", str(repos.link), "A = 2\n"),
                                                            ("replay", "live", str(repos.link), "A = 1\n")]
-    counts = ("live-history replay: the head's code replayed 1 running workflow(s) and failed 1; the live code "
-              "replayed 2 and failed 0")
-    assert lines.index(f"holding {deploy.CODE_RELOAD_LOCK}") < lines.index(counts)
+    counts = [f"live-history replay on the head's code: replayed 1 (workflow-a), failed 1 (workflow-b: "
+              f"{NONDETERMINISM}), not registered 0", "live-history replay on the live code: replayed 2 (workflow-a; "
+              "workflow-b), failed 0"]
+    assert lines.index(f"holding {deploy.CODE_RELOAD_LOCK}") < lines.index(counts[0]) == lines.index(counts[1]) - 1
     assert not (deploy.RUNS_DIR / task / "tree").exists()
     assert git(repos.live, "rev-parse", "main") == repos.old and not [c for c in host.calls if c[0] == "systemctl"]
 
@@ -4183,3 +4184,19 @@ def test_a_version_only_claude_pin_compares_the_version_only(repos):
     # The head's version installed, whatever its binary's sha256: deployed.
     result = deploy.self_deploy(main_spec(head), FakeHost(repos.live, claude=("2.1.300", "c" * 64)), log=lambda m: None)
     assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+
+
+def test_the_heads_replay_is_logged_when_the_live_replay_could_not_run(repos):
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM},
+                                          "unregistered": {"workflow-c": "OldWorkflow"}},
+                                         {"error": "it did not finish within 300 s"}])
+    lines = []
+    result = deploy.self_deploy(main_spec(head), host, log=lines.append)
+    assert result["status"] == "deployed"
+    # Both answers are on record, the head's counts and ids before the reason nothing was compared.
+    head_line = (f"live-history replay on the head's code: replayed 1 (workflow-a), failed 1 (workflow-b: "
+                 f"{NONDETERMINISM}), not registered 1 (workflow-c: OldWorkflow)")
+    live_line = "live-history replay on the live code: could not run (it did not finish within 300 s)"
+    assert lines.index(head_line) < lines.index(live_line) < lines.index(
+        "the live-history replay could not run: it did not finish within 300 s")
