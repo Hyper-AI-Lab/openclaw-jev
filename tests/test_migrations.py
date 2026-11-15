@@ -787,6 +787,35 @@ def test_a_database_ahead_of_the_tree_is_skipped(pg_database):
     assert _fingerprint(pg_database.url) == before and _version(pg_database.url) == ["0099_from_a_later_tree"]
 
 
+def test_a_drift_report_that_cannot_be_made_never_changes_the_exit_code(pg_database, tmp_path, monkeypatch):
+    assert _upgrade(pg_database.url, allow_empty=True) == 0
+    no_head = _tree(tmp_path, "tree", {})
+    (no_head / "head.json").unlink()
+    for command in ("upgrade", "check"):
+        lines = []
+        assert migrate.run(pg_database.url, command=command, script_location=no_head, json_result=True,
+                           log=lines.append) == 0, "\n".join(lines)
+        assert [line for line in lines if line.startswith("migrate: no drift report: FileNotFoundError: ")]
+        assert (_result(lines)["drift"], _result(lines)["error"]) == ([], None)
+
+    def unreadable(conn):
+        raise RuntimeError("the catalog does not read")
+
+    readable = fingerprint.fingerprint
+    monkeypatch.setattr(fingerprint, "fingerprint", unreadable)
+    for command in ("upgrade", "check"):
+        lines = []
+        assert migrate.run(pg_database.url, command=command, json_result=True, log=lines.append) == 0
+        assert "migrate: no drift report: RuntimeError: the catalog does not read" in lines
+        assert _result(lines)["error"] is None
+    # Ahead, the same reads decide whether the tree may run, so their failure ends the run.
+    monkeypatch.setattr(fingerprint, "fingerprint", readable)
+    _execute(pg_database.url, "UPDATE alembic_version SET version_num = '0099_from_a_later_tree'")
+    lines = []
+    assert _upgrade(pg_database.url, lines, script_location=no_head) == 1
+    assert _result(lines)["error"].startswith("FileNotFoundError: ")
+
+
 def _at_a_revision_the_tree_lacks(database, tmp_path, body):
     """``database`` built by a tree whose head, 0002_r, ``tmp_path``'s other trees do not have."""
     location = _tree(tmp_path, "tree-r", {"0002_r.py": _revision("0002_r", HEAD, body)})

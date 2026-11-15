@@ -331,17 +331,25 @@ def _live(conn: Connection) -> dict:
     return found
 
 
-def _report_drift(conn: Connection, ctx: _Context, allow: Sequence[str], head: Optional[dict] = None,
-                  live: Optional[dict] = None) -> List[str]:
-    """The database's differences from head.json, printed as ``migrate: drift:`` lines. Neither they nor a report
-    that cannot be made change the run's exit code."""
+def _head_and_live(conn: Connection, ctx: _Context) -> Optional[Tuple[dict, dict]]:
+    """head.json and the live fingerprint, for the drift report; None, with ``migrate: no drift report:`` printed, when
+    either cannot be read. A report that cannot be made never changes the run's exit code."""
     try:
-        head = head if head is not None else _load(ctx.location / "head.json")
-        live = live if live is not None else _live(conn)
+        return _load(ctx.location / "head.json"), _live(conn)
     except Exception as exc:
         _rollback(conn)
         ctx.log(f"migrate: no drift report: {_describe(exc)}")
+        return None
+
+
+def _report_drift(conn: Connection, ctx: _Context, allow: Sequence[str],
+                  found: Optional[Tuple[dict, dict]] = None) -> List[str]:
+    """The database's differences from head.json (``found``, else read now), printed as ``migrate: drift:`` lines;
+    they never change the run's exit code."""
+    found = found or _head_and_live(conn, ctx)
+    if found is None:
         return []
+    head, live = found
     lines = fingerprint.diff(head, live, allow_extensions=allow)
     for line in lines:
         ctx.log(f"migrate: drift: {line}")
@@ -392,17 +400,19 @@ def _lacking(head: dict, live: dict) -> List[str]:
 def _settled(conn: Connection, state: str, current: Optional[str], ctx: _Context) -> int:
     """A database at the head, or ahead of this tree: nothing runs; an ahead one that lacks what the tree needs
     fails (D-6)."""
-    head, live = _load(ctx.location / "head.json"), _live(conn)
-    if state == "ahead":
-        missing = _lacking(head, live)
-        for line in missing:
-            ctx.log(f"migrate: lacking: {line}")
-        if missing:
-            raise _Stop(ERROR, f"rmp_db is at {current}, which this tree does not have, and lacks what this tree needs")
-        ctx.log(f"migrate: rmp_db is at {current}, which this tree does not have; no revision ran (rule 17)")
-    else:
+    if state != "ahead":
         ctx.log(f"migrate: at head {current}")
-    _report_drift(conn, ctx, ALLOWED_EXTENSIONS, head, live)
+        _report_drift(conn, ctx, ALLOWED_EXTENSIONS)
+        return OK
+    # The ahead rule decides the run, so here head.json and the live catalog must be read.
+    head, live = _load(ctx.location / "head.json"), _live(conn)
+    missing = _lacking(head, live)
+    for line in missing:
+        ctx.log(f"migrate: lacking: {line}")
+    if missing:
+        raise _Stop(ERROR, f"rmp_db is at {current}, which this tree does not have, and lacks what this tree needs")
+    ctx.log(f"migrate: rmp_db is at {current}, which this tree does not have; no revision ran (rule 17)")
+    _report_drift(conn, ctx, ALLOWED_EXTENSIONS, (head, live))
     return OK
 
 
@@ -584,11 +594,13 @@ def _check(conn: Connection, ctx: _Context) -> int:
     ctx.log(f"migrate: state {state} {current or 'none'}")
     _preflight(conn, ctx)
     if state in ("ahead", "at_head"):
-        head, live = _load(ctx.location / "head.json"), _live(conn)
-        missing = _lacking(head, live) if state == "ahead" else []
+        found = _head_and_live(conn, ctx)
+        if found is None:
+            return OK
+        missing = _lacking(*found) if state == "ahead" else []
         for line in missing:
             ctx.log(f"migrate: lacking: {line}")
-        drift = _report_drift(conn, ctx, ctx.allow_extensions, head, live)
+        drift = _report_drift(conn, ctx, ctx.allow_extensions, found)
         return DRIFT if missing or fingerprint.unallowed(drift) else OK
     pending = _pending(chain, current)
     if state == "pre_alembic":
