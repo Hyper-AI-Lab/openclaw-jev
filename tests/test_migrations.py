@@ -880,6 +880,10 @@ def test_a_database_ahead_that_lacks_a_foreign_key_or_check_of_the_head_fails(pg
     lines = []
     assert _upgrade(pg_database.url, lines, script_location=location) == 1
     assert lacked in lines
+    assert _result(lines)["error"] == (
+        "rmp_db is at 0002_r, which this tree does not have, and lacks what this tree needs; if a foreign key or CHECK "
+        "was dropped by hand, re-add it in the hand-DDL form (specs/WP-26.md §2), NOT VALID then VALIDATE, before or "
+        "with the re-land")
     assert _fingerprint(pg_database.url) == before and _version(pg_database.url) == ["0002_r"]
 
 

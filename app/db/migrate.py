@@ -80,6 +80,9 @@ IDLE_IN_TRANSACTION_TIMEOUT = "60s"
 WATCH_POLL_SEC = 0.5
 # The gate's one accepted difference (D-2), and the drift report's, until WP-26 batch 7 drops the unused extension.
 ALLOWED_EXTENSIONS = ("vector",)
+# No revision removes a foreign key or CHECK, so an ahead database that lacks one lost it by hand (§10 point 8).
+HAND_DROPPED_HINT = ("; if a foreign key or CHECK was dropped by hand, re-add it in the hand-DDL form "
+                     "(specs/WP-26.md §2), NOT VALID then VALIDATE, before or with the re-land")
 TEMPORAL_DATABASES = ("temporal", "temporal_visibility")
 LIVE_DATABASE = "rmp_db"
 # alembic_version.version_num is a String(32) (alembic/ddl/impl.py).
@@ -414,7 +417,10 @@ def _settled(conn: Connection, state: str, current: Optional[str], ctx: _Context
     for line in missing:
         ctx.log(f"migrate: lacking: {line}")
     if missing:
-        raise _Stop(ERROR, f"rmp_db is at {current}, which this tree does not have, and lacks what this tree needs")
+        message = f"rmp_db is at {current}, which this tree does not have, and lacks what this tree needs"
+        if any(line.startswith(("foreign key ", "check ")) for line in missing):
+            message += HAND_DROPPED_HINT
+        raise _Stop(ERROR, message)
     ctx.log(f"migrate: rmp_db is at {current}, which this tree does not have; no revision ran (rule 17)")
     _report_drift(conn, ctx, ALLOWED_EXTENSIONS, (head, live))
     return OK
