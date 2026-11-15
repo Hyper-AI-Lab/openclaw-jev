@@ -1285,8 +1285,22 @@ def _dist_copy(task: str) -> Path:
 
 
 def drop_dist_copy(task_id: str) -> None:
-    """Delete the copy of OpenClaw's dist a run took before its change, once the run has its result. Never raises."""
+    """Delete the copy of OpenClaw's dist a run took before its change, where it is no longer the way back
+    (``end_dist_copy``). Never raises."""
     shutil.rmtree(_dist_copy(task_id), ignore_errors=True)
+
+
+def end_dist_copy(task_id: str, status: str, phase: Optional[str]) -> None:
+    """The copy of OpenClaw's dist at the run's final result, reached in ``phase``: dropped on ``deployed``,
+    ``rolled_back`` and every result reached before ``applying``; kept on any other result reached from ``applying``
+    on, where it may be the only way back, and that result's summary names it."""
+    if status in ("deployed", "rolled_back") or phase not in CHANGING:
+        drop_dist_copy(task_id)
+
+
+def _touches_openclaw(paths: Iterable[str]) -> bool:
+    """Whether a change of ``paths`` runs OpenClaw's steps in its window: its model policy or its dist patches."""
+    return any(path == POLICY_SOURCE or path in PATCH_SOURCES for path in paths)
 
 
 def _copy_dist(task: str, changed: List[Tuple[str, str]], log: Callable[[str], None]) -> None:
@@ -1351,11 +1365,13 @@ def restore_tree(copy: Path, target: Path) -> List[str]:
     return done
 
 
-def _openclaw_steps(host: Host, task: str, paths: List[str], forward: bool, log: Callable[[str], None]) -> None:
+def _openclaw_steps(host: Host, task: str, run: Dict[str, Any], paths: List[str], forward: bool,
+                    log: Callable[[str], None]) -> None:
     """OpenClaw's side of the window, after the tree and the mirrors: forward, the model policy of the new tree, then
     the patches of the dist and their audit; back, the dist restored from the copy taken before the change, then the
-    policy of the reverted tree. Each runs only when the change touched its files; a failure raises, so forward it is
-    the deploy's failure."""
+    policy of the reverted tree, and once both are done the run records it (``openclaw_back``, which ``_rollback``
+    set to False with the revert commit). Each runs only when the change touched its files; a failure raises, so
+    forward it is the deploy's failure, and back it keeps the run reverting (``_reverted``)."""
     patches, policy = any(path in PATCH_SOURCES for path in paths), POLICY_SOURCE in paths
     if forward and policy:
         log(f"applied OpenClaw's model policy (changed {host.apply_openclaw_policy()})")
@@ -1367,6 +1383,8 @@ def _openclaw_steps(host: Host, task: str, paths: List[str], forward: bool, log:
         log(f"restored {OPENCLAW_DIST} from {_dist_copy(task)} ({len(restored)} path(s))")
     if not forward and policy:
         log(f"applied OpenClaw's model policy again (changed {host.apply_openclaw_policy()})")
+    if not forward and run.get("openclaw_back") is False:
+        _save(task, run, openclaw_back=True)
 
 
 def _venv_back(host: Host, run: Dict[str, Any], log: Callable[[str], None]) -> None:
@@ -1442,7 +1460,7 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
                 _restore_web_venv(task, log)
         for prefix, mirror in MIRRORS:
             reconcile(live, target, changed, prefix, mirror)
-        _openclaw_steps(host, task, [path for _, path in changed], forward, log)
+        _openclaw_steps(host, task, run, [path for _, path in changed], forward, log)
         if units:
             host.systemctl("start", *units)
             log(f"started {', '.join(units)}")
@@ -1610,6 +1628,9 @@ def _resume(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
     if _web_venv_copy(task).is_dir():
         summary += (f" The web backends' venv from before this deploy is kept at {_web_venv_copy(task)}, to be renamed "
                     f"back to {WEB_VENV} by hand if it is needed.")
+    if _dist_copy(task).is_dir():
+        summary += (f" OpenClaw's dist from before this deploy is kept at {_dist_copy(task)}, to be put back over "
+                    f"{OPENCLAW_DIST} by hand (deploy.restore_tree) if it is needed.")
     return {"status": "failed", "summary": summary}
 
 
@@ -1680,17 +1701,20 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     summary and the next still runs, so the revert always reaches GitHub. What the publish did is recorded, so a
     resumed rollback publishes no second time; only a publish that failed with an error is tried again. A revert
     window that raised before the host was back (``_reverted``: the tree at the revert commit, the venv link at the
-    recorded previous venv, the web backends' venv copy renamed back) is not the end: once the revert is published,
-    its error is raised, so the run keeps ``reverting``, the escape is counted, and the next idle pass resumes the
-    window (three such escapes leave the run stuck, ``end_dead_runs``). The re-check leaves ``claude_direct`` out
-    while the revert waits on GitHub: its clause that GitHub's main contains the live main fails until the revert
-    merges there."""
+    recorded previous venv, the web backends' venv copy renamed back, OpenClaw's dist and policy undone) is not the
+    end: once the revert is published, its error is raised, so the run keeps ``reverting``, the escape is counted, and
+    the next idle pass resumes the window (three such escapes leave the run stuck, ``end_dead_runs``). The re-check
+    leaves ``claude_direct`` out while the revert waits on GitHub: its clause that GitHub's main contains the live main
+    fails until the revert merges there."""
     live, head, failure, restarted = host.live, run["head"], run["failure"], run["affected"]
     if not run.get("revert"):
         revert = _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
                       f"{run['old']}^{{tree}}", "-p", head, "-m",
                       f"Revert {head[:12]}: the deploy's checks failed ({failure[:200]})").strip()
-        _save(task, run, revert=revert)
+        # OpenClaw's side is undone only once the revert window says so: until then the revert is not in place.
+        touched = _touches_openclaw(path for _, path in changes(live, run["old"], head))
+        undo = {"openclaw_back": False} if touched else {}
+        _save(task, run, revert=revert, **undo)
     revert, units = run["revert"], ", ".join(restarted) or "nothing"
     unmoved: Optional[Exception] = None
     try:
@@ -1729,9 +1753,11 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
 
 def _reverted(live: Path, task: str, run: Dict[str, Any]) -> bool:
     """Whether a revert window that raised left the host where the revert puts it: the live main at the revert commit
-    (False when it cannot be read), the venv link at the recorded previous venv, and the web backends' venv copy from
-    before the change renamed back."""
-    return _main_at(live, run["revert"]) and not _venv_moved(live, run) and not _web_venv_copy(task).exists()
+    (False when it cannot be read), the venv link at the recorded previous venv, the web backends' venv copy from
+    before the change renamed back, and OpenClaw's side undone when the change touched it (its dist restored and the
+    policy applied again, ``openclaw_back``)."""
+    return (_main_at(live, run["revert"]) and not _venv_moved(live, run) and not _web_venv_copy(task).exists()
+            and run.get("openclaw_back") is not False)
 
 
 def _install_blocked(host: Host, old: str, head: str, run: Dict[str, Any]) -> Optional[Dict[str, Any]]:

@@ -4088,3 +4088,70 @@ def test_the_dist_copy_goes_with_the_runs_result(repos, dist, monkeypatch, syste
     status = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())["status"]
     assert status == ("blocked" if ending == "blocked" else "failed")
     assert not copy.exists() and files_in(dist) == before and not deploy.state_file("t1").exists()
+
+
+@pytest.mark.parametrize("fails", ["the dist restore", "the policy re-apply"])
+def test_a_revert_whose_openclaw_undo_fails_keeps_reverting_with_the_dist_copy(repos, dist, monkeypatch, fails):
+    unit, seen = deploy_unit(monkeypatch)
+    before, copy, path = files_in(dist), deploy.RUNS_DIR / "t1" / "openclaw-dist.before", deploy.spec_file("t1")
+    head = repos.change({"patch_openclaw.sh": "#!/bin/bash\necho patched\n", "app/llm/model_policy.py": "P = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    real_restore, armed = deploy.restore_tree, [True]
+
+    class UndoFailingHost(MainWatchingHost):
+        """The revert window's policy step fails, once."""
+
+        def apply_openclaw_policy(self):
+            if armed and fails == "the policy re-apply" and ("apply_policy", head) in self.calls:
+                armed.clear()
+                raise RuntimeError("applying OpenClaw's model policy failed: openclaw.json is busy")
+            return super().apply_openclaw_policy()
+
+    def restore(copied, target):
+        if armed and fails == "the dist restore":
+            armed.clear()
+            raise OSError(28, "No space left on device")
+        return real_restore(copied, target)
+
+    monkeypatch.setattr(deploy, "restore_tree", restore)
+    host = UndoFailingHost(repos.live, patch=patching, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    assert unit.main(str(path)) == 1
+    run = state()
+    # The tree is back and the revert published, but OpenClaw's side is not undone: the run keeps reverting, an escape
+    # is counted, nothing is recorded, and the copy of the dist stays.
+    assert run["phase"] == "reverting" and run["openclaw_back"] is False and run["escapes"] == 1
+    assert run["published"]["status"] == "merged" and git(repos.live, "rev-parse", "main") == run["revert"]
+    assert files_in(copy) == before and not path.with_name("result.json").exists()
+
+    # The next pass resumes the revert window: the dist is restored and the policy applied again, with no new publish.
+    host = MainWatchingHost(repos.live)
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    assert unit.main(str(path)) == 1
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == "rolled_back" and result["revert_pr"] == run["published"]
+    assert ("apply_policy", run["revert"]) in host.calls and not [c for c in host.calls if c[0] == "land"]
+    assert files_in(dist) == before and not copy.exists() and not deploy.state_file("t1").exists()
+
+
+def test_a_result_after_applying_keeps_the_dist_copy(repos, dist, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    before, copy = files_in(dist), deploy.RUNS_DIR / "t1" / "openclaw-dist.before"
+    head = repos.change({"patch_openclaw.sh": "#!/bin/bash\necho patched\n"})
+    deploy.queue(reviewed(repos, head=head))
+    # Killed at the start, after the patch: the dist is patched, and the copy is the only way back.
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live, patch=patching, kill_at=("start", 1)),
+                           log=lambda m: None)
+    assert state()["phase"] == "merged" and files_in(copy) == before != files_in(dist)
+    # The live main moves under the killed run: its resume ends failed, from merged.
+    write(repos.live, {"docs/d.md": "someone else's commit\n"})
+    commit(repos.live, "a commit no deploy made")
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live))
+    assert unit.main(str(deploy.spec_file("t1"))) == 1
+    result = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())
+    assert result["status"] == "failed" and "which this deploy did not make" in result["summary"]
+    # Kept, and named in the summary.
+    assert files_in(copy) == before and not deploy.state_file("t1").exists()
+    assert (f"OpenClaw's dist from before this deploy is kept at {copy}, to be put back over {dist} by hand "
+            "(deploy.restore_tree) if it is needed.") in result["summary"]
