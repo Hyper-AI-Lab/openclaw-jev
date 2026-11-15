@@ -296,33 +296,46 @@ def host_file_drift(repo: Path, commit: str = "HEAD") -> Dict[str, List[str]]:
     return drift
 
 
-def _default_pin(live: Path, commit: str) -> Dict[str, Any]:
+def _default_pin(live: Path, commit: str) -> Optional[Dict[str, Any]]:
     """The Claude Code pin in ``commit``'s ``DEFAULT_CODING`` (``CLAUDE_PIN_KEYS``), read from its ``app/config.py``
-    with ``ast``: the commit's code is never imported."""
-    module = ast.parse(_git_bytes(live, "show", f"{commit}:{CLAUDE_PIN_SOURCE}"))
-    for node in module.body:
-        targets = (node.targets if isinstance(node, ast.Assign) else
-                   [node.target] if isinstance(node, ast.AnnAssign) else [])
-        if any(isinstance(target, ast.Name) and target.id == "DEFAULT_CODING" for target in targets) and isinstance(
-                node.value, ast.Dict):
-            return {key.value: ast.literal_eval(value) for key, value in zip(node.value.keys, node.value.values)
-                    if isinstance(key, ast.Constant) and key.value in CLAUDE_PIN_KEYS}
-    return {}
+    with ``ast``: the commit's code is never imported. None when it cannot be read that way: no such file, one that
+    does not parse, no ``DEFAULT_CODING`` dict literal, or no literal string ``claude_version`` in it."""
+    try:
+        module = ast.parse(_git_bytes(live, "show", f"{commit}:{CLAUDE_PIN_SOURCE}"))
+        for node in module.body:
+            targets = (node.targets if isinstance(node, ast.Assign) else
+                       [node.target] if isinstance(node, ast.AnnAssign) else [])
+            if any(isinstance(target, ast.Name) and target.id == "DEFAULT_CODING" for target in targets) and isinstance(
+                    node.value, ast.Dict):
+                pin = {key.value: ast.literal_eval(value) for key, value in zip(node.value.keys, node.value.values)
+                       if isinstance(key, ast.Constant) and key.value in CLAUDE_PIN_KEYS}
+                return pin if isinstance(pin.get("claude_version"), str) else None
+    except Exception:
+        return None
+    return None
 
 
-def claude_pin(live: Path, commit: str, own: Dict[str, Any]) -> Tuple[Any, ...]:
+def claude_pin(live: Path, commit: str, own: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
     """The effective Claude Code pin at ``commit``, (version, sha256): each key settings.json's own ``coding`` (``own``)
-    sets, else ``commit``'s ``DEFAULT_CODING``, as ``app.config.load_settings`` merges them."""
+    sets, else ``commit``'s ``DEFAULT_CODING``, as ``app.config.load_settings`` merges them. None when a key ``own``
+    does not set cannot be read from ``commit`` (``_default_pin``)."""
+    if all(key in own for key in CLAUDE_PIN_KEYS):
+        return tuple(own[key] for key in CLAUDE_PIN_KEYS)
     default = _default_pin(live, commit)
+    if default is None:
+        return None
     return tuple(own[key] if key in own else default.get(key) for key in CLAUDE_PIN_KEYS)
 
 
-def install_gaps(live: Path, old: str, head: str, changed: List[Tuple[str, str]], host: "Host") -> List[str]:
+def install_gaps(live: Path, old: str, head: str, changed: List[Tuple[str, str]], host: "Host", *,
+                 log: Callable[[str], None] = logger.info) -> List[str]:
     """What must be installed on this host before ``head`` deploys over ``old`` (rule 18), by name; empty when nothing.
 
     A readiness-hashed host file whose repo copy the range changes (``changed``) must be installed with the head's
     bytes (a copy the head deletes has nothing to install), and when the range moves the effective Claude Code pin, the
-    installed binary must be the head's version with the head's sha256. The deploy installs none of them."""
+    installed binary must be the head's version with the head's sha256; a pin without a sha256 is checked by its
+    version alone, as readiness only warns there. A head pin that cannot be read is logged and is no gap: readiness
+    checks it after the deploy. The deploy installs none of them."""
     paths = {path for status, path in changed if status != "D"}
     gaps = []
     for source, installed in HOST_INSTALLED:
@@ -332,8 +345,12 @@ def install_gaps(live: Path, old: str, head: str, changed: List[Tuple[str, str]]
     if CLAUDE_PIN_SOURCE in paths:
         own = host.coding_settings()
         pin = claude_pin(live, head, own)
-        if pin != claude_pin(live, old, own) and tuple(host.installed_claude()) != pin:
-            gaps.append(f"Claude Code {pin[0]} (sha256 {pin[1]}) as {CLAUDE_BIN}")
+        if pin is None:
+            log("the Claude Code pin at head could not be read; readiness checks it after the deploy")
+        elif pin != claude_pin(live, old, own):
+            version, sha256 = host.installed_claude()
+            if version != pin[0] or (pin[1] and sha256 != pin[1]):
+                gaps.append(f"Claude Code {pin[0]}{f' (sha256 {pin[1]})' if pin[1] else ''} as {CLAUDE_BIN}")
     return gaps
 
 
@@ -1531,14 +1548,14 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         if not _is_ancestor(live, old, head):
             return {"status": "blocked", "summary": f"The live main ({old[:12]}) has commits GitHub's main lacks, so nothing "
                     "was deployed; main is unchanged."}
-        blocked = _install_blocked(host, old, head, run)
+        blocked = _install_blocked(host, old, head, run, log)
         if blocked:
             return blocked
     else:
         if old != spec["old"]:
             return {"status": "failed", "summary": "main moved while the deploy waited, so nothing was deployed. Ask me again."}
         # Before the land, so a change whose host files are not installed never reaches GitHub's main.
-        blocked = _install_blocked(host, old, spec["head"], run) or _drift(live, old)
+        blocked = _install_blocked(host, old, spec["head"], run, log) or _drift(live, old)
         if blocked:
             return blocked
         if run.get("phase") != "landed":
@@ -1556,7 +1573,7 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         log(f"landed {run['pr']['url']} as {head[:12]}")
         host.fetch_main()
         # The merge commit is what ships, and it also carries what GitHub's main held beyond the live main.
-        blocked = _install_blocked(host, old, head, run)
+        blocked = _install_blocked(host, old, head, run, log)
         if blocked:
             return blocked
         check = host.wait_check(head)
@@ -1760,11 +1777,12 @@ def _reverted(live: Path, task: str, run: Dict[str, Any]) -> bool:
             and run.get("openclaw_back") is not False)
 
 
-def _install_blocked(host: Host, old: str, head: str, run: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _install_blocked(host: Host, old: str, head: str, run: Dict[str, Any],
+                     log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
     """A blocked result naming what must be installed on the host before ``head`` deploys over ``old``
     (``install_gaps``, in ``needs_install``), or None when nothing must. The watcher queues a head of GitHub's main
     blocked this way again once it is installed."""
-    gaps = install_gaps(host.live, old, head, changes(host.live, old, head), host)
+    gaps = install_gaps(host.live, old, head, changes(host.live, old, head), host, log=log)
     if not gaps:
         return None
     summary = (f"{', '.join(gaps)} must be installed on the host before this deploy (rule 18), so nothing was "

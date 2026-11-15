@@ -4155,3 +4155,31 @@ def test_a_result_after_applying_keeps_the_dist_copy(repos, dist, monkeypatch):
     assert files_in(copy) == before and not deploy.state_file("t1").exists()
     assert (f"OpenClaw's dist from before this deploy is kept at {copy}, to be put back over {dist} by hand "
             "(deploy.restore_tree) if it is needed.") in result["summary"]
+
+
+@pytest.mark.parametrize("config", [
+    'DEFAULT_CODING = dict(claude_version="2.1.300", claude_sha256="{}")\n'.format("b" * 64),
+    'CLAUDE = {{"claude_version": "2.1.300", "claude_sha256": "{}"}}\nDEFAULT_CODING = {{"enabled": True}}\n'.format(
+        "b" * 64)], ids=["not a dict literal", "the keys moved"])
+def test_an_unreadable_claude_pin_at_head_is_logged_and_no_gap(repos, config):
+    write(repos.live, {"app/config.py": CONFIG.format("2.1.288", "a" * 64)})
+    repos.old = commit(repos.live, "the pin as installed")
+    head = merged_on_github(repos, {"app/config.py": config})
+    host = FakeHost(repos.live, claude=("2.1.288", "a" * 64))
+    lines = []
+    result = deploy.self_deploy(main_spec(head), host, log=lines.append)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert "the Claude Code pin at head could not be read; readiness checks it after the deploy" in lines
+    assert ("installed_claude",) not in host.calls
+
+
+def test_a_version_only_claude_pin_compares_the_version_only(repos):
+    write(repos.live, {"app/config.py": CONFIG.format("2.1.288", "a" * 64)})
+    repos.old = commit(repos.live, "the pin as installed")
+    head = merged_on_github(repos, {"app/config.py": 'DEFAULT_CODING = {\n    "claude_version": "2.1.300",\n}\n'})
+    # The old version installed: a gap, named by its version alone.
+    result = deploy.self_deploy(main_spec(head), FakeHost(repos.live, claude=("2.1.288", "a" * 64)), log=lambda m: None)
+    assert result["status"] == "blocked" and result["needs_install"] == [f"Claude Code 2.1.300 as {units.CLAUDE_BIN}"]
+    # The head's version installed, whatever its binary's sha256: deployed.
+    result = deploy.self_deploy(main_spec(head), FakeHost(repos.live, claude=("2.1.300", "c" * 64)), log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
