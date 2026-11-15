@@ -1138,6 +1138,16 @@ def _build_venv(host: Host, task: str, head: str, changed: List[Tuple[str, str]]
     return target
 
 
+def _replay_answer(answer: Any) -> Dict[str, Any]:
+    """A replay's answer as ``_replay_live`` reads it: ``{"error": ...}`` as it is, else ``replayed``, a list of ids,
+    and ``failed``, ids with their errors. Any other answer could not come from a replay that ran: it is an error."""
+    if isinstance(answer, dict) and "error" in answer:
+        return answer
+    if isinstance(answer, dict) and isinstance(answer.get("replayed"), list) and isinstance(answer.get("failed"), dict):
+        return answer
+    return {"error": f"the replay's answer lacks replayed or failed ({str(answer)[:100]})"}
+
+
 def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: Optional[Path],
                  log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
     """Before the change, under the lock: the running workflows replayed on the head's code (its tree from
@@ -1145,15 +1155,21 @@ def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: 
     the live code. A workflow that replays on the live code and fails on the head's would wedge on the new code: the
     blocked result. One that fails on both was broken already and blocks nothing. A replay that could not run is noted
     in the run (``replay``, for the result's summary) and blocks nothing either, so an outage of the replay never stops
-    every deploy, the fix included. The tree is deleted after; the log names the counts."""
+    every deploy, the fix included: a head whose tree cannot be built (``git archive``, or an extraction the ``data``
+    filter refuses, such as an absolute or escaping symlink) and an answer without the expected keys count as such.
+    The tree is deleted after; the log names the counts."""
     tree = RUNS_DIR / task / "tree"
-    shutil.rmtree(tree, ignore_errors=True)
-    tree.mkdir(parents=True, mode=0o700)
     try:
-        with tarfile.open(fileobj=io.BytesIO(_git_bytes(host.live, "archive", "--format=tar", head))) as archive:
-            archive.extractall(tree, filter="data")
-        new = host.replay(tree, venv=target or host.live / "venv")
-        old = host.replay(host.live, venv=host.live / "venv")
+        try:
+            shutil.rmtree(tree, ignore_errors=True)
+            tree.mkdir(parents=True, mode=0o700)
+            with tarfile.open(fileobj=io.BytesIO(_git_bytes(host.live, "archive", "--format=tar", head))) as archive:
+                archive.extractall(tree, filter="data")
+        except Exception as exc:
+            new: Dict[str, Any] = {"error": f"the head's tree could not be built ({str(exc)[:300]})"}
+        else:
+            new = _replay_answer(host.replay(tree, venv=target or host.live / "venv"))
+        old = _replay_answer(host.replay(host.live, venv=host.live / "venv"))
     finally:
         shutil.rmtree(tree, ignore_errors=True)
     failure = new.get("error") or old.get("error")

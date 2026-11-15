@@ -3810,6 +3810,58 @@ def test_a_replay_that_cannot_run_is_reported_not_blocking(repos, new, old, reas
     assert f"the live-history replay could not run: {reason}" in lines
 
 
+def merged_with_a_link(repos, target):
+    """GitHub's main gains a change and ``docs/link``, a symbolic link to ``target``; its commit."""
+    clone = repos.tmp / "linked"
+    git(repos.tmp, "clone", "-q", "-b", "main", str(repos.origin), str(clone))
+    write(clone, {"app/a.py": "A = 2\n"})
+    (clone / "docs" / "link").symlink_to(target)
+    head = commit(clone, "a change with a link")
+    git(clone, "push", "-q", "origin", "HEAD:refs/heads/main")
+    return head
+
+
+@pytest.mark.parametrize("target", ["/nonexistent-absolute-target", "../../outside-the-tree"])
+def test_a_head_whose_tree_cannot_be_built_is_reported_not_blocking(repos, target):
+    head = merged_with_a_link(repos, target)
+    host = FakeHost(repos.live)
+    lines = []
+    result = deploy.self_deploy(main_spec(head), host, log=lines.append)
+    # The data filter refuses the link: the head's replay could not run, the live one still ran, the deploy went on.
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    reason = re.search(r"The live-history replay could not run \((.*)\)\.$", result["summary"]).group(1)
+    assert reason.startswith("the head's tree could not be built (") and "link" in reason
+    assert [c[:2] for c in host.calls if c[0] == "replay"] == [("replay", "live")]
+    assert f"the live-history replay could not run: {reason}" in lines
+    assert not (deploy.RUNS_DIR / deploy.MAIN / "tree").exists()
+
+
+@pytest.mark.parametrize("answers", ["the head's {}", "the live {}", "a tool printing {}"])
+def test_a_replay_answer_without_its_keys_is_reported_not_blocking(repos, tmp_path, answers):
+    # Both trees carry the tool, so the host's own replay runs it on its interpreter.
+    write(repos.live, {"ops/replay_live.py": "# the tool\n"})
+    repos.old = commit(repos.live, "the tool")
+    git(repos.live, "push", "-q", "origin", "main")
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    venv = tmp_path / "printing-venv"
+    write(venv, {"bin/python": "#!/bin/sh\necho '{}'\n"})
+    (venv / "bin" / "python").chmod(0o755)
+
+    class PrintingHost(FakeHost):
+        """Runs each tree's tool for real, on an interpreter that prints ``{}``."""
+
+        def replay(self, tree, *, venv=None):
+            return deploy.Host.replay(self, tree, venv=tmp_path / "printing-venv")
+
+    nothing = {"replayed": [], "failed": {}}
+    host = (PrintingHost(repos.live) if answers == "a tool printing {}" else
+            FakeHost(repos.live, replays=[{}, nothing] if answers == "the head's {}" else [nothing, {}]))
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert result["summary"].endswith("The live-history replay could not run (the replay's answer lacks replayed or "
+                                      "failed ({})).")
+
+
 def test_the_hosts_replay_runs_the_tool_on_the_trees_python_and_reads_its_line(tmp_path, monkeypatch):
     tree, venv = tmp_path / "tree", tmp_path / "venv"
     write(tree, {"ops/replay_live.py": "# the tool\n"})
