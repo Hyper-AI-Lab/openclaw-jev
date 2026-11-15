@@ -1107,6 +1107,29 @@ def test_writing_to_a_database_with_tables_needs_a_recent_verified_backup(pg_liv
     assert _upgrade(pg_database.url, backup_root=none, allow_empty=True) == 0
 
 
+def test_an_impossible_backup_stamp_is_reported_and_is_no_usable_backup_only_for_a_write(pg_database, pg_live_shaped,
+                                                                                         tmp_path):
+    root = tmp_path / "odd"
+    # Named like a stamp, so newest() takes it, but month 13 is no time.
+    make_backup(root, age_h=1).rename(root / "20261340T031502Z")
+    line = "migrate: preflight: newest backup: 20261340T031502Z's stamp is not a time ("
+    assert _upgrade(pg_database.url, allow_empty=True) == 0
+    for version in (HEAD, "0099_from_a_later_tree"):
+        _execute(pg_database.url, f"UPDATE alembic_version SET version_num = '{version}'")
+        lines = []
+        assert _upgrade(pg_database.url, lines, backup_root=root) == 0, "\n".join(lines)
+        assert [entry for entry in lines if entry.startswith(line)]
+    lines = []
+    assert migrate.run(pg_live_shaped.url, command="check", backup_root=root, log=lines.append) == 0
+    assert [entry for entry in lines if entry.startswith(line)]
+    lines = []
+    assert _upgrade(pg_live_shaped.url, lines, backup_root=root) == 1
+    assert _result(lines)["error"].startswith("no usable backup: 20261340T031502Z's stamp is not a time (")
+    assert _version(pg_live_shaped.url) is None
+    assert _upgrade(pg_live_shaped.url, backup_root=root, skip_backup_check=True) == 0
+    assert _version(pg_live_shaped.url) == [HEAD]
+
+
 DATA_REVISION = _revision("0002_data", HEAD, 'op.execute("UPDATE tasks SET priority = 0 WHERE priority IS NULL")',
                           kind='KIND = "data"')
 

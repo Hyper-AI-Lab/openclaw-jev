@@ -225,7 +225,9 @@ def _stamp_time(name: str) -> datetime:
 
 
 def _preflight(conn: Connection, ctx: _Context) -> _Preflight:
-    """What a write would meet, printed on every run and enforced only on the write path (``_guard``); committed."""
+    """What a write would meet, printed on every run and enforced only on the write path (``_guard``); committed. It
+    only reports: a backup root that does not read, or a newest backup whose stamp is no real time, is a line here and
+    "no usable backup" only for a write."""
     found = _Preflight()
     ctx.log(f"migrate: preflight: backup root {ctx.root}")
     try:
@@ -235,6 +237,8 @@ def _preflight(conn: Connection, ctx: _Context) -> _Preflight:
             found.problems = backup_manifest.problems(found.newest, hashes=False)
     except OSError as exc:
         found.unreadable = f"{ctx.root} does not read ({exc.strerror or type(exc).__name__})"
+    except ValueError as exc:
+        found.unreadable = f"{found.newest.name}'s stamp is not a time ({_single_line(exc)})"
     if found.unreadable:
         ctx.log(f"migrate: preflight: newest backup: {found.unreadable}")
     elif found.newest is None:
