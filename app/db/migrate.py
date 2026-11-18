@@ -603,14 +603,16 @@ def _check(conn: Connection, ctx: _Context) -> int:
     ctx.result.update({"state": state, "from": current, "to": current})
     ctx.log(f"migrate: state {state} {current or 'none'}")
     _preflight(conn, ctx)
-    if state in ("ahead", "at_head"):
-        found = _head_and_live(conn, ctx)
-        if found is None:
-            return OK
-        missing = _lacking(*found) if state == "ahead" else []
+    if state == "at_head":
+        drift = _report_drift(conn, ctx, ctx.allow_extensions)
+        return DRIFT if fingerprint.unallowed(drift) else OK
+    if state == "ahead":
+        # D-6's verdict needs head.json and the live catalog, as upgrade's does: their failure ends the run.
+        head, live = _load(ctx.location / "head.json"), _live(conn)
+        missing = _lacking(head, live)
         for line in missing:
             ctx.log(f"migrate: lacking: {line}")
-        drift = _report_drift(conn, ctx, ctx.allow_extensions, found)
+        drift = _report_drift(conn, ctx, ctx.allow_extensions, (head, live))
         return DRIFT if missing or fingerprint.unallowed(drift) else OK
     pending = _pending(chain, current)
     if state == "pre_alembic":

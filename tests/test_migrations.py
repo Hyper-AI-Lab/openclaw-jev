@@ -808,12 +808,14 @@ def test_a_drift_report_that_cannot_be_made_never_changes_the_exit_code(pg_datab
         assert migrate.run(pg_database.url, command=command, json_result=True, log=lines.append) == 0
         assert "migrate: no drift report: RuntimeError: the catalog does not read" in lines
         assert _result(lines)["error"] is None
-    # Ahead, the same reads decide whether the tree may run, so their failure ends the run.
+    # Ahead, the same reads decide whether the tree may run (D-6), so their failure ends the run, in check too.
     monkeypatch.setattr(fingerprint, "fingerprint", readable)
     _execute(pg_database.url, "UPDATE alembic_version SET version_num = '0099_from_a_later_tree'")
-    lines = []
-    assert _upgrade(pg_database.url, lines, script_location=no_head) == 1
-    assert _result(lines)["error"].startswith("FileNotFoundError: ")
+    for command in ("upgrade", "check"):
+        lines = []
+        assert migrate.run(pg_database.url, command=command, script_location=no_head, json_result=True,
+                           log=lines.append) == 1, command
+        assert _result(lines)["error"].startswith("FileNotFoundError: "), command
 
 
 def _at_a_revision_the_tree_lacks(database, tmp_path, body):
