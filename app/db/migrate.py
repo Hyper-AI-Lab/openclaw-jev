@@ -87,7 +87,6 @@ TEMPORAL_DATABASES = ("temporal", "temporal_visibility")
 LIVE_DATABASE = "rmp_db"
 # alembic_version.version_num is a String(32) (alembic/ddl/impl.py).
 REVISION_ID_MAX = 32
-STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 
 
 def _utcnow() -> datetime:
@@ -129,6 +128,8 @@ class _Preflight:
     age_h: Optional[float] = None
     problems: List[str] = field(default_factory=list)
     unreadable: Optional[str] = None
+    # Backups stamped ahead of the clock, with how many hours: reported, never used.
+    ahead: List[Tuple[Path, float]] = field(default_factory=list)
     dumps: List[int] = field(default_factory=list)
     holders: List[int] = field(default_factory=list)
     in_window: bool = False
@@ -223,10 +224,6 @@ def _state(conn: Connection, chain: List[Script]) -> Tuple[str, Optional[str]]:
     return ("at_head" if heads[0] == ids[-1] else "behind"), heads[0]
 
 
-def _stamp_time(name: str) -> datetime:
-    return datetime.strptime(name, STAMP_FORMAT).replace(tzinfo=timezone.utc)
-
-
 def _preflight(conn: Connection, ctx: _Context) -> _Preflight:
     """What a write would meet, printed on every run and enforced only on the write path (``_guard``); committed. It
     only reports: a backup root that does not read, or a newest backup whose stamp is no real time, is a line here and
@@ -234,14 +231,18 @@ def _preflight(conn: Connection, ctx: _Context) -> _Preflight:
     found = _Preflight()
     ctx.log(f"migrate: preflight: backup root {ctx.root}")
     try:
-        found.newest = backup_manifest.newest(ctx.root)
+        found.ahead = [(path, (backup_manifest.stamped(path.name) - ctx.now).total_seconds() / 3600)
+                       for path in backup_manifest.ahead(ctx.root, now=ctx.now)]
+        found.newest = backup_manifest.newest(ctx.root, now=ctx.now)
         if found.newest is not None:
-            found.age_h = (ctx.now - _stamp_time(found.newest.name)).total_seconds() / 3600
+            found.age_h = (ctx.now - backup_manifest.stamped(found.newest.name)).total_seconds() / 3600
             found.problems = backup_manifest.problems(found.newest, hashes=False)
     except OSError as exc:
         found.unreadable = f"{ctx.root} does not read ({exc.strerror or type(exc).__name__})"
     except ValueError as exc:
         found.unreadable = f"{found.newest.name}'s stamp is not a time ({_single_line(exc)})"
+    for path, hours in found.ahead:
+        ctx.log(f"migrate: preflight: ignored backup {path.name}, stamped {hours:.1f} h ahead of the clock")
     if found.unreadable:
         ctx.log(f"migrate: preflight: newest backup: {found.unreadable}")
     elif found.newest is None:
@@ -278,6 +279,10 @@ def _guard(found: _Preflight, kinds: Dict[str, str], ctx: _Context) -> None:
         return
     if found.unreadable:
         raise _Stop(ERROR, f"no usable backup: {found.unreadable}")
+    if (found.newest is None or found.age_h is None) and found.ahead:
+        path, hours = found.ahead[-1]
+        raise _Stop(ERROR, f"no usable backup: {path.name} is stamped {hours:.1f} h ahead of the clock, and "
+                           f"{ctx.root} holds no other backup")
     if found.newest is None or found.age_h is None:
         raise _Stop(ERROR, f"no backup under {ctx.root}: a database with tables is written only with a backup newer "
                            f"than {BACKUP_MAX_AGE_H} h")

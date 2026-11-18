@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tarfile
 import zlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -35,6 +36,9 @@ MANIFEST = "manifest.json"
 REQUIRED_COMPONENTS = ("postgres", "temporal", "qdrant", "artifacts", "openclaw-state", "workspace", "settings")
 # A backup directory is named after the UTC time its run started.
 STAMP = re.compile(r"20\d{6}T\d{6}Z")
+STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+# A stamp further ahead of a reader's clock than this is no real run's: a skewed clock, or a directory made by hand.
+FUTURE_SKEW = timedelta(minutes=5)
 # The file a run makes of Qdrant, by the mode Qdrant runs in.
 QDRANT_FILES = {"server": "qdrant-full.snapshot", "embedded": "qdrant.tar.gz"}
 OPENCLAW_STATE = "openclaw-state"
@@ -257,14 +261,41 @@ def default_root() -> Path:
     return Path(environ.get("OPENCLAW_HOME") or "/root/.openclaw") / "rmp" / "data" / "backups"
 
 
-def newest(root: Path) -> Optional[Path]:
-    """The newest backup under ``root``: the newest directory named like a stamp that holds a manifest.json. A run in
-    progress has none yet, and a killed run never writes one. Other directories there, such as openclaw-state/ and an
-    OpenClaw update's backup, are never one. Its age comes from its stamp."""
+def stamped(name: str) -> datetime:
+    """The UTC time a backup directory's name stamps; ValueError for a name that is no time (20261399T000000Z)."""
+    return datetime.strptime(name, STAMP_FORMAT).replace(tzinfo=timezone.utc)
+
+
+def _backups(root: Path) -> List[Path]:
+    """Every backup under ``root``: the directories named like a stamp that hold a manifest.json. A run in progress has
+    none yet, and a killed run never writes one. Other directories there, such as openclaw-state/ and an OpenClaw
+    update's backup, are never one."""
     root = Path(root)
     if not root.is_dir():
-        return None
-    backups = [p for p in root.iterdir() if STAMP.fullmatch(p.name) and (p / MANIFEST).is_file()]
+        return []
+    return [p for p in root.iterdir() if STAMP.fullmatch(p.name) and (p / MANIFEST).is_file()]
+
+
+def _is_ahead(path: Path, now: datetime) -> bool:
+    try:
+        return stamped(path.name) > now + FUTURE_SKEW
+    except ValueError:
+        return False
+
+
+def ahead(root: Path, *, now: datetime) -> List[Path]:
+    """The backups under ``root`` stamped more than FUTURE_SKEW after ``now``, oldest first: none is a real run."""
+    return sorted((p for p in _backups(root) if _is_ahead(p, now)), key=lambda p: p.name)
+
+
+def newest(root: Path, *, now: Optional[datetime] = None) -> Optional[Path]:
+    """The newest backup under ``root``, by its stamp, from which its age comes. Given ``now`` (the migration
+    wrapper's clock), a backup stamped more than FUTURE_SKEW after it is no real run and is never the newest; a name
+    that is no time stays a candidate, for its reader to report. Without ``now`` every backup counts, so readiness
+    sees a stamp ahead of the clock, which sorts above every real run, and warns about it."""
+    backups = _backups(root)
+    if now is not None:
+        backups = [p for p in backups if not _is_ahead(p, now)]
     return max(backups, key=lambda p: p.name, default=None)
 
 

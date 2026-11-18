@@ -27,6 +27,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
 from app.db import fingerprint, migrate
+from app.production import backup_manifest
 from app.db.revision_kind import kind_of
 from tests.backup_fixture import NOON, make_backup
 
@@ -1134,6 +1135,35 @@ def test_an_impossible_backup_stamp_is_reported_and_is_no_usable_backup_only_for
     assert _version(pg_live_shaped.url) is None
     assert _upgrade(pg_live_shaped.url, backup_root=root, skip_backup_check=True) == 0
     assert _version(pg_live_shaped.url) == [HEAD]
+
+
+def test_a_backup_stamped_in_the_future_is_not_usable(pg_database, pg_live_shaped, tmp_path):
+    root = tmp_path / "ahead"
+    # Stamped a day after the clock: a skewed clock, or a directory made by hand. It sorts above every real run.
+    future = make_backup(root, age_h=-24)
+    ignored = f"migrate: preflight: ignored backup {future.name}, stamped 24.0 h ahead of the clock"
+    lines = []
+    assert _upgrade(pg_live_shaped.url, lines, backup_root=root) == 1
+    assert _result(lines)["error"] == (f"no usable backup: {future.name} is stamped 24.0 h ahead of the clock, and "
+                                       f"{root} holds no other backup")
+    assert ignored in lines and "migrate: preflight: newest backup: none" in lines
+    assert _version(pg_live_shaped.url) is None
+    # Off the write path it is reported, not used.
+    assert _upgrade(pg_database.url, allow_empty=True) == 0
+    lines = []
+    assert _upgrade(pg_database.url, lines, backup_root=root) == 0, "\n".join(lines)
+    assert ignored in lines
+    # Beside a real backup, the real one is the newest and the write uses it.
+    real = make_backup(root, age_h=2)
+    lines = []
+    assert _upgrade(pg_live_shaped.url, lines, backup_root=root) == 0, "\n".join(lines)
+    assert ignored in lines and f"migrate: preflight: newest backup {real.name}, 2.0 h old, no problems" in lines
+    assert _version(pg_live_shaped.url) == [HEAD]
+    # newest() skips it only given a clock; readiness, which passes none, sees it and warns. Five minutes are skew.
+    assert backup_manifest.newest(root, now=NOON) == real and backup_manifest.newest(root) == future
+    skewed = make_backup(tmp_path / "skewed", age_h=-4 / 60)
+    assert backup_manifest.newest(skewed.parent, now=NOON) == skewed and backup_manifest.ahead(skewed.parent,
+                                                                                               now=NOON) == []
 
 
 DATA_REVISION = _revision("0002_data", HEAD, 'op.execute("UPDATE tasks SET priority = 0 WHERE priority IS NULL")',
