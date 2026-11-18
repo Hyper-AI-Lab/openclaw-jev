@@ -329,6 +329,19 @@ def test_rmp_qdrant_it_lifts_the_qdrant_ports_only(tmp_path, monkeypatch):
     assert guard.check(TEMPORAL_CONNECT, ("localhost:7233",)) is not None
 
 
+def test_the_live_socket_directory_is_denied(tmp_path):
+    # libpq's own connects are C, which the guard never sees: tests/postgres_fixture.py asserts its URLs, and the
+    # harness hides the directory. A Python-level connect, asyncpg's, is refused here.
+    guard = checking(tmp_path)
+    for socket_path in ("/run/postgresql/.s.PGSQL.5432", "/var/run/postgresql/.s.PGSQL.5432"):
+        assert guard.check("socket.connect", (UNIX, socket_path)) == f"production socket {socket_path}"
+    with GUARD.expect_violations() as recorded:
+        with socket.socket(socket.AF_UNIX) as sock, pytest.raises(PermissionError, match="hermetic tests"):
+            sock.connect("/run/postgresql/.s.PGSQL.5432")
+    assert [(v.event, v.target) for v in recorded] == [
+        ("socket.connect", "production socket /run/postgresql/.s.PGSQL.5432")]
+
+
 @pytest.mark.parametrize("root", DENIED_DIRS)
 def test_the_installed_hook_refuses_and_records_reading_or_listing_a_denied_root(root):
     probe = f"{root}/hermetic-probe-{uuid.uuid4()}"

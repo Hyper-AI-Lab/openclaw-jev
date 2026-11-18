@@ -282,6 +282,24 @@ def test_newest_is_the_newest_stamped_directory_that_holds_a_manifest(tmp_path):
     assert bm.newest(root) == root / "20261020T031502Z"
 
 
+def test_the_default_backup_root_ignores_the_working_directory(tmp_path, monkeypatch):
+    # ops/backup.sh's chain; the deploy runs the migration wrapper from a run directory of its own.
+    for name in ("RMP_BACKUP_ROOT", "RMP_DATA_DIR", "RMP_ROOT", "OPENCLAW_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / "data" / "backups").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    # Only named, never touched: the guard would refuse a read of the live root.
+    assert bm.default_root() == Path("/root/.openclaw/rmp/data/backups")
+    monkeypatch.setenv("OPENCLAW_HOME", str(tmp_path / "openclaw"))
+    assert bm.default_root() == tmp_path / "openclaw" / "rmp" / "data" / "backups"
+    monkeypatch.setenv("RMP_ROOT", str(tmp_path / "rmp"))
+    assert bm.default_root() == tmp_path / "rmp" / "data" / "backups"
+    monkeypatch.setenv("RMP_DATA_DIR", str(tmp_path / "state"))
+    assert bm.default_root() == tmp_path / "state" / "backups"
+    monkeypatch.setenv("RMP_BACKUP_ROOT", str(tmp_path / "elsewhere"))
+    assert bm.default_root() == tmp_path / "elsewhere"
+
+
 def test_the_command_line_writes_a_manifest_and_verifies_a_backup(dest, tmp_path, monkeypatch, capsys):
     fake, state = tmp_path / "bin", tmp_path / "state"
     fake.mkdir()

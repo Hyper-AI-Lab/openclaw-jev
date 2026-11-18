@@ -24,6 +24,7 @@ bash ops/verify_openclaw_patch.sh   # when OpenClaw dist patches change
 - [ ] `settings.example.json` updated if new config keys were added
 - [ ] No live credentials or host-specific secrets in the diff
 - [ ] README / ARCHITECTURE updated when the public contract changes
+- [ ] Until the schema conventions land (WP-26 batch 6), no PR changes the database schema: no Alembic revision in `app/db/migrations/versions/`, and no change in `app/db/models.py` to a table, to a column's presence, type, nullability or server default, to an index or to a constraint (ordering rule 44). Python-side `default=` and `onupdate=` arguments are not schema and are not frozen.
 
 ## Code of collaboration
 
