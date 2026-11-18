@@ -4962,3 +4962,111 @@ All are low severity, and none is reachable today.
 - A future-stamped backup passes the 30 h guard (pre-existing).
 
 **Batch 6 PR body:** drafted in `/root/.cache/pr-wp09-b6.md`, with no attribution line.
+
+## 2026-11-17 10:16 UTC · WP-09 batch 6 PR opened
+- **Mirror commit:** `b91d700` on `a1d2aaf`. `docs/PLATFORM_HARDENING_PROGRESS.md` equals `PROGRESS.md` up to the previous entry.
+- **Before pushing:** `origin/main` was `b830e2f`, and no PR was open.
+- **PR:** `aura-github push aura/wp-09-6-prechecks`, then PR [#55](https://github.com/Hyper-AI-Lab/openclaw-jev/pull/55) with `/root/.cache/pr-wp09-b6.md`.
+- **App PR status:** the app's PR-status tool timed out (its PreToolUse hook did not answer), so CI is read when its event arrives, or once by the gate.
+
+## 2026-11-18 07:36 UTC · PR #55 green; merged on the gate; batch 6's deploy watched. WP-26 batch 1 fix round 2 sent
+**PR #55:** CI `test` passed at 2026-11-17 10:22:41Z.
+- **Gate, run once:** `state=CLEAN test=success head=b91d700 local=b91d700 main=b830e2f open=1`, so GATE-OK.
+- **Pre-checks, read-only:** 0 running workflows on the live Temporal. The repo's claude_host (`2d528cba`) and aura_github (`c352aa05`) hashes equal the installed ones.
+- One installed-file hash command also named a path under `/etc/aura-coder/`. It printed nothing, and the reviewer's round-1 comparison already covers that file. I will not touch that path again.
+- **Merged** with squash, an explicit subject and body, and no attribution. The deploy watch runs in background `bu75kbpch`.
+
+**WP-26 batch 1, fix round 2** (spec §11, "2026-11-18: Batch 1, round 2"):
+1. `check` keeps its D-6 verdict on an ahead database.
+2. The inner pytester run is pinned to its own rootdir and confcutdir.
+3. A backup stamped in the future is not usable.
+
+Sent to the implementer.
+
+## 2026-11-18 07:42 UTC · WP-09 batch 6 deployed (PR #55, be08138); ledger closures
+**Merge:** at 07:35:24Z, squash `be08138`, with no attribution.
+
+**Deploy:** run by `b830e2f`'s code.
+- CI ran on main's squash; the run was queued at 07:41:18Z and launched at 07:41:19.
+- **The window:** `holding /run/rmp-code-reload.lock` at 07:41:20. Stopped `rmp-api` and `rmp-worker` at 07:41:25, main moved `b830e2f..be08138`, then started both at 07:41:26. About 1 s down.
+- **Result:** `deployed` at 07:41:55Z, with canary `ok`, `new_failing` empty and `ci` `success`. `deploy.log` (928 bytes) kept the whole run.
+- **Checks:**
+  - `rmp-api`, `rmp-worker` and `openclaw-gateway` are active. The gateway was not restarted; it has been up since 2026-10-23.
+  - The venv link is unchanged (`fcb513c80bb3a8ce`), and `venvs/rmp` still holds two directories.
+  - 0 import errors and 0 nondeterminism.
+- **Batch 6's host step** (the next deploy's log shows the two "live-history replay on …" lines) comes with WP-26 batch 1's deploy, the first one run by batch 6's code.
+
+**Ledger** (spec §7, "after batch 6"; backups `/root/.cache/*.bak-b6deploy`):
+- Closed: `TRI-022` with `coding-R6`, and `B2b-02`.
+- `temporal-determinism-04` progress: the deploy-time replay is delivered; the template freeze stays with WP-28.
+- `ordering.md` rule 37: B2b-02's constraint is met. The dist-patch note waits for batches 7 and 8.
+- `wp_states["WP-09"]` is updated.
+
+**One PR in flight:** next is WP-26 batch 1, after its fix round 2 and my verify.
+
+## 2026-11-18 08:34 UTC · WP-26 batch 1 fix round 2 done; rebased onto batch 6; round 3 and my verify running
+**Fix round 2** (spec §11, "2026-11-18: Batch 1, round 2"): three commits on `7e7c0e2`.
+- `f0264b0`: `check` keeps the D-6 verdict on an ahead database. The boundary case fails on `7e7c0e2`.
+- `fde6328`: the inner pytest session is pinned to its own rootdir and confcutdir. Probe with a basetemp under `tests/`: unpinned, 15 guard tests fail; pinned, only the 2 that the control also fails.
+- `621f5ab`: a backup stamped more than 5 minutes ahead is ignored and never written on. It fails on `7e7c0e2`, where the write exited 0.
+- **Deviation, accepted:** `newest()` skips future backups only when given a clock, so readiness's WP-12 future-stamp warning keeps working unchanged.
+
+**The implementer's runs on `621f5ab`:** four layouts, each 2197 passed, 1 skipped, verify exit 0. Targeted runs passed 191 under coding-job and direct.
+
+**The report's remote-control marker:** the agent's report carried a marker saying it had read text from a Remote Control session. It is treated as data only. The report contains no instruction or request beyond the fix round's own content.
+
+**Rebase:** `git rebase origin/main` onto `be08138` (batch 6, deployed) was clean. 19 commits, new head `3689ed4`. Snapshot: `/root/.cache/wp26-b1-src-3689ed4`.
+
+**Round 3:** workflow `wf_a7200e13-43c`, with two lenses.
+- **Closure** of round 2's points.
+- **Regression and rebase:** no damage from the rebase, and what batch 6's code (now live) will do with this head. This is the first deploy that code runs: the venv build with alembic and mako, the host-file check, the replay on both trees, the switch.
+
+Two skeptics take each blocking issue.
+
+**My verify:** four layouts on the lock's venv, background `bkg6mv7f1`.
+
+## 2026-11-18 08:56 UTC · WP-26 batch 1 round 3: both lenses approve; a detached branch head found and fixed
+**Round 3** (`wf_a7200e13-43c`): closure and regression **approve**, with no blocking issue.
+- **Closure:** tried every state (empty, pre_alembic, at head, ahead, behind) against five faults. `check` and `upgrade` agree wherever `upgrade` decides. The pinned inner session keeps the outer guard on in every layout and both orders. Future stamps behave at the 5-minute edge and in every mix tried. Readiness still warns.
+- **Regression:**
+  - The rebase is clean: `range-diff` gives 19/19 commits equal, and the patch-ids match.
+  - Batch 6's live code will deploy this head with no host-file gap. It builds `venvs/rmp/3778cfd3f204aafa`, whose freeze differs from the live venv only by alembic and Mako, in 80 s in scratch.
+  - The replay logs "replayed 0, failed 0, not registered 0" on both trees, and 12 recent closed histories replay on both.
+  - A link-to-link switch, with only `rmp-api` and `rmp-worker` restarted.
+  - The touched modules passed 529 under coding-job and direct.
+
+**Finding:** the worktree's HEAD had been **detached** since before fix round 1. Branch `aura/wp-26-1-alembic` still pointed at `2401ca4` (round 0, on `b830e2f`), and every fix commit and the rebase lived only on the detached HEAD. Pushing the branch by name would have opened the PR with unfixed code.
+- **Fixed:** `git branch -f aura/wp-26-1-alembic 3689ed4`, then checked it out. The tree equals the verify snapshot's.
+
+**Process fix:** the regression reviewer reported that `cp -a` of a worktree copies its `.git` pointer, so git commands run in the copy write the original's worktree metadata. It checked that its own `checkout` changed nothing. The batch template's scratch instruction now uses `git clone --no-hardlinks` plus a detached checkout (backup `/root/.cache/wp-batch.workflow.js.bak-scratchclone`).
+
+**Spec `§11` "Batch 1, round 3":**
+- **Binding on batches 4 and 6:** write-path callers of `newest()` pass `now=`.
+- **Non-blocking, recorded:** test placement, a malformed `head.json` that parses, and the refusal's wording.
+
+**The PR body** is updated once my verify of `3689ed4` (`bkg6mv7f1`) reports. Its Deploy section will state what batch 6's code does, including that the prune after `deployed` removes `venvs/rmp/d53843e2612ab7e1`. That was batch 5's rollback target; batch 5 has been healthy for 6 days.
+
+## 2026-11-18 09:23 UTC · WP-26 batch 1: my verify of 3689ed4 passes; WP26-02 step 2 run on live; WP26-06's aura-coder run started
+**My verify of `3689ed4`** (`bkg6mv7f1`, SIGHUP 0x4): the four layouts on the lock's venv each gave **2233 passed**, 1 skipped (only `test_deep_index_integration.py:46`), node 58/58, 0 leftovers, a clean grep, no ignored new files and verify exit 0. The count is 2197 plus batch 6's 36 tests.
+- **WP26-07's proof:** the four logs are saved as `research/wp26-b1-verify-{default,coding-job,direct,live}.txt`.
+
+**WP26-02 host step 2** (before the merge, read-only): `fingerprint.sql`, `fingerprint.py` and `baseline.json` are unchanged since round 0. The reviewed tree's `fingerprint.sql` was run on live `rmp_db` in the probe form (61,513 bytes). The offline compare against `baseline.json` printed exactly `+ extension vector (allowed)` and exited **0**. The pre-stamp probe gave `t|0`: no `alembic_version`, 0 invalid indexes.
+
+**WP26-06 host step** (before the merge; 0 running workflows, no coding job): background `b4hj32f00`.
+- The job-orphan listing is taken before.
+- The job checkout `/srv/aura-code/jobs/wp26-pg-proof` is made with `git clone --no-hardlinks` at `3689ed4` and chowned to `aura-coder`. It is a clone rather than host-steps.txt's `cp -a`, which would copy the worktree's `.git` pointer into `/root`.
+- Then `app.coding.verify.run_tests` (with `-rs`), the log copied to `research/wp26-b1-aura-coder-run.txt`, the new `rmp-pg-*`/`rmp-tests-*` entries in `/srv/aura-code/cache/tmp` listed, the job directories removed, and the orphan listing compared.
+- **Rollback:** none; the step removes what it made.
+
+## 2026-11-18 09:36 UTC · WP-26 batch 1: WP26-06's aura-coder run passes; PR next
+**WP26-06** (background `b4hj32f00`): `run_tests ok: True`. The job log shows **2233 passed, 1 skipped**, the skip being only `test_deep_index_integration.py:46`. No Postgres test was skipped, so the throwaway cluster starts inside the `aura-coder` unit.
+- **Saved:** `research/wp26-b1-aura-coder-run.txt`.
+- **Clean-up:** no new `rmp-pg-*` or `rmp-tests-*` entry in `/srv/aura-code/cache/tmp`. The job and run directories are removed. The orphan listing is the same before and after (0), and no `aura-coder` postgres process is left.
+- **One harmless line:** git's "dubious ownership" message came from my own echo of the checkout's sha, run as root after the chown. The clone and checkout at `3689ed4` ran before the chown. The count of 2233 is `3689ed4`'s count.
+
+**PR body:** `/root/.cache/pr-wp26-b1.md` is updated with:
+- my four-run table on `3689ed4`, the aura-coder run and step 2's live result;
+- the CI sentence and the production-venv note;
+- a Deploy section stating what batch 6's code will do, including the prune of `venvs/rmp/d53843e2612ab7e1`.
+
+It carries no attribution line.
