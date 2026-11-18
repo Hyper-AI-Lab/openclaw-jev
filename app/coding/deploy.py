@@ -8,21 +8,29 @@ the full suite on that exact commit as aura-coder, then hands off; the unit land
 A deploy waits queued on disk (``RUNS_DIR/<task>``). One launcher, ``next_deploy``, run by the reconciler's
 ``watch_main`` every minute and by the hand-off, starts the detached root unit (``ops/coding_deploy.py``) of the
 next queued run, only when no deploy unit runs, nothing holds the code-reload lock and no user task is active.
-The unit does its slow work first (a reviewed run's land and CI wait, and the venv of the head's lock files when
-they changed), then holds the code-reload lock, refuses mirrors edited by hand and, right after the strict idle
-count, stops the affected units, the API first with a second count; it points the live venv link at the new venv,
-fast-forwards the live ``main`` to GitHub's, reconciles the mirrors in full and starts the units again, then checks
-health, readiness (like with like: only a check that passed before can fail it) and a canary.
+The unit first checks that the run still applies (GitHub's main is not live yet, or a reviewed job's base is still the
+live main), then blocks a change whose readiness-hashed host files or Claude Code pin are not installed on the host,
+then does its slow work (a reviewed run's land and CI wait, the venv of the head's lock files when they changed, and
+a copy of OpenClaw's dist when its patches changed), then holds the code-reload lock, replays the running workflows
+on the head's code, refuses mirrors edited by hand and, right after the strict idle count, stops the affected units,
+the API first with a second count; it points the live venv link at the new venv, fast-forwards the live ``main`` to
+GitHub's, reconciles the mirrors in full, applies OpenClaw's model policy and dist patches when they changed and
+starts the units again, then checks health, readiness (like with like: only a check that passed before can fail it)
+and a canary.
 It never installs a unit file; the result names the changed ones. On failure it reverts the live ``main`` the same
-way at once, the tree first and the venv after, lands the revert on GitHub as a pull request of its own whatever
-that window did, then checks health again. Each phase is written to the run's state as it happens, so a killed
-unit's run resumes from its phase. It records the result under the code-reload lock: Kirill's note for Aura's own
-first, retried, then the event; a reviewed job's workflow then replies on the new code.
+way at once, the tree first and the venv after, then OpenClaw's dist and policy, lands the revert on GitHub as a pull
+request of its own whatever that window did, then checks health again. Each phase is written to the run's state as
+it happens, so a killed unit's run resumes from its phase. It records the result under the code-reload lock: Kirill's
+note for Aura's own first, retried, then the event; a reviewed job's workflow then replies on the new code.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import fcntl
+import filecmp
+import hashlib
+import io
 import json
 import logging
 import os
@@ -30,6 +38,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
 import time
 from contextlib import contextmanager
@@ -39,8 +48,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 from app.coding import github, venvs, verify, workspace
-from app.coding.units import CODE_ROOT, CODER_USER, JOBS_DIR, RUNS_DIR
-from app.config import OPENCLAW_HOME
+from app.coding.units import CLAUDE_BIN, CODE_ROOT, CODER_USER, JOBS_DIR, MANAGED_SETTINGS, RUNS_DIR
+from app.config import OPENCLAW_HOME, _read_settings_file
+from app.production import coding_readiness
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +69,10 @@ APPLY_RESERVE_SEC = 90 * 60
 CHANGING = ("applying", "merged", "restarted", "reverting")
 # Errors before the change a run survives: the last of them ends it ``failed``.
 MAX_ATTEMPTS = 3
+# The replay of the running workflows on the head's code, then on the live code, each at most this long.
+REPLAY_TIMEOUT_SEC = 300
+# The replay's error for a running workflow whose type the head no longer registers.
+UNREGISTERED = "type not registered at head"
 # (path or directory prefix, services restarted when it changes); docs, tests and ops restart nothing.
 SERVICE_PATHS = (
     ("app/", ("rmp-api", "rmp-worker")),
@@ -66,6 +80,8 @@ SERVICE_PATHS = (
     ("requirements.txt", ("rmp-api", "rmp-worker")),
     ("requirements-dev.txt", ("rmp-api", "rmp-worker")),
     ("plugins/", ("openclaw-gateway",)),
+    ("patch_openclaw.sh", ("openclaw-gateway",)),
+    ("ops/openclaw_patch_audit.py", ("openclaw-gateway",)),
     ("web-stack/", ("aura-web-backends",)),
 )
 # RMP's venvs, one per lock, under the venvs root (``venvs.VENVS_ROOT``); the live checkout's ``venv`` links to one.
@@ -77,6 +93,17 @@ CURSOR_RULES_MIRROR = Path("/root/.cursor/rules")
 # The web backends' venv, untracked in their mirror, and the requirements installed into it in place when they change.
 WEB_VENV = WEB_STACK_MIRROR / "backends" / ".venv"
 WEB_REQUIREMENTS = "web-stack/backends/requirements.txt"
+# OpenClaw's side of a change, run in the window once the tree moved, and again (or undone) by a revert: the model
+# policy, which the gateway reads from openclaw.json live, and the patches of OpenClaw's dist, which the gateway loads at
+# its start. The dist is the one patch_openclaw.sh patches; a run copies it first, and its revert restores that copy.
+POLICY_SOURCE = "app/llm/model_policy.py"
+POLICY_COMMAND = ("import json; from app.llm.model_policy import apply_openclaw_policy; "
+                  "print(json.dumps(apply_openclaw_policy()['changed']))")
+POLICY_TIMEOUT_SEC = 300
+PATCH_SOURCES = ("patch_openclaw.sh", "ops/openclaw_patch_audit.py")
+OPENCLAW_DIST = Path(os.environ.get("OPENCLAW_DIST_DIR", "/usr/lib/node_modules/openclaw/dist"))
+PATCH_TIMEOUT_SEC = 900
+AUDIT_TIMEOUT_SEC = 300
 MIRRORS = (
     ("plugins/", PLUGINS_MIRROR),
     ("web-stack/", WEB_STACK_MIRROR),
@@ -93,6 +120,16 @@ RMP_UNIT_PREFIXES = ("rmp-", "aura-", "openclaw-", "temporal.", "temporal-")
 # or no directory.
 MISSING = " (missing)"
 NOT_REGULAR = " (not a regular file)"
+# The readiness-hashed host files, as (repo copy, installed copy). Rule 18 installs a changed one before its merge; a
+# deploy whose head changes one waits, blocked, until the installed copy holds the head's bytes.
+HOST_INSTALLED = (
+    ("ops/claude_host/managed-settings.json", coding_readiness.HOST_POLICY),
+    ("ops/aura_github.sh", coding_readiness.GITHUB_WRAPPER),
+    ("ops/aura_coder/managed-settings.json", MANAGED_SETTINGS),
+)
+# Where the Claude Code pin is set: these keys of DEFAULT_CODING, unless settings.json's own ``coding`` sets them.
+CLAUDE_PIN_SOURCE = "app/config.py"
+CLAUDE_PIN_KEYS = ("claude_version", "claude_sha256")
 
 
 class Interrupted(BaseException):
@@ -258,6 +295,64 @@ def host_file_drift(repo: Path, commit: str = "HEAD") -> Dict[str, List[str]]:
     drift["mirrors"] = [path for prefix, target in MIRRORS
                         for _, _, path, _ in _out_of_date(repo, commit, prefix, target)]
     return drift
+
+
+def _default_pin(live: Path, commit: str) -> Optional[Dict[str, Any]]:
+    """The Claude Code pin in ``commit``'s ``DEFAULT_CODING`` (``CLAUDE_PIN_KEYS``), read from its ``app/config.py``
+    with ``ast``: the commit's code is never imported. None when it cannot be read that way: no such file, one that
+    does not parse, no ``DEFAULT_CODING`` dict literal, or no literal string ``claude_version`` in it."""
+    try:
+        module = ast.parse(_git_bytes(live, "show", f"{commit}:{CLAUDE_PIN_SOURCE}"))
+        for node in module.body:
+            targets = (node.targets if isinstance(node, ast.Assign) else
+                       [node.target] if isinstance(node, ast.AnnAssign) else [])
+            if any(isinstance(target, ast.Name) and target.id == "DEFAULT_CODING" for target in targets) and isinstance(
+                    node.value, ast.Dict):
+                pin = {key.value: ast.literal_eval(value) for key, value in zip(node.value.keys, node.value.values)
+                       if isinstance(key, ast.Constant) and key.value in CLAUDE_PIN_KEYS}
+                return pin if isinstance(pin.get("claude_version"), str) else None
+    except Exception:
+        return None
+    return None
+
+
+def claude_pin(live: Path, commit: str, own: Dict[str, Any]) -> Optional[Tuple[Any, ...]]:
+    """The effective Claude Code pin at ``commit``, (version, sha256): each key settings.json's own ``coding`` (``own``)
+    sets, else ``commit``'s ``DEFAULT_CODING``, as ``app.config.load_settings`` merges them. None when a key ``own``
+    does not set cannot be read from ``commit`` (``_default_pin``)."""
+    if all(key in own for key in CLAUDE_PIN_KEYS):
+        return tuple(own[key] for key in CLAUDE_PIN_KEYS)
+    default = _default_pin(live, commit)
+    if default is None:
+        return None
+    return tuple(own[key] if key in own else default.get(key) for key in CLAUDE_PIN_KEYS)
+
+
+def install_gaps(live: Path, old: str, head: str, changed: List[Tuple[str, str]], host: "Host", *,
+                 log: Callable[[str], None] = logger.info) -> List[str]:
+    """What must be installed on this host before ``head`` deploys over ``old`` (rule 18), by name; empty when nothing.
+
+    A readiness-hashed host file whose repo copy the range changes (``changed``) must be installed with the head's
+    bytes (a copy the head deletes has nothing to install), and when the range moves the effective Claude Code pin, the
+    installed binary must be the head's version with the head's sha256; a pin without a sha256 is checked by its
+    version alone, as readiness only warns there. A head pin that cannot be read is logged and is no gap: readiness
+    checks it after the deploy. The deploy installs none of them."""
+    paths = {path for status, path in changed if status != "D"}
+    gaps = []
+    for source, installed in HOST_INSTALLED:
+        if source in paths and host.installed_sha256(installed) != hashlib.sha256(
+                _git_bytes(live, "show", f"{head}:{source}")).hexdigest():
+            gaps.append(f"{source} as {installed}")
+    if CLAUDE_PIN_SOURCE in paths:
+        own = host.coding_settings()
+        pin = claude_pin(live, head, own)
+        if pin is None:
+            log("the Claude Code pin at head could not be read; readiness checks it after the deploy")
+        elif pin != claude_pin(live, old, own):
+            version, sha256 = host.installed_claude()
+            if version != pin[0] or (pin[1] and sha256 != pin[1]):
+                gaps.append(f"Claude Code {pin[0]}{f' (sha256 {pin[1]})' if pin[1] else ''} as {CLAUDE_BIN}")
+    return gaps
 
 
 def fetch_approved(job: workspace.Job, head: str, *, live: Path = LIVE_REPO) -> Dict[str, Any]:
@@ -590,6 +685,7 @@ def end_dead_runs(host: "Host") -> List[Tuple[str, Dict[str, Any], Dict[str, Any
                 write_json(spec_file(task).with_name("result.json"), result)
                 state_file(task).unlink()
                 drop_web_venv_copy(task)
+                drop_dist_copy(task)
             logger.error("The deploy run of %s is dead: %s", task, result["summary"])
             ended.append((task, spec, result))
         return ended
@@ -633,6 +729,7 @@ def abort_run(task_id: str) -> str:
                    {"status": "failed", "source": _source(task_id, spec), "head": spec.get("head"), "summary": summary})
         state_file(task_id).unlink()
         drop_web_venv_copy(task_id)
+        drop_dist_copy(task_id)
         return f"Aborted the deploy of {task_id} in phase {phase}: it is recorded failed, and its state is removed."
     finally:
         os.close(fd)
@@ -659,7 +756,8 @@ def hand_off(spec: Dict[str, Any], *, live: Path = LIVE_REPO) -> str:
 
 
 MAIN = "main"
-# A head whose deploy ended this way waits for a later commit instead of being tried again.
+# A head whose deploy ended this way waits for a later commit instead of being tried again; one blocked until host
+# files are installed (``needs_install``) is queued again once they are.
 NOT_RETRIED = ("blocked", "failed", "rolled_back")
 # Kirill's note is tried at once and again after each of these pauses while it is not delivered: about 2.5 minutes.
 NOTE_RETRY_SEC = (30, 120)
@@ -693,7 +791,8 @@ def _queue_main(host: "Host") -> None:
         return
     last = _read_json(spec_file(MAIN).with_name("result.json"))
     if last and last.get("head") == head and last.get("status") in NOT_RETRIED:
-        return
+        if not last.get("needs_install") or install_gaps(host.live, old, head, changes(host.live, old, head), host):
+            return
     if github.check(head, host.repo) != "success":
         return
     queue({"task_id": MAIN, "source": "github", "head": head, "ci": "success"})
@@ -894,6 +993,65 @@ class Host:
         """CI's test check on ``sha`` once it finished, or its state when the wait ran out."""
         return github.wait_check(sha, self.repo)
 
+    def replay(self, tree: Path, *, venv: Path) -> Dict[str, Any]:
+        """The running workflows replayed on ``tree``'s code, by its ``ops/replay_live.py`` on ``venv``'s python:
+        ``{"replayed": [ids], "failed": {id: error}}``, or ``{"error": why the replay could not run}``."""
+        tool = tree / "ops" / "replay_live.py"
+        if not tool.is_file():
+            return {"error": f"{tree} has no ops/replay_live.py"}
+        try:
+            run = subprocess.run([str(venv / "bin" / "python"), str(tool)], cwd=tree, capture_output=True, text=True,
+                                 env={**os.environ, "PYTHONPATH": str(tree)}, timeout=REPLAY_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            return {"error": f"it did not finish within {REPLAY_TIMEOUT_SEC} s"}
+        except OSError as exc:
+            return {"error": str(exc)[:300]}
+        lines = run.stdout.strip().splitlines()
+        try:
+            result = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            result = None
+        if not isinstance(result, dict):
+            return {"error": f"exit {run.returncode}: {run.stderr.strip()[-300:]}"}
+        if run.returncode != 0 or "error" in result:
+            return {"error": result.get("error") or f"exit {run.returncode}"}
+        return result
+
+    def _openclaw_step(self, argv: List[str], timeout: float, failure: str) -> str:
+        """Run one of OpenClaw's steps from the live tree, which is the change's (or the revert's) by now: its output,
+        or ``failure`` with the end of what it printed when it exits non-zero."""
+        run = subprocess.run(argv, cwd=self.live, capture_output=True, text=True, timeout=timeout,
+                             env={**os.environ, "PYTHONPATH": str(self.live), "OPENCLAW_DIST_DIR": str(OPENCLAW_DIST)})
+        if run.returncode != 0:
+            raise RuntimeError(f"{failure}: {(run.stdout + run.stderr).strip()[-300:]}")
+        return run.stdout
+
+    def apply_openclaw_policy(self) -> str:
+        """OpenClaw's model policy as the live tree writes it into openclaw.json, in a process of its own on the live
+        venv: this unit's modules are from before the change. The keys it changed, as JSON."""
+        python = str(self.live / "venv" / "bin" / "python")
+        return self._openclaw_step([python, "-c", POLICY_COMMAND], POLICY_TIMEOUT_SEC,
+                                   "applying OpenClaw's model policy failed").strip()
+
+    def patch_openclaw(self) -> None:
+        """The live tree's patches of OpenClaw's dist, then its audit of them, while the gateway is stopped."""
+        python = str(self.live / "venv" / "bin" / "python")
+        self._openclaw_step(["bash", str(self.live / "patch_openclaw.sh")], PATCH_TIMEOUT_SEC, "patching OpenClaw failed")
+        self._openclaw_step([python, str(self.live / "ops" / "openclaw_patch_audit.py"), str(OPENCLAW_DIST)],
+                            AUDIT_TIMEOUT_SEC, "patching OpenClaw failed")
+
+    def installed_sha256(self, path: Path) -> Optional[str]:
+        """The sha256 of the host file ``path`` as installed, or None when it is not a file."""
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+    def coding_settings(self) -> Dict[str, Any]:
+        """settings.json's own ``coding`` section, without the defaults of the code running here."""
+        return _read_settings_file().get("coding") or {}
+
+    def installed_claude(self) -> Tuple[Optional[str], Optional[str]]:
+        """The installed Claude Code: its version and the sha256 of its binary, as readiness reads them."""
+        return coding_readiness.installed_version(), coding_readiness.binary_sha256(CLAUDE_BIN)
+
     def readiness_report(self) -> Dict[str, str]:
         from app.coding import deploy_checks
 
@@ -1000,6 +1158,81 @@ def _build_venv(host: Host, task: str, head: str, changed: List[Tuple[str, str]]
     return target
 
 
+def _replay_answer(answer: Any, mappings: Tuple[str, ...] = ("failed",)) -> Dict[str, Any]:
+    """A replay's answer as ``_replay_live`` reads it: ``{"error": ...}`` as it is, else ``replayed``, a list of ids,
+    and ``mappings``, each a dict: ``failed``, ids with their errors, and from the head's tree ``unregistered``, the
+    running workflows of types it does not register. Any other answer could not come from a replay that ran: it is an
+    error."""
+    if isinstance(answer, dict) and "error" in answer:
+        return answer
+    if isinstance(answer, dict) and isinstance(answer.get("replayed"), list) and all(
+            isinstance(answer.get(key), dict) for key in mappings):
+        return answer
+    return {"error": f"the replay's answer lacks one of {', '.join(('replayed', *mappings))} ({str(answer)[:100]})"}
+
+
+def _replay_line(code: str, answer: Dict[str, Any]) -> str:
+    """The deploy log's line for the replay on ``code``: why it could not run, or its counts with their ids (each
+    failure with its error, each workflow of a type the tree does not register with its type)."""
+    if "error" in answer:
+        return f"live-history replay on {code}: could not run ({answer['error']})"
+
+    def counted(what: str, ids: List[str]) -> str:
+        return f"{what} {len(ids)}" + (f" ({'; '.join(ids)})" if ids else "")
+
+    parts = [counted("replayed", answer["replayed"]),
+             counted("failed", [f"{workflow}: {error}" for workflow, error in answer["failed"].items()])]
+    if "unregistered" in answer:
+        parts.append(counted("not registered",
+                             [f"{workflow}: {kind}" for workflow, kind in answer["unregistered"].items()]))
+    return f"live-history replay on {code}: {', '.join(parts)}"
+
+
+def _replay_live(host: Host, task: str, run: Dict[str, Any], head: str, target: Optional[Path],
+                 log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
+    """Before the change, under the lock: the running workflows replayed on the head's code (its tree from
+    ``git archive`` in ``RUNS_DIR/<task>/tree``, on the head's venv: the one built for it, else the live one), then on
+    the live code. A workflow that replays on the live code and fails on the head's, or whose type the head's listing
+    names as one it no longer registers, would wedge on the new code: the blocked result. One that fails on both was
+    broken already and blocks nothing; one that started after the head's listing is in neither of its lists, and
+    blocks nothing either. A replay that could not run is noted in the run (``replay``, for the result's summary) and
+    blocks nothing either, so an outage of the replay never stops every deploy, the fix included: a head whose tree
+    cannot be built (``git archive``, or an extraction the ``data`` filter refuses, such as an absolute or escaping
+    symlink) and an answer without the expected keys count as such. The tree is deleted after; the log gives both
+    trees' counts and ids first (``_replay_line``)."""
+    tree = RUNS_DIR / task / "tree"
+    try:
+        try:
+            shutil.rmtree(tree, ignore_errors=True)
+            tree.mkdir(parents=True, mode=0o700)
+            with tarfile.open(fileobj=io.BytesIO(_git_bytes(host.live, "archive", "--format=tar", head))) as archive:
+                archive.extractall(tree, filter="data")
+        except Exception as exc:
+            new: Dict[str, Any] = {"error": f"the head's tree could not be built ({str(exc)[:300]})"}
+        else:
+            new = _replay_answer(host.replay(tree, venv=target or host.live / "venv"), ("failed", "unregistered"))
+        old = _replay_answer(host.replay(host.live, venv=host.live / "venv"))
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
+    # Both trees' answers go to the log first, so the head's failures are on record also when the live one failed.
+    log(_replay_line("the head's code", new))
+    log(_replay_line("the live code", old))
+    failure = new.get("error") or old.get("error")
+    run["replay"] = f"The live-history replay could not run ({failure})." if failure else None
+    if failure:
+        log(f"the live-history replay could not run: {failure}")
+        return None
+    broken = {workflow: error for workflow, error in new["failed"].items() if workflow in old["replayed"]}
+    broken.update((workflow, UNREGISTERED) for workflow in new["unregistered"] if workflow in old["replayed"])
+    if not broken:
+        return None
+    summary = (f"The new code cannot replay running workflow(s) {', '.join(broken)} ({next(iter(broken.values()))}), "
+               "so nothing was deployed; main is unchanged. A workflow change needs workflow.patched.")
+    if run.get("merge"):
+        summary += " GitHub's main has the change; it goes live with GitHub's main."
+    return {"status": "blocked", **({"pr": run["pr"]} if run.get("pr") else {}), "summary": summary}
+
+
 def _canonical(link: Path, path: Union[str, Path]) -> str:
     """``path`` as the link ``link`` would name it, absolute and normalised: a relative path is joined to the link's
     directory, then ``normpath`` drops ``.``, ``..`` and trailing slashes."""
@@ -1083,6 +1316,113 @@ def _restore_web_venv(task: str, log: Callable[[str], None]) -> None:
     log(f"renamed {copy} back to {WEB_VENV}")
 
 
+def _dist_copy(task: str) -> Path:
+    return RUNS_DIR / task / "openclaw-dist.before"
+
+
+def drop_dist_copy(task_id: str) -> None:
+    """Delete the copy of OpenClaw's dist a run took before its change, where it is no longer the way back
+    (``end_dist_copy``). Never raises."""
+    shutil.rmtree(_dist_copy(task_id), ignore_errors=True)
+
+
+def end_dist_copy(task_id: str, status: str, phase: Optional[str]) -> None:
+    """The copy of OpenClaw's dist at the run's final result, reached in ``phase``: dropped on ``deployed``,
+    ``rolled_back`` and every result reached before ``applying``; kept on any other result reached from ``applying``
+    on, where it may be the only way back, and that result's summary names it."""
+    if status in ("deployed", "rolled_back") or phase not in CHANGING:
+        drop_dist_copy(task_id)
+
+
+def _touches_openclaw(paths: Iterable[str]) -> bool:
+    """Whether a change of ``paths`` runs OpenClaw's steps in its window: its model policy or its dist patches."""
+    return any(path == POLICY_SOURCE or path in PATCH_SOURCES for path in paths)
+
+
+def _copy_dist(task: str, changed: List[Tuple[str, str]], log: Callable[[str], None]) -> None:
+    """Before the change, when OpenClaw's patches or their audit changed: a copy of OpenClaw's dist in the run's
+    directory, which a revert restores. Patches are edits in place that nothing else undoes. A copy an earlier launch
+    took before it waited is replaced: the dist is still the one it copied."""
+    if not any(path in PATCH_SOURCES for _, path in changed):
+        return
+    copy = _dist_copy(task)
+    shutil.rmtree(copy, ignore_errors=True)
+    shutil.copytree(OPENCLAW_DIST, copy, symlinks=True)
+    log(f"copied {OPENCLAW_DIST} to {copy}")
+
+
+def _same_entry(one: Path, other: Path) -> bool:
+    """Whether two paths hold the same: links with the same target, or regular files with the same bytes."""
+    if one.is_symlink() or other.is_symlink():
+        return one.is_symlink() and other.is_symlink() and os.readlink(one) == os.readlink(other)
+    return one.is_file() and other.is_file() and filecmp.cmp(one, other, shallow=False)
+
+
+def _is_tree(path: Path) -> bool:
+    return path.is_dir() and not path.is_symlink()
+
+
+def restore_tree(copy: Path, target: Path) -> List[str]:
+    """Put ``target`` back as ``copy`` holds it: every file or link the copy lacks is removed (a directory it lacks
+    with everything in it), and every one whose content differs from the copy's, or that is missing, is copied back,
+    each through a temporary file renamed over it. What is already as in the copy is left alone, so a resumed revert can
+    run it again. The paths removed or restored, relative to ``target``."""
+    done = []
+    for root, dirs, files in os.walk(target):
+        for name in [*dirs, *files]:
+            path = Path(root) / name
+            kept = copy / path.relative_to(target)
+            if os.path.lexists(kept) and _is_tree(kept) == _is_tree(path):
+                continue
+            if _is_tree(path):
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            if name in dirs:
+                dirs.remove(name)
+            done.append(str(path.relative_to(target)))
+    for root, dirs, files in os.walk(copy):
+        for name in [*dirs, *files]:
+            kept = Path(root) / name
+            path = target / kept.relative_to(copy)
+            if _is_tree(kept):
+                path.mkdir(exist_ok=True)
+                continue
+            if os.path.lexists(path) and _same_entry(kept, path):
+                continue
+            tmp = path.with_name(f".{path.name}.aura-restore")
+            tmp.unlink(missing_ok=True)
+            if kept.is_symlink():
+                os.symlink(os.readlink(kept), tmp)
+            else:
+                shutil.copy2(kept, tmp)
+            os.replace(tmp, path)
+            done.append(str(path.relative_to(target)))
+    return done
+
+
+def _openclaw_steps(host: Host, task: str, run: Dict[str, Any], paths: List[str], forward: bool,
+                    log: Callable[[str], None]) -> None:
+    """OpenClaw's side of the window, after the tree and the mirrors: forward, the model policy of the new tree, then
+    the patches of the dist and their audit; back, the dist restored from the copy taken before the change, then the
+    policy of the reverted tree, and once both are done the run records it (``openclaw_back``, which ``_rollback``
+    set to False with the revert commit). Each runs only when the change touched its files; a failure raises, so
+    forward it is the deploy's failure, and back it keeps the run reverting (``_reverted``)."""
+    patches, policy = any(path in PATCH_SOURCES for path in paths), POLICY_SOURCE in paths
+    if forward and policy:
+        log(f"applied OpenClaw's model policy (changed {host.apply_openclaw_policy()})")
+    if forward and patches:
+        host.patch_openclaw()
+        log(f"patched and audited {OPENCLAW_DIST}")
+    if not forward and patches and _dist_copy(task).is_dir():
+        restored = restore_tree(_dist_copy(task), OPENCLAW_DIST)
+        log(f"restored {OPENCLAW_DIST} from {_dist_copy(task)} ({len(restored)} path(s))")
+    if not forward and policy:
+        log(f"applied OpenClaw's model policy again (changed {host.apply_openclaw_policy()})")
+    if not forward and run.get("openclaw_back") is False:
+        _save(task, run, openclaw_back=True)
+
+
 def _venv_back(host: Host, run: Dict[str, Any], log: Callable[[str], None]) -> None:
     """Point the venv link back at the run's recorded previous venv on the way out of a window that failed before the
     tree moved. A switch that fails is logged, so the failure that brought the run here is the one handled; the run
@@ -1105,9 +1445,10 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
     (waiting). Then, forward, the venv link goes to the run's planned venv before the tree moves to ``head``
     (``merged``); back, the tree moves to the recorded revert commit before the link goes back to the recorded previous
     venv. The web stack's changed requirements are installed into its venv (back: its copy from before the change is
-    renamed back), the mirrors are reconciled and the units started in one call (``restarted``, forward). Back, both
-    counts are skipped. Every step finds itself done when a resumed run repeats it. Whatever raises inside, the units
-    are started before the window is left. While the live main, read again then, is still at ``old``, a failure first
+    renamed back), the mirrors are reconciled, OpenClaw's side is applied (back: undone, ``_openclaw_steps``) and the
+    units started in one call (``restarted``, forward). Back, both counts are skipped. Every step finds itself done
+    when a resumed run repeats it. Whatever raises inside, the units are started before the window is left. While the
+    live main, read again then, is still at ``old``, a failure first
     points the venv link back at the recorded previous venv; a kill (``Interrupted``) leaves it where the switch got
     to, which the switch's one exchange keeps at either venv, never at none. Either puts the run back in its phase
     before ``applying`` once the link is at the recorded previous venv, so a run whose venv moved stays ``applying``,
@@ -1155,6 +1496,7 @@ def _switch(host: Host, task: str, run: Dict[str, Any], direction: str, log: Cal
                 _restore_web_venv(task, log)
         for prefix, mirror in MIRRORS:
             reconcile(live, target, changed, prefix, mirror)
+        _openclaw_steps(host, task, run, [path for _, path in changed], forward, log)
         if units:
             host.systemctl("start", *units)
             log(f"started {', '.join(units)}")
@@ -1190,15 +1532,20 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     held, less than ``APPLY_RESERVE_SEC`` of the unit's time is left, or a user task was active (or the idle count
     failed) at the final check; the run then keeps its state, and the launcher's next pass tries again.
 
-    ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed; otherwise the spec's
-    approved ``head`` lands through a pull request first, the run's state records the merge commit (``landed``), and
-    exactly that commit is deployed once CI's test check passed on it. That slow work runs first, without the lock, and
-    so does the build of the head's venv when the change moves the lock files (``_build_venv``), and the copy of the
-    web backends' venv when their requirements change (``_copy_web_venv``). Then, holding the
-    code-reload lock: the hand-edit check, the readiness baseline and, last before the units stop, the strict idle
-    count; then ``applying`` with the venv plan, the switch window (``_switch``), the checks, and on failure the revert
-    window. A run whose state is past ``landed`` was killed during or after its change: it resumes from its phase
-    (``_resume``) and runs no step before the change.
+    ``source`` "github" deploys the spec's ``head``, a commit of GitHub's main that CI passed: one the live main already
+    contains is ``unchanged``, and a live main with commits GitHub's main lacks is ``blocked``. Otherwise the spec's
+    approved ``head``, over a live main still at its ``old``, lands through a pull request, the run's state records the
+    merge commit (``landed``), and exactly that commit is deployed once CI's test check passed on it. A change to a
+    readiness-hashed host file or to the Claude Code pin that is not installed on the host blocks the run
+    (``_install_blocked``): for GitHub's main right after those first checks; for a reviewed run before its hand-edit
+    check and its land, and again for its merge commit before the CI wait. The slow work, the land and the CI wait,
+    runs without the lock, and so do the build of the head's venv when the change moves the lock files
+    (``_build_venv``), the copy of the web backends' venv when their requirements change (``_copy_web_venv``) and the
+    copy of OpenClaw's dist when its patches change (``_copy_dist``). Then, holding the code-reload lock: the readiness
+    baseline, the replay of the running workflows on the head's code and the live code (``_replay_live``), the
+    hand-edit check and, last before the units stop, the strict idle count; then ``applying`` with the venv plan, the
+    switch window (``_switch``), the checks, and on failure the revert window. A run whose state is past ``landed``
+    was killed during or after its change: it resumes from its phase (``_resume``) and runs no step before the change.
     """
     task, live = spec["task_id"], host.live
     run = _read_json(state_file(task))
@@ -1222,10 +1569,14 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         if not _is_ancestor(live, old, head):
             return {"status": "blocked", "summary": f"The live main ({old[:12]}) has commits GitHub's main lacks, so nothing "
                     "was deployed; main is unchanged."}
+        blocked = _install_blocked(host, old, head, run, log)
+        if blocked:
+            return blocked
     else:
         if old != spec["old"]:
             return {"status": "failed", "summary": "main moved while the deploy waited, so nothing was deployed. Ask me again."}
-        blocked = _drift(live, old)
+        # Before the land, so a change whose host files are not installed never reaches GitHub's main.
+        blocked = _install_blocked(host, old, spec["head"], run, log) or _drift(live, old)
         if blocked:
             return blocked
         if run.get("phase") != "landed":
@@ -1242,6 +1593,10 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
         head = run["merge"]
         log(f"landed {run['pr']['url']} as {head[:12]}")
         host.fetch_main()
+        # The merge commit is what ships, and it also carries what GitHub's main held beyond the live main.
+        blocked = _install_blocked(host, old, head, run, log)
+        if blocked:
+            return blocked
         check = host.wait_check(head)
         if check != "success":
             return {"status": "blocked", "pr": run["pr"], "summary": f"CI's test check on the merged commit "
@@ -1250,14 +1605,15 @@ def self_deploy(spec: Dict[str, Any], host: Host, *, log: Callable[[str], None] 
     changed = changes(live, old, head)
     target = _build_venv(host, task, head, changed, log)
     _copy_web_venv(task, changed, log)
+    _copy_dist(task, changed, log)
     with host.hold(CODE_RELOAD_LOCK, LOCK_WAIT_SEC) as held:
         if not held:
             log(f"waiting: {CODE_RELOAD_LOCK} stayed held for {LOCK_WAIT_SEC} s; the run keeps its phase")
             return None
         log(f"holding {CODE_RELOAD_LOCK}")
         baseline = host.readiness_report()
-        # After the baseline, which can take a minute and a half: a hand edit made meanwhile still blocks.
-        blocked = _drift(live, old)
+        # After the baseline and the replay, which can take minutes: a hand edit made meanwhile still blocks.
+        blocked = _replay_live(host, task, run, head, target, log) or _drift(live, old)
         if blocked:
             return blocked
         # The venv plan is made here, as the run first reaches applying from a phase before it, and is recorded with
@@ -1310,6 +1666,9 @@ def _resume(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
     if _web_venv_copy(task).is_dir():
         summary += (f" The web backends' venv from before this deploy is kept at {_web_venv_copy(task)}, to be renamed "
                     f"back to {WEB_VENV} by hand if it is needed.")
+    if _dist_copy(task).is_dir():
+        summary += (f" OpenClaw's dist from before this deploy is kept at {_dist_copy(task)}, to be put back over "
+                    f"{OPENCLAW_DIST} by hand (deploy.restore_tree) if it is needed.")
     return {"status": "failed", "summary": summary}
 
 
@@ -1345,7 +1704,12 @@ def _change(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], Non
     return {"status": "deployed", **_shipped(host, run), "canary": checked["canary"], "units": units,
             "new_failing": new_failing,
             "summary": f"Deployed {head[:12]} to main. Restarted {', '.join(restarted) or 'nothing'}; health and "
-            f"readiness passed and {canary}.{tightened}{installs}"}
+            f"readiness passed and {canary}.{tightened}{_replay_note(run)}{installs}"}
+
+
+def _replay_note(run: Dict[str, Any]) -> str:
+    """The result summary's sentence when the run's replay of the running workflows could not run (``_replay_live``)."""
+    return f" {run['replay']}" if run.get("replay") else ""
 
 
 def _prune_venvs(host: Host, run: Dict[str, Any], log: Callable[[str], None]) -> None:
@@ -1375,17 +1739,20 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     summary and the next still runs, so the revert always reaches GitHub. What the publish did is recorded, so a
     resumed rollback publishes no second time; only a publish that failed with an error is tried again. A revert
     window that raised before the host was back (``_reverted``: the tree at the revert commit, the venv link at the
-    recorded previous venv, the web backends' venv copy renamed back) is not the end: once the revert is published,
-    its error is raised, so the run keeps ``reverting``, the escape is counted, and the next idle pass resumes the
-    window (three such escapes leave the run stuck, ``end_dead_runs``). The re-check leaves ``claude_direct`` out
-    while the revert waits on GitHub: its clause that GitHub's main contains the live main fails until the revert
-    merges there."""
+    recorded previous venv, the web backends' venv copy renamed back, OpenClaw's dist and policy undone) is not the
+    end: once the revert is published, its error is raised, so the run keeps ``reverting``, the escape is counted, and
+    the next idle pass resumes the window (three such escapes leave the run stuck, ``end_dead_runs``). The re-check
+    leaves ``claude_direct`` out while the revert waits on GitHub: its clause that GitHub's main contains the live main
+    fails until the revert merges there."""
     live, head, failure, restarted = host.live, run["head"], run["failure"], run["affected"]
     if not run.get("revert"):
         revert = _git(live, "-c", "user.name=RMP deploy", "-c", "user.email=rmp@aura.local", "commit-tree",
                       f"{run['old']}^{{tree}}", "-p", head, "-m",
                       f"Revert {head[:12]}: the deploy's checks failed ({failure[:200]})").strip()
-        _save(task, run, revert=revert)
+        # OpenClaw's side is undone only once the revert window says so: until then the revert is not in place.
+        touched = _touches_openclaw(path for _, path in changes(live, run["old"], head))
+        undo = {"openclaw_back": False} if touched else {}
+        _save(task, run, revert=revert, **undo)
     revert, units = run["revert"], ", ".join(restarted) or "nothing"
     unmoved: Optional[Exception] = None
     try:
@@ -1418,14 +1785,33 @@ def _rollback(host: Host, task: str, run: Dict[str, Any], log: Callable[[str], N
     shutil.rmtree(_web_venv_failed(task), ignore_errors=True)
     drop_web_venv_copy(task)
     return {"status": "rolled_back", **_shipped(host, run), "revert": revert, "revert_pr": published, "error": failure,
-            "summary": f"Deploying {head[:12]} failed its checks ({failure}){reverted}; {health}; {github_now}."}
+            "summary": f"Deploying {head[:12]} failed its checks ({failure}){reverted}; {health}; {github_now}."
+            f"{_replay_note(run)}"}
 
 
 def _reverted(live: Path, task: str, run: Dict[str, Any]) -> bool:
     """Whether a revert window that raised left the host where the revert puts it: the live main at the revert commit
-    (False when it cannot be read), the venv link at the recorded previous venv, and the web backends' venv copy from
-    before the change renamed back."""
-    return _main_at(live, run["revert"]) and not _venv_moved(live, run) and not _web_venv_copy(task).exists()
+    (False when it cannot be read), the venv link at the recorded previous venv, the web backends' venv copy from
+    before the change renamed back, and OpenClaw's side undone when the change touched it (its dist restored and the
+    policy applied again, ``openclaw_back``)."""
+    return (_main_at(live, run["revert"]) and not _venv_moved(live, run) and not _web_venv_copy(task).exists()
+            and run.get("openclaw_back") is not False)
+
+
+def _install_blocked(host: Host, old: str, head: str, run: Dict[str, Any],
+                     log: Callable[[str], None]) -> Optional[Dict[str, Any]]:
+    """A blocked result naming what must be installed on the host before ``head`` deploys over ``old``
+    (``install_gaps``, in ``needs_install``), or None when nothing must. The watcher queues a head of GitHub's main
+    blocked this way again once it is installed."""
+    gaps = install_gaps(host.live, old, head, changes(host.live, old, head), host, log=log)
+    if not gaps:
+        return None
+    summary = (f"{', '.join(gaps)} must be installed on the host before this deploy (rule 18), so nothing was "
+               "deployed; main is unchanged.")
+    if run.get("merge"):
+        summary += " GitHub's main has the change; it goes live with GitHub's main once that is installed."
+    return {"status": "blocked", **({"pr": run["pr"]} if run.get("pr") else {}), "needs_install": gaps,
+            "summary": summary}
 
 
 def _drift(live: Path, old: str) -> Optional[Dict[str, Any]]:

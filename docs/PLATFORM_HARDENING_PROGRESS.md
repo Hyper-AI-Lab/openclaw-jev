@@ -4613,3 +4613,352 @@ My five-run verify of `e7ca336` (`b73i6ae8j`, logs in `/root/.cache/wp09-b5-myve
 `origin/main` is `40528e9`, and no PR is open.
 
 **Next:** mirror this log, push (this answers WP-26's Q1: whether the token can change workflow files, since this PR edits `ci.yml`), open the PR, and run the gated merge. The deploy is production's first venv switch, and the read-only host checks follow it.
+
+## 2026-11-12 08:34 UTC · WP-09 batch 5 PR opened; WP-26 Q1 answered
+- **Mirror commit:** `c703376` on `e7ca336`. `docs/PLATFORM_HARDENING_PROGRESS.md` equals `PROGRESS.md` up to the previous entry.
+- **Push:** `aura-github push aura/wp-09-5-lock` was accepted. The branch edits `.github/workflows/ci.yml`, so **the renewed token has Workflows write**. WP-26's Q1 is answered and needs nothing from Kirill.
+- **PR:** [#54](https://github.com/Hyper-AI-Lab/openclaw-jev/pull/54), opened with `/root/.cache/pr-wp09-b5.md` (verify table filled, no attribution line), and bound in the app.
+- **Next:** wait for CI's event, then run the gate once: CLEAN, `test` success, PR head = `c703376`, main = `40528e9`, exactly one open PR. Then a squash merge with an explicit subject and body.
+- **The deploy:** production's first venv switch. The read-only host checks follow.
+- **WP09-21's proof:** the CI install log must show starlette-0.52.1, pytest-9.0.3 and pytest_asyncio-1.4.0. I will record it from the run's log.
+
+## 2026-11-12 09:49 UTC · PR #54 green; WP09-21's CI proof; merged on the gate; first venv switch being watched
+**CI** (run 43184087813, job `test`): success.
+- **WP09-21's proof,** from the job log (saved to `/root/.cache/wp09-b5-ci-log.txt`): the step `pip install --require-hashes -r requirements-dev.txt` installed **starlette-0.52.1, pytest-9.0.3, pytest-asyncio-1.4.0 and langchain-1.2.12**, after `pip install --upgrade pip` installed pip-26.3. The suite gave 2091 passed, 2 skipped.
+- **The web-stack step** still installs its own unpinned requirements into its own venv (starlette 1.10.0, pytest 9.2.0), as the spec keeps it.
+
+**Gate, run once:** `state=CLEAN test=success head=c703376 local=c703376 main=40528e9 open=1`, so GATE-OK.
+
+**Before the merge:**
+- The last deploy was `deployed` at `40528e9`.
+- `/root/.openclaw/rmp/venv` is a real directory (360 MB), and `/root/.openclaw/venvs` is absent.
+- `/` has 98 GB free.
+
+**Merged** with squash, an explicit subject and body, and no attribution.
+
+**Watch:** background `butxcy8iq`. It records the timeline with the venv's type and link, the full `deploy.log` and the result. Then the host checks: the link, `venvs/rmp` and its stamps, `pip check`, a hashed dry run, the coding and deep links, units, and import errors and nondeterminism in the journal.
+
+## 2026-11-12 12:48 UTC · WP-09 batch 5 deployed (PR #54, b830e2f): production's first venv switch; host checks pass; ledger closures
+**Merge:** at 09:49:15Z, squash `b830e2f`, with no attribution.
+
+**Deploy:**
+- Queued at 09:56:38Z, after CI on main's squash, and launched at 09:56:39Z.
+- **The build, before the window:** `building the venv /root/.openclaw/venvs/rmp/fcb513c80bb3a8ce` at 09:56:40, then `… is ready` at 09:57:32 (52 s, from PyPI with hashes).
+- **The window:**
+  - `holding /run/rmp-code-reload.lock` at 09:57:32.
+  - The venv plan, logged: target `fcb513c80bb3a8ce`, previous `d53843e2612ab7e1`, adopt `d53843e2612ab7e1a1bf…`.
+  - Stopped `rmp-api` and `rmp-worker` at 09:57:36, then `switched the venv`, `main moved 40528e95fe55..b830e2f43646`, and `started rmp-api, rmp-worker` at 09:57:38. That is about 2 s down.
+- **Result:** `deployed` at 09:58:02Z, with canary `ok`, `new_failing` empty and `ci` `success`.
+- The full `deploy.log` (1,341 bytes) kept the run from the launch line to the result.
+
+**Host steps after the deploy (WP09-20), all pass:**
+- `readlink /root/.openclaw/rmp/venv` gives `/root/.openclaw/venvs/rmp/fcb513c80bb3a8ce`.
+- `ls /root/.openclaw/venvs/rmp` gives `d53843e2612ab7e1` and `fcb513c80bb3a8ce`. Their stamps begin with their names.
+- **Rollback target:** `/root/.openclaw/venvs/rmp/d53843e2612ab7e1`, production's previous 101 distributions.
+- `pip check` gives "No broken requirements found."
+- A hashed dry run of `requirements-dev.txt` finds 0 to install.
+- `rmp-coding/venv` and `rmp-deep/venv` resolve to `fcb513c80bb3a8ce`.
+- `rmp-api`, `rmp-worker` and `openclaw-gateway` are active.
+- Since the deploy: 0 `ModuleNotFoundError`/`ImportError`, 0 nondeterminism, and `CANARY OK` at 10:07Z, 11:07Z and 12:07Z.
+- **Still to do:** the import-error count again after 24 h, at about 2026-11-13 10:00Z.
+
+**Coding jobs:** the shared venv `/srv/aura-code/venvs/rmp` is rebuilt from the dev lock at the next job (WP09-18). No job has run since.
+
+**Ledger** (spec §7, "after batch 5"):
+- Closed: `debt-scalability-18` and `WP04-b1-starlette-drift`.
+- `wp_states["WP-09"]` is updated.
+- `ordering.md` (backup `/root/.cache/ordering.md.bak-wp09b5`): rule 4 "Met …", rule 25's list gains WP09-21, and rule 43 "WP-26 starts after WP-09 batch 5 (met)".
+
+**Next:** WP-26's "before batch 1" bookkeeping (spec §7) and WP26-07's harness change, then WP-26 batch 1, alongside WP-09 batch 6. One PR in flight at a time.
+
+## 2026-11-12 12:51 UTC · WP-26 starts: the harness change, batch 1's host steps before the PR, and two implementers in parallel
+**WP26-07, done by the programme.** `program/bin/verify.sh` (backup `/root/.cache/verify.sh.bak-wp26`):
+- `chmod 1777` on the private `/tmp`, and `0711` on the srv scratch directory and on `/srv/aura-code/cache` and `cache/tmp`;
+- inside the namespace, a 1 MB tmpfs over `/run/postgresql`, so no test can reach the live server's socket;
+- pytest runs with `RMP_PG_IT_REQUIRED=1`.
+
+**Smoke test** (scratch probe): in the default, coding-job and live layouts, `/run/postgresql` is empty inside the run, `RMP_PG_IT_REQUIRED=1` is set, and `TMPDIR` is 1777 (default and live) or 0711 (coding-job). 17 passed and verify exited 0 each time. The host's `/run/postgresql` is untouched.
+
+**Rollback:** copy the backup over `verify.sh`.
+
+**WP-26 batch 1, host steps before the PR** (programme):
+- **Worktree:** `/root/work/wp-26` on branch `aura/wp-26-1-alembic`, from `b830e2f`.
+- **WP26-01:** `requirements.in` gains `# schema migrations (app/db/migrate.py); Mako comes with it` and `alembic==1.20.1`.
+  - `PYTHONDONTWRITEBYTECODE=1 make -s lock` (production's python, pip dry-run only): exit 0, `wrote requirements.txt (81 pins) and requirements-dev.txt (5 more)`, `moved pins: none (84 of the 84 …)`, `outside the lock: none`.
+  - The diff adds exactly `alembic==1.20.1` (`9970712c…f598`, `83490def…2e0b`) and `mako==1.4.3` (`72329600…9d4f`, `cd6537fe…c37a`), equal to the Alembic brief's hashes. `requirements-dev.txt` is unchanged.
+  - The files are left uncommitted for the implementer to commit unchanged.
+- **WP26-02, step 1:** the newest backup is `20261112T031513Z`, and its manifest has `failures == []`.
+  - `pg_restore --schema-only --no-owner --no-privileges --no-comments --no-tablespaces`, then filtered, gives `/root/.cache/wp26/baseline.sql`: 1,290 lines, 20 `CREATE TABLE public.`, 0 `OWNER TO`/`GRANT`/`REVOKE`/`alembic_version`. The only extension mention is pg_dump's comment line.
+
+**Implementers, in parallel, one PR in flight:**
+- **WP-26 batch 1** (Alembic on the frozen live baseline): prompts in `/root/.cache/wp-batch-manual/wp26-b1/`.
+- **WP-09 batch 6** (checks before the change and OpenClaw's side): branch `aura/wp-09-6-prechecks` in `/root/work/wp-01`, prompts in `wp09-b6/`.
+- Each runs at most one full harness at a time, and waits if two verify scopes are active.
+
+**Bookkeeping:** WP-26 §7's "before batch 1" list (work-packages rows and notes, rules 3, 25, 44, 45 and 46, notes in the WP-09 and WP-04 specs, `wp_states`) is delegated to an agent. File backups go to `/root/.cache/*.bak-wp26-b1-bookkeeping`.
+
+## 2026-11-12 12:56 UTC · WP-26 "before batch 1" bookkeeping applied
+**The agent's changes** (each file backed up to `/root/.cache/<name>.bak-wp26-b1-bookkeeping`):
+- **`ordering.md`:** rule 3 gains the §7 text, rule 25 gains the Workflows-write sentence, and rule 43 gains "WP-26 started 2026-11-12." New rules 44, 45 and 46 are added verbatim. Rule 17 is untouched.
+- **`work-packages.md`:**
+  - §3: five rows reordered (`deploy.py`, `coding_deploy.py`, `models.py`, `server.py`, `production_guard.py`), and two rows added (the restore and backup files, and `app/db/migrations/`).
+  - The WP-26 section gains the "From specs/WP-26.md" bullet.
+  - Cross-WP notes are added to WP-03, -04, -07, -16, -20, -23, -27, -29, -31a, -33 and -39. WP-16's note records that Q1 was answered.
+- **`specs/WP-09.md` amendment 17:** §0's manual ship runs WP26-16's migration command when the head has pending revisions, and §5's row reads `09 → 26 / 04c`.
+- **`specs/WP-04.md`:** notes on WP04-24 (the runbook; after WP-26 batch 6) and on WP04-33 (either side of WP-26 batch 4; the schema sentence on a stop).
+- **`ledger.json`:** `wp_states["WP-26"]` gets §7's string, with the met date and Q1's answer.
+- **Deliberately not done:** `decisions.md`, because no K-number is needed for Q1 once it is answered.
+
+**I added myself:** `specs/WP-26.md` gains §11 "Programme notes", which records Q1's answer and the "before batch 1" steps.
+
+## 2026-11-12 13:35 UTC · WP-09 batch 6 implemented (head b2ad7c9); review round 1 running; its harness runs in progress
+**Implementer's report** (`/root/.cache/wp-batch-manual/wp09-b6/impl-report.txt`): seven commits on `b830e2f`. Clean tree, nothing under `app/workflows`, and no requirements, dist-patch or model-policy change.
+- **WP09-23:** `install_gaps` blocks a deploy, before anything changes, when a readiness-hashed host file or a moved Claude Code pin is not installed. The result is `blocked` with `needs_install`, and the watcher queues the head again once the file is installed.
+- **WP09-24:** a new `ops/replay_live.py` replays the running workflows on the head's code and on the live code under the lock, 300 s each. A workflow that fails only on the head blocks the deploy. A replay that cannot run is noted and does not block.
+- **WP09-25:** the model policy runs inside the window. A patch change copies the dist, then patches and audits it while the gateway is stopped. A revert restores the dist and applies the policy again.
+- **WP09-33:** the Shipping lines.
+
+**Fail-before:** all 18 new deploy cases fail on `b830e2f`.
+
+**Scratch runs on `86af5a5`:**
+- `b830e2f`'s code deploys this head: stop, move and start of `rmp-api` and `rmp-worker` only, with no venv or mirror change.
+- This code finishes every run state `b830e2f` leaves behind.
+
+**Five deviations, for the reviewers to judge:**
+- a merge-commit host-file check;
+- deleted sources are skipped;
+- every failure to replay is non-blocking;
+- several details of the window's steps;
+- extra tests.
+
+**Harness:** the implementer's five runs (`run5.sh`) started at 13:32Z and are still running; they had not finished when it handed back. Logs go to `wp09-b6/runs/`.
+
+**Review round 1:** workflow `wp09-b6-review`, run `wf_9589cda8-e74`. Three lenses:
+- correctness;
+- closure;
+- **deploy-pipeline safety:** this batch's own deploy re-run on the final head; whether every readiness-hashed host file is installed today, so the first deploys after this one are not blocked; the replay's cost and failure modes against live Temporal; the dist copy's size; and state compatibility both ways.
+
+Two skeptics take each blocking issue.
+
+## 2026-11-12 23:26 UTC · Resumed after the usage limit: WP-09 batch 6's harness runs fail, diagnosed; WP-26 batch 1 resumed
+**Batch 6's five runs** (`wp09-b6/runs/`): all ended `verify: exit 1`, with 4 failed, 2110 passed, 1 skipped and 18 errors. Two causes, diagnosed in scratch copies:
+1. **18 errors: a real defect of this batch.**
+   - `tests/test_replay_live.py` leaks state into later tests, so `web_capability.obscura_available` connects to `127.0.0.1:8791` and the production guard fails them ("hermetic tests: this test reached production").
+   - Evidence: `test_web_capability.py` alone passes (15); after `test_coding_deploy.py` it passes (222); after `test_replay_live.py` it gives 14 errors. On `b830e2f` the same files pass (22).
+2. **4 failures, environmental.** The HUP cases of `tests/test_backup_script.py` pass from a normal shell (8 passed on `b2ad7c9`). The implementer's `run5.sh` evidently ran with SIGHUP ignored, which the restore's children inherited.
+
+**Fix:** sent to the batch-6 implementer: the root cause at its source, never weakening the guard; then five runs with SIGHUP at its default.
+
+**Review:** round 1 (`wf_9589cda8-e74`) failed at the limit before any lens reported. It starts again on the fixed head.
+
+**WP-26 batch 1:** stopped at the limit with ten commits (`974a838..6cf6613`):
+- the lock;
+- `baseline.sql`;
+- the Postgres fixture with a tmpfs over the live socket;
+- the fingerprint;
+- `backup_manifest.default_root`;
+- `env.py`, the template and the baseline revision;
+- `app.db.migrate`;
+- the rule 44 docs and test;
+- `ARCHITECTURE.md`.
+
+The agent was resumed with the same SIGHUP note.
+
+## 2026-11-12 23:30 UTC · WP-09 batch 6: test-isolation fix (d153b7d); review round 1 started on it
+**Root cause, from the implementer:** the Temporal workflow sandbox's lazy import, running in the replay core's fixture test, rebinds `app.orchestrator.web_capability` in `sys.modules`. Later tests then see an unpatched module.
+
+**Fix** (`d153b7d`): that test runs in a process of its own. `tests/test_replay_live.py` changes by 46 lines added and 3 removed.
+
+**Production:** not affected. The deploy runs `ops/replay_live.py` as a separate process, not inside the API or the worker. The reviewers are to confirm this.
+
+**The implementer's five runs:** in progress, with SIGHUP at its default.
+
+**Review round 1:** `wf_f2e0aa3a-3fb`, on `d153b7d`, with correctness, closure and deploy-pipeline safety lenses.
+
+## 2026-11-15 15:37 UTC · Resumed after the usage limit; batch 5's 24 h check passes; both batches' runs read
+**WP-09 batch 5's last host step** (WP09-20): 0 `ModuleNotFoundError`/`ImportError` from `rmp-api` or `rmp-worker` since the switch on 2026-11-12 09:57Z, more than 72 h ago.
+- `CANARY OK` keeps coming: 3 in the last 3 h.
+- The live venv is still `venvs/rmp/fcb513c80bb3a8ce`, and the live head is `b830e2f`.
+- **The batch-5 deploy is fully confirmed.**
+
+**WP-09 batch 6 runs** on `d153b7d` (`wp09-b6/runs/`; `SigIgn` 0x4, so SIGHUP was not ignored): all five exited 0, with 2114 passed, 1 skipped, node 58/58 and 0 leftovers. The earlier runs on `b2ad7c9` are kept as `runs-b2ad7c9-sighup-ignored/`.
+
+**WP-26 batch 1 runs** on `2401ca4` (`wp26-b1/runs/`):
+- The four layouts on the lock's venv exited 0, with 2190 passed, 1 skipped and 0 leftovers.
+- The default run on production's current venv exits 1. It fails collecting `tests/test_migrations.py`, because alembic is not installed until this batch deploys, as expected.
+
+**Housekeeping:** three implementer scratch directories from 2026-11-13, with no process using them (217 MB), are removed.
+
+**Resumed:** the batch-6 review (`wf_f2e0aa3a-3fb`, all three lenses running again), and both implementers, to write their reports.
+
+## 2026-11-15 15:44 UTC · Both implementers report; WP-26 batch 1 review started
+**WP-09 batch 6:** final head `d153b7d` (eight commits). The report is in `wp09-b6/impl-report.txt`.
+- **Root cause of the leak:** replaying `CatalogStepChildWorkflow` in-process lazily imported a fresh `app.orchestrator.web_capability` inside the sandbox and attached it to the real package. conftest's `_no_live_obscura` then stubbed the copy instead of the original.
+- **Fix:** a subprocess, plus a guard asserting that every loaded `app.*` module is still its parent's attribute. A mutation probe brings the 14 errors back.
+- **Five runs:** all passed.
+- **Scratch runs redone on `d153b7d`:** `b830e2f` deploys this head (7 passed), and this code finishes every run `b830e2f` leaves (6 passed).
+- **Review round 1:** running (`wf_f2e0aa3a-3fb`).
+
+**WP-26 batch 1:** head `2401ca4` (11 commits). The report is in `wp26-b1/impl-report.txt`, the host steps in `host-steps.txt` and the PR body in `pr-body.txt`.
+- **Done:** WP26-01 to 05 and WP26-30. WP26-06's repository part is done; its aura-coder run is the programme's. WP26-07 was used; WP26-08's code is ready, and its stamp is the programme's after the deploy.
+- **`KNOWN_DRIFT`** covers exactly D1-D9 (15 entries), with no new drift found.
+- **Four deviations:** advisory-lock tries in AUTOCOMMIT, which is stricter; the drift report's failure is non-fatal; extension lines carry no version; a refused `RMP_PG_IT_URL` fails the run.
+
+**WP-26 batch 1 review round 1:** workflow `wp26-b1-review`, run `wf_99509cc0-fa8`. Four lenses:
+- correctness;
+- closure;
+- **production safety:** the reviewer runs WP26-02's step 2 (the live fingerprint in the read-only probe form, compared offline) and checks that the stamp is a no-op;
+- **test isolation and CI:** no route from a test to live Postgres, fixture cleanup, and CI without a Postgres service.
+
+Two skeptics take each blocking issue.
+
+**One PR in flight:** batch 6 ships first; WP-26 batch 1 follows once batch 6 is deployed.
+
+## 2026-11-15 20:32 UTC · Reviews half done before the limit; resumed; my verify of batch 6 started
+**WP-09 batch 6, round 1** (`wf_f2e0aa3a-3fb`):
+- **Correctness: approve.** All four items are closed and deviations 1-5 are accepted, each with a mutation probe or a reason.
+  - A scratch run used the real `Host.replay` and the real tool. With Temporal unreachable, the deploy says "could not run", does not block, and removes the tree.
+  - A real open `DeepRecallWorkflow` history replays on the live tree and fails with `Nondeterminism` on a head that renames its first activity.
+- **Closure: approve.**
+- **Pipeline-safety lens:** stopped at the limit; resumed (`wa0ftitfs`).
+
+**WP-26 batch 1, round 1** (`wf_99509cc0-fa8`):
+- **Correctness: approve.** It ran WP26-02's host step 2 itself, read-only, on today's live data. `fingerprint.sql` in the probe form, compared offline with `baseline.json`, gives exactly `+ extension vector (allowed)` with exit 0, under both the lock's venv and production's. The pre-stamp probe gives `t|0`.
+  - Scratch probes on the throwaway cluster: a failing revision rolls back its DDL; a real pgvector extension passes the gate; an empty `alembic_version` is stamped; an INVALID index makes the gate refuse.
+  - Deviation 1 (AUTOCOMMIT) is guarded by a mutation.
+- **Closure: approve.** The fail-before was reproduced: `KeyError 'alembic'` on `b830e2f`.
+- **Production-safety and test-isolation lenses:** stopped at the limit; resumed (`wakusphkt`).
+
+**Scratch:** two reviewer scratch directories (128 MB, no process) are removed.
+
+**My verify of batch 6:** five runs on the snapshot `/root/.cache/wp09-b6-src-d153b7d`, background `bg03pdw68`. SIGHUP is at its default, and the runs wait while two verify scopes are active.
+
+## 2026-11-15 20:55 UTC · WP-26 batch 1 round 1: three lenses approve; test isolation finds one gap; fix round 1
+**Round 1** (`wf_99509cc0-fa8`): correctness, closure and **production safety approve**.
+- Production safety re-checked the stamp's no-op on live, read-only. `fingerprint.sql` in the probe form, compared with `baseline.json`, gives exactly `+ extension vector (allowed)` with exit 0. `alembic_version` is absent, and there are 0 invalid indexes.
+
+**Test isolation: "changes", with one blocking issue, confirmed by both skeptics.** No test observes the fixture's outcome: a skip with its reason, or a failure under `RMP_PG_IT_REQUIRED=1`. Production is not at risk, but the D-11 rule that a skipped Postgres test fails the harness run has no test.
+
+**Spec `§11` "Batch 1, round 1":**
+1. Outcome tests through `pytester`.
+2. The drift report never changes an exit code in `_settled` and `_check`.
+3. The preflight only reports. A bad backup stamp counts as "no usable backup" only on the write path.
+4. §10 point 8's hint for an "ahead" database.
+5. `default_root()`'s docstring states its real chain.
+
+Also recorded, and not changed: the function-overload key (batch 6), CI's Postgres tests in batch 1 (the PR body), the `55P03` stop case and the aura-coder leftover check. The last two are added to `wp26-b1/host-steps.txt`, along with `PYTHONDONTWRITEBYTECODE=1` for step 2.
+
+**Fix round 1:** sent to the implementer.
+
+## 2026-11-15 20:56 UTC · WP-09 batch 6 round 1: all three lenses approve; amendment 18 closes six pipeline-robustness points before it ships
+**Round 1** (`wf_f2e0aa3a-3fb`): correctness, closure and **deploy-pipeline safety all approve**, with no blocking issue.
+
+**Pipeline safety measured, read-only:**
+- All three readiness-hashed host files (claude_host `2d528cba…`, aura_github `c352aa05…`, aura_coder `9b95cbf4…`) are identical at `b830e2f`, at `d153b7d`, in the live tree and installed.
+- The Claude pin 2.1.288 equals the installed binary, so the first deploys after this one have no hidden gap.
+- Live Temporal: 0 running workflows. The replay tool takes about 2.7 s and 126 MB per tree.
+- With Temporal unreachable the result is "could not run" after 2.6 s; with a black-hole server, 32.8 s.
+- OpenClaw's dist is 369 MB, against 97 GB free.
+- The reviewer re-ran the scratch phases on `d153b7d` independently: 7 passed and 6 passed.
+
+**Non-blocking points found independently by several lenses,** each a way a later head could fail or wedge the pipeline or lose the way back. Since this code runs every later deploy, they are taken as **spec `§9 amendment 18`** (backup `/root/.cache/WP-09.md.bak-amend18`):
+1. Errors while building the tree become "could not run".
+2. A running workflow whose type is gone at head blocks the deploy.
+3. The dist copy is kept where it is the way back, and a failed restore keeps the run `reverting`.
+4. An unreadable or version-only Claude pin is never an unsatisfiable gap.
+5. The head's failures are always logged.
+6. The docs give the real order.
+
+**Rule 37 and K-4:** recorded, not coded. Only the programme merges (K-3), and dist-patch PRs wait for batches 7 and 8.
+
+**Fix round 1:** sent to the implementer, including scratch phases A and B on the new head.
+
+**My verify of `d153b7d`** (`bg03pdw68`): stopped, because the head will change.
+
+## 2026-11-17 04:25 UTC · Resumed after the usage limit: both fix rounds are committed and pass; round-2 reviews and my verifies running
+**State found:** `origin/main` and the live deploy are still `b830e2f`. Both implementers had committed their fix rounds and finished their runs before the limit stopped them, without reports.
+
+**WP-09 batch 6, fix round 1** (amendment 18): head `a1d2aaf`, six commits on `d153b7d`, clean tree.
+- `32758ee` (1): a head tree that cannot be built, or a replay answer without its keys, is "could not run".
+- `5f7f428` (2): a running workflow whose type the head no longer registers blocks the deploy.
+- `27ff81e` (3): a revert stays `reverting` until the dist and the policy are undone, and the dist copy is kept after `applying` except on `deployed` and `rolled_back`.
+- `4a039f9` (4): an unreadable pin is logged, and a version-only pin compares the version.
+- `078b1fd` (5): both trees' counts and ids are logged before deciding.
+- `a1d2aaf` (6): the docs give the real order.
+
+**Its runs** (`wp09-b6/runs-fix1/`, SIGHUP not ignored):
+- five full runs, each 2128 passed, 1 skipped, verify exit 0;
+- the touched files, 224 passed under coding-job and direct;
+- scratch phase A 7 passed (`b830e2f` deploys this head) and phase B 6 passed.
+
+**WP-26 batch 1, fix round 1** (spec §11): head `7e7c0e2`, five commits on `2401ca4`, clean tree.
+- `1030848`: the drift report sits inside its own guard at head and in `check`.
+- `3196782`: the preflight only reports a bad stamp.
+- `7d72dc4`: the hand-DDL hint in the "ahead" refusal.
+- `b21f611`: `default_root`'s docstring.
+- `7e7c0e2`: `pg_server`'s outcome tested through an inner pytest session.
+
+**Its runs** (`wp26-b1/runs/fix1-*.txt`): four layouts on the lock's venv, each 2196 passed, 1 skipped, verify exit 0; targeted runs 148 passed under coding-job and direct.
+
+**Now running:**
+- **Round-2 reviews:** one workflow, `wf_7b2a7cc4-e96`, with closure and regression lenses for each batch and two skeptics per blocking issue.
+- **My verifies:** background `blqa0j233`. Batch 6's five runs on the snapshot `wp09-b6-src-a1d2aaf`, then WP-26 batch 1's four on `wp26-b1-src-7e7c0e2`, one at a time.
+- **Both implementers:** resumed only to write their fix-round reports.
+
+**Housekeeping:** one stale scratch directory (94 MB, no process) is removed.
+
+## 2026-11-17 09:27 UTC · My verifies of both final heads pass; round-2 reviews resumed
+**WP-09 batch 6 at `a1d2aaf`** (`blqa0j233`, logs in `/root/.cache/wp09-b6-myverify-a1d2aaf/`): five runs, the four layouts on the lock's venv plus default on production's venv. Each gave 2128 passed, 1 skipped, node 58/58, 0 leftovers, a clean grep, no ignored new files and verify exit 0.
+
+**WP-26 batch 1 at `7e7c0e2`** (logs in `/root/.cache/wp26-b1-myverify-7e7c0e2/`): four layouts on the lock's venv. Each gave 2196 passed, 1 skipped, node 58/58, 0 leftovers and verify exit 0. The only skip is `test_deep_index_integration.py:46` (opt-in Qdrant). No Postgres test was skipped, under `RMP_PG_IT_REQUIRED=1`.
+- The production-venv run is not repeated: it cannot import alembic until this batch deploys (logged 2026-11-15).
+
+**Round-2 reviews** (`wf_7b2a7cc4-e96`): all four agents had stopped at the limit before doing anything. Resumed as `wmpa2goi8`. The two implementers were resumed for their write-ups only.
+
+## 2026-11-17 09:29 UTC · Both fix-round reports in; one ruled deviation
+**WP-26 batch 1, fix round 1** (`wp26-b1/impl-report.txt`):
+- Points 2-4 each fail on `2401ca4`'s `migrate.py`: upgrade at head without `head.json` gives exit 1; an impossible stamp gives a `ValueError` exit 1; the ahead message lacks the hint.
+- Point 1 has no fail-before: the fixture already behaved correctly, and only its test was missing. A mutation proof stands in for it: a fixture that always skips, or keeps its directory, fails 4 tests.
+- **Deviations accepted:**
+  - the message names the spec file;
+  - the hint appears only when a foreign key or CHECK is missing;
+  - `check` on an ahead database with an unreadable `head.json` exits 0 (it is read-only);
+  - the inner pytest session runs with `-p no:asyncio`.
+
+**WP-09 batch 6, fix round 1** (`wp09-b6/impl-report.txt`): 17 new or changed cases, all failing on `d153b7d`.
+
+**Deviation in point 2, ruled:** the "type not registered at head" rule uses the head's own `unregistered` list, not the amendment's literal "any id the live tree replayed that the head's listing does not return". I **accept** it.
+- The head's listing runs about 2.7 s before the live one. The literal rule would falsely block a deploy of GitHub's main on any workflow started in that gap, such as an hourly canary, and that block is final until the next merge.
+- The deviation keeps the intent: a type that disappears while instances run still blocks.
+- The amendment's text is superseded on this point. The PR body names it.
+
+**Other deviations accepted:** the policy-only revert flag, and per-tree log lines.
+
+**Waiting for:** the round-2 reviews (`wmpa2goi8`).
+
+## 2026-11-17 10:15 UTC · Round 2 complete: all four reviews approve both batches; batch 6 ships first
+**Round 2** (`wf_7b2a7cc4-e96`): **all four approve**, with no blocking issue.
+
+**WP-09 batch 6 at `a1d2aaf`:**
+- **Closure:** every point of amendment 18 is closed. The 17-case fail-before was reproduced independently on `d153b7d`, and 11 mutations are all killed.
+- **Regression:** the scratch phases were re-run independently. `b830e2f` deploys this head, and this code finishes every run `b830e2f` leaves. No test was weakened. The live head's tree has no symlinks.
+- **The deviation in amendment 18 point 2** (the head's own `unregistered` list) is judged safer than the literal rule, and is accepted as ruled.
+
+**WP-26 batch 1 at `7e7c0e2`:** closure and regression approve. A mutated `pg_server` fails the new outcome tests. No leak between the inner and outer pytest sessions was found in either order.
+
+**Batch 6's non-blocking points,** ledgered for batch 7, which edits `deploy.py` next (backup `/root/.cache/ledger.json.bak-b6r2`):
+- `WP09-b6-replay-answer-types`: non-string ids or non-UTF-8 output would count an attempt;
+- `WP09-b6-defn-name`: types are matched by class `__name__`;
+- `WP09-b6-openclaw-back-unreached`;
+- `WP09-b6-stale-texts`;
+- `WP09-b6-main-dist-copy-lifetime`;
+- `WP09-b6-pin-last-assignment`.
+
+All are low severity, and none is reachable today.
+
+**WP-26 batch 1's non-blocking points,** to be judged before its PR:
+- `check` on an ahead database with an unreadable `head.json` exits 0, where it exited 1 before. Both lenses noted it.
+- The inner pytester session is not pinned to its own rootdir or confcutdir. It would leak into the outer session only if TMPDIR sat under `tests/`, which no layout does.
+- A future-stamped backup passes the 30 h guard (pre-existing).
+
+**Batch 6 PR body:** drafted in `/root/.cache/pr-wp09-b6.md`, with no attribution line.

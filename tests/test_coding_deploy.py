@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.coding import deploy, venvs, verify, workspace
+from app.coding import deploy, units, venvs, verify, workspace
 from app.production import canary_sentinel
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +77,11 @@ def repos(tmp_path, monkeypatch):
     monkeypatch.setattr(deploy, "RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(deploy, "CODE_RELOAD_LOCK", tmp_path / "code-reload.lock")
     monkeypatch.setattr(venvs, "VENVS_ROOT", tmp_path / "venvs")
+    # OpenClaw's dist, which a change of its patches copies, patches and restores (absent until a test makes it).
+    monkeypatch.setattr(deploy, "OPENCLAW_DIST", tmp_path / "openclaw" / "dist")
+    # The host files the deploy compares with their repo copies, installed on tmp_path (none installed yet).
+    monkeypatch.setattr(deploy, "HOST_INSTALLED", tuple(
+        (source, tmp_path / "host" / str(installed).lstrip("/")) for source, installed in deploy.HOST_INSTALLED))
     venv_runs = []
 
     def run(argv, *, cwd=None, timeout):
@@ -114,15 +119,23 @@ class FakeHost(deploy.Host):
     unit at its n-th call of that kind: ``deploy.Interrupted`` is raised there, once, before the call is made.
     ``merged`` is GitHub's record of the pull requests that merged, by branch, which a land adds to; hosts can share
     it. The venv steps run ``venvs`` for real on tmp_path (``repos``) and are recorded: a build with the lock files
-    it was given, a switch with the live main it saw, a prune with what it keeps."""
+    it was given, a switch with the live main it saw, a prune with what it keeps. The installed host files are read
+    for real on tmp_path (``repos``) and recorded; the installed Claude Code is ``claude``, (version, sha256), and
+    settings.json's own ``coding`` is ``settings``. The replay of the running workflows answers from ``replays``, a
+    result for each call in turn (the head's tree, then the live one), then nothing running; each call is recorded
+    with its venv and the tree's ``app/a.py``. OpenClaw's policy step and its patch step are recorded with the live
+    main they saw; the patch step edits ``deploy.OPENCLAW_DIST`` (``patch``, a function of the dist), then raises
+    ``patch_failure`` when one is given."""
 
     def __init__(self, live, *, busy=(), checks=(), lands=(), units=(), held=False, ci=None, kill_at=None,
-                 merged=None):
+                 merged=None, claude=(None, None), settings=None, replays=(), patch=None, patch_failure=None):
         super().__init__(live, repo="Hyper-AI-Lab/openclaw-jev")
         self.calls, self.busy, self.results, self.lands = [], list(busy), list(checks), list(lands)
         self.units, self.held, self.ci = list(units), held, dict(ci or {})
         self.kill_at = list(kill_at) if kill_at else None
         self.merged = {} if merged is None else merged
+        self.claude, self.settings, self.replays = claude, dict(settings or {}), list(replays)
+        self.patch, self.patch_failure = patch, patch_failure
 
     def active_user_tasks(self):
         count = self.busy.pop(0) if self.busy else 0
@@ -191,6 +204,33 @@ class FakeHost(deploy.Host):
     def checks(self, restarted, baseline, *, ignore=()):
         self.calls.append(("checks", tuple(restarted), tuple(baseline), *([tuple(ignore)] if ignore else [])))
         return self.results.pop(0) if self.results else {"failure": None, "canary": "ok"}
+
+    def installed_sha256(self, path):
+        self.calls.append(("installed", str(path)))
+        return super().installed_sha256(path)
+
+    def coding_settings(self):
+        return dict(self.settings)
+
+    def installed_claude(self):
+        self.calls.append(("installed_claude",))
+        return self.claude
+
+    def apply_openclaw_policy(self):
+        self.calls.append(("apply_policy", git(self.live, "rev-parse", "main")))
+        return '["agents.defaults.model.primary"]'
+
+    def patch_openclaw(self):
+        self.calls.append(("patch_openclaw", git(self.live, "rev-parse", "main")))
+        if self.patch:
+            self.patch(deploy.OPENCLAW_DIST)
+        if self.patch_failure:
+            raise self.patch_failure
+
+    def replay(self, tree, *, venv):
+        which = "live" if tree == self.live else "head"
+        self.calls.append(("replay", which, str(venv), (tree / "app" / "a.py").read_text()))
+        return self.replays.pop(0) if self.replays else {"replayed": [], "failed": {}, "unregistered": {}}
 
 
 def spec(repos, head):
@@ -3584,3 +3624,579 @@ def test_a_relative_live_link_is_recorded_canonically_and_kept_by_prune(repos, t
         assert sorted(os.listdir(repos.kinds)) == sorted((previous.name, built_venv().name))
     else:
         assert os.readlink(repos.link) == str(previous) and older.is_dir()
+
+
+def installed(source):
+    """The installed copy of the readiness-hashed host file ``source``, on tmp_path (``repos``)."""
+    path = dict(deploy.HOST_INSTALLED)[source]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_a_github_wrapper_change_blocks_until_installed(repos):
+    write(repos.live, {"ops/aura_github.sh": "#!/bin/sh\necho v1\n"})
+    repos.old = commit(repos.live, "the wrapper as installed")
+    wrapper = installed("ops/aura_github.sh")
+    wrapper.write_text("#!/bin/sh\necho v1\n")
+    head = repos.change({"ops/aura_github.sh": "#!/bin/sh\necho v2\n", "app/a.py": "A = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    # Installed with the old bytes: blocked before the land, with what to install.
+    assert result["status"] == "blocked" and result["needs_install"] == [f"ops/aura_github.sh as {wrapper}"]
+    assert result["summary"] == (f"ops/aura_github.sh as {wrapper} must be installed on the host before this deploy "
+                                 "(rule 18), so nothing was deployed; main is unchanged.")
+    assert ("installed", str(wrapper)) in host.calls
+    assert not [c for c in host.calls if c[0] in ("land", "systemctl", "build_venv")]
+    assert git(repos.live, "rev-parse", "main") == repos.old and git(repos.origin, "rev-parse", "main") != head
+
+    # Installed with the head's bytes: deployed.
+    wrapper.write_text("#!/bin/sh\necho v2\n")
+    host = FakeHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert ("land", "aura/t1-x", "squash") in host.calls
+
+    # A change that deletes the repo copy has nothing to install.
+    gone = repos.change({}, deletes=["ops/aura_github.sh"], on=head)
+    host = FakeHost(repos.live)
+    assert deploy.install_gaps(repos.live, head, gone, deploy.changes(repos.live, head, gone), host) == []
+    assert not [c for c in host.calls if c[0] == "installed"]
+
+
+# app/config.py's DEFAULT_CODING with a Claude Code pin.
+CONFIG = 'DEFAULT_CODING = {{\n    "enabled": True,\n    "claude_version": "{}",\n    "claude_sha256": "{}",\n}}\n'
+
+
+def test_a_claude_pin_change_blocks_until_the_binary_matches(repos):
+    old_pin, new_pin = ("2.1.288", "a" * 64), ("2.1.300", "b" * 64)
+    write(repos.live, {"app/config.py": CONFIG.format(*old_pin)})
+    repos.old = commit(repos.live, "the pin as installed")
+    head = merged_on_github(repos, {"app/config.py": CONFIG.format(*new_pin)})
+    gap = f"Claude Code 2.1.300 (sha256 {'b' * 64}) as {units.CLAUDE_BIN}"
+    # The old binary, then the new version with another binary: blocked, with nothing deployed.
+    for claude in (old_pin, ("2.1.300", "c" * 64)):
+        host = FakeHost(repos.live, claude=claude)
+        result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+        assert result["status"] == "blocked" and result["needs_install"] == [gap]
+        assert git(repos.live, "rev-parse", "main") == repos.old and not [c for c in host.calls if c[0] == "systemctl"]
+    # settings.json's own coding pins Claude Code itself: the effective pin did not move, so nothing is compared.
+    host = FakeHost(repos.live, claude=old_pin, settings={"claude_version": "2.1.288", "claude_sha256": "a" * 64})
+    changed = deploy.changes(repos.live, repos.old, head)
+    assert deploy.install_gaps(repos.live, repos.old, head, changed, host) == []
+    assert ("installed_claude",) not in host.calls
+    # The binary matches the head's pin: deployed.
+    host = FakeHost(repos.live, claude=new_pin)
+    assert deploy.self_deploy(main_spec(head), host, log=lambda m: None)["status"] == "deployed"
+    assert git(repos.live, "rev-parse", "main") == head
+
+
+def test_the_watcher_retries_a_head_once_its_files_are_installed(repos, watching):
+    head = merged_on_github(repos, {"ops/aura_coder/managed-settings.json": "{\"v\": 2}\n"})
+    policy = installed("ops/aura_coder/managed-settings.json")
+    result = deploy.spec_file(deploy.MAIN).with_name("result.json")
+    result.parent.mkdir(parents=True)
+    result.write_text(json.dumps({"head": head, "status": "blocked",
+                                  "needs_install": [f"ops/aura_coder/managed-settings.json as {policy}"]}))
+    # Not installed yet: the head waits, as any blocked head does.
+    assert deploy.watch_main(FakeHost(repos.live)) is None and watching.started == []
+    policy.write_text("{\"v\": 1}\n")
+    assert deploy.watch_main(FakeHost(repos.live)) is None and watching.started == []
+    # Installed: queued again, without a new commit.
+    policy.write_text("{\"v\": 2}\n")
+    assert deploy.watch_main(FakeHost(repos.live)) == "aura-deploy-main"
+    assert watching.started == [main_spec(head)]
+    # A head blocked for another reason is still not retried.
+    deploy.state_file(deploy.MAIN).unlink()
+    result.write_text(json.dumps({"head": head, "status": "blocked"}))
+    watching.started.clear()
+    assert deploy.watch_main(FakeHost(repos.live)) is None and watching.started == []
+
+
+def test_a_merge_commit_that_carries_an_uninstalled_host_file_is_blocked_before_ci_is_awaited(repos):
+    # GitHub's main holds a commit beyond the live main that changes the host's policy; the reviewed change itself
+    # does not touch it, but its squash merge carries that commit.
+    head = repos.change({"app/a.py": "A = 2\n"})
+    github = repos.tmp / "github"
+    git(repos.tmp, "clone", "-q", "-b", "main", str(repos.origin), str(github))
+    write(github, {"ops/claude_host/managed-settings.json": "{\"v\": 2}\n"})
+    commit(github, "Another pull request")
+    git(github, "push", "-q", "origin", "HEAD:refs/heads/main")
+    write(github, {"app/a.py": "A = 2\n"})
+    merge = commit(github, "The approved change (#7)")
+    git(github, "push", "-q", str(repos.live), f"{merge}:refs/aura/squash")
+    deploy.queue(reviewed(repos, head=head))
+
+    class SquashingHost(FakeHost):
+        def land(self, commit, branch, title, body, method):
+            self.calls.append(("land", branch, method))
+            git(self.live, "push", "-q", "origin", f"{merge}:refs/heads/main")
+            return {"status": "merged", "pr": {"number": 7, "url": "https://github.com/x/y/pull/7"}, "merge": merge}
+
+    host = SquashingHost(repos.live)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    policy = dict(deploy.HOST_INSTALLED)["ops/claude_host/managed-settings.json"]
+    assert result["status"] == "blocked" and result["needs_install"] == [
+        f"ops/claude_host/managed-settings.json as {policy}"]
+    assert result["summary"].endswith("GitHub's main has the change; it goes live with GitHub's main once that is "
+                                      "installed.") and result["pr"]["number"] == 7
+    assert not [c for c in host.calls if c[0] in ("wait_check", "systemctl")]
+    assert git(repos.live, "rev-parse", "main") == repos.old
+
+
+NONDETERMINISM = ("Nondeterminism error: Activity type of scheduled event 'run_openclaw_turn' does not match activity "
+                  "type of activity command 'run_turn'")
+
+
+@pytest.mark.parametrize("source", ["github", "reviewed"])
+def test_a_change_that_breaks_a_running_workflow_is_blocked(repos, source):
+    if source == "github":
+        head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+        task, the_spec = deploy.MAIN, main_spec(head)
+    else:
+        head = repos.change({"app/a.py": "A = 2\n"})
+        task, the_spec = "t1", reviewed(repos, head=head)
+        deploy.queue(the_spec)
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM},
+                                          "unregistered": {}},
+                                         {"replayed": ["workflow-a", "workflow-b"], "failed": {}}])
+    lines = []
+    result = deploy.self_deploy(the_spec, host, log=lines.append)
+    summary = (f"The new code cannot replay running workflow(s) workflow-b ({NONDETERMINISM}), so nothing was "
+               "deployed; main is unchanged. A workflow change needs workflow.patched.")
+    if source == "github":
+        assert result == {"status": "blocked", "summary": summary}
+    else:
+        # The reviewed change landed before the replay: GitHub's main has it.
+        assert result == {"status": "blocked", "pr": state()["pr"], "summary": f"{summary} GitHub's main has the "
+                          "change; it goes live with GitHub's main."}
+    # Under the lock, after the baseline: the head's tree on the live venv (the lock did not change), then the live
+    # tree; the head's tree is gone after.
+    assert [c for c in host.calls if c[0] == "replay"] == [("replay", "head", str(repos.link), "A = 2\n"),
+                                                           ("replay", "live", str(repos.link), "A = 1\n")]
+    counts = [f"live-history replay on the head's code: replayed 1 (workflow-a), failed 1 (workflow-b: "
+              f"{NONDETERMINISM}), not registered 0", "live-history replay on the live code: replayed 2 (workflow-a; "
+              "workflow-b), failed 0"]
+    assert lines.index(f"holding {deploy.CODE_RELOAD_LOCK}") < lines.index(counts[0]) == lines.index(counts[1]) - 1
+    assert not (deploy.RUNS_DIR / task / "tree").exists()
+    assert git(repos.live, "rev-parse", "main") == repos.old and not [c for c in host.calls if c[0] == "systemctl"]
+
+
+def test_a_workflow_broken_before_the_deploy_does_not_block_it(repos):
+    # A lock change: the head's code replays on the venv built for it.
+    head = repos.change({"app/a.py": "A = 2\n", **LOCKED})
+    deploy.queue(reviewed(repos, head=head))
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM},
+                                          "unregistered": {}},
+                                         {"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM}}])
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert "replay" not in result["summary"]
+    assert [c[:3] for c in host.calls if c[0] in ("build_venv", "replay")] == [
+        ("build_venv", str(built_venv()), ["requirements-dev.txt", "requirements.txt"]),
+        ("replay", "head", str(built_venv())), ("replay", "live", str(repos.link))]
+
+
+@pytest.mark.parametrize("new, old, reason", [
+    ({"error": "listing or fetching the running workflows failed: Failed client connect"},
+     {"replayed": [], "failed": {}}, "listing or fetching the running workflows failed: Failed client connect"),
+    ({"replayed": [], "failed": {}, "unregistered": {}}, {"error": "it did not finish within 300 s"},
+     "it did not finish within 300 s"),
+    ({"replayed": [], "failed": {"workflow-b": NONDETERMINISM}, "unregistered": {}},
+     {"error": "/root/.openclaw/rmp has no ops/replay_live.py"}, "/root/.openclaw/rmp has no ops/replay_live.py")])
+def test_a_replay_that_cannot_run_is_reported_not_blocking(repos, new, old, reason):
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    lines = []
+    result = deploy.self_deploy(main_spec(head), FakeHost(repos.live, replays=[new, old]), log=lines.append)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert result["summary"].endswith(f"The live-history replay could not run ({reason}).")
+    assert f"the live-history replay could not run: {reason}" in lines
+
+
+def test_a_running_workflow_whose_type_the_head_no_longer_registers_is_blocked(repos):
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    # The head removed the class of workflow-c, which runs: the head's listing names it as a type it does not register.
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {},
+                                          "unregistered": {"workflow-c": "OldWorkflow", "cron-x": "SomeoneElses"}},
+                                         {"replayed": ["workflow-a", "workflow-c"], "failed": {}}])
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result == {"status": "blocked", "summary": "The new code cannot replay running workflow(s) workflow-c (type "
+                      "not registered at head), so nothing was deployed; main is unchanged. A workflow change needs "
+                      "workflow.patched."}
+    assert git(repos.live, "rev-parse", "main") == repos.old and not [c for c in host.calls if c[0] == "systemctl"]
+
+    # A workflow that started after the head's listing is in neither of its lists: it blocks nothing.
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {}, "unregistered": {}},
+                                         {"replayed": ["workflow-a", "workflow-new"], "failed": {}}])
+    assert deploy.self_deploy(main_spec(head), host, log=lambda m: None)["status"] == "deployed"
+
+
+def merged_with_a_link(repos, target):
+    """GitHub's main gains a change and ``docs/link``, a symbolic link to ``target``; its commit."""
+    clone = repos.tmp / "linked"
+    git(repos.tmp, "clone", "-q", "-b", "main", str(repos.origin), str(clone))
+    write(clone, {"app/a.py": "A = 2\n"})
+    (clone / "docs" / "link").symlink_to(target)
+    head = commit(clone, "a change with a link")
+    git(clone, "push", "-q", "origin", "HEAD:refs/heads/main")
+    return head
+
+
+@pytest.mark.parametrize("target", ["/nonexistent-absolute-target", "../../outside-the-tree"])
+def test_a_head_whose_tree_cannot_be_built_is_reported_not_blocking(repos, target):
+    head = merged_with_a_link(repos, target)
+    host = FakeHost(repos.live)
+    lines = []
+    result = deploy.self_deploy(main_spec(head), host, log=lines.append)
+    # The data filter refuses the link: the head's replay could not run, the live one still ran, the deploy went on.
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    reason = re.search(r"The live-history replay could not run \((.*)\)\.$", result["summary"]).group(1)
+    assert reason.startswith("the head's tree could not be built (") and "link" in reason
+    assert [c[:2] for c in host.calls if c[0] == "replay"] == [("replay", "live")]
+    assert f"the live-history replay could not run: {reason}" in lines
+    assert not (deploy.RUNS_DIR / deploy.MAIN / "tree").exists()
+
+
+@pytest.mark.parametrize("answers", ["the head's {}", "the live {}", "a tool printing {}"])
+def test_a_replay_answer_without_its_keys_is_reported_not_blocking(repos, tmp_path, answers):
+    # Both trees carry the tool, so the host's own replay runs it on its interpreter.
+    write(repos.live, {"ops/replay_live.py": "# the tool\n"})
+    repos.old = commit(repos.live, "the tool")
+    git(repos.live, "push", "-q", "origin", "main")
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    venv = tmp_path / "printing-venv"
+    write(venv, {"bin/python": "#!/bin/sh\necho '{}'\n"})
+    (venv / "bin" / "python").chmod(0o755)
+
+    class PrintingHost(FakeHost):
+        """Runs each tree's tool for real, on an interpreter that prints ``{}``."""
+
+        def replay(self, tree, *, venv=None):
+            return deploy.Host.replay(self, tree, venv=tmp_path / "printing-venv")
+
+    nothing = {"replayed": [], "failed": {}, "unregistered": {}}
+    host = (PrintingHost(repos.live) if answers == "a tool printing {}" else
+            FakeHost(repos.live, replays=[{}, nothing] if answers == "the head's {}" else [nothing, {}]))
+    result = deploy.self_deploy(main_spec(head), host, log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    lacks = "replayed, failed" if answers == "the live {}" else "replayed, failed, unregistered"
+    assert result["summary"].endswith(f"The live-history replay could not run (the replay's answer lacks one of "
+                                      f"{lacks} ({{}})).")
+
+
+def test_the_hosts_replay_runs_the_tool_on_the_trees_python_and_reads_its_line(tmp_path, monkeypatch):
+    tree, venv = tmp_path / "tree", tmp_path / "venv"
+    write(tree, {"ops/replay_live.py": "# the tool\n"})
+    python = venv / "bin" / "python"
+    # A fake interpreter: it records how it was run, prints what OUT holds after a line of noise and exits CODE.
+    write(venv, {"bin/python": '#!/bin/sh\necho "$PYTHONPATH $PWD $1" > "$CALLS"\necho noise\ncat "$OUT"\n'
+                               'echo "Traceback: it broke" >&2\n[ -n "$SLOW" ] && exec sleep 5\nexit "$CODE"\n'})
+    python.chmod(0o755)
+    calls, out = tmp_path / "calls", tmp_path / "out"
+    monkeypatch.setenv("CALLS", str(calls))
+    monkeypatch.setenv("OUT", str(out))
+    host = deploy.Host(tmp_path, repo="Hyper-AI-Lab/openclaw-jev")
+
+    def replay(code, printed):
+        monkeypatch.setenv("CODE", str(code))
+        out.write_text(printed)
+        return host.replay(tree, venv=venv)
+
+    found = {"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM}}
+    assert replay(0, json.dumps(found) + "\n") == found
+    assert calls.read_text() == f"{tree} {tree} {tree / 'ops' / 'replay_live.py'}\n"
+    assert replay(2, json.dumps({"error": "listing failed"}) + "\n") == {"error": "listing failed"}
+    assert replay(1, "") == {"error": "exit 1: Traceback: it broke"}
+    assert host.replay(tmp_path / "old-tree", venv=venv) == {"error": f"{tmp_path / 'old-tree'} has no "
+                                                                      "ops/replay_live.py"}
+    monkeypatch.setattr(deploy, "REPLAY_TIMEOUT_SEC", 0.5)
+    monkeypatch.setenv("SLOW", "1")
+    assert replay(0, "") == {"error": "it did not finish within 0.5 s"}
+
+
+def test_a_model_policy_change_applies_the_policy_inside_the_window(repos):
+    head = repos.change({"app/llm/model_policy.py": "PRIMARY_MODEL = 'openai/gpt-6-luna'\n"})
+    deploy.queue(reviewed(repos, head=head))
+    host = MainWatchingHost(repos.live)
+    lines = []
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lines.append)
+    # On the new tree, while the units are stopped; the gateway reads openclaw.json live, so no unit is added.
+    assert result["status"] == "deployed" and result["restarted"] == ["rmp-api", "rmp-worker"]
+    assert [c for c in host.calls if c[0] in ("systemctl", "apply_policy")] == [
+        ("systemctl", "stop", "rmp-api", repos.old), ("systemctl", "stop", "rmp-worker", repos.old),
+        ("apply_policy", head), ("systemctl", "start", "rmp-api", "rmp-worker", head)]
+    assert "applied OpenClaw's model policy (changed [\"agents.defaults.model.primary\"])" in lines
+
+    # A rollback runs it again on the reverted tree; a change that leaves the policy alone runs it not at all.
+    repos.old = head
+    head = repos.change({"app/llm/model_policy.py": "PRIMARY_MODEL = 'openai/gpt-6'\n"}, on=head)
+    for path in (deploy.spec_file("t1"), deploy.state_file("t1")):
+        path.unlink(missing_ok=True)
+    deploy.queue(reviewed(repos, head=head))
+    host = MainWatchingHost(repos.live, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back"
+    assert [c for c in host.calls if c[0] == "apply_policy"] == [("apply_policy", head),
+                                                                 ("apply_policy", result["revert"])]
+    repos.old = result["revert"]
+    head = repos.change({"app/a.py": "A = 3\n"}, on=result["revert"])
+    for path in (deploy.spec_file("t1"), deploy.state_file("t1")):
+        path.unlink()
+    host = FakeHost(repos.live)
+    assert deploy.self_deploy(spec(repos, head), host, log=lambda m: None)["status"] == "deployed"
+    assert not [c for c in host.calls if c[0] in ("apply_policy", "patch_openclaw")]
+
+
+@pytest.fixture
+def dist(repos):
+    """OpenClaw's dist on tmp_path, as installed."""
+    write(deploy.OPENCLAW_DIST, {"index.js": "unpatched\n", "chunks/a.mjs": "export const a = 1;\n",
+                                 "chunks/b.mjs": "export const b = 2;\n"})
+    (deploy.OPENCLAW_DIST / "chunks" / "latest.mjs").symlink_to("a.mjs")
+    return deploy.OPENCLAW_DIST
+
+
+def patching(dist):
+    """What patch_openclaw.sh does to the dist, and more: edits in place, a file added, one deleted, a link moved."""
+    write(dist, {"index.js": "patched RMP_HOOK_PERSISTENCE\n", "chunks/new.mjs": "added\n", "extra/x.js": "added\n"})
+    (dist / "chunks" / "b.mjs").unlink()
+    (dist / "chunks" / "latest.mjs").unlink()
+    (dist / "chunks" / "latest.mjs").symlink_to("new.mjs")
+
+
+def test_a_patch_change_copies_the_dist_patches_audits_and_restarts_the_gateway(repos, dist, monkeypatch):
+    assert deploy.restarts_for(["patch_openclaw.sh"]) == deploy.restarts_for(["ops/openclaw_patch_audit.py"]) == [
+        "openclaw-gateway"]
+    unit, seen = deploy_unit(monkeypatch)
+    before, copy = files_in(dist), deploy.RUNS_DIR / "t1" / "openclaw-dist.before"
+
+    class CopyWatchingHost(MainWatchingHost):
+        """Records, at each stop, what the copy of the dist holds."""
+
+        def systemctl(self, *args):
+            if args[0] == "stop":
+                self.calls.append(("copy at stop", files_in(copy) if copy.is_dir() else None))
+            super().systemctl(*args)
+
+    host = CopyWatchingHost(repos.live, patch=patching)
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    head = repos.change({"patch_openclaw.sh": "#!/bin/bash\necho patched\n"})
+    deploy.queue(reviewed(repos, head=head))
+    assert unit.main(str(deploy.spec_file("t1"))) == 0
+    result = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())
+    assert result["status"] == "deployed" and result["restarted"] == ["openclaw-gateway"]
+    # Copied before the gateway stopped; patched and audited while it was stopped and the tree at the head.
+    assert [c for c in host.calls if c[0] in ("copy at stop", "systemctl", "patch_openclaw")] == [
+        ("copy at stop", before), ("systemctl", "stop", "openclaw-gateway", repos.old), ("patch_openclaw", head),
+        ("systemctl", "start", "openclaw-gateway", head)]
+    assert files_in(dist)["index.js"] == "patched RMP_HOOK_PERSISTENCE\n"
+    # The copy goes with the result.
+    assert not copy.exists() and not deploy.state_file("t1").exists()
+
+
+def test_a_failing_audit_rolls_back_and_restores_the_dist(repos, dist):
+    before = files_in(dist)
+    head = repos.change({"ops/openclaw_patch_audit.py": "REQUIRED = ('hook-persistence',)\n"})
+    deploy.queue(reviewed(repos, head=head))
+    failure = RuntimeError("patching OpenClaw failed: ERROR: required patch missing after apply: hook-persistence")
+    host = MainWatchingHost(repos.live, patch=patching, patch_failure=failure)
+    result = deploy.self_deploy(reviewed(repos, head=head), host, log=lambda m: None)
+    assert result["status"] == "rolled_back" and result["error"] == f"applying the change failed ({failure})"
+    # The window started the gateway after the failure; the revert window restored the dist from its copy while the
+    # gateway was stopped again, and published the revert.
+    revert = result["revert"]
+    assert [c for c in host.calls if c[0] in ("systemctl", "patch_openclaw", "land")] == [
+        ("land", "aura/t1-x", "squash"), ("systemctl", "stop", "openclaw-gateway", repos.old), ("patch_openclaw", head),
+        ("systemctl", "start", "openclaw-gateway", head), ("systemctl", "stop", "openclaw-gateway", head),
+        ("systemctl", "start", "openclaw-gateway", revert), ("land", f"aura/revert-{head[:12]}", "merge")]
+    assert files_in(dist) == before and (dist / "chunks" / "latest.mjs").is_symlink()
+    assert git(repos.live, "rev-parse", "main") == revert
+
+
+def test_restore_tree_puts_back_changed_and_removes_added_files(tmp_path):
+    copy, target = tmp_path / "copy", tmp_path / "target"
+    write(copy, {"a.js": "a\n", "sub/b.js": "b\n", "sub/deep/c.js": "c\n", "run.sh": "#!/bin/sh\n"})
+    (copy / "run.sh").chmod(0o755)
+    (copy / "sub" / "link.js").symlink_to("b.js")
+    shutil.copytree(copy, target, symlinks=True)
+    write(target, {"a.js": "patched\n", "sub/new.js": "added\n", "added/x.js": "added\n", "run.sh": "#!/bin/sh\nx\n"})
+    (target / "sub" / "deep" / "c.js").unlink()
+    (target / "sub" / "link.js").unlink()
+    (target / "sub" / "link.js").symlink_to("new.js")
+    (target / "sub" / "b.js").unlink()
+    (target / "sub" / "b.js").mkdir()
+
+    done = deploy.restore_tree(copy, target)
+    assert files_in(target) == files_in(copy) and (target / "sub" / "link.js").is_symlink()
+    assert sorted(os.listdir(target)) == ["a.js", "run.sh", "sub"]
+    assert oct((target / "run.sh").stat().st_mode & 0o777) == oct(0o755)
+    assert sorted(done) == ["a.js", "added", "run.sh", "sub/b.js", "sub/b.js", "sub/deep/c.js", "sub/link.js",
+                            "sub/new.js"]
+    # Again: nothing left to do.
+    assert deploy.restore_tree(copy, target) == []
+
+
+def test_the_hosts_policy_step_runs_the_live_trees_writer_on_the_live_venv(tmp_path, monkeypatch):
+    live = tmp_path / "live"
+    python = live / "venv" / "bin" / "python"
+    # A fake interpreter: it records how it was run, prints the changed keys and an error, and exits CODE.
+    write(live, {"venv/bin/python": '#!/bin/sh\nprintf "%s\\n" "$PYTHONPATH" "$PWD" "$1" "$2" "$OPENCLAW_DIST_DIR" '
+                                    '> "$CALLS"\necho \'["agents.defaults.model.primary"]\'\n'
+                                    'echo "Traceback: openclaw.json is not JSON" >&2\nexit "$CODE"\n'})
+    python.chmod(0o755)
+    calls = tmp_path / "calls"
+    monkeypatch.setenv("CALLS", str(calls))
+    monkeypatch.setenv("CODE", "0")
+    host = deploy.Host(live, repo="Hyper-AI-Lab/openclaw-jev")
+    assert host.apply_openclaw_policy() == '["agents.defaults.model.primary"]'
+    assert calls.read_text().splitlines() == [str(live), str(live), "-c", deploy.POLICY_COMMAND,
+                                              str(deploy.OPENCLAW_DIST)]
+    monkeypatch.setenv("CODE", "1")
+    with pytest.raises(RuntimeError, match=r"(?s)^applying OpenClaw's model policy failed: .*Traceback: openclaw.json "
+                                           "is not JSON$"):
+        host.apply_openclaw_policy()
+
+
+@pytest.mark.parametrize("ending", ["blocked", "an ended dead run", "an abort"])
+def test_the_dist_copy_goes_with_the_runs_result(repos, dist, monkeypatch, systemd_run, ending):
+    unit, seen = deploy_unit(monkeypatch)
+    before, copy = files_in(dist), deploy.RUNS_DIR / "t1" / "openclaw-dist.before"
+    head = repos.change({"patch_openclaw.sh": "#!/bin/bash\necho patched\n"})
+    deploy.queue(reviewed(repos, head=head))
+    if ending == "blocked":
+        copied = []
+
+        class CopyReplayingHost(FakeHost):
+            """Notes whether the copy was taken by the time of the replay, which blocks the run."""
+
+            def replay(self, tree, *, venv):
+                copied.append(files_in(copy) if copy.is_dir() else None)
+                return super().replay(tree, venv=venv)
+
+        monkeypatch.setattr(deploy, "Host", lambda: CopyReplayingHost(repos.live, replays=[
+            {"replayed": [], "failed": {"workflow-b": NONDETERMINISM}, "unregistered": {}},
+            {"replayed": ["workflow-b"], "failed": {}}]))
+        assert unit.main(str(deploy.spec_file("t1"))) == 1
+        assert copied == [before, before]
+    else:
+        # A copy an earlier launch took before it waited.
+        shutil.copytree(dist, copy, symlinks=True)
+        if ending == "an ended dead run":
+            launched("t1", 3, started=0)
+            assert [task for task, _, _ in deploy.end_dead_runs(FakeHost(repos.live))] == ["t1"]
+        else:
+            assert deploy.abort_run("t1").startswith("Aborted the deploy of t1")
+    status = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())["status"]
+    assert status == ("blocked" if ending == "blocked" else "failed")
+    assert not copy.exists() and files_in(dist) == before and not deploy.state_file("t1").exists()
+
+
+@pytest.mark.parametrize("fails", ["the dist restore", "the policy re-apply"])
+def test_a_revert_whose_openclaw_undo_fails_keeps_reverting_with_the_dist_copy(repos, dist, monkeypatch, fails):
+    unit, seen = deploy_unit(monkeypatch)
+    before, copy, path = files_in(dist), deploy.RUNS_DIR / "t1" / "openclaw-dist.before", deploy.spec_file("t1")
+    head = repos.change({"patch_openclaw.sh": "#!/bin/bash\necho patched\n", "app/llm/model_policy.py": "P = 2\n"})
+    deploy.queue(reviewed(repos, head=head))
+    real_restore, armed = deploy.restore_tree, [True]
+
+    class UndoFailingHost(MainWatchingHost):
+        """The revert window's policy step fails, once."""
+
+        def apply_openclaw_policy(self):
+            if armed and fails == "the policy re-apply" and ("apply_policy", head) in self.calls:
+                armed.clear()
+                raise RuntimeError("applying OpenClaw's model policy failed: openclaw.json is busy")
+            return super().apply_openclaw_policy()
+
+    def restore(copied, target):
+        if armed and fails == "the dist restore":
+            armed.clear()
+            raise OSError(28, "No space left on device")
+        return real_restore(copied, target)
+
+    monkeypatch.setattr(deploy, "restore_tree", restore)
+    host = UndoFailingHost(repos.live, patch=patching, checks=[{"failure": "CANARY FAIL: task failed", "canary": None}])
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    assert unit.main(str(path)) == 1
+    run = state()
+    # The tree is back and the revert published, but OpenClaw's side is not undone: the run keeps reverting, an escape
+    # is counted, nothing is recorded, and the copy of the dist stays.
+    assert run["phase"] == "reverting" and run["openclaw_back"] is False and run["escapes"] == 1
+    assert run["published"]["status"] == "merged" and git(repos.live, "rev-parse", "main") == run["revert"]
+    assert files_in(copy) == before and not path.with_name("result.json").exists()
+
+    # The next pass resumes the revert window: the dist is restored and the policy applied again, with no new publish.
+    host = MainWatchingHost(repos.live)
+    monkeypatch.setattr(deploy, "Host", lambda: host)
+    assert unit.main(str(path)) == 1
+    result = json.loads(path.with_name("result.json").read_text())
+    assert result["status"] == "rolled_back" and result["revert_pr"] == run["published"]
+    assert ("apply_policy", run["revert"]) in host.calls and not [c for c in host.calls if c[0] == "land"]
+    assert files_in(dist) == before and not copy.exists() and not deploy.state_file("t1").exists()
+
+
+def test_a_result_after_applying_keeps_the_dist_copy(repos, dist, monkeypatch):
+    unit, seen = deploy_unit(monkeypatch)
+    before, copy = files_in(dist), deploy.RUNS_DIR / "t1" / "openclaw-dist.before"
+    head = repos.change({"patch_openclaw.sh": "#!/bin/bash\necho patched\n"})
+    deploy.queue(reviewed(repos, head=head))
+    # Killed at the start, after the patch: the dist is patched, and the copy is the only way back.
+    with pytest.raises(deploy.Interrupted):
+        deploy.self_deploy(reviewed(repos, head=head), FakeHost(repos.live, patch=patching, kill_at=("start", 1)),
+                           log=lambda m: None)
+    assert state()["phase"] == "merged" and files_in(copy) == before != files_in(dist)
+    # The live main moves under the killed run: its resume ends failed, from merged.
+    write(repos.live, {"docs/d.md": "someone else's commit\n"})
+    commit(repos.live, "a commit no deploy made")
+    monkeypatch.setattr(deploy, "Host", lambda: FakeHost(repos.live))
+    assert unit.main(str(deploy.spec_file("t1"))) == 1
+    result = json.loads(deploy.spec_file("t1").with_name("result.json").read_text())
+    assert result["status"] == "failed" and "which this deploy did not make" in result["summary"]
+    # Kept, and named in the summary.
+    assert files_in(copy) == before and not deploy.state_file("t1").exists()
+    assert (f"OpenClaw's dist from before this deploy is kept at {copy}, to be put back over {dist} by hand "
+            "(deploy.restore_tree) if it is needed.") in result["summary"]
+
+
+@pytest.mark.parametrize("config", [
+    'DEFAULT_CODING = dict(claude_version="2.1.300", claude_sha256="{}")\n'.format("b" * 64),
+    'CLAUDE = {{"claude_version": "2.1.300", "claude_sha256": "{}"}}\nDEFAULT_CODING = {{"enabled": True}}\n'.format(
+        "b" * 64)], ids=["not a dict literal", "the keys moved"])
+def test_an_unreadable_claude_pin_at_head_is_logged_and_no_gap(repos, config):
+    write(repos.live, {"app/config.py": CONFIG.format("2.1.288", "a" * 64)})
+    repos.old = commit(repos.live, "the pin as installed")
+    head = merged_on_github(repos, {"app/config.py": config})
+    host = FakeHost(repos.live, claude=("2.1.288", "a" * 64))
+    lines = []
+    result = deploy.self_deploy(main_spec(head), host, log=lines.append)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+    assert "the Claude Code pin at head could not be read; readiness checks it after the deploy" in lines
+    assert ("installed_claude",) not in host.calls
+
+
+def test_a_version_only_claude_pin_compares_the_version_only(repos):
+    write(repos.live, {"app/config.py": CONFIG.format("2.1.288", "a" * 64)})
+    repos.old = commit(repos.live, "the pin as installed")
+    head = merged_on_github(repos, {"app/config.py": 'DEFAULT_CODING = {\n    "claude_version": "2.1.300",\n}\n'})
+    # The old version installed: a gap, named by its version alone.
+    result = deploy.self_deploy(main_spec(head), FakeHost(repos.live, claude=("2.1.288", "a" * 64)), log=lambda m: None)
+    assert result["status"] == "blocked" and result["needs_install"] == [f"Claude Code 2.1.300 as {units.CLAUDE_BIN}"]
+    # The head's version installed, whatever its binary's sha256: deployed.
+    result = deploy.self_deploy(main_spec(head), FakeHost(repos.live, claude=("2.1.300", "c" * 64)), log=lambda m: None)
+    assert result["status"] == "deployed" and git(repos.live, "rev-parse", "main") == head
+
+
+def test_the_heads_replay_is_logged_when_the_live_replay_could_not_run(repos):
+    head = merged_on_github(repos, {"app/a.py": "A = 2\n"})
+    host = FakeHost(repos.live, replays=[{"replayed": ["workflow-a"], "failed": {"workflow-b": NONDETERMINISM},
+                                          "unregistered": {"workflow-c": "OldWorkflow"}},
+                                         {"error": "it did not finish within 300 s"}])
+    lines = []
+    result = deploy.self_deploy(main_spec(head), host, log=lines.append)
+    assert result["status"] == "deployed"
+    # Both answers are on record, the head's counts and ids before the reason nothing was compared.
+    head_line = (f"live-history replay on the head's code: replayed 1 (workflow-a), failed 1 (workflow-b: "
+                 f"{NONDETERMINISM}), not registered 1 (workflow-c: OldWorkflow)")
+    live_line = "live-history replay on the live code: could not run (it did not finish within 300 s)"
+    assert lines.index(head_line) < lines.index(live_line) < lines.index(
+        "the live-history replay could not run: it did not finish within 300 s")
