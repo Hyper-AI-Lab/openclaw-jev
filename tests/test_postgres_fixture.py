@@ -154,8 +154,11 @@ def test_a_test_using_the_fixture_skips_without_a_server_or_errors_when_one_is_r
             monkeypatch.delenv("RMP_PG_IT_REQUIRED", raising=False)
         clusters = {p.name for p in Path(tempfile.gettempdir()).iterdir() if p.name.startswith("rmp-pg-")}
         pytester.makepyfile(test_inner=USES_A_DATABASE)
-        # The inner session has no ini file, so pytest-asyncio, which it does not need, would warn about its settings.
-        result = pytester.runpytest_inprocess("-rs", "-p", "no:cacheprovider", "-p", "no:asyncio")
+        # The inner session is pinned to its own directory, whatever TMPDIR is: it never loads tests/conftest.py, whose
+        # unconfigure would turn this session's production guard off and remove its temp root. pytest-asyncio, which it
+        # does not need, would warn about its settings.
+        result = pytester.runpytest_inprocess("-rs", "-p", "no:cacheprovider", "-p", "no:asyncio",
+                                              f"--rootdir={pytester.path}", f"--confcutdir={pytester.path}")
         if required:
             result.assert_outcomes(errors=1)
             assert f"RMP_PG_IT_REQUIRED=1 and no Postgres server: {reason}" in result.stdout.str()
